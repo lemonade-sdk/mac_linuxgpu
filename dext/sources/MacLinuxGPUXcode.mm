@@ -2405,11 +2405,14 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     if (ivars && ivars->linuxFile && !ivars->onOwnerQueue) {
         // On the client's own queue: its process's system calls run here;
         // device initialization and cached queries on the owner's queue.
+        // HostWindow comes with InitDevice: the probe maps the GART at the
+        // host window the client placed (libmlg_drm/src/mlg_init.c).
         if (ivars->stopping) return kIOReturnNotAttached;
         if (selector >= MLG_SELECTOR_LX_OPEN && selector <= MLG_SELECTOR_LX_MUNMAP)
             return lx_external_method(this, selector, arguments);
         if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
-            selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice)
+            selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice &&
+            selector != kMacAMDGPUMethodHostWindow)
             return kIOReturnUnsupported;
         __block kern_return_t result = kIOReturnNotAttached;
         ivars->onOwnerQueue = true;
