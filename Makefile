@@ -259,7 +259,7 @@ test_xarray=$(BUILD)/linuxu/xarray.o $(BUILD)/linuxu/sync.o
 test_rcu=$(BUILD)/linuxu/rcu.o
 test_kmemcheck=$(BUILD)/linuxu/kmem/kmemcheck.o $(BUILD)/linuxu/kmem/kmemalloc.o $(BUILD)/linuxu/shims/printk.o
 test_workqueue=$(BUILD)/linuxu/work.o $(BUILD)/linuxu/shims/printk.o $(BUILD)/linuxu/timer.o $(BUILD)/linuxu/delay.o $(BUILD)/linuxu/mm/page.o
-test_timer=$(BUILD)/linuxu/timer.o $(BUILD)/linuxu/delay.o $(BUILD)/linuxu/mm/page.o
+test_timer=$(BUILD)/linuxu/timer.o $(BUILD)/linuxu/shims/timekeeping.o $(BUILD)/linuxu/delay.o $(BUILD)/linuxu/mm/page.o
 test_irq=$(BUILD)/linuxu/amdgpu-rt/device.o $(BUILD)/linuxu/amdgpu-rt/irq.o $(BUILD)/linuxu/pci/pci_stub.o $(BUILD)/linuxu/dart/dma_mask.o $(BUILD)/linuxu/pci/pdev_mmio.o $(BUILD)/linuxu/shims/printk.o
 test_firmware=$(BUILD)/linuxu/shims/firmware.o $(BUILD)/linuxu/shims/printk.o $(BUILD)/linuxu/fw/fw_table.o $(BUILD)/linuxu/fw/fw_mailbox.o $(FW_OBJ) $(BUILD)/linuxu/kmem/kmemalloc.o $(BUILD)/linuxu/kmem/kmemcheck.o
 test_dma_dart=$(BUILD)/linuxu/dart/dart.o $(BUILD)/linuxu/dart/dma_mask.o $(BUILD)/linuxu/pci/pci_stub.o $(BUILD)/linuxu/pci/pdev_mmio.o $(BUILD)/linuxu/pci/pci_irq_seam.o $(BUILD)/linuxu/mm/page.o $(BUILD)/linuxu/kmem/kmemalloc.o $(BUILD)/linuxu/kmem/kmemcheck.o $(BUILD)/linuxu/shims/printk.o
@@ -336,7 +336,7 @@ test: all test-ttm-device-pool test-page-alloc-dk test-dext-alloc test-dext-time
 	if [ "$(TEST_SRCS)" = "$(TEST_SRCS)" ] && [ -f "linuxu/tests/test_timer.c" ]; then \
 		b=$(BUILD)/tests/test_timer; \
 		echo "-- linuxu/tests/test_timer.c"; \
-		if $(CC) $(HOSTCFLAGS) $(INCPATHS) linuxu/tests/test_timer.c build/linuxu/timer.o build/linuxu/delay.o build/linuxu/mm/page.o build/linuxu/kmem/kmemalloc.o build/linuxu/kmem/kmemcheck.o -Wl,-dead_strip -lpthread -o $$b 2>$(BUILD)/tests/err.test_timer.log; then \
+		if $(CC) $(HOSTCFLAGS) $(INCPATHS) linuxu/tests/test_timer.c build/linuxu/timer.o build/linuxu/shims/timekeeping.o build/linuxu/delay.o build/linuxu/mm/page.o build/linuxu/kmem/kmemalloc.o build/linuxu/kmem/kmemcheck.o -Wl,-dead_strip -lpthread -o $$b 2>$(BUILD)/tests/err.test_timer.log; then \
 			if $$b; then echo "   PASS linuxu/tests/test_timer.c"; pass=$$((pass+1)); \
 			else echo "   FAIL linuxu/tests/test_timer.c (runtime)"; fail=$$((fail+1)); fi; \
 		else \
