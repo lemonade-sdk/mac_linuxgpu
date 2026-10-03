@@ -19,13 +19,15 @@ struct RPC final: ShimInitializationRPC {
  // The driver's GART aperture: the runtime must reserve whatever size it
  // reports, never an assumed one.
  uint64_t windowBytes=512ull<<20, base=0x200000000ull, vendor=0x1002, device=0x1234;
+ // RuntimeBuild handshake answer: any other magic or ABI is a foreign driver.
+ uint64_t magic=0x414d444750554142ull, abi=1;
  hsa_status_t failureStatus=HSA_STATUS_ERROR;
  hsa_status_t scalar(uint32_t selector,std::span<const uint64_t> in,std::span<uint64_t> out) override {
   if(selector==9 && serving)servedInit++;
   if(selector!=9)assert(!serving);
   if(selector==failSelector)return failureStatus;
   switch(selector) {
-  case 43:out[0]=0x414d444750554142ull;out[1]=1;out[2]=ready?(session?192:190):0;break;
+  case 43:out[0]=magic;out[1]=abi;out[2]=ready?(session?192:190):0;break;
   case 1:if(busy)return HSA_STATUS_ERROR_OUT_OF_RESOURCES;claim++;out[3]=vendor;out[4]=device;out[6]=0x07;break;
   case 54:
    if(kfd&&sessionAsked){
@@ -77,9 +79,24 @@ int main(){
  static_assert(driverProtocol(bundle,"MacLinuxGPU")==DriverProtocol::LinuxShim);
  static_assert(driverProtocol(bundle,"MacAMDGPU")==DriverProtocol::Converted);
  static_assert(driverProtocol(bundle,"MacLinuxGPUUserClient")==DriverProtocol::Unknown);
- static_assert(driverProtocol("other.driver","MacLinuxGPU")==DriverProtocol::Unknown);
  static_assert(driverProtocol(bundle,"")==DriverProtocol::Unknown);
+ // The shim is found by class under any identifier (an app-embedded dext has
+ // its own); the RuntimeBuild handshake below is what rejects an impostor.
+ static_assert(driverProtocol("com.geramyloveless.LemonSeedStudio.AMDGpuDriver","MacLinuxGPU")==DriverProtocol::LinuxShim);
+ static_assert(driverProtocol("other.driver","MacLinuxGPU")==DriverProtocol::LinuxShim);
+ static_assert(driverProtocol("","MacLinuxGPU")==DriverProtocol::Unknown);
+ // The converted protocol has no handshake before its firmware upload, so it
+ // stays bound to the identifier it shipped under.
+ static_assert(driverProtocol("com.geramyloveless.LemonSeedStudio.AMDGpuDriver","MacAMDGPU")==DriverProtocol::Unknown);
+ static_assert(driverProtocol("other.driver","MacAMDGPU")==DriverProtocol::Unknown);
  ShimInitializationResult out;bool claimed;
+ // A service that merely shares the class name fails the handshake before
+ // the session is claimed or any host VA is reserved.
+ for(int foreign=0;foreign<2;++foreign){
+  RPC r;if(foreign)r.abi=2;else r.magic=0x1234;
+  claimed=false;
+  assert(initializeShimDevice(r,out,claimed)==HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
+  assert(!claimed&&!r.claim&&!r.reserve&&!r.config&&!r.init);}
  {RPC r;assert(initializeShimDevice(r,out,claimed)==HSA_STATUS_SUCCESS);
   assert(claimed&&r.claim==1&&r.init==1&&r.reserve==1&&r.releases==1&&out.capacity==(31ull<<30));}
  {RPC r;r.ready=true;assert(initializeShimDevice(r,out,claimed,false)==HSA_STATUS_SUCCESS);

@@ -6,7 +6,30 @@
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+// The iOS SDK withholds <mach/mach_vm.h>; on arm64 the vm_map family takes the
+// same 64-bit addresses and sizes, so the reservations below are unchanged.
+#include <mach/vm_map.h>
+namespace {
+static_assert(sizeof(vm_address_t) == sizeof(mach_vm_address_t));
+inline kern_return_t mach_vm_map(vm_map_t task, mach_vm_address_t *address, mach_vm_size_t size,
+                                 mach_vm_offset_t mask, int flags, mem_entry_name_port_t object,
+                                 memory_object_offset_t offset, boolean_t copy, vm_prot_t current,
+                                 vm_prot_t maximum, vm_inherit_t inheritance) {
+    vm_address_t placed = vm_address_t(*address);
+    const auto result = vm_map(task, &placed, vm_size_t(size), vm_address_t(mask), flags, object,
+                               vm_offset_t(offset), copy, current, maximum, inheritance);
+    *address = placed;
+    return result;
+}
+inline kern_return_t mach_vm_deallocate(vm_map_t task, mach_vm_address_t address, mach_vm_size_t size) {
+    return vm_deallocate(task, vm_address_t(address), vm_size_t(size));
+}
+}
+#else
 #include <mach/mach_vm.h>
+#endif
 #include <atomic>
 #include <new>
 #include <array>
@@ -717,9 +740,31 @@ private:
     // installed root) through the mailbox the driver exports on ownerPort.
     // A driver that exports none, or any other failure, leaves the driver
     // with its embedded firmware only; that is reported once per process.
+    // Empty selects the servicer's default ($MAC_LINUXGPU_FIRMWARE_ROOT, else
+    // the installed root). An iOS app cannot read outside its container, so
+    // there the default is the firmware directory inside the app bundle.
+    static std::string firmwareRoot() {
+#if TARGET_OS_IOS
+        if (const char *configured = std::getenv("MAC_LINUXGPU_FIRMWARE_ROOT"); configured && *configured) return {};
+        std::string root;
+        if (const auto bundle = CFBundleGetMainBundle()) {
+            if (const auto url = CFBundleCopyResourcesDirectoryURL(bundle)) {
+                char path[PATH_MAX];
+                if (CFURLGetFileSystemRepresentation(url, true, reinterpret_cast<UInt8 *>(path), sizeof(path)))
+                    root = std::string(path) + "/firmware";
+                CFRelease(url);
+            }
+        }
+        return root;
+#else
+        return {};
+#endif
+    }
     bool startFirmwareService() override {
         if (firmwareService) return true;
-        const int error = mlg_fw_service_start_connection(ownerPort, nullptr, &firmwareService);
+        const std::string root = firmwareRoot();
+        const int error = mlg_fw_service_start_connection(ownerPort, root.empty() ? nullptr : root.c_str(),
+                                                          &firmwareService);
         if (!error && firmwareService) return true;
         firmwareService = nullptr;
         static std::atomic_flag reported = ATOMIC_FLAG_INIT;
