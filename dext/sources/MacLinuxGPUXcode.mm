@@ -1758,9 +1758,12 @@ static kern_return_t observer_drm_selftest(IOUserClientMethodArguments *argument
     const unsigned parked = rt_cs_selftest_parked();
     s_observerReads.leave();
     __atomic_store_n(&s_selfTestRunning, 0u, __ATOMIC_RELEASE);
-    MACLINUXGPU_LOG("CS self-test: %d (failed step %u, passed %#x, compute %llu ns, sdma %llu ns, parked %u)",
+    MACLINUXGPU_LOG("CS self-test: %d (failed step %u, passed %#x, compute %llu ns, sdma %llu ns, "
+                    "ttm to GTT %llu bytes %llu ns, back %llu bytes %llu ns, parked %u)",
                     r, result.failed_step, result.passed,
-                    (unsigned long long)result.compute_ns, (unsigned long long)result.sdma_ns, parked);
+                    (unsigned long long)result.compute_ns, (unsigned long long)result.sdma_ns,
+                    (unsigned long long)result.gtt_moved, (unsigned long long)result.gtt_ns,
+                    (unsigned long long)result.vram_moved, (unsigned long long)result.vram_ns, parked);
     arguments->structureOutput = OSData::withBytes(&result, sizeof(result));
     if (!arguments->structureOutput) return kIOReturnNoMemory;
     out[0] = (uint64_t)(int64_t)r;

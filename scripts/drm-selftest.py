@@ -5,8 +5,10 @@ The MacLinuxGPU driver runs, in a Linux process of its own, what a Vulkan
 driver does on a render node: AMDGPU_INFO, a context, GTT and VRAM buffers
 mapped in its own GPUVM, AMDGPU_CS of a PM4 IB on the compute ring and of
 SDMA IBs (fill, then a copy ordered by a syncobj), AMDGPU_WAIT_CS on an
-async worker and a syncobj wait, checking every value, then undoing all of
-it. It uses the observer client: it never initializes the GPU, joins a
+async worker and a syncobj wait, then moves its VRAM buffer to GTT and back
+the way a client's submission moves it (TTM's move into GTT goes through a
+GART transfer window, as an eviction does: SDMA uploads the window PTEs,
+flushes VMID 0 and copies), checking every value, then undoing all of it. It uses the observer client: it never initializes the GPU, joins a
 session, creates a queue or touches another client's memory, and each wait
 is bounded. The GPU must already be running (a session client initialized
 it); otherwise the call fails with "not ready". With --init the script
@@ -38,19 +40,24 @@ NOT_READY = 0xe00002d8
 NOT_PERMITTED = 0xe00002e2
 BUSY = 0xe00002d5
 
-# linuxu/headers/rt/cs_selftest.h
-VERSION = 1
-STEPS = ["open", "version", "dev_info", "hw_ip", "ctx", "syncobj", "gem_create", "gem_va",
-         "gem_mmap", "compute_cs", "compute_wait_cs", "compute_syncobj", "compute_result",
-         "sdma_fill", "sdma_copy", "sdma_wait", "sdma_result", "teardown"]
+# linuxu/headers/rt/cs_selftest.h. Version 2 adds the TTM steps and fields;
+# a version 1 driver (no TTM steps) is still read.
+VERSION = 2
+STEPS_V1 = ["open", "version", "dev_info", "hw_ip", "ctx", "syncobj", "gem_create", "gem_va",
+            "gem_mmap", "compute_cs", "compute_wait_cs", "compute_syncobj", "compute_result",
+            "sdma_fill", "sdma_copy", "sdma_wait", "sdma_result", "teardown"]
+STEPS = STEPS_V1[:-1] + ["ttm_gtt", "ttm_vram", "teardown"]
 STATUS = {0: "passed", 1: "not run", 2: "skipped (no such engine)",
           3: "mismatch (the GPU wrote something else)",
           4: "parked (GPU work still running; the process is kept until it completes)"}
 # struct rt_cs_selftest_result
-LAYOUT = struct.Struct("<4I24i6I6Q4I")
-FIELDS = ["family", "chip_external_rev", "device_id", "num_shader_engines",
-          "compute_rings", "sdma_rings", "va_start", "va_end", "compute_seq", "sdma_seq",
-          "compute_ns", "sdma_ns", "compute_value", "vram_value", "fill_value", "user_fence"]
+LAYOUT_V1 = struct.Struct("<4I24i6I6Q4I")
+LAYOUT = struct.Struct("<4I24i6I6Q4I4Q2I")
+FIELDS_V1 = ["family", "chip_external_rev", "device_id", "num_shader_engines",
+             "compute_rings", "sdma_rings", "va_start", "va_end", "compute_seq", "sdma_seq",
+             "compute_ns", "sdma_ns", "compute_value", "vram_value", "fill_value", "user_fence"]
+FIELDS = FIELDS_V1 + ["gtt_moved", "vram_moved", "gtt_ns", "vram_ns", "gtt_value",
+                      "vram_back_value"]
 
 
 class DriverError(RuntimeError):
@@ -71,17 +78,22 @@ def describe(status):
 
 def decode(blob):
     """The driver's struct rt_cs_selftest_result as a dict."""
-    if len(blob) < LAYOUT.size:
+    if len(blob) < LAYOUT_V1.size:
         raise DriverError(f"self-test result is {len(blob)} bytes, expected {LAYOUT.size}")
-    values = LAYOUT.unpack_from(blob)
-    version, steps, passed, failed = values[:4]
-    if version != VERSION or steps != len(STEPS):
+    version, steps = struct.unpack_from("<2I", blob)
+    known = {1: (LAYOUT_V1, STEPS_V1, FIELDS_V1), 2: (LAYOUT, STEPS, FIELDS)}
+    if version not in known or steps != len(known[version][1]):
         raise DriverError(f"self-test result version {version} with {steps} steps is not this reader's")
+    layout, names, fields = known[version]
+    if len(blob) < layout.size:
+        raise DriverError(f"self-test result is {len(blob)} bytes, expected {layout.size}")
+    values = layout.unpack_from(blob)
+    passed, failed = values[2:4]
     status = values[4:4 + 24]
-    result = {"passed": passed,
-              "failed_step": STEPS[failed] if failed < len(STEPS) else None,
-              "steps": {name: status[i] for i, name in enumerate(STEPS)}}
-    result.update(zip(FIELDS, values[28:]))
+    result = {"version": version, "passed": passed,
+              "failed_step": names[failed] if failed < len(names) else None,
+              "steps": {name: status[i] for i, name in enumerate(names)}}
+    result.update(zip(fields, values[28:]))
     return result
 
 
@@ -94,7 +106,7 @@ def run(call):
 
 
 def report(status, parked, result, out=sys.stdout):
-    for name in STEPS:
+    for name in result["steps"]:
         print(f"  {name:<16} {describe(result['steps'][name])}", file=out)
     print(f"  device {result['device_id']:#06x} family {result['family']} rev {result['chip_external_rev']:#x}, "
           f"compute rings {result['compute_rings']:#x}, SDMA rings {result['sdma_rings']:#x}", file=out)
@@ -102,6 +114,10 @@ def report(status, parked, result, out=sys.stdout):
           f"user fence {result['user_fence']}, {result['compute_ns'] / 1e6:.3f} ms", file=out)
     print(f"  SDMA: seq {result['sdma_seq']}, VRAM {result['vram_value']:#010x}, "
           f"fill {result['fill_value']:#010x}, {result['sdma_ns'] / 1e6:.3f} ms", file=out)
+    if "gtt_moved" in result:
+        print(f"  TTM: to GTT moved {result['gtt_moved']} bytes, read {result['gtt_value']:#010x}, "
+              f"{result['gtt_ns'] / 1e6:.3f} ms; back to VRAM moved {result['vram_moved']} bytes, "
+              f"read {result['vram_back_value']:#010x}, {result['vram_ns'] / 1e6:.3f} ms", file=out)
     print(f"  GPU VA {result['va_start']:#x}-{result['va_end']:#x}", file=out)
     verdict = "PASS" if status == 0 else f"FAIL at {result['failed_step']}: {describe(status)}"
     print(verdict, file=out)

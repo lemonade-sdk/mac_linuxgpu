@@ -141,7 +141,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * (linuxu/headers/rt/cs_selftest.h) on the GPU, in a Linux process of its
  * own: render node, AMDGPU_INFO, a context, GEM buffers mapped in its own
  * GPUVM, AMDGPU_CS on the compute ring and on SDMA, AMDGPU_WAIT_CS and
- * syncobj waits, then everything undone. It touches nothing of any other
+ * syncobj waits, its VRAM buffer moved to GTT (through a GART transfer
+ * window, as TTM evicts) and back by submissions, then everything undone. It touches nothing of any other
  * client and creates no queue; each wait is bounded.
  *   scalar in:  [0] MLG_DRM_SELFTEST_CONFIRM
  *   struct out: struct rt_cs_selftest_result (MLG_DRM_SELFTEST_RESULT_MAX

@@ -17,7 +17,7 @@ extern int usleep(unsigned int usec);
 static const char *const step_names[RT_CS_STEP_COUNT] = {
 	"open", "version", "dev_info", "hw_ip", "ctx", "syncobj", "gem_create", "gem_va",
 	"gem_mmap", "compute_cs", "compute_wait_cs", "compute_syncobj", "compute_result",
-	"sdma_fill", "sdma_copy", "sdma_wait", "sdma_result", "teardown",
+	"sdma_fill", "sdma_copy", "sdma_wait", "sdma_result", "ttm_gtt", "ttm_vram", "teardown",
 };
 
 static void report(const struct rt_cs_selftest_result *res)
@@ -30,6 +30,10 @@ static void report(const struct rt_cs_selftest_result *res)
 		(unsigned long long)res->compute_ns, (unsigned long long)res->sdma_seq,
 		res->vram_value, res->fill_value, (unsigned long long)res->sdma_ns,
 		(unsigned long long)res->va_start, (unsigned long long)res->va_end);
+	fprintf(stderr, "  ttm: to GTT moved %llu bytes, read 0x%08x (%llu ns); back moved %llu bytes, "
+		"read 0x%08x (%llu ns)\n", (unsigned long long)res->gtt_moved, res->gtt_value,
+		(unsigned long long)res->gtt_ns, (unsigned long long)res->vram_moved,
+		res->vram_back_value, (unsigned long long)res->vram_ns);
 }
 
 int main(void)
@@ -52,6 +56,11 @@ int main(void)
 		CHECK(res.compute_rings == 1 && res.sdma_rings == 1);
 		CHECK(res.compute_value == 0xc0de0001u && res.vram_value == 0xc0de0002u &&
 		      res.fill_value == 0x5eed5eedu && res.user_fence == (uint32_t)res.compute_seq);
+		/* The VRAM buffer went to GTT through TTM (a GART window) and
+		 * its copy from there still holds what it held. */
+		CHECK(res.version == 2 && res.steps == RT_CS_STEP_COUNT);
+		CHECK(res.gtt_moved >= 64 * 1024 && res.gtt_value == 0xc0de0002u &&
+		      res.vram_back_value == 0xc0de0002u);
 		cs_fixture_stats(&after);
 		/* One compute IB with two WRITE_DATA; the user's two SDMA IBs
 		 * and the kernel's (page tables, the cleared VRAM buffer). */
