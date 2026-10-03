@@ -29,8 +29,18 @@
 #   scripts/activate.sh --install-hsa            # Install the HSA runtime library
 #   scripts/activate.sh --replace                # Remove the old host app after staging the new one
 #   scripts/activate.sh --build-only             # Build, sign, verify; do not install
+#   scripts/activate.sh --display                # Enable Display Core in the dext personality
 #   scripts/activate.sh --uninstall              # Uninstall the NEW mac_linuxgpu driver
 #   scripts/activate.sh --help                   # Show this help
+#
+# Display: by default the dext probes compute-only (amdgpu.dc=0). --display
+# sets the optional personality key MacLinuxGPUDisplay=true in the built
+# dext's Info.plist before it is signed, so the driver brings up Display
+# Core on the GPU's own outputs (amdgpu.dc=-1) and the display test
+# (scripts/display-test.py, MacLinuxGPUHost display-*) can run. The source
+# Info.plist is not changed; installing again without --display turns
+# display off. macOS replaces an installed extension only for a new
+# CFBundleVersion, so switching between the two needs a version bump.
 #
 # Firmware: by default the locked set in firmware/firmware.lock is bundled
 # (fetched into build/firmware/amdgpu). Set LINUX_FIRMWARE_DIR to a
@@ -76,6 +86,7 @@ uninstall=0
 install_hsa=0
 replace=0
 build_only=0
+display=0
 signing_identity=""
 provisioning_profile=""
 
@@ -90,6 +101,7 @@ while [[ $# -gt 0 ]]; do
     --install-hsa) install_hsa=1; shift ;;
     --replace) replace=1; shift ;;
     --build-only) build_only=1; shift ;;
+    --display) display=1; shift ;;
     --identity|--profile)
       option="$1"
       [[ $# -ge 2 && -n "$2" ]] || { echo "missing value for $option" >&2; exit 2; }
@@ -246,6 +258,35 @@ if [[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$BUILT_APP/Conte
 fi
 # The package is verified after its final Developer ID signature is applied.
 
+# --display: MacLinuxGPUDisplay=true in every MacLinuxGPU personality of the
+# built dext, before its final signature. Without --display the built
+# Info.plist is checked to carry no such key (display stays off).
+set_display_personality() {
+  python3 - "$DEXT_IN_APP/Info.plist" "$1" <<'PY'
+import plistlib
+import sys
+
+path, enable = sys.argv[1], sys.argv[2] == "1"
+with open(path, "rb") as handle:
+    info = plistlib.load(handle)
+personalities = [p for p in info.get("IOKitPersonalities", {}).values()
+                 if p.get("IOUserClass") == "MacLinuxGPU"]
+if not personalities:
+    sys.exit("error: the dext has no MacLinuxGPU personality")
+for personality in personalities:
+    if enable:
+        personality["MacLinuxGPUDisplay"] = True
+    elif personality.get("MacLinuxGPUDisplay") is True:
+        sys.exit("error: the built dext enables display, but --display was not given")
+if enable:
+    with open(path, "wb") as handle:
+        plistlib.dump(info, handle)
+print(f"{len(personalities)} personalit{'y' if len(personalities) == 1 else 'ies'}: "
+      f"display {'on (MacLinuxGPUDisplay=true)' if enable else 'off'}")
+PY
+}
+echo "==> dext display: $(set_display_personality "$display")"
+
 # Replace the bundled firmware with a whole amdgpu firmware directory when
 # LINUX_FIRMWARE_DIR is set. Accepts a linux-firmware checkout (containing
 # amdgpu/) or an amdgpu directory itself. Licensing files travel with it.
@@ -385,7 +426,16 @@ PY
     --entitlements "$ent_dir/host.plist" "$BUILT_APP"
 else
   stage_firmware_payload
-  if [[ $install_hsa -eq 1 || $firmware_staged -eq 1 ]]; then
+  if [[ $display -eq 1 ]]; then
+    # The personality changed after Xcode signed the dext: sign it again
+    # with the same identity, entitlements and flags, then the app.
+    dext_identity="$(codesign -dv --verbose=4 "$DEXT_IN_APP" 2>&1 |
+      sed -n 's/^Authority=//p' | head -1)"
+    [[ -n "$dext_identity" ]] || { echo "error: missing dext signing identity" >&2; exit 1; }
+    codesign --force --sign "$dext_identity" \
+      --preserve-metadata=entitlements,requirements,flags,runtime "$DEXT_IN_APP"
+  fi
+  if [[ $install_hsa -eq 1 || $firmware_staged -eq 1 || $display -eq 1 ]]; then
     payload_identity="$(codesign -dv --verbose=4 "$BUILT_APP" 2>&1 |
       sed -n 's/^Authority=//p' | head -1)"
     [[ -n "$payload_identity" ]] || { echo "error: missing app signing identity" >&2; exit 1; }
