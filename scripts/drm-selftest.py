@@ -9,9 +9,14 @@ async worker and a syncobj wait, checking every value, then undoing all of
 it. It uses the observer client: it never initializes the GPU, joins a
 session, creates a queue or touches another client's memory, and each wait
 is bounded. The GPU must already be running (a session client initialized
-it); otherwise the call fails with "not ready".
+it); otherwise the call fails with "not ready". With --init the script
+initializes it itself through a session client (InitDevice), which stays
+open for the test; if no other client uses the GPU, closing it at the end
+closes the session (upstream removal, function reset), as any last client
+does.
 
   drm-selftest.py            # run once, print each step
+  drm-selftest.py --init     # bring the GPU up first, then run
   drm-selftest.py --json     # the result as JSON
   drm-selftest.py --runs 5   # repeat
 
@@ -24,7 +29,8 @@ import os
 import struct
 import sys
 
-OBSERVER_CLIENT = 1
+SESSION_CLIENT, OBSERVER_CLIENT = 0, 1
+RUNTIME_BUILD, INIT_DEVICE = 43, 9
 DRM_SELFTEST = 82              # dext/sources/session_state.h MLG_SELECTOR_DRM_SELFTEST
 CONFIRM = 0x43535354           # MLG_DRM_SELFTEST_CONFIRM ("CSST")
 RESULT_MAX = 512               # MLG_DRM_SELFTEST_RESULT_MAX
@@ -103,7 +109,7 @@ def report(status, parked, result, out=sys.stdout):
         print(f"  {parked} self-test process(es) still wait for their GPU work", file=out)
 
 
-def connect():
+def connect(init=False):
     io = c.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
     system = c.CDLL("/usr/lib/libSystem.B.dylib")
     io.IOServiceNameMatching.argtypes = [c.c_char_p]
@@ -119,17 +125,37 @@ def connect():
                                        c.c_void_p, c.c_size_t, c.POINTER(c.c_uint64),
                                        c.POINTER(c.c_uint), c.c_void_p, c.POINTER(c.c_size_t)]
     io.IOConnectCallMethod.restype = c.c_int
+    io.IOConnectCallScalarMethod.argtypes = [c.c_uint, c.c_uint, c.POINTER(c.c_uint64), c.c_uint,
+                                             c.POINTER(c.c_uint64), c.POINTER(c.c_uint)]
+    io.IOConnectCallScalarMethod.restype = c.c_int
     service = io.IOServiceGetMatchingService(0, io.IOServiceNameMatching(b"MacLinuxGPU"))
     if not service:
         raise DriverError("MacLinuxGPU registry service was not found")
     port = c.c_uint()
+    session = c.c_uint()
     try:
         task = c.c_uint.in_dll(system, "mach_task_self_").value
+        if init:
+            result = io.IOServiceOpen(service, task, SESSION_CLIENT, c.byref(session))
+            if result:
+                raise DriverError(f"session open failed: {result & 0xffffffff:#x}")
         result = io.IOServiceOpen(service, task, OBSERVER_CLIENT, c.byref(port))
     finally:
         io.IOObjectRelease(service)
     if result:
         raise DriverError(f"observer open failed: {result & 0xffffffff:#x}")
+    if init:
+        build = (c.c_uint64 * 3)()
+        count = c.c_uint(3)
+        result = io.IOConnectCallScalarMethod(session, RUNTIME_BUILD, None, 0, build, c.byref(count))
+        if not result:
+            count = c.c_uint(0)
+            result = io.IOConnectCallScalarMethod(session, INIT_DEVICE, None, 0, None, c.byref(count))
+        if result:
+            io.IOServiceClose(session)
+            io.IOServiceClose(port)
+            raise DriverError(f"GPU initialization failed: {result & 0xffffffff:#x} "
+                              "(scripts/read-driver-log.py shows why)")
 
     def call(selector, scalars, capacity):
         inputs = (c.c_uint64 * len(scalars))(*scalars)
@@ -152,6 +178,8 @@ def connect():
 
     def close():
         result = io.IOServiceClose(port)
+        if init:
+            io.IOServiceClose(session)
         if result:
             raise DriverError(f"observer close failed: {result & 0xffffffff:#x}")
     return call, close
@@ -162,8 +190,10 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
     parser.add_argument("--runs", type=int, default=1, help="repeat the test")
+    parser.add_argument("--init", action="store_true",
+                        help="initialize the GPU through a session client first")
     args = parser.parse_args()
-    call, close = connect()
+    call, close = connect(args.init)
     failures = 0
     try:
         for index in range(max(args.runs, 1)):

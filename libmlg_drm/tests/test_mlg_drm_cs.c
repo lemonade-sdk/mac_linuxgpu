@@ -210,6 +210,34 @@ int main(void)
 	CHECK(mlg_ioctl(sh.fd, DRM_IOCTL_VERSION, &version) == -1 && errno == EBADF);
 	CHECK(mlg_close(sh.fd) == 0 && lx_loopback_open_files() == files);
 
+	/* sync_file: export the syncobj's fence, import it into another
+	 * syncobj (what WSI and external semaphores do), and the CS fence as
+	 * a sync_file directly. */
+	struct drm_syncobj_handle sf = { .handle = done,
+		.flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &sf) == 0 && sf.fd >= 0);
+	struct drm_syncobj_create sc2 = { 0 };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_CREATE, &sc2) == 0);
+	struct drm_syncobj_handle imp = { .handle = sc2.handle, .fd = sf.fd,
+		.flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &imp) == 0);
+	handles[0] = sc2.handle;
+	sw = (struct drm_syncobj_wait){ .handles = (uint64_t)(uintptr_t)handles, .count_handles = 1,
+		.timeout_nsec = deadline_ns(2000), .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == 0);
+	CHECK(mlg_close(sf.fd) == 0);
+	union drm_amdgpu_fence_to_handle fs = { .in = { .fence = { .ctx_id = ctx_id,
+		.ip_type = AMDGPU_HW_IP_COMPUTE, .seq_no = seq },
+		.what = AMDGPU_FENCE_TO_HANDLE_GET_SYNC_FILE_FD } };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_AMDGPU_FENCE_TO_HANDLE, &fs) == 0);
+	CHECK(mlg_close((int)fs.out.handle) == 0 && lx_loopback_open_files() == files);
+	struct drm_syncobj_destroy sd2 = { .handle = sc2.handle };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sd2) == 0);
+	/* linuxu has no eventfd (CONFIG_EVENTFD=n): DRM_IOCTL_SYNCOBJ_EVENTFD
+	 * fails as on a Linux kernel built without it. */
+	struct drm_syncobj_eventfd ev = { .handle = done, .fd = 0 };
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_EVENTFD, &ev) == -1);
+
 	/* Teardown, as a winsys does. */
 	CHECK(mlg_munmap(cpu, bo_size) == 0 && mlg_munmap(ib, bo_size) == 0);
 	gem_va(fd, data, AMDGPU_VA_OP_UNMAP, va, bo_size);
@@ -237,6 +265,6 @@ int main(void)
 	cs_fixture_stop();
 	puts("PASS libmlg_drm CS: version, caps, INFO, ctx, GEM create/VA/mmap, BO list, "
 	     "AMDGPU_CS on compute, WAIT_CS/WAIT_FENCES/SYNCOBJ_WAIT through async workers, "
-	     "syncobj and fence export as driver-process descriptors, teardown");
+	     "syncobj, sync_file and fence export as driver-process descriptors, teardown");
 	return 0;
 }
