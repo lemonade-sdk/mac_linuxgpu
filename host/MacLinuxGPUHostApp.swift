@@ -1284,7 +1284,8 @@ struct AppMain {
         let host = MacLinuxGPUHost()
         // Cached-state commands use an observer client, which works while a
         // session closes or stays quarantined and never joins a session.
-        let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch"]
+        let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch",
+                                             "power-hold"]
 
         if !host.openUserClient(observer: observerCommands.contains(args[1])) {
             print("ERROR: failed to open the UserClient (is the dext activated, "
@@ -1334,6 +1335,18 @@ case "release":
 case "power":
     if let state = host.power() {
         print(state.summary)
+        commandStatus = 0
+    } else {
+        commandStatus = 1
+    }
+case "power-hold":
+    // Holds a low-power request for N seconds (default 10), then drops it:
+    // the quiesce and resume a backgrounded app gets, while clients run.
+    let seconds = args.count >= 3 ? max(1, Int(args[2]) ?? 10) : 10
+    if let state = host.power(kPowerOpPrepare) {
+        print("held: " + state.summary)
+        Thread.sleep(forTimeInterval: TimeInterval(seconds))
+        if let resumed = host.power(kPowerOpResume) { print("released: " + resumed.summary) }
         commandStatus = 0
     } else {
         commandStatus = 1
