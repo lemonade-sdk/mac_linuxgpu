@@ -2654,8 +2654,8 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
     const uint64_t *in = arguments->scalarInput;
     uint64_t *out = arguments->scalarOutput;
     const OSData *nameData = arguments->structureInput;
-    if (!in || arguments->scalarInputCount != 3 || !out ||
-        arguments->scalarOutputCount < MLG_DISPLAY_WORDS ||
+    // One status word for these ops (callers from before IMPORT ask for one).
+    if (!in || arguments->scalarInputCount != 3 || !out || arguments->scalarOutputCount < 1 ||
         arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
         arguments->structureOutputMaximumSize < sizeof(struct rt_display_report) ||
         !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, in, arguments->scalarInputCount))
@@ -2688,7 +2688,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         arguments->structureOutput = OSData::withBytes(&modes, sizeof(modes));
         if (!arguments->structureOutput) return kIOReturnNoMemory;
         out[0] = (uint64_t)(int64_t)r;
-        arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+        arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
     struct rt_display_report report;
@@ -2701,7 +2701,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
         if (!arguments->structureOutput) return kIOReturnNoMemory;
         out[0] = (uint64_t)(int64_t)r;
-        arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+        arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
     if (in[0] == MLG_DISPLAY_OP_PROBE) {
@@ -2730,7 +2730,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
     arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
     if (!arguments->structureOutput) return kIOReturnNoMemory;
     out[0] = (uint64_t)(int64_t)r;
-    arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+    arguments->scalarOutputCount = 1;
     return kIOReturnSuccess;
 }
 

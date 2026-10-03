@@ -1332,12 +1332,13 @@ int dext_dma_import(void *descriptor, uint64_t length, uint64_t *addresses,
 	uint32_t n = *count;
 	uint64_t flags = 0;
 	memory->retain();
-	if (dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, memory, 0, length, &flags,
-			       &n, segments) != kIOReturnSuccess) {
+	const kern_return_t prepared = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, memory,
+							  0, length, &flags, &n, segments);
+	if (prepared != kIOReturnSuccess) {
 		dma->release();
 		memory->release();
-		DEXT_DMA_LOG("DMA import refused: PrepareForDMA of %llu bytes failed",
-			     (unsigned long long)length);
+		DEXT_DMA_LOG("DMA import refused: PrepareForDMA of %llu bytes failed (%#x)",
+			     (unsigned long long)length, prepared);
 		return -1;
 	}
 	operation.did_prepare();

@@ -1001,7 +1001,7 @@ extension MacLinuxGPUHost {
         -> (kern_return_t, Int64, DisplayReport?) {
         let name = Data((connector ?? "").utf8)
         let (kr, values, data) = callMethod(kSelDisplay, inScalars: [op.rawValue, pattern, kDisplayConfirm],
-                                            inData: name, outScalars: 1, outSize: kDisplayReportMax)
+                                            inData: name, outScalars: 2, outSize: kDisplayReportMax)
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), DisplayReport(data))
     }
@@ -1009,7 +1009,7 @@ extension MacLinuxGPUHost {
     /// One connector's probed modes (op MODES).
     func displayModes(_ connector: String) -> (kern_return_t, Int64, DisplayModes?) {
         let (kr, values, data) = callMethod(kSelDisplay, inScalars: [DisplayOp.modes.rawValue, 0, kDisplayConfirm],
-                                            inData: Data(connector.utf8), outScalars: 1, outSize: kDisplayReportMax)
+                                            inData: Data(connector.utf8), outScalars: 2, outSize: kDisplayReportMax)
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), DisplayModes(data))
     }

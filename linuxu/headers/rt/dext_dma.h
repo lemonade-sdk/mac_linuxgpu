@@ -117,7 +117,9 @@ int dext_dma_free_coherent(void *cpu_addr, size_t size);
  * reach it; under the shutdown hold the release is retired until the
  * endpoint reset, a quarantine retains it, and fini refuses while it
  * lives. -1 on any failure, with nothing retained. */
-#define DEXT_DMA_IMPORT_SEGMENTS_MAX 64u
+/* IODMACommand::PrepareForDMA takes at most 32 segments (its IIG
+ * declaration passes IOAddressSegment segments[32]). */
+#define DEXT_DMA_IMPORT_SEGMENTS_MAX 32u
 int dext_dma_import(void *descriptor, uint64_t length, uint64_t *addresses,
 		    uint64_t *lengths, uint32_t *count, uint64_t *import_id);
 int dext_dma_release_import(uint64_t import_id);

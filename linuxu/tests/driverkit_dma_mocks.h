@@ -207,7 +207,8 @@ public:
     kern_return_t PrepareForDMA(uint64_t, IOMemoryDescriptor *b,
             uint64_t, uint64_t size, uint64_t *, uint32_t *count, IOAddressSegment *seg) {
         if (mock_fail()) return -1;
-        assert(!buffer && *count >= 1);
+        /* The IIG declaration passes IOAddressSegment segments[32]. */
+        assert(!buffer && *count >= 1 && *count <= 32);
         if (address_bits < mock_dart_refuse_below_bits) return -1;
         buffer = b; b->retain(); ++mock_dma_prepared;
         if (*count == 1) {
