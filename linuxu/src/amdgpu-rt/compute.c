@@ -17,6 +17,7 @@
 #include <drm/gpu_scheduler.h>
 #include <rt/compute.h>
 #include <rt/dart.h>
+#include <rt/removal.h>
 #include <rt/rt.h>
 
 #include "amdgpu.h"
@@ -653,7 +654,9 @@ int rt_compute_bo_free(struct rt_compute_ctx *ctx, struct rt_compute_bo *bo)
 	if (!ctx || !bo)
 		return -EINVAL;
 	pthread_mutex_lock(&ctx->lock);
-	if (ctx->poisoned) {
+	/* Poisoned: a timed-out copy may still use the memory, unless the
+	 * device left the bus. */
+	if (ctx->poisoned && !rt_removal_active(ctx->adev)) {
 		pthread_mutex_unlock(&ctx->lock);
 		return -EBUSY;
 	}
@@ -680,7 +683,7 @@ int rt_compute_close(struct rt_compute_ctx *ctx)
 	if (!ctx)
 		return -EINVAL;
 	pthread_mutex_lock(&ctx->lock);
-	if (ctx->poisoned) {
+	if (ctx->poisoned && !rt_removal_active(ctx->adev)) {
 		pthread_mutex_unlock(&ctx->lock);
 		return -EBUSY;
 	}
@@ -694,6 +697,8 @@ int rt_compute_close(struct rt_compute_ctx *ctx)
 		}
 		ctx->bos = next;
 	}
+	dma_fence_put(ctx->uncertain_fence);
+	ctx->uncertain_fence = NULL;
 	pthread_mutex_unlock(&ctx->lock);
 	pthread_mutex_destroy(&ctx->lock);
 	/* Session close holds every DMA release until the endpoint reset; the

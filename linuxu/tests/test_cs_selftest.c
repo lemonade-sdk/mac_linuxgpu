@@ -91,6 +91,9 @@ int main(void)
 		usleep(10000);
 	CHECK(rt_cs_selftest_parked() == 0);
 
+	/* Last: the device leaves the bus with work outstanding. */
+	removal_check(pdev);
+
 	cs_fixture_stop();
 	cs_fixture_stats(&after);
 	printf("PASS cs selftest offline: render node, INFO, ctx, syncobjs, GEM create/VA/mmap, "

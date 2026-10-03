@@ -36,6 +36,7 @@ for source in third_party/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_gmc.c \
 done
 clang "${cflags[@]}" -fsanitize=address \
   linuxu/tests/test_cs_selftest.c linuxu/tests/cs_fixture.c linuxu/tests/ttm_evict_check.c \
+  linuxu/tests/removal_check.c \
   "${plain[@]}" build/libmacamgdu.a \
   -lpthread -o "$work/test_cs_selftest"
 # CS_SELFTEST_KEEP=<path> keeps the binary for a debugger; CS_FIXTURE_TRACE=1

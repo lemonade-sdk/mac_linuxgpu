@@ -51,6 +51,7 @@ extern int usleep(unsigned int usec);
 /* ---- the device ---- */
 
 struct amdgpu_device *adev;
+static struct pci_dev fixture_pdev;	/* the device's PCI function */
 struct kfd_dev kfd;
 struct kfd_node node;
 struct kfd_topology_device topo;
@@ -850,10 +851,16 @@ int amdgpu_copy_buffer(struct amdgpu_device *a, struct amdgpu_ttm_buffer_entity 
 /* The held engine catches up: every pending copy runs and signals. */
 void fixture_sdma_release(void)
 {
+	fixture_sdma_finish(true);
+}
+/* ... or, for a device that left the bus, signals without running. */
+void fixture_sdma_finish(bool run)
+{
 	for (unsigned int i = 0; i < sdma_npending; ++i) {
-		memmove(mc_to_host(sdma_pending[i].dst, sdma_pending[i].bytes),
-			mc_to_host(sdma_pending[i].src, sdma_pending[i].bytes),
-			sdma_pending[i].bytes);
+		if (run)
+			memmove(mc_to_host(sdma_pending[i].dst, sdma_pending[i].bytes),
+				mc_to_host(sdma_pending[i].src, sdma_pending[i].bytes),
+				sdma_pending[i].bytes);
 		dma_fence_signal(sdma_pending[i].fence);
 		dma_fence_put(sdma_pending[i].fence);
 	}
@@ -1049,6 +1056,8 @@ void fixture_device_init(void)
 	assert(vram);
 	adev->asic_type = CHIP_IP_DISCOVERY;
 	adev->ip_versions[GC_HWIP][0] = IP_VERSION(12, 0, 1);
+	adev->pdev = &fixture_pdev;
+	fixture_pdev.error_state = pci_channel_io_normal;
 	adev->enable_mes = true;
 	adev->mes.funcs = &fake_mes_funcs;
 	mutex_init(&adev->mes.mutex_hidden);
@@ -1135,6 +1144,21 @@ void fixture_device_fini(void)
 	free(adev);
 }
 
+
+/* ---- surprise removal (rt/removal.h) ----
+ * Marking the device's PCI function removed is what linuxu_pci_mark_removed
+ * does (pci_stub.c is not linked here). */
+bool rt_removal_active(struct amdgpu_device *a)
+{
+	return a && a->pdev &&
+	       __atomic_load_n(&a->pdev->error_state, __ATOMIC_ACQUIRE) == pci_channel_io_perm_failure;
+}
+void fixture_remove_device(bool removed)
+{
+	__atomic_store_n(&fixture_pdev.error_state,
+			 removed ? pci_channel_io_perm_failure : pci_channel_io_normal,
+			 __ATOMIC_RELEASE);
+}
 
 /* Kernel-free entry points the C++ tests use. */
 struct amdgpu_device *fixture_adev(void) { return adev; }
