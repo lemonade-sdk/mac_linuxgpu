@@ -20,6 +20,8 @@ exits, and a pattern still showing is turned off by that close.
   display-test.py show                     # bars on every connected output
   display-test.py show --connector DP-2 --pattern gradient --seconds 20
   display-test.py off
+  display-test.py status                   # cached state and hotplug epoch
+  display-test.py modes DP-1               # one connector's probed modes
   display-test.py --init show --seconds 30 # bring the GPU up, show, off
 
 Exit status 0 when the requested operation succeeded.
@@ -37,7 +39,7 @@ RUNTIME_BUILD, INIT_DEVICE = 43, 9
 SYSFS_READ = 80                # MLG_SELECTOR_SYSFS_READ
 DISPLAY = 84                   # dext/sources/session_state.h MLG_SELECTOR_DISPLAY
 CONFIRM = 0x44495350           # MLG_DISPLAY_CONFIRM ("DISP")
-OP_PROBE, OP_SHOW, OP_OFF = 0, 1, 2
+OP_PROBE, OP_SHOW, OP_OFF, OP_STATUS, OP_MODES = 0, 1, 2, 3, 4
 PATTERNS = {"bars": 0, "white": 1, "gradient": 2}
 REPORT_MAX = 1024              # MLG_DISPLAY_REPORT_MAX
 NAME_MAX = 31                  # MLG_DISPLAY_NAME_MAX
@@ -54,6 +56,12 @@ CONNECTOR = struct.Struct("<32s12I")
 CONNECTORS_MAX = 8
 REPORT_SIZE = HEADER.size + CONNECTORS_MAX * CONNECTOR.size
 STATUS = {1: "connected", 2: "disconnected", 3: "unknown"}
+# struct rt_display_modes, version 1.
+MODES_HEADER = struct.Struct("<6I")
+MODE = struct.Struct("<HHIII")
+MODES_MAX = 56
+MODES_SIZE = MODES_HEADER.size + MODES_MAX * MODE.size
+MODE_PREFERRED, MODE_INTERLACE = 1, 2
 
 
 class DriverError(RuntimeError):
@@ -84,7 +92,7 @@ def decode(blob):
         raise DriverError(f"display report version {head[0]} is not this reader's")
     keys = ["version", "connectors", "showing", "pattern", "fb_width", "fb_height", "fb_pitch",
             "crtcs", "fb_gpu_addr", "fill_ns", "commit_ns", "probe_status", "commit_status",
-            "restore_status", "reserved"]
+            "restore_status", "hotplug_epoch"]
     report = dict(zip(keys, head))
     if report["connectors"] > CONNECTORS_MAX:
         raise DriverError("display report lists too many connectors")
@@ -98,6 +106,34 @@ def decode(blob):
         values["name"] = name
         report["connector"].append(values)
     return report
+
+
+def decode_modes(blob):
+    """struct rt_display_modes as a dict."""
+    if len(blob) < MODES_SIZE:
+        raise DriverError(f"mode list is {len(blob)} bytes, expected {MODES_SIZE}")
+    version, status, count, total, width_mm, height_mm = MODES_HEADER.unpack_from(blob)
+    if version != VERSION or count > MODES_MAX or count > total:
+        raise DriverError("mode list this reader does not understand")
+    modes = []
+    for i in range(count):
+        width, height, refresh_mhz, clock_khz, flags = MODE.unpack_from(blob, MODES_HEADER.size + i * MODE.size)
+        modes.append({"width": width, "height": height, "refresh": refresh_mhz / 1000,
+                      "clock_khz": clock_khz, "preferred": bool(flags & MODE_PREFERRED),
+                      "interlace": bool(flags & MODE_INTERLACE)})
+    return {"status": status, "total": total, "width_mm": width_mm, "height_mm": height_mm,
+            "modes": modes}
+
+
+def modes_op(call, connector):
+    """MODES for one connector: (status, mode list)."""
+    name = connector.encode()
+    if not name or len(name) > NAME_MAX:
+        raise DriverError(f"connector name must be 1 to {NAME_MAX} bytes")
+    values, blob = call(DISPLAY, [OP_MODES, 0, CONFIRM], name, REPORT_MAX)
+    if not values:
+        raise DriverError("display reply without status")
+    return signed(values[0]), decode_modes(blob)
 
 
 def display_op(call, op, pattern=0, connector=None):
@@ -312,6 +348,21 @@ def run(call, args, out=sys.stdout, sleep=time.sleep):
                     print(f"  {conn['name']} EDID: {error}", file=out)
                     status = status or -errno.EIO
         return 0 if status == 0 else 1
+    if args.command == "status":
+        status, report = display_op(call, OP_STATUS)
+        print(f"status: {errno_text(status)}, hotplug epoch {report['hotplug_epoch']}", file=out)
+        report_text(report, out)
+        return 0 if status == 0 else 1
+    if args.command == "modes":
+        status, modes = modes_op(call, args.connector)
+        print(f"modes of {args.connector}: {errno_text(status)}", file=out)
+        if status == 0:
+            print(f"  {STATUS.get(modes['status'], modes['status'])}, {modes['width_mm']}x{modes['height_mm']} mm, "
+                  f"{len(modes['modes'])} of {modes['total']} mode(s)", file=out)
+            for m in modes["modes"]:
+                print(f"  {m['width']}x{m['height']}{'i' if m['interlace'] else ''}@{m['refresh']:.3f} "
+                      f"({m['clock_khz'] / 1000:.2f} MHz){' preferred' if m['preferred'] else ''}", file=out)
+        return 0 if status == 0 else 1
     if args.command == "off":
         status, report = display_op(call, OP_OFF)
         print(f"off: {errno_text(status)}", file=out)
@@ -353,6 +404,9 @@ def main():
     show.add_argument("--seconds", type=float, default=0,
                       help="turn the pattern off after this many seconds (default: leave it on)")
     sub.add_parser("off", help="turn the test pattern off, restoring the previous configuration")
+    sub.add_parser("status", help="cached connector state and the hotplug epoch (no detection)")
+    modes = sub.add_parser("modes", help="one connector's probed modes")
+    modes.add_argument("connector")
     args = parser.parse_args()
     if args.init and args.command == "show" and not args.seconds:
         # The session (and with it the pattern) ends when this script exits.

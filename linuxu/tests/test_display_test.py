@@ -140,4 +140,22 @@ for bad in (b"\0" * 128, edid_block()[:-1] + b"\0"):
         pass
     else:
         raise AssertionError("bad EDID accepted")
-print("PASS display-test.py: probe/show/off requests, report layout, EDID decode, errors")
+# STATUS: cached state with the hotplug epoch; MODES: one connector's list.
+blob = bytearray(report([DP1]))
+struct.pack_into("<I", blob, 68, 7)
+d = Driver([(0, bytes(blob))])
+out = io.StringIO()
+assert tool.run(d.call, args("status"), out) == 0 and d.calls[0][1] == [3, 0, 0x44495350]
+assert "hotplug epoch 7" in out.getvalue()
+modes = tool.MODES_HEADER.pack(1, 1, 2, 9, 600, 340) + tool.MODE.pack(1920, 1080, 60000, 148500, 1) + \
+    tool.MODE.pack(1920, 1080, 59940, 148352, 0)
+modes += bytes(tool.MODES_SIZE - len(modes))
+assert tool.MODES_SIZE == 24 + 56 * 16
+d = Driver([(0, modes)])
+out = io.StringIO()
+assert tool.run(d.call, args("modes", connector="DP-1"), out) == 0
+assert d.calls[0] == (84, [4, 0, 0x44495350], b"DP-1")
+text = out.getvalue()
+assert "connected, 600x340 mm, 2 of 9 mode(s)" in text
+assert "1920x1080@60.000 (148.50 MHz) preferred" in text and "1920x1080@59.940" in text
+print("PASS display-test.py: probe/show/off/status/modes requests, report layout, EDID decode, errors")
