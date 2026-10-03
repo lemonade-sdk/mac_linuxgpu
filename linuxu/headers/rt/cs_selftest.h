@@ -17,6 +17,11 @@
  *            TTM uses for clears) filling part of the VRAM buffer, then a
  *            second submission waiting on the first through a syncobj and
  *            copying the VRAM buffer into the GTT buffer;
+ *   TTM      the VRAM buffer moved to GTT and back the way a client's
+ *            submission moves it (AMDGPU_GEM_OP SET_PLACEMENT, then an SDMA
+ *            copy of it whose AMDGPU_CS validates it there): TTM's move
+ *            reaches GTT through a GART transfer window, as an eviction
+ *            does (window PTEs uploaded by SDMA, VMID 0 flush, copy);
  * and checks every value through its CPU mapping. Everything is undone
  * in reverse, and the process exits.
  *
@@ -43,7 +48,7 @@ extern "C" {
 
 struct pci_dev;
 
-#define RT_CS_SELFTEST_VERSION	1u
+#define RT_CS_SELFTEST_VERSION	2u	/* 2: the TTM steps and fields */
 #define RT_CS_SELFTEST_WAIT_MS	2000u
 
 enum rt_cs_step {
@@ -64,6 +69,8 @@ enum rt_cs_step {
 	RT_CS_STEP_SDMA_COPY,		/* AMDGPU_CS on DMA after a syncobj: copy */
 	RT_CS_STEP_SDMA_WAIT,		/* AMDGPU_WAIT_CS on the copy */
 	RT_CS_STEP_SDMA_RESULT,		/* VRAM values seen through GTT */
+	RT_CS_STEP_TTM_GTT,		/* VRAM buffer moved to GTT, copied, checked */
+	RT_CS_STEP_TTM_VRAM,		/* ... and back to VRAM */
 	RT_CS_STEP_TEARDOWN,		/* unmap, close, free, exit */
 	RT_CS_STEP_COUNT
 };
@@ -87,13 +94,17 @@ struct rt_cs_selftest_result {
 	uint64_t compute_ns, sdma_ns;		/* submit to fence signaled */
 	uint32_t compute_value, vram_value;	/* read back */
 	uint32_t fill_value, user_fence;
+	/* Version 2: the TTM steps. */
+	uint64_t gtt_moved, vram_moved;		/* bytes TTM moved during the step */
+	uint64_t gtt_ns, vram_ns;		/* placement to the copy's fence */
+	uint32_t gtt_value, vram_back_value;	/* the moved buffer's first word */
 };
 
 /* scripts/drm-selftest.py reads this layout. */
 #ifdef __cplusplus
-static_assert(sizeof(struct rt_cs_selftest_result) == 200, "rt_cs_selftest_result layout");
+static_assert(sizeof(struct rt_cs_selftest_result) == 240, "rt_cs_selftest_result layout");
 #else
-_Static_assert(sizeof(struct rt_cs_selftest_result) == 200, "rt_cs_selftest_result layout");
+_Static_assert(sizeof(struct rt_cs_selftest_result) == 240, "rt_cs_selftest_result layout");
 #endif
 
 /* Run the test on the GPU bound to @pdev. Returns 0 when every step that

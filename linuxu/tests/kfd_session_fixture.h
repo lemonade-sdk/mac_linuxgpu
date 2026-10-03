@@ -23,6 +23,7 @@
 #define FIXTURE_AQL_COMPLETION		56	/* packet completion_signal */
 #define FIXTURE_AQL_PACKET_INVALID	1
 #define FIXTURE_AQL_PACKET_DISPATCH	2
+#define FIXTURE_MES_SLOTS		32	/* ADD_QUEUEs recorded */
 
 #ifdef __cplusplus
 extern "C" {
@@ -48,6 +49,11 @@ struct rt_compute_ctx *fixture_compute_ctx(void);
 size_t fixture_kmalloc_live(void);
 unsigned int fixture_mes_adds(void);
 unsigned int fixture_mes_removes(void);
+/* MES queues whose waves never preempt: REMOVE_QUEUE fails until MES's
+ * hung-queue reset reset them. */
+void fixture_mes_hang_all(bool hung);
+unsigned int fixture_mes_failed_removes(void);
+unsigned int fixture_mes_hang_resets(void);
 unsigned int fixture_live_bos(void);
 unsigned int fixture_kernel_allocs(void);
 unsigned int fixture_cp_dispatches(void);
@@ -68,13 +74,25 @@ extern struct kfd_node node;
 extern struct kfd_topology_device topo;
 extern uint64_t doorbell_bar[TEST_DOORBELL_BYTES / 8];
 extern unsigned int mes_adds, mes_removes;
-extern uint32_t mes_doorbells[8];
-extern uint64_t mes_wptr[8], mes_page_table[8];
-extern uint32_t mes_pasid[8];
+extern uint32_t mes_doorbells[FIXTURE_MES_SLOTS];
+extern uint64_t mes_wptr[FIXTURE_MES_SLOTS], mes_page_table[FIXTURE_MES_SLOTS];
+extern uint32_t mes_pasid[FIXTURE_MES_SLOTS];
+/* REMOVE_QUEUEs to fail once each (MES timing out; the queue stays). */
+extern unsigned int mes_fail_removes;
+extern bool fixture_restores_allowed;
+extern unsigned int bo_restores;
 extern unsigned int live_bos, gart_maps, render_opens, render_releases, vm_acquires;
 extern unsigned int kgd_allocs, kgd_frees, kgd_maps, kgd_unmaps, kernel_allocs;
 extern unsigned int sdma_copies, mes_shader_debugger_sets, mes_shader_debugger_flushes;
 extern unsigned int cp_dispatches;
 extern size_t kmemcheck_live_bytes(void);
+/* MES failure modes (kfd_session_fixture.c). */
+extern bool mes_dead;
+extern unsigned int mes_remove_delay_us, mes_failed_removes, mes_hang_resets, mes_resumes,
+	gpu_reset_requests;
+void fixture_mes_hang(uint32_t doorbell, bool hung);
+/* An SDMA engine that holds its copies until released. */
+extern bool sdma_hold;
+void fixture_sdma_release(void);
 #endif
 #endif

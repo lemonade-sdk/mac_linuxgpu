@@ -13,7 +13,7 @@ for stage in 1 2 3 4 5 6 7; do
 done
 for scenario in open-failure dispatch-timeout dispatch bounded-timeout bounded-oom \
   bounded-nospc create-nospc query-topology geometry legacy-one-hqd kfd-two-queues \
-  kfd-open-failure kfd-stop kfd-destroy-retained \
+  kfd-open-failure kfd-stop kfd-destroy-retained kfd-death-recovered kfd-death-kept \
   allocation-cleanup create-retained create-oom service-retained kick-poison \
   destroy-retained stop-retained ordinary-errors close-retained; do
   "$test_dir/test_dext_compute_production" "$scenario"

@@ -59,6 +59,24 @@ void *linuxu_dma_alloc_coherent(struct device *dev, size_t size,
 void linuxu_dma_free_coherent(struct device *dev, size_t size, void *vaddr,
 			      dma_addr_t dma_handle);
 
+/* Whether [iova, iova + bytes) lies inside one live mapping: what the
+ * IOMMU (DART) would translate for the device. An access outside every
+ * live mapping is one the DART faults, and behind a Thunderbolt tunnel a
+ * DART fault can take the device off the bus. */
+int linuxu_dart_contains(uint64_t iova, uint64_t bytes);
+
+/* Hold DMA releases while @stalled(@arg) reports that a GPU engine has
+ * work it has been running longer than its job timeout: memory the driver
+ * frees then stays mapped (and allocated) until no engine is stalled, so
+ * late work cannot reach an IOVA the DART no longer maps or has handed out
+ * again. NULL removes the predicate and releases what was held. Released
+ * opportunistically by later mapping calls, or by
+ * linuxu_dart_release_held (which returns how many releases are still
+ * held). */
+void linuxu_dart_set_hold(bool (*stalled)(void *arg), void *arg);
+unsigned int linuxu_dart_held(void);
+unsigned int linuxu_dart_release_held(void);
+
 /* Budget getters (test + future metrics). */
 uint64_t linuxu_dart_used(void);
 uint64_t linuxu_dart_peak(void);

@@ -77,13 +77,38 @@ struct rt_kfd_queue_limits {
 int rt_kfd_session_open(struct amdgpu_device *adev, struct rt_compute_ctx *ctx,
 			int pid, const char *comm, struct rt_kfd_session **out);
 /* Destroy every queue (DESTROY_QUEUE), free every BO (UNMAP + FREE), exit
- * the process and free @s. Returns 0 after a clean close. A queue whose
- * removal failed leaves the GPU possibly using the session's memory: the
- * session is then kept (returns -EBUSY), every later call fails, and the
- * caller must treat the device as uncertain. */
+ * the process and free @s, as a Linux process that dies with live queues is
+ * torn down. Returns 0 after a clean close.
+ *
+ * Every wait is bounded. A queue whose DESTROY_QUEUE MES did not confirm
+ * (a wave that does not preempt, a slow or failed MES acknowledgement) is
+ * recovered as upstream recovers a hung user queue: MES detects and resets
+ * hung compute queues, then removes this one again (remove after reset).
+ * A copy that outlived its timeout is waited for once more. Only when the
+ * GPU still did not let go is the session kept (returns -EBUSY): every
+ * later call but rt_kfd_session_settle and close fails, and the caller must
+ * treat the device as uncertain. Closing again retries the recovery. */
 int rt_kfd_session_close(struct rt_kfd_session *s);
-/* Nonzero once a teardown step failed (see rt_kfd_session_close). */
+/* Nonzero while a teardown step has not confirmed the GPU let go. */
 int rt_kfd_session_uncertain(const struct rt_kfd_session *s);
+/* Re-examine what made the session uncertain without closing it: wait up to
+ * @wait_ms for a copy that outlived its timeout and retry the recovery of
+ * every queue whose removal failed. Returns 0 once nothing is uncertain
+ * (the session works again), -EBUSY otherwise. */
+int rt_kfd_session_settle(struct rt_kfd_session *s, unsigned int wait_ms);
+
+/* The teardown step that first failed to confirm that the GPU let go of the
+ * session's memory, for diagnostics. */
+enum rt_kfd_step {
+	RT_KFD_STEP_NONE = 0,
+	RT_KFD_STEP_COPY = 1,		/* an SDMA copy did not complete in time */
+	RT_KFD_STEP_DESTROY_QUEUE = 2,	/* DESTROY_QUEUE failed, KFD kept the queue */
+	RT_KFD_STEP_MES_RESET = 3,	/* MES hung-queue detection/reset failed */
+	RT_KFD_STEP_MES_REMOVE = 4,	/* MES did not remove the queue after reset */
+};
+/* The first failed step (RT_KFD_STEP_*) and its error, even after recovery
+ * succeeded; RT_KFD_STEP_NONE when no step failed. */
+int rt_kfd_session_failure(const struct rt_kfd_session *s, int *error);
 
 int rt_kfd_session_pid(const struct rt_kfd_session *s);
 int rt_kfd_session_apertures(struct rt_kfd_session *s, struct rt_kfd_apertures *out);
@@ -172,8 +197,10 @@ int rt_kfd_queue_info(struct rt_kfd_session *s, struct rt_kfd_queue *q,
 		      struct rt_kfd_queue_info *out);
 /* Write @value to the queue's doorbell (64-bit doorbells on SOC15). */
 int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value);
-/* DESTROY_QUEUE, then free the queue's EOP and context-save BOs. A failed
- * DESTROY_QUEUE makes the session uncertain. */
+/* DESTROY_QUEUE, then free the queue's EOP and context-save BOs. When MES
+ * does not confirm the removal the queue is recovered as in
+ * rt_kfd_session_close; if that fails too the session becomes uncertain and
+ * keeps the queue, and destroying it again retries the recovery. */
 int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 unsigned int rt_kfd_session_queue_count(struct rt_kfd_session *s);
 
