@@ -606,13 +606,42 @@ static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
 
 	memset(&info, 0, sizeof(info));
 	si_meminfo(&info);
-	pr_warn("kfd session: ALLOC_MEMORY_OF_GPU %s %llu bytes failed %ld; KFD VRAM used %lld "
-		"pinned %lld available %zu of %llu; RAM %llu\n",
+	pr_warn("kfd session: %s %llu bytes refused (%ld%s); KFD VRAM used %lld "
+		"pinned %lld available %zu of %llu; VRAM manager used %llu of %llu; RAM %llu\n",
 		domain == RT_KFD_VRAM ? "VRAM" : "GTT", (unsigned long long)size, r,
+		r == -ENOSPC ? ": would evict, VRAM manager full" : "",
 		(long long)adev->kfd.vram_used[0], (long long)atomic64_read(&adev->vram_pin_size),
 		amdgpu_amdkfd_get_available_memory(adev, 0),
 		(unsigned long long)adev->gmc.real_vram_size,
+		(unsigned long long)adev->mman.vram_mgr.manager.usage,
+		(unsigned long long)adev->mman.vram_mgr.manager.size,
 		(unsigned long long)info.totalram * (info.mem_unit ? info.mem_unit : 1));
+}
+
+/* VRAM a KFD allocation must leave free in the VRAM manager: the page
+ * tables mapping it, and the kernel's own buffers, also come from VRAM. */
+#define RT_KFD_VRAM_HEADROOM (128ULL << 20)
+
+/* Whether the VRAM manager can place @size bytes without evicting anything.
+ * KFD admits a VRAM allocation against its own accounting, which counts only
+ * KFD buffers; when the manager is full anyway (kernel buffers, page tables,
+ * firmware), TTM makes room by evicting this process's buffers to GTT, and on
+ * a device behind a narrow, BAR-limited link that move is what hangs the
+ * copy engine and loses the device. Refusing here keeps an allocation that
+ * does not fit an allocation failure. A manager that reports no size (not
+ * initialized) is not checked. */
+static bool vram_fits(struct amdgpu_device *adev, uint64_t size)
+{
+	struct ttm_resource_manager *man = &adev->mman.vram_mgr.manager;
+	uint64_t used;
+
+	if (!man->size)
+		return true;
+	spin_lock(&adev->mman.bdev.lru_lock);
+	used = man->usage;
+	spin_unlock(&adev->mman.bdev.lru_lock);
+	return used <= man->size && size <= man->size - used &&
+	       man->size - used - size >= RT_KFD_VRAM_HEADROOM;
 }
 
 /* Caller holds s->lock and is inside the process. */
@@ -656,6 +685,12 @@ static int bo_alloc_locked(struct rt_kfd_session *s, uint64_t size, uint64_t ali
 	/* libhsakmt's flags: device-local VRAM, or coherent non-paged system
 	 * memory (fine-grained, shared with the host). Both executable, as
 	 * code objects and signal kernels run from them. */
+	if (domain == RT_KFD_VRAM && !vram_fits(s->adev, size)) {
+		report_alloc_failure(s, size, domain, -ENOSPC);
+		va_free(region, va);
+		kfree(bo);
+		return -ENOMEM;
+	}
 	alloc.va_addr = va;
 	alloc.size = size;
 	alloc.gpu_id = s->ap.gpu_id;
