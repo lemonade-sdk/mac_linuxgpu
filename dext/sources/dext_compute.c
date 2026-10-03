@@ -240,6 +240,8 @@ int dext_compute_quiescent(void)
     return 1;
 }
 
+void dext_compute_device_removed(void) {}
+
 /* QueryInfo (21): in tag, out values[].  Returns the number of out values
  * written on success (the caller copies them to scalarOutput + sets
  * scalarOutputCount), or a -E*_L error. */

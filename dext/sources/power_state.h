@@ -127,6 +127,7 @@ enum mlg_power_cause {
 	MLG_POWER_CAUSE_LINK_DOWN      = 10, /* the device was gone after wake */
 	MLG_POWER_CAUSE_REPROBED       = 11, /* a new session after LOST */
 	MLG_POWER_CAUSE_SESSION_CLOSED = 12, /* the session closed while suspended */
+	MLG_POWER_CAUSE_DEVICE_REMOVED = 13, /* the device left the bus (unplugged) */
 };
 
 enum mlg_power_op {

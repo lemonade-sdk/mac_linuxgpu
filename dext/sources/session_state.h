@@ -39,6 +39,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_RAW_BAR_MAPPED      = 1u << 8,
 	MLG_SESSION_FLAG_RUNTIME_DEVICE      = 1u << 9,
 	MLG_SESSION_FLAG_ISOLATION_ATTEMPTED = 1u << 10,
+	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
 };
 
 /* Which close/probe step quarantined the session. */

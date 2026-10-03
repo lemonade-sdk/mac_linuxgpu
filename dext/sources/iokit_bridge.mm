@@ -60,6 +60,9 @@ static bool g_dma_holding_frees;
 static bool g_dma_probe_hold;
 static bool g_dma_probe_committing;
 static bool g_dma_quarantined;
+/* The device left the bus: it can reach no memory, so nothing is held for
+ * it and a quarantine no longer applies (dext_dma_device_removed). */
+static bool g_dma_removed;
 static uint64_t g_dma_shutdown_bytes;
 static uint64_t g_dma_shutdown_ceiling;
 static bool g_dma_cleanup_failed;
@@ -210,6 +213,7 @@ int dext_dma_set_pci(void *pci_device)
 	}
 	g_dma_pci = static_cast<IOPCIDevice *>(pci_device);
 	g_dma_stopping = false;
+	g_dma_removed = false;	/* a new device starts with nothing removed */
 	dext_dma_release();
 	return 0;
 }
@@ -785,6 +789,11 @@ extern "C" int dext_dma_begin_probe(uint64_t dma_budget)
 extern "C" void dext_dma_quarantine(void)
 {
 	dext_dma_acquire();
+	if (g_dma_removed) {
+		/* Nothing on the bus can use the backing any more. */
+		dext_dma_release();
+		return;
+	}
 	g_dma_quarantined = true;
 	g_dma_stopping = true;
 	g_dma_holding_frees = true;
@@ -903,6 +912,44 @@ extern "C" int dext_dma_begin_shutdown_reset(void)
 	++g_dma_operations;
 	dext_dma_release();
 	return 0;
+}
+
+/* The device left the bus. No DART mapping can be used by it any more:
+ * lift a quarantine and the shutdown or probe hold, and complete every
+ * retired descriptor now. Later frees complete at once. Descriptors whose
+ * completion fails stay retained (dext_dma_fini then reports them); the
+ * provider can still be closed. Returns how many stayed retained. */
+extern "C" int dext_dma_device_removed(void)
+{
+	dext_dma_acquire();
+	g_dma_removed = true;
+	g_dma_quarantined = false;
+	g_dma_probe_hold = false;
+	g_dma_stopping = true;
+	dext_dma_release();
+	int kept = 0;
+	for (auto &entry : dext_dma_table) {
+		dext_dma_acquire();
+		const bool retired = entry.in_use && entry.retired && !entry.releasing;
+		IODMACommand *dma = entry.dma;
+		IOBufferMemoryDescriptor *buf = entry.buf;
+		if (retired) entry.releasing = true;
+		dext_dma_release();
+		if (!retired) continue;
+		if (dext_dma_complete_now(dma, buf)) {
+			++kept;
+			continue;
+		}
+		dext_dma_acquire();
+		entry = {};
+		dext_dma_release();
+	}
+	dext_dma_acquire();
+	g_dma_holding_frees = false;
+	g_dma_shutdown_bytes = 0;
+	g_dma_shutdown_ceiling = 0;
+	dext_dma_release();
+	return kept;
 }
 
 extern "C" int dext_dma_end_shutdown_reset(int reset_succeeded)
@@ -1272,6 +1319,7 @@ extern "C" int dext_dma_begin_shutdown(uint64_t) { return -1; }
 extern "C" int dext_dma_begin_probe(uint64_t) { return -1; }
 extern "C" int dext_dma_commit_probe(void) { return -1; }
 extern "C" void dext_dma_quarantine(void) {}
+extern "C" int dext_dma_device_removed(void) { return 0; }
 extern "C" int dext_dma_begin_shutdown_reset(void) { return -1; }
 extern "C" int dext_bar0_cpu_release_orphaned(void) { return 0; }
 extern "C" int dext_dma_quarantine_releasable(void) { return 0; }
