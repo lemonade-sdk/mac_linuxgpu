@@ -595,6 +595,26 @@ static int unmap_and_free(struct rt_kfd_session *s, uint64_t handle)
 	return (int)r;
 }
 
+/* KFD reports why an allocation was refused only at debug level. Say what
+ * was asked and what KFD's own limits stood at: its VRAM accounting (used,
+ * pinned, available) and the system RAM its system limit derives from. */
+static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
+				 enum rt_kfd_domain domain, long r)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct sysinfo info;
+
+	memset(&info, 0, sizeof(info));
+	si_meminfo(&info);
+	pr_warn("kfd session: ALLOC_MEMORY_OF_GPU %s %llu bytes failed %ld; KFD VRAM used %lld "
+		"pinned %lld available %zu of %llu; RAM %llu\n",
+		domain == RT_KFD_VRAM ? "VRAM" : "GTT", (unsigned long long)size, r,
+		(long long)adev->kfd.vram_used[0], (long long)atomic64_read(&adev->vram_pin_size),
+		amdgpu_amdkfd_get_available_memory(adev, 0),
+		(unsigned long long)adev->gmc.real_vram_size,
+		(unsigned long long)info.totalram * (info.mem_unit ? info.mem_unit : 1));
+}
+
 /* Caller holds s->lock and is inside the process. */
 static int bo_alloc_locked(struct rt_kfd_session *s, uint64_t size, uint64_t alignment,
 			   enum rt_kfd_domain domain, enum rt_kfd_place place,
@@ -649,6 +669,7 @@ static int bo_alloc_locked(struct rt_kfd_session *s, uint64_t size, uint64_t ali
 			       KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
 	r = session_ioctl(s, AMDKFD_IOC_ALLOC_MEMORY_OF_GPU, &alloc, sizeof(alloc));
 	if (r) {
+		report_alloc_failure(s, size, domain, r);
 		va_free(region, va);
 		kfree(bo);
 		return (int)r;
