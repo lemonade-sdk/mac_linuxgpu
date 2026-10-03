@@ -75,17 +75,44 @@ int dext_kfd_uncertain(const dext_kfd_client *c)
     return c && (c->uncertain || rt_kfd_session_uncertain(c->session));
 }
 
+// Queue records whose KFD queue the session no longer schedules go; one
+// still uncertain stays retained. 0 when none is left retained.
+static int destroy_queue_records(dext_kfd_client *c)
+{
+    int kept = 0;
+    for (dext_kfd_queue *q = c->queues, *next; q; q = next) {
+        next = q->next;
+        if (dext_kfd_queue_destroy(q)) kept = 1;
+    }
+    return kept;
+}
+
+int dext_kfd_settle(dext_kfd_client *c, unsigned int wait_ms)
+{
+    if (!c) return -EINVAL;
+    // The session retries its pending copy and every failed queue first;
+    // then retained records whose queue it recovered can go.
+    (void)rt_kfd_session_settle(c->session, wait_ms);
+    int kept = 0;
+    for (dext_kfd_queue *q = c->queues, *next; q; q = next) {
+        next = q->next;
+        if (q->retained && dext_kfd_queue_destroy(q)) kept = 1;
+    }
+    c->uncertain = kept || rt_kfd_session_uncertain(c->session);
+    return c->uncertain ? -EBUSY : 0;
+}
+
 int dext_kfd_close(dext_kfd_client *c)
 {
     if (!c) return -EINVAL;
-    if (dext_kfd_uncertain(c)) return -EBUSY;
-    // Queue records first (the session destroys their KFD queues too).
-    while (c->queues) {
-        dext_kfd_queue *q = c->queues;
-        if (dext_kfd_queue_destroy(q)) { c->uncertain = true; return -EBUSY; }
-    }
+    // A dying client's queues and memory, as Linux tears down a process
+    // that dies with live queues: every queue record first (the session
+    // destroys their KFD queues, recovering any MES does not confirm),
+    // then the session, which retries whatever is still uncertain. Each
+    // step is bounded; a client whose GPU work never let go is kept.
+    int kept = destroy_queue_records(c);
     int r = rt_kfd_session_close(c->session);
-    if (r) { c->uncertain = true; return -EBUSY; }
+    if (kept || r) { c->uncertain = true; return -EBUSY; }
     IOFree(c, sizeof(*c));
     return 0;
 }
@@ -360,8 +387,10 @@ int dext_kfd_queue_service(dext_kfd_queue *q, uint64_t *inactive)
 
 int dext_kfd_queue_destroy(dext_kfd_queue *q)
 {
-    if (!q || q->retained) return -EBUSY;
+    if (!q) return -EBUSY;
     dext_kfd_client *c = q->client;
+    // A retained queue is retried: the session recovers one MES did not
+    // confirm removing, or finds it already recovered by a settle.
     int r = rt_kfd_queue_destroy(c->session, q->queue);
     if (r) {
         // MES may still run it: keep the queue and everything it uses.
@@ -369,6 +398,7 @@ int dext_kfd_queue_destroy(dext_kfd_queue *q)
         c->uncertain = true;
         return r;
     }
+    q->retained = false;
     if (q->scratch) (void)rt_kfd_bo_free(c->session, q->scratch);
     if (q->storage) (void)rt_kfd_bo_free(c->session, q->storage);
     for (dext_kfd_queue **link = &c->queues; *link; link = &(*link)->next)

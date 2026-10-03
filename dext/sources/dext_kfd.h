@@ -28,10 +28,18 @@ struct dext_kfd_queue;
 int dext_kfd_supported(struct rt_compute_ctx *ctx);
 int dext_kfd_open(struct rt_compute_ctx *ctx, int pid, const char *comm,
                   struct dext_kfd_client **out);
-/* Destroy every queue and BO and exit the KFD process. -EBUSY when GPU
- * completion is uncertain: the client is kept and must never be reused. */
+/* Destroy every queue and BO and exit the KFD process, as Linux tears down
+ * a process that dies with live queues: a queue MES does not confirm
+ * removing is recovered through MES's hung-queue reset, and a copy that
+ * outlived its timeout is waited for once more (rt_kfd_session_close).
+ * -EBUSY when GPU completion is still uncertain: the client is kept and
+ * only dext_kfd_settle or another close may touch it. */
 int dext_kfd_close(struct dext_kfd_client *c);
 int dext_kfd_uncertain(const struct dext_kfd_client *c);
+/* Retry what left the client uncertain (rt_kfd_session_settle) and drop the
+ * queue records whose queue the session recovered. 0 when the client is
+ * certain again and may be used or closed normally. */
+int dext_kfd_settle(struct dext_kfd_client *c, unsigned int wait_ms);
 
 /* What the runtime sees of the client (QueryInfo tags 10 and 12). */
 struct dext_kfd_info {
