@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>mac_linuxgpu dext</string>
+	<!-- MUST be DEXT, not KEXT (DriverKit driver-extension). -->
+	<key>CFBundlePackageType</key>
+	<string>DEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>OSBundleCompatibleVersion</key>
+	<string>1</string>
+	<key>OSBundleUsageDescription</key>
+	<string>Userspace host for the unmodified upstream AMDGPU kernel driver, for AMD GPUs attached over Thunderbolt, with a Linux-kernel shim layer.</string>
+	<!--
+	    Required on macOS Tahoe for sysextd to register the driver-extension
+	    as an activation candidate. Without this key sysextd rejects the request
+	    as "Extension not found in App bundle" even when the .dext is present.
+	    (Ported from the proven mac_amdgpu Info.plist.)
+	-->
+	<key>OSSystemExtensionCategory</key>
+	<string>com.apple.system_extension.driver_extension</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.driver.AppleDriverKit</key>
+		<string>1.0</string>
+		<key>com.apple.DriverKit-ApplePCIDriver</key>
+		<string>1.0</string>
+	</dict>
+	<!--
+	    IOKit personality:
+	      - IOClass=IOUserService + IOUserClass + IOUserServerName: the
+	        UserClient is spawned by the IOService (see MacLinuxGPU.iig).
+	      - IOPCITunnelCompatible=true: REQUIRED for any GPU attached over
+	        Thunderbolt; without it the driver will not claim a tunneled PCI
+	        device.
+	      - IOPCIPrimaryMatch: any function with the AMD/ATI vendor ID 0x1002
+	        (the vendor of every entry in upstream amdgpu's PCI ID table). No
+	        device ID is listed.
+	      - IOPCIClassMatch (ANDed with the vendor match, space-separated
+	        alternatives): display controllers (base class 0x03: VGA 0x0300,
+	        3D 0x0302, other 0x0380) and processing accelerators (0x1200),
+	        the classes upstream amdgpu binds. This excludes the GPU's other
+	        PCI functions, such as the HDMI/DP audio controller (class 0x0403)
+	        and USB controllers (0x0c03).
+	      - The authoritative filter is upstream amdgpu's own pciidlist,
+	        applied by the linuxu PCI core when the probe matches the driver.
+	        A function of these classes that upstream does not support fails
+	        the match there, exactly as on Linux.
+	      - IOProbeScore: no other driver on Apple Silicon matches these
+	        functions; the score only keeps this personality ahead of generic
+	        PCI matching and does not depend on the device.
+	-->
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>MacLinuxGPU</key>
+		<dict>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClass</key>
+			<string>MacLinuxGPU</string>
+			<key>IOUserServerName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x00001002&amp;0x0000FFFF</string>
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xFF000000 0x12000000&amp;0xFFFF0000</string>
+			<key>IOProbeScore</key>
+			<integer>10000</integer>
+			<key>MacLinuxGPUUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>MacLinuxGPUUserClient</string>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

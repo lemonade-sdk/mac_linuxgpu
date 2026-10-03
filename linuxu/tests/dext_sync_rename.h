@@ -1,0 +1,21 @@
+/* Build the DriverKit adapters under distinct names in host mock tests so
+ * the test process can continue using native pthreads for worker threads. */
+#define pthread_mutex_init linuxu_dk_pthread_mutex_init
+#define pthread_mutex_destroy linuxu_dk_pthread_mutex_destroy
+#define pthread_mutex_lock linuxu_dk_pthread_mutex_lock
+#define pthread_mutex_trylock linuxu_dk_pthread_mutex_trylock
+#define pthread_mutex_unlock linuxu_dk_pthread_mutex_unlock
+#define pthread_rwlock_init linuxu_dk_pthread_rwlock_init
+#define pthread_rwlock_destroy linuxu_dk_pthread_rwlock_destroy
+#define pthread_rwlock_rdlock linuxu_dk_pthread_rwlock_rdlock
+#define pthread_rwlock_tryrdlock linuxu_dk_pthread_rwlock_tryrdlock
+#define pthread_rwlock_wrlock linuxu_dk_pthread_rwlock_wrlock
+#define pthread_rwlock_trywrlock linuxu_dk_pthread_rwlock_trywrlock
+#define pthread_rwlock_unlock linuxu_dk_pthread_rwlock_unlock
+#define pthread_cond_init linuxu_dk_pthread_cond_init
+#define pthread_cond_destroy linuxu_dk_pthread_cond_destroy
+#define pthread_cond_signal linuxu_dk_pthread_cond_signal
+#define pthread_cond_broadcast linuxu_dk_pthread_cond_broadcast
+#define pthread_cond_wait linuxu_dk_pthread_cond_wait
+#define pthread_cond_timedwait_relative_np linuxu_dk_pthread_cond_timedwait_relative_np
+#define pthread_once linuxu_dk_pthread_once

@@ -1,0 +1,67 @@
+//
+//  MacLinuxGPUUserClient.iig — Per-process IPC endpoint.
+//
+//  Ported from mac_amdgpu/MacAMDGPUUserClient.iig, renamed
+//  MacAMDGPUUserClient → MacLinuxGPUUserClient. The selector numbers
+//  (kMacAMDGPUMethod*) are kept identical to the reference so the host app
+//  (a later track, T-hostapp-sysextd) reuses its client ABI.
+//
+//  Surface (this shell):
+//      Ping              — round-trip plumbing test
+//      GetIdentity       — bus/dev/fn + VID/DID/class code
+//      GetBARInfo        — per-BAR memoryIndex/size/type
+//      SetupInterrupts   — allocate MSI-X vectors + IRQ shared page
+//                          (T-irq-dext)
+//      ResetDevice       — FLR
+//      CopyClientMemoryForType — BAR0..5 (T-dma-dart-dext)
+//
+//  Reserved for the KMD host tracks (T-bringup-dext / T-dma-dart-dext):
+//      Claim / Terminate                   — explicit PCI Open/Close
+//      submit_cs / wait_fence / alloc_bo   — amdgpu UAPI
+//      DART iova region management         — for GART page tables
+//
+//  NOTE: .iig codegen is Xcode-only (see MacLinuxGPU.iig header note).
+//
+
+#ifndef MacLinuxGPUUserClient_h
+#define MacLinuxGPUUserClient_h
+
+#include <Availability.h>
+#include <DriverKit/IOUserClient.iig>
+#include <DriverKit/IOInterruptDispatchSource.iig>
+
+class MacLinuxGPUUserClient: public IOUserClient
+{
+public:
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+
+    // Local completion after all interrupt callbacks have drained.
+    void FinishStop(IOService *provider) LOCALONLY;
+
+    virtual kern_return_t
+    ExternalMethod(uint64_t selector,
+                   IOUserClientMethodArguments *arguments,
+                   const IOUserClientMethodDispatch *dispatch,
+                   OSObject *target,
+                   void *reference) override;
+
+    virtual kern_return_t
+    CopyClientMemoryForType(uint64_t type,
+                            uint64_t *options,
+                            IOMemoryDescriptor **memory) override;
+
+    virtual void
+    AsyncCompletion(OSAction *action,
+                    IOReturn status,
+                    const IOUserClientAsyncArgumentsArray asyncData,
+                    uint32_t asyncDataCount) override;
+
+    virtual void
+    InterruptOccurred(OSAction *action,
+                      uint64_t count,
+                      uint64_t time)
+        TYPE(IOInterruptDispatchSource::InterruptOccurred);
+};
+
+#endif /* MacLinuxGPUUserClient_h */

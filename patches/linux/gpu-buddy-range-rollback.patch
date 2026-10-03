@@ -1,0 +1,20 @@
+gpu/buddy: drop a free block from the free tree before rollback coalescing
+
+When a range allocation fails after splitting, the rollback path coalesces
+the block with its buddy. A block that is still marked free remains linked
+in its free tree, so the merge frees metadata that the tree still points to.
+Remove the block from the tree before merging.
+
+diff --git a/drivers/gpu/buddy.c b/drivers/gpu/buddy.c
+--- a/drivers/gpu/buddy.c
++++ b/drivers/gpu/buddy.c
+@@ -248,6 +248,9 @@
+ {
+ 	struct gpu_buddy_block *parent;
+ 	unsigned int order;
++
++	if (gpu_buddy_block_is_free(block) && !RB_EMPTY_NODE(&block->rb))
++		rbtree_remove(mm, block);
+
+ 	while ((parent = block->parent)) {
+ 		struct gpu_buddy_block *buddy;

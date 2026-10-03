@@ -1,0 +1,30 @@
+mac_linuxgpu
+Copyright (c) 2026 Geramy Loveless
+
+SPDX-License-Identifier: MIT OR GPL-2.0-only
+
+The original code in this repository is available under either the MIT
+license or the GNU General Public License version 2 only, at the
+recipient's option. The full texts are in LICENSES/MIT and
+LICENSES/GPL-2.0.
+
+This applies to the files in this repository that do not carry their own
+license notice. Files that state a different license keep it; in
+particular:
+
+  * third_party/linux is the upstream Linux kernel, fetched as a git
+    submodule. Its files keep their own licenses (see the SPDX identifiers
+    in each file, and COPYING and LICENSES/ in that tree). The patches in
+    patches/linux/ modify those files and are offered under the license of
+    the file they modify.
+
+  * linuxu/ files copied or derived from Linux keep the license stated in
+    their header.
+
+  * hsa/third_party/hsa holds the HSA ABI headers under their own license
+    (hsa/third_party/hsa/LICENSE.txt).
+
+  * GPU firmware is not part of this repository. scripts/fetch-firmware.sh
+    downloads it from linux-firmware at build time; those files are
+    distributed under their own terms (see WHENCE and LICENSE.amdgpu next
+    to the fetched files).

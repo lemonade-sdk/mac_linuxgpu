@@ -1,0 +1,42 @@
+//
+//  MacLinuxGPU.iig — Driver class interface.
+//
+//  This is the IOService subclass that matches the PCI device and
+//  spawns one MacLinuxGPUUserClient per open. Lifecycle only — the
+//  upstream KMD bringup happens on first UserClient claim (T-bringup-dext),
+//  not here. Ported from mac_amdgpu/MacAMDGPU.iig, renamed MacAMDGPU →
+//  MacLinuxGPU.
+//
+//  NOTE: this .iig is processed by the Xcode DriverKit build-phase codegen
+//  (the `iig` tool) into a derived .h + .iig.cpp. A plain make/clang build
+//  does NOT run that codegen, so the make `make dext` path uses the
+//  hand-rolled MacLinuxGPU.mm (compile-clean class decl + lifecycle) and the
+//  .iig is the source of truth for the Xcode build (activation, T-hostapp-
+//  sysextd). Do not try to #include this .iig directly in a make build.
+//
+
+#ifndef MacLinuxGPU_h
+#define MacLinuxGPU_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <DriverKit/IOInterruptDispatchSource.iig>
+#include <PCIDriverKit/IOPCIDevice.iig>
+
+class MacLinuxGPU: public IOService
+{
+public:
+    virtual void free() override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+    void FinishSession() LOCALONLY;
+    void FinishStop(IOService *provider) LOCALONLY;
+    virtual kern_return_t NewUserClient(uint32_t type,
+                                        IOUserClient **userClient) override;
+    virtual void InterruptOccurred(OSAction *action,
+                                   uint64_t count,
+                                   uint64_t time)
+        TYPE(IOInterruptDispatchSource::InterruptOccurred) QUEUENAME(Interrupts);
+};
+
+#endif /* MacLinuxGPU_h */

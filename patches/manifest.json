@@ -1,0 +1,70 @@
+{
+  "linux": {
+    "path": "third_party/linux",
+    "url": "https://github.com/torvalds/linux.git",
+    "pin": "1f63dd8ca0dc05a8272bb8155f643c691d29bb11",
+    "sparse_checkout": [
+      "/COPYING",
+      "/LICENSES/",
+      "/drivers/gpu/buddy.c",
+      "/drivers/gpu/drm/*.c",
+      "/drivers/gpu/drm/*.h",
+      "/drivers/gpu/drm/amd/",
+      "/drivers/gpu/drm/scheduler/",
+      "/drivers/gpu/drm/ttm/",
+      "/drivers/video/hdmi.c",
+      "/include/",
+      "!/include/uapi/linux/netfilter/",
+      "!/include/uapi/linux/netfilter_ipv4/",
+      "!/include/uapi/linux/netfilter_ipv6/",
+      "/lib/crc/crc16.c",
+      "/lib/kfifo.c",
+      "/lib/list_sort.c",
+      "/lib/rbtree.c",
+      "/lib/sort.c"
+    ]
+  },
+  "patches": [
+    {
+      "patch": "patches/linux/gpu-buddy-range-rollback.patch",
+      "sha256": "bdc419d8570a91f93739228fd72ac9aa9dbba04d4bc4bba1bd7b1db1d385953f",
+      "files": [
+        "drivers/gpu/buddy.c"
+      ],
+      "reason": "Remove a still-free block from its free tree before coalescing during allocation-failure rollback. Otherwise a range-split OOM leaves freed metadata in the tree; scripts/test-gpu-buddy.sh reproduces it as an ASan negative control. AMDGPU driver sources are unchanged."
+    }
+  ],
+  "verified_copies": {
+    "reason": "Shadow headers in linuxu/headers that are byte-identical to the pinned upstream file. They stay in the shim include tree because <linux/...>, <drm/...> and <uapi/...> must resolve there without adding the upstream include/ directory to the search path; the verifier checks each one against the submodule.",
+    "files": {
+      "linuxu/headers/drm/drm_accel.h": "include/drm/drm_accel.h",
+      "linuxu/headers/drm/drm_fbdev_ttm.h": "include/drm/drm_fbdev_ttm.h",
+      "linuxu/headers/drm/drm_privacy_screen_machine.h": "include/drm/drm_privacy_screen_machine.h",
+      "linuxu/headers/drm/drm_ras_genl_family.h": "include/drm/drm_ras_genl_family.h",
+      "linuxu/headers/linux/circ_buf.h": "include/linux/circ_buf.h",
+      "linuxu/headers/linux/err.h": "include/linux/err.h",
+      "linuxu/headers/linux/gpu_buddy.h": "include/linux/gpu_buddy.h",
+      "linuxu/headers/linux/irqreturn.h": "include/linux/irqreturn.h",
+      "linuxu/headers/linux/kfifo.h": "include/linux/kfifo.h",
+      "linuxu/headers/linux/sizes.h": "include/linux/sizes.h",
+      "linuxu/headers/linux/sort.h": "include/linux/sort.h",
+      "linuxu/headers/uapi/drm/drm_fourcc.h": "include/uapi/drm/drm_fourcc.h",
+      "linuxu/headers/uapi/drm/drm_mode.h": "include/uapi/drm/drm_mode.h",
+      "linuxu/headers/uapi/drm/drm_ras.h": "include/uapi/drm/drm_ras.h",
+      "linuxu/headers/uapi/linux/bits.h": "include/uapi/linux/bits.h",
+      "linuxu/headers/uapi/linux/i2c.h": "include/uapi/linux/i2c.h"
+    }
+  },
+  "compile_interventions": [
+    {
+      "flag": "-Damdgpu_gmc_gart_location=rt_amdgpu_gmc_gart_location",
+      "scope": "build/driver/amdgpu/gmc_v12_0.o and build-dk/driver/amdgpu/gmc_v12_0.o, from drivers/gpu/drm/amd/amdgpu/gmc_v12_0.c",
+      "reason": "Routes only the GFX12 GART placement call through the host-window policy so GART lands on the client-reserved host VA without overlapping VRAM. amdgpu_gmc.c keeps the original symbol."
+    },
+    {
+      "flag": "-include rt/device_string.h",
+      "scope": "every DriverKit upstream and linuxu object",
+      "reason": "Replaces memset/memcpy/memmove/memcmp/bzero with scalar volatile routines. Compiler-generated DC ZVA and vector stores fault on BAR0 device memory."
+    }
+  ]
+}

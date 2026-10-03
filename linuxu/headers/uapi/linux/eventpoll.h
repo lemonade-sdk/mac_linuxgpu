@@ -1,0 +1,18 @@
+/* linuxu: SHIM (upstream uapi/linux/eventpoll.h — pure constants). */
+#ifndef _UAPI_EVENTPOLL_H
+#define _UAPI_EVENTPOLL_H
+
+#define EPOLLIN		0x00000001
+#define EPOLLPRI	0x00000002
+#define EPOLLOUT	0x00000004
+#define EPOLLERR	0x00000008
+#define EPOLLHUP	0x00000010
+#define EPOLLRDNORM	0x00000040
+#define EPOLLRDHUP	0x00002000
+#define EPOLLWRNORM	0x00000004
+#define EPOLLET		0x40000000
+#define EPOLLONESHOT	0x40000001
+#define EPOLLEXCLUSIVE	(1LL << 29)
+#define EPOLLWAKEUP	(1LL << 30)
+
+#endif /* _UAPI_EVENTPOLL_H */

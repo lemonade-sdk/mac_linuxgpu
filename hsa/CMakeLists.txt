@@ -1,0 +1,122 @@
+cmake_minimum_required(VERSION 3.20)
+project(MacLinuxGPUHSA LANGUAGES C CXX)
+if(NOT APPLE)
+  message(FATAL_ERROR "The IOKit transport requires macOS")
+endif()
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
+# The userspace HSA runtime: a separate dylib (NOT compiled into the dext).
+# Host processes link against it; it talks to the dext over the IOKit
+# user-client selector-RPC. The transport is abstracted (the Connection
+# interface in src/transport.h); the IOKit transport (src/transport_iokit.cpp)
+# is the real one, and the fake (src/transport_fake.cpp) is the host-testing
+# backend selected by MAC_LINUXGPU_FAKE_TRANSPORT=1.
+set(HSA_RUNTIME_SOURCES
+  src/runtime.cpp
+  src/gpu_signals.cpp
+  src/gpu_signal_service.cpp
+  src/memory.cpp
+  src/queues.cpp
+  src/device_init.cpp
+  src/isa.cpp
+  src/isa_target.cpp
+  src/signal_kernels.cpp
+  src/code_object.cpp
+  src/executable.cpp
+  src/virtual_memory.cpp
+  src/host_services.cpp
+  src/ipc_memory.cpp
+  src/ipc_signal.cpp
+  src/platform_extensions.cpp
+  src/transport_iokit.cpp
+  src/transport_fake.cpp)
+
+# The on-demand firmware servicer the Linux-shim driver needs while InitDevice
+# runs (protocol: linuxu/headers/rt/fw_mailbox.h). Compiled in place from
+# host/, which the host app's Xcode target also builds, so there is one copy.
+set(FW_SERVICER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../host)
+set(FW_SERVICER_SOURCES
+  ${FW_SERVICER_DIR}/fw_mailbox_service.c
+  ${FW_SERVICER_DIR}/fw_mailbox_iokit.c)
+
+add_library(hsa-runtime64 SHARED ${HSA_RUNTIME_SOURCES} ${FW_SERVICER_SOURCES})
+target_compile_definitions(hsa-runtime64 PRIVATE HSA_EXPORT)
+target_include_directories(hsa-runtime64 PUBLIC include third_party/hsa/include)
+target_include_directories(hsa-runtime64 PRIVATE ${FW_SERVICER_DIR})
+target_compile_options(hsa-runtime64 PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(hsa-runtime64 PRIVATE "-framework IOKit" "-framework CoreFoundation")
+set_target_properties(hsa-runtime64 PROPERTIES VERSION 0.1.0 SOVERSION 1)
+
+include(CTest)
+if(BUILD_TESTING)
+  # Host unit tests: exercise the runtime's transport-agnostic logic (packet
+  # construction, signal state machine, queue management, memory allocation)
+  # against the fake backend (MAC_LINUXGPU_FAKE_TRANSPORT=1, no IOKit, no dext).
+  add_executable(hsa-aql-packet-test tests/test_aql_packet.cpp)
+  target_link_libraries(hsa-aql-packet-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-aql-packet-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-aql-packet-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-aql-packet COMMAND hsa-aql-packet-test)
+  set_tests_properties(hsa-aql-packet PROPERTIES
+    ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
+  add_executable(hsa-signal-test tests/test_signal.cpp)
+  target_link_libraries(hsa-signal-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-signal-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-signal-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-signal COMMAND hsa-signal-test)
+  set_tests_properties(hsa-signal PROPERTIES
+    ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
+  add_executable(hsa-queue-test tests/test_queue.cpp)
+  target_link_libraries(hsa-queue-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-queue-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-queue-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-queue COMMAND hsa-queue-test)
+  set_tests_properties(hsa-queue PROPERTIES
+    ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
+  # ISA identity, generic-target compatibility, code-object acceptance and
+  # signal-kernel selection across GPU generations. Internal (hidden) code, so
+  # the sources are compiled into the test rather than linked from the dylib.
+  add_executable(hsa-isa-target-test tests/test_isa_target.cpp src/isa_target.cpp
+    src/code_object.cpp src/signal_kernels.cpp src/device_init.cpp)
+  target_compile_options(hsa-isa-target-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-isa-target-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-isa-target COMMAND hsa-isa-target-test)
+
+  # Agent/ISA info and queue-slot degradation against configurable fake
+  # devices of several generations.
+  foreach(name device-info queue-slots)
+    string(REPLACE "-" "_" source ${name})
+    add_executable(hsa-${name}-test tests/test_${source}.cpp)
+    target_link_libraries(hsa-${name}-test PRIVATE hsa-runtime64)
+    target_compile_options(hsa-${name}-test PRIVATE -Wall -Wextra -Werror)
+    target_include_directories(hsa-${name}-test PRIVATE src third_party/hsa/include)
+    add_test(NAME hsa-${name} COMMAND hsa-${name}-test)
+    set_tests_properties(hsa-${name} PROPERTIES ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+  endforeach()
+
+  # Code-object loading while a persistent queue holds the only queue slot:
+  # the loader's code-sync falls back to an AQL packet on that queue. Uses the
+  # runtime's bundled kernels (internal code) as the code object.
+  add_executable(hsa-code-sync-test tests/test_code_sync.cpp src/signal_kernels.cpp
+    src/isa_target.cpp src/code_object.cpp)
+  target_link_libraries(hsa-code-sync-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-code-sync-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-code-sync-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-code-sync COMMAND hsa-code-sync-test)
+  set_tests_properties(hsa-code-sync PROPERTIES ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
+  add_executable(hsa-memory-test tests/test_memory.cpp)
+  target_link_libraries(hsa-memory-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-memory-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-memory-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-memory COMMAND hsa-memory-test)
+  set_tests_properties(hsa-memory PROPERTIES
+    ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+endif()

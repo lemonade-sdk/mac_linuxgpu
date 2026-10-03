@@ -1,0 +1,105 @@
+#pragma once
+
+#include "transport.h"
+#include "signal_state.h"
+#include <hsa/hsa_ext_amd.h>
+#include <hsa/hsa_ven_amd_loader.h>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+
+namespace mac_hsa::detail {
+struct Agent {
+    hsa_agent_t handle;
+    std::shared_ptr<Connection> connection; // null for host CPU
+};
+struct Pool {
+    uint64_t handle;
+    hsa_agent_t owner;
+    size_t capacity;
+    std::shared_ptr<Connection> connection;
+    bool sharedHost = false; // CPU-owned GTT, single-writer coarse memory and kernargs
+};
+struct Allocation {
+    hsa_amd_pointer_type_t type = HSA_EXT_POINTER_TYPE_HSA;
+    hsa_access_permission_t access = HSA_ACCESS_PERMISSION_RW;
+    BufferToken ipcToken{};
+    uint32_t ipcReferences = 1;
+    std::shared_ptr<void> backing; // mappings retain their reservation and storage
+    void *base = nullptr;
+    size_t size = 0;
+    hsa_agent_t owner{};
+    void *userData = nullptr;
+    uint32_t globalFlags = 0; // zero uses the legacy host/device default
+    std::shared_ptr<Connection> connection;
+    DeviceBuffer buffer;
+    SharedBuffer shared;
+    hsa_status_t release() {
+        if (!connection || !buffer.handle) return HSA_STATUS_SUCCESS;
+        const auto status = shared.host ? connection->freeSharedBuffer(shared) : connection->freeBuffer(buffer);
+        if (status == HSA_STATUS_SUCCESS) { buffer = {}; shared = {}; base = nullptr; }
+        return status;
+    }
+    ~Allocation() {
+        if (connection) { if (buffer.handle) release(); }
+        else if (!backing && type == HSA_EXT_POINTER_TYPE_HSA) std::free(base);
+    }
+};
+struct CopyJob {
+    std::atomic<bool> done{false};
+    std::jthread worker;
+};
+
+extern std::mutex runtimeMutex;
+extern std::recursive_mutex executableLifecycleMutex;
+void clearLoadedImages(); // caller holds runtimeMutex and executableLifecycleMutex
+hsa_status_t loaderExtensionTable(size_t size, void *table);
+extern uint32_t references;
+extern uint64_t lastHandle;
+extern std::vector<Agent> agents;
+extern std::unordered_map<uint64_t, std::shared_ptr<Signal>> signals;
+extern std::vector<Pool> pools;
+extern std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
+extern std::vector<std::unique_ptr<CopyJob>> copyJobs;
+struct Executable;
+struct ExecutableSymbol;
+struct CodeReader;
+extern std::unordered_map<uint64_t, std::shared_ptr<Executable>> executables;
+extern std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> executableSymbols;
+extern std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> codeReaders;
+
+// Caller holds runtimeMutex. IDs are never reused across runtime sessions.
+Agent *findAgent(hsa_agent_t handle);
+Pool *findPool(uint64_t handle);
+std::shared_ptr<Allocation> findAllocation(const void *pointer);
+std::shared_ptr<Signal> findSignal(hsa_signal_t handle);
+struct RuntimeQueue;
+using RetiredQueueSet=std::unordered_map<const hsa_queue_t *,std::shared_ptr<RuntimeQueue>>;
+RetiredQueueSet clearQueues(); // retire under runtimeMutex; destroy after unlocking
+void stopQueueServices(RetiredQueueSet &);
+// Runs the device's code-cache synchronization (a one-instruction kernel
+// whose SYSTEM-scope acquire fence invalidates the agent's instruction and
+// data caches) as an AQL packet on one of this connection's live runtime
+// queues. Used when the driver's bounded code-sync launch cannot borrow a
+// queue slot because the runtime's queues hold them all. Returns
+// HSA_STATUS_ERROR_OUT_OF_RESOURCES, having submitted nothing, when the
+// connection has no usable queue.
+hsa_status_t codeSyncOnRuntimeQueue(const std::shared_ptr<Connection> &connection);
+size_t hostPageSize();
+void clearVirtualMemory(); // caller holds runtimeMutex; allocation pins retain mappings
+void clearHostLocks();
+bool describeHostLock(const void *pointer, hsa_amd_pointer_info_t &info); // caller holds runtimeMutex
+void clearCaches();
+void reapCopyJobs();
+void clearSystemEvents();
+hsa_status_t deliverSystemEvent(const hsa_amd_event_t &event);
+hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &, int64_t, const std::shared_ptr<Signal> &);
+void invalidateGPUSignals(const std::shared_ptr<Connection> &);
+hsa_status_t reclaimGPUSignalService(const std::shared_ptr<Connection> &,std::shared_ptr<void> *lease=nullptr);
+hsa_status_t createIPCSignal(hsa_signal_value_t initial, uint32_t count, const hsa_agent_t *consumers, hsa_signal_t *out);
+
+template<typename T> hsa_status_t writeValue(void *output, T value) {
+    std::memcpy(output, &value, sizeof(value));
+    return HSA_STATUS_SUCCESS;
+}
+} // namespace mac_hsa::detail

@@ -1,0 +1,5 @@
+[submodule "third_party/linux"]
+	path = third_party/linux
+	url = https://github.com/torvalds/linux.git
+	shallow = true
+	ignore = dirty

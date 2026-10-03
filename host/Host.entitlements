@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.system-extension.install</key>
+	<true/>
+	<!-- Lets this app release a quarantined driver session whose cached
+	     state proves quiescence (selector 61); see dext/sources/session_state.h. -->
+	<key>com.geramyloveless.MacAMDGPUHost.session-release</key>
+	<true/>
+</dict>
+</plist>

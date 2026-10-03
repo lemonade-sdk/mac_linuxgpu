@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	    transport.pci entitlement match-string MUST exactly match what the
+	    embedded provisioning profile allows. Apple's portal grants the team the
+	    wildcard "0xFFFFFFFF&0x00000000" (same scope as qemu-vfio-apple) — not a
+	    per-device narrow match, so it already covers every AMD GPU.
+
+	    Which functions the dext binds is decided by the vendor/class
+	    personality in dext/Info.plist and, finally, by upstream amdgpu's PCI
+	    ID table; nothing here names a device.
+	-->
+	<key>com.apple.developer.driverkit.transport.pci</key>
+	<array>
+		<dict>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0xFFFFFFFF&amp;0x00000000</string>
+		</dict>
+	</array>
+	<!--
+	    allow-any-userclient-access: the in-process KMD client (and the host
+	    app's observer client) open the UserClient. Ported from mac_amdgpu.
+	-->
+	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+	<true/>
+</dict>
+</plist>
