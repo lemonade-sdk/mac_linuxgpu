@@ -687,6 +687,14 @@ static int queue_recover(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 	memset(hung, 0xff, sizeof(hung));
 	memset(&remove, 0, sizeof(remove));
 	dqm_lock(dqm);
+	/* As remove_queue_mes: no MES queue operation while the queue manager
+	 * is stopped (KFD suspended, rt/power.h) or halted. The stop's own
+	 * removals cover only the queues KFD still lists, so this one stays
+	 * failed, with its memory, until the manager schedules again. */
+	if (!dqm->sched_running || dqm->sched_halt) {
+		dqm_unlock(dqm);
+		return -EAGAIN;
+	}
 	if (!down_read_trylock(&adev->reset_domain->sem)) {
 		dqm_unlock(dqm);
 		return -EIO;
@@ -1640,7 +1648,11 @@ static int queue_release_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q
 	}
 	if (q->detached) {
 		r = queue_recover(s, q);
-		if (r) {
+		if (r == -EAGAIN)
+			pr_warn("kfd session %d: queue %u: KFD's queue manager is stopped; its "
+				"recovery waits for the resume, keeping its memory\n",
+				session_pid(s), q->queue_id);
+		else if (r) {
 			note_failure(s, RT_KFD_STEP_MES_REMOVE, (int)r);
 			pr_err("kfd session %d: queue %u: MES did not let go (%ld); keeping the "
 			       "queue and the memory it uses\n", session_pid(s), q->queue_id, r);

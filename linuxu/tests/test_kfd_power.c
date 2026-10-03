@@ -193,6 +193,30 @@ int main(void)
 	assert(!rt_power_kfd_resume(adev, &r) && r.active == 1);
 	assert(!rt_kfd_session_close(s));
 
+	/* ---- a queue MES did not let go, across a suspend ----
+	 * Its recovery issues no MES call while the queue manager is stopped
+	 * (as remove_queue_mes does not): the session stays uncertain with the
+	 * queue's memory, and recovers once KFD schedules again. */
+	assert(!rt_kfd_session_open(adev, &compute_ctx, 4244, "lse-hung", &s));
+	assert(!rt_kfd_session_set_window(s, window * 4, 0));
+	make_queue(s, &q, 64);
+	mes_dead = true;
+	assert(rt_kfd_queue_destroy(s, q.q) == -ETIMEDOUT && rt_kfd_session_uncertain(s));
+	mes_dead = false;
+	assert(!rt_power_kfd_suspend(adev, &r));
+	{
+		const unsigned int failed = mes_failed_removes, removed = mes_removes,
+				   resets = mes_hang_resets;
+
+		assert(rt_kfd_session_settle(s, 0) == -EBUSY);
+		assert(mes_failed_removes == failed && mes_removes == removed &&
+		       mes_hang_resets == resets);
+		assert(rt_kfd_session_close(s) == -EBUSY);
+		assert(mes_removes == removed && mes_hang_resets == resets);
+	}
+	assert(!rt_power_kfd_resume(adev, &r));
+	assert(!rt_kfd_session_close(s));
+
 	fixture_kfd_release_processes();
 	assert(render_releases == render_opens);
 	fixture_cp_stop();
