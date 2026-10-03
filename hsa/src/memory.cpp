@@ -1,6 +1,7 @@
 #include "runtime_state.h"
 #include "mac_hsa.h"
 #include "synchronization_policy.h"
+#include "host_window.h"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -216,6 +217,7 @@ HSA_API_EXPORT hsa_status_t mac_hsa_memory_get_sync_capabilities(hsa_agent_t han
     *flags=mac_hsa::synchronizationCapabilities(path,allocation->connection ? &snapshot : nullptr);
     return HSA_STATUS_SUCCESS;
 }
+void mac_hsa_set_host_memory_budget(uint64_t bytes) { mac_hsa::setHostMemoryBudget(bytes); }
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out) {
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     *out = nullptr;

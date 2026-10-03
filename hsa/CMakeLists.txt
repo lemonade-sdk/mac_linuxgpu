@@ -29,6 +29,7 @@ set(HSA_RUNTIME_SOURCES
   src/executable.cpp
   src/virtual_memory.cpp
   src/host_services.cpp
+  src/host_window.cpp
   src/ipc_memory.cpp
   src/ipc_signal.cpp
   src/platform_extensions.cpp
@@ -130,4 +131,11 @@ if(BUILD_TESTING)
   add_test(NAME hsa-memory COMMAND hsa-memory-test)
   set_tests_properties(hsa-memory PROPERTIES
     ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
+  # The host window reservation (against this process's real address space),
+  # the host memory budget and the window size asked of the driver.
+  add_executable(hsa-host-window-test tests/test_host_window.cpp src/host_window.cpp)
+  target_compile_options(hsa-host-window-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-host-window-test PRIVATE src)
+  add_test(NAME hsa-host-window COMMAND hsa-host-window-test)
 endif()

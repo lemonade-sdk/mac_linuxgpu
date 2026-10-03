@@ -95,6 +95,16 @@ hsa_status_t mac_hsa_executable_dispatch_aql(hsa_executable_symbol_t symbol,
 __attribute__((visibility("default")))
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out);
 
+// Caps the host memory the runtime shares with the GPU at once: every shared
+// (GTT) buffer together, whatever it holds (staging, kernel arguments,
+// signals, AQL rings). An allocation past the cap fails with
+// HSA_STATUS_ERROR_OUT_OF_RESOURCES and a message on stderr. Zero removes
+// the cap (the default; the host window is then the only limit). Overrides
+// MAC_HSA_HOST_MEMORY_BUDGET (bytes, optional K/M/G suffix). Call it before
+// hsa_init to also size the host window the driver is asked for.
+__attribute__((visibility("default")))
+void mac_hsa_set_host_memory_budget(uint64_t bytes);
+
 enum {
     MAC_HSA_SYNC_CPU_LOCAL_ATOMICS = 1u << 0,
     MAC_HSA_SYNC_GPU_LOCAL_ATOMICS = 1u << 1,

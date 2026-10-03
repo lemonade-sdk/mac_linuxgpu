@@ -7,29 +7,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <TargetConditionals.h>
-#if TARGET_OS_IOS
-// The iOS SDK withholds <mach/mach_vm.h>; on arm64 the vm_map family takes the
-// same 64-bit addresses and sizes, so the reservations below are unchanged.
-#include <mach/vm_map.h>
-namespace {
-static_assert(sizeof(vm_address_t) == sizeof(mach_vm_address_t));
-inline kern_return_t mach_vm_map(vm_map_t task, mach_vm_address_t *address, mach_vm_size_t size,
-                                 mach_vm_offset_t mask, int flags, mem_entry_name_port_t object,
-                                 memory_object_offset_t offset, boolean_t copy, vm_prot_t current,
-                                 vm_prot_t maximum, vm_inherit_t inheritance) {
-    vm_address_t placed = vm_address_t(*address);
-    const auto result = vm_map(task, &placed, vm_size_t(size), vm_address_t(mask), flags, object,
-                               vm_offset_t(offset), copy, current, maximum, inheritance);
-    *address = placed;
-    return result;
-}
-inline kern_return_t mach_vm_deallocate(vm_map_t task, mach_vm_address_t address, mach_vm_size_t size) {
-    return vm_deallocate(task, vm_address_t(address), vm_size_t(size));
-}
-}
-#else
-#include <mach/mach_vm.h>
-#endif
+#include "mach_vm_compat.h"
+#include "host_window.h"
 #include <atomic>
 #include <new>
 #include <array>
@@ -186,7 +165,7 @@ public:
         std::lock_guard lock(sessionMutex);
         auto status = ensureReady();
         if (status == HSA_STATUS_SUCCESS) status = ensureHostWindow();
-        if (status == HSA_STATUS_SUCCESS) bytes = hostWindowSize;
+        if (status == HSA_STATUS_SUCCESS) bytes = sharedCapacityLocked();
         return status;
     }
 
@@ -328,6 +307,8 @@ public:
         if (IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host)) != KERN_SUCCESS) {
             state = State::Faulted; return HSA_STATUS_ERROR;
         }
+        hostReservation.give(buffer.device.address, buffer.device.size);
+        sharedBytes -= std::min(sharedBytes, buffer.device.size);
         sharedBuffers.erase(found);
         const auto status = scalar(17, {&buffer.device.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
@@ -640,6 +621,20 @@ private:
     bool mappedStagingDeclined = false;
     static constexpr size_t kMappedStagingBytes = 4u << 20;
     uint64_t hostWindowBase = 0, hostWindowSize = 0;
+    // The window's free VA, held for the session (host_window.h), and the
+    // bytes of shared buffers currently mapped in it.
+    HostWindowReservation hostReservation;
+    uint64_t sharedBytes = 0;
+    void reserveHostWindowLocked() {
+        const auto reserved = hostReservation.reserve(hostWindowBase, hostWindowSize);
+        if (const char *trace = std::getenv("MAC_HSA_SESSION_TRACE"); trace && trace[0] == '1')
+            std::fprintf(stderr, "mac_linuxgpu: host window %#llx+%#llx: %#llx bytes held free for shared buffers\n",
+                (unsigned long long)hostWindowBase, (unsigned long long)hostWindowSize, (unsigned long long)reserved);
+    }
+    uint64_t sharedCapacityLocked() const {
+        const auto budget = hostMemoryBudget();
+        return budget ? std::min(hostWindowSize, budget) : hostWindowSize;
+    }
     ComputeSessionMode sessionMode = ComputeSessionMode::Unknown;
     std::map<uint64_t, SharedBuffer> sharedBuffers;
     std::map<std::string, std::vector<uint8_t>> firmware;
@@ -808,6 +803,7 @@ private:
                 hostWindowSize=result.hostBytes;
                 sessionMode=result.sessionMode;
                 state=State::Ready;
+                reserveHostWindowLocked();
                 if (const char *trace=std::getenv("MAC_HSA_SESSION_TRACE"); trace && trace[0]=='1')
                     std::fprintf(stderr, "mac_linuxgpu: compute session %s, host window %#llx+%#llx\n",
                         sessionMode==ComputeSessionMode::KFD ? "KFD process" :
@@ -891,6 +887,7 @@ private:
             }
         }
         hostWindowBase = window[0]; hostWindowSize = window[1];
+        reserveHostWindowLocked();
         return HSA_STATUS_SUCCESS;
     }
     hsa_status_t allocateSharedBufferLocked(uint64_t bytes, SharedBuffer &out) {
@@ -901,23 +898,38 @@ private:
         if (status != HSA_STATUS_SUCCESS) return status;
         if (!bytes || bytes > hostWindowSize || bytes > UINT64_MAX - 16383)
             return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        const uint64_t rounded = (bytes + 16383) & ~uint64_t(16383);
+        if (const auto capacity = sharedCapacityLocked(); rounded > capacity - std::min(capacity, sharedBytes)) {
+            std::fprintf(stderr, "mac_linuxgpu: shared host memory budget exhausted: %#llx bytes requested, "
+                "%#llx of %#llx in use (MAC_HSA_HOST_MEMORY_BUDGET / mac_hsa_set_host_memory_budget)\n",
+                (unsigned long long)rounded, (unsigned long long)sharedBytes, (unsigned long long)capacity);
+            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
         SharedBuffer buffer;
-        status = allocateRaw((bytes + 16383) & ~uint64_t(16383), 2, buffer.device);
+        status = allocateRaw(rounded, 2, buffer.device);
         if (status != HSA_STATUS_SUCCESS) return status;
         std::array<uint64_t, 2> mapping{};
         status = scalar(36, {&buffer.device.handle, 1}, mapping);
         mach_vm_address_t address = buffer.device.address;
         mach_vm_size_t size = 0;
+        kern_return_t mapped = KERN_INVALID_ARGUMENT;
+        bool taken = false;
         if (status == HSA_STATUS_SUCCESS && mapping[0] <= UINT32_MAX && mapping[1] == buffer.device.size &&
             address >= hostWindowBase && address - hostWindowBase <= hostWindowSize &&
             buffer.device.size <= hostWindowSize - (address - hostWindowBase)) {
             buffer.memoryType = uint32_t(mapping[0]);
-            // A placed mapping fails on collisions; never overwrite process memory.
-            if (IOConnectMapMemory64(ownerPort, buffer.memoryType, mach_task_self(), &address, &size, 0) == KERN_SUCCESS) {
+            // The window's VA is held for exactly this: release this buffer's
+            // range just before the placed mapping. A placed mapping still
+            // fails on a collision (a range the reservation never held); it
+            // never overwrites process memory.
+            taken = hostReservation.take(buffer.device.address, buffer.device.size);
+            mapped = IOConnectMapMemory64(ownerPort, buffer.memoryType, mach_task_self(), &address, &size, 0);
+            if (mapped == KERN_SUCCESS) {
                 if (address == buffer.device.address && size == buffer.device.size) {
                     buffer.host = reinterpret_cast<void *>(address);
                     try {
                         sharedBuffers.emplace(buffer.device.handle, buffer);
+                        sharedBytes += buffer.device.size;
                         std::memset(buffer.host, 0, size);
                         std::atomic_thread_fence(std::memory_order_seq_cst);
                         out = buffer; return HSA_STATUS_SUCCESS;
@@ -927,7 +939,13 @@ private:
                     state = State::Faulted; return HSA_STATUS_ERROR;
                 }
             }
+            if (taken) hostReservation.give(buffer.device.address, buffer.device.size);
         }
+        if (status == HSA_STATUS_SUCCESS)
+            std::fprintf(stderr, "mac_linuxgpu: shared buffer %#llx+%#llx did not map at its GPU VA "
+                "(IOReturn %#x)%s\n", (unsigned long long)buffer.device.address,
+                (unsigned long long)buffer.device.size, unsigned(mapped),
+                taken ? "" : "; something else in the process maps that range");
         const auto cleanup = scalar(17, {&buffer.device.handle, 1}, {});
         if (cleanup != HSA_STATUS_SUCCESS) { state = State::Faulted; return cleanup; }
         return status != HSA_STATUS_SUCCESS ? status : HSA_STATUS_ERROR_OUT_OF_RESOURCES;
