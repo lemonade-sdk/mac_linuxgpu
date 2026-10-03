@@ -62,6 +62,10 @@ int rt_surface_import(struct pci_dev *pdev, const struct rt_surface_segment *seg
  * once the BO is destroyed (possibly later, on a TTM worker). */
 void rt_surface_release(struct rt_surface *surface);
 
+/* The surface's geometry. */
+void rt_surface_geometry(const struct rt_surface *surface, uint32_t *width, uint32_t *height,
+			 uint32_t *pitch);
+
 /* The surface's GPU (GART) address while imported. */
 uint64_t rt_surface_gpu_address(const struct rt_surface *surface);
 
@@ -75,6 +79,56 @@ struct rt_surface_copy_stats {
 	uint64_t bytes;
 	uint64_t ns;		/* submit to fence signalled */
 };
+
+/* ---- pinning check: does the GPU see what the client writes? ----
+ * The client fills the surface with rt_surface_pattern(seed, i) for every
+ * dword i; rt_surface_verify() reads RT_SURFACE_SAMPLES ranges spread over
+ * the surface with the GPU (SDMA copies into a GTT buffer) and, when a CPU
+ * view of the client's memory is given, with the CPU, and counts the
+ * dwords that differ from the pattern of @seed. */
+#define RT_SURFACE_SAMPLES	64u
+#define RT_SURFACE_SAMPLE_BYTES	256u
+
+static inline uint32_t rt_surface_pattern(uint32_t seed, uint64_t dword)
+{
+	return (uint32_t)(dword * 2654435761u) ^ (seed * 0x85ebca77u) ^ 0x5a5a0000u;
+}
+
+struct rt_surface_verify_result {
+	uint32_t version;		/* 1 */
+	uint32_t samples, sample_bytes;
+	uint32_t gpu_mismatches;	/* dwords the GPU read that differ */
+	uint32_t cpu_mismatches;	/* dwords the CPU view read that differ */
+	uint32_t cpu_checked;		/* a CPU view was given */
+	uint64_t first_gpu_mismatch;	/* surface byte offset, or UINT64_MAX */
+	uint64_t first_cpu_mismatch;
+	uint64_t gpu_ns;		/* the GPU read, submit to fence */
+	uint64_t gpu_address;		/* the surface in the GART */
+	uint32_t gpu_value, expected_value;	/* at the first GPU mismatch, or sample 0 */
+};
+
+/* Check the surface against the pattern of @seed. @cpu_view, when not NULL,
+ * is a CPU mapping of the whole surface. Returns 0 (the counts tell the
+ * result), or the GPU read's errno (-ETIME after @timeout_ms). */
+int rt_surface_verify(struct rt_surface *surface, uint32_t seed, const void *cpu_view,
+		      unsigned int timeout_ms, struct rt_surface_verify_result *result);
+
+/* ---- imports by owner (a user client), by handle ---- */
+#define RT_SURFACE_IMPORTS_MAX	32u
+
+/* Register an imported surface for @owner: a nonzero handle, or 0 when the
+ * table is full (the caller still owns @surface then). */
+uint32_t rt_surface_add(uint64_t owner, struct rt_surface *surface);
+/* The surface of @owner's @handle, or NULL. Valid until removed. */
+struct rt_surface *rt_surface_get(uint64_t owner, uint32_t handle);
+/* The provider context the surface was imported with. */
+void *rt_surface_provider_context(const struct rt_surface *surface);
+/* Remove and release: one handle (0 or -ENOENT), all of an owner's, or all
+ * (both return how many). */
+int rt_surface_remove(uint64_t owner, uint32_t handle);
+unsigned int rt_surface_remove_owner(uint64_t owner);
+unsigned int rt_surface_remove_all(void);
+unsigned int rt_surface_count(void);
 
 #ifdef __KERNEL__
 struct drm_gem_object;

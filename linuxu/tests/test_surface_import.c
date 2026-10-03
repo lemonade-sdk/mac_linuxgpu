@@ -216,6 +216,66 @@ int main(void)
 		CHECK(r == 0 && stats.jobs == 2 && stats.rows == 1100 && stats.bytes == 1100 * 4);
 	}
 
+	/* The pinning check: the GPU (SDMA into GTT) and a CPU view see the
+	 * pattern the client wrote last, and not the one before. */
+	{
+		struct rt_surface_verify_result v;
+		uint8_t *view = malloc(surf.size);
+
+		CHECK(view);
+		for (int seed = 1; seed <= 3; seed++) {
+			for (uint64_t d = 0; d < surf.size / 4; d++) {
+				uint32_t value = rt_surface_pattern(seed, d);
+
+				memcpy(surface_byte(&surf, d * 4), &value, 4);
+				memcpy(view + d * 4, &value, 4);
+			}
+			CHECK(rt_surface_verify(surface, seed, view, 5000, &v) == 0);
+			printf("surface: verify seed %d -> GPU %u, CPU %u mismatching dwords of %u, %llu us\n",
+			       seed, v.gpu_mismatches, v.cpu_mismatches,
+			       v.samples * v.sample_bytes / 4, (unsigned long long)v.gpu_ns / 1000);
+			CHECK(v.version == 1 && v.samples == RT_SURFACE_SAMPLES && v.cpu_checked);
+			CHECK(!v.gpu_mismatches && !v.cpu_mismatches && v.first_gpu_mismatch == UINT64_MAX);
+			CHECK(v.gpu_value == v.expected_value && v.gpu_address == rt_surface_gpu_address(surface));
+			CHECK(rt_surface_verify(surface, seed + 100, NULL, 5000, &v) == 0);
+			CHECK(v.gpu_mismatches == v.samples * v.sample_bytes / 4 && !v.cpu_checked &&
+			      v.first_gpu_mismatch == 0);
+		}
+		free(view);
+	}
+
+	/* The import table: handles by owner, removal by handle, by owner and
+	 * all (the client-stop and session-close paths). */
+	{
+		struct fake_surface t[3];
+		struct rt_surface_provider p[3];
+		struct rt_surface *imported[3];
+		uint32_t h[3];
+
+		for (int i = 0; i < 3; i++) {
+			fake_surface_init(&t[i], SRC_PITCH, 0x11000000u * (i + 1));
+			p[i] = (struct rt_surface_provider){ provider_release, &t[i] };
+			CHECK(rt_surface_import(pdev, t[i].segment, 3, t[i].size, W, H, SRC_PITCH, &p[i],
+						&imported[i]) == 0);
+			CHECK(rt_surface_provider_context(imported[i]) == &t[i]);
+		}
+		h[0] = rt_surface_add(7, imported[0]);
+		h[1] = rt_surface_add(7, imported[1]);
+		h[2] = rt_surface_add(9, imported[2]);
+		CHECK(h[0] && h[1] && h[2] && h[0] != h[1] && rt_surface_count() == 3);
+		CHECK(rt_surface_get(7, h[0]) == imported[0] && !rt_surface_get(9, h[0]) &&
+		      !rt_surface_get(7, 0));
+		CHECK(rt_surface_remove(9, h[0]) == -ENOENT && rt_surface_remove(7, 0) == -ENOENT);
+		CHECK(rt_surface_remove(7, h[0]) == 0 && !rt_surface_get(7, h[0]));
+		wait_released(&t[0]);
+		CHECK(rt_surface_remove_owner(7) == 1 && rt_surface_count() == 1);
+		wait_released(&t[1]);
+		CHECK(rt_surface_remove_all() == 1 && rt_surface_count() == 0);
+		wait_released(&t[2]);
+		for (int i = 0; i < 3; i++)
+			fake_surface_free(&t[i]);
+	}
+
 	/* Release: the provider's release follows once the BO is gone, the
 	 * DART charge with it. */
 	rt_surface_release(surface);
