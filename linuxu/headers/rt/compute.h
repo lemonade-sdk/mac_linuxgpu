@@ -108,6 +108,11 @@ struct amdgpu_device *rt_compute_device(struct rt_compute_ctx *ctx);
 /* -ENODEV until KFD has added the device to its topology. */
 int rt_device_topology(struct amdgpu_device *adev, struct rt_compute_topology *out);
 int rt_compute_close(struct rt_compute_ctx *ctx);
+/* Hold DMA releases while an engine of @adev is stalled (a job running past
+ * its timeout) so late GPU work never reaches memory released meanwhile
+ * (linuxu_dart_set_hold); NULL detaches and releases what was held.
+ * rt_compute_open attaches the device and rt_compute_close detaches it. */
+void rt_dma_hold_attach(struct amdgpu_device *adev);
 
 /* GTT returns a coherent CPU/DART backing bound at a pinned upstream GART
  * address. The CPU address can be passed to the dext DMA descriptor exporter;
