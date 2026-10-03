@@ -23,6 +23,14 @@ typedef struct {
 	__u8 b[UUID_SIZE];
 } guid_t;
 
+/* The macOS SDK's <unistd.h> also declares a uuid_t (unsigned char[16]),
+ * guarded by _UUID_T. The kernel type is spelled linuxu_uuid_t underneath,
+ * and the SDK typedef is suppressed when this header comes first, so
+ * translation units that see both compile. */
+#define uuid_t linuxu_uuid_t
+#ifndef _UUID_T
+#define _UUID_T
+#endif
 typedef struct {
 	__u8 b[UUID_SIZE];
 } uuid_t;

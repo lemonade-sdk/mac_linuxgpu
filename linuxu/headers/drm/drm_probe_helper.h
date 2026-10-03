@@ -1,5 +1,7 @@
-/* linuxu: SHIM (display surface — drm_probe_helper poll/HPD entry
- * points amdgpu_display.c calls; no modeset in the compute dext) */
+/* linuxu: AS-IS (third_party/linux/include/drm/drm_probe_helper.h) - vendored verbatim from
+ * the pinned tree; kernel-only includes resolve to linuxu shadows. */
+// SPDX-License-Identifier: GPL-2.0 OR MIT
+
 #ifndef __DRM_PROBE_HELPER_H__
 #define __DRM_PROBE_HELPER_H__
 
@@ -10,13 +12,9 @@ struct drm_crtc;
 struct drm_device;
 struct drm_modeset_acquire_ctx;
 
-static inline unsigned int drm_helper_probe_single_connector_modes(struct drm_connector
-						    *connector, uint32_t maxX,
-						    uint32_t maxY)
-{
-	(void)connector; (void)maxX; (void)maxY;
-	return 0;
-}
+int drm_helper_probe_single_connector_modes(struct drm_connector
+					    *connector, uint32_t maxX,
+					    uint32_t maxY);
 int drm_helper_probe_detect(struct drm_connector *connector,
 			    struct drm_modeset_acquire_ctx *ctx,
 			    bool force);

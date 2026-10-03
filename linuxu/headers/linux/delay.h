@@ -44,4 +44,24 @@ extern void usleep_range_state(unsigned long min, unsigned long max,
 extern void usleep_range(unsigned long min, unsigned long max);
 extern bool wait_us_range(unsigned long min, unsigned long max);
 
+/* Upstream inline helpers over the sleep primitives above. */
+static inline void ssleep(unsigned int seconds)
+{
+	msleep(seconds * 1000);
+}
+
+static const unsigned int max_slack_shift = 2;
+#define USLEEP_RANGE_UPPER_BOUND	((TICK_NSEC << max_slack_shift) / NSEC_PER_USEC)
+
+/* fsleep - flexible sleep which autoselects the best mechanism (upstream). */
+static inline void fsleep(unsigned long usecs)
+{
+	if (usecs <= 10)
+		udelay(usecs);
+	else if (usecs < USLEEP_RANGE_UPPER_BOUND)
+		usleep_range(usecs, usecs + (usecs >> max_slack_shift));
+	else
+		msleep(DIV_ROUND_UP(usecs, USEC_PER_MSEC));
+}
+
 #endif

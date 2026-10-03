@@ -15,6 +15,16 @@
 #define CONFIG_DRM_SUBALLOC_HELPER 1
 #define CONFIG_DRM_AMDGPU 1
 #define CONFIG_DRM_AMDGPU_USERPTR 1
+/* Display Core is compiled in; linuxu_driver_bootstrap() keeps it off
+ * (amdgpu_dc=0) unless display is requested. CONFIG_DRM_AMD_DC_FP is a
+ * declared intervention (patches/manifest.json config_interventions). */
+#define CONFIG_DRM_AMD_DC 1
+#define CONFIG_DRM_AMD_DC_FP 1
+#define CONFIG_DRM_DISPLAY_HELPER 1
+#define CONFIG_DRM_DISPLAY_DP_HELPER 1
+#define CONFIG_DRM_DISPLAY_DSC_HELPER 1
+#define CONFIG_DRM_DISPLAY_HDCP_HELPER 1
+#define CONFIG_DRM_DISPLAY_HDMI_HELPER 1
 #define CONFIG_HSA_AMD 1
 /* No recoverable GPU faults/SVM or peer GPU access over this TB5 path. */
 #define CONFIG_64BIT 1
@@ -31,5 +41,8 @@
 #define CONFIG_DEBUG_FS 1
 #define CONFIG_SYSFS 1
 #define CONFIG_DEV_COREDUMP 1
+
+/* IS_ENABLED()/IS_BUILTIN()/IS_REACHABLE(), as kbuild's forced kconfig.h. */
+#include <linux/kconfig.h>
 
 #endif

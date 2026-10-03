@@ -1,4 +1,5 @@
-/* linuxu: AS-IS (third_party/linux/include/drm/drm_modeset_helper) */
+/* linuxu: AS-IS (third_party/linux/include/drm/drm_modeset_helper.h) - vendored verbatim from
+ * the pinned tree; kernel-only includes resolve to linuxu shadows. */
 /*
  * Copyright (c) 2016 Intel Corporation
  *
@@ -41,16 +42,7 @@ void drm_helper_mode_fill_fb_struct(struct drm_device *dev,
 int drm_crtc_init(struct drm_device *dev, struct drm_crtc *crtc,
 		  const struct drm_crtc_funcs *funcs);
 
-static inline int drm_mode_config_helper_suspend(struct drm_device *dev)
-{
-	(void)dev;
-	return 0;
-}
-static inline int drm_mode_config_helper_resume(struct drm_device *dev)
-{
-	(void)dev;
-	return 0;
-}
-
+int drm_mode_config_helper_suspend(struct drm_device *dev);
+int drm_mode_config_helper_resume(struct drm_device *dev);
 
 #endif

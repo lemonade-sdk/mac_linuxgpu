@@ -609,5 +609,4 @@ static inline void drm_debugfs_bridge_params(void)
 
 
 
-void drm_privacy_screen_put(void *handle);
 #endif

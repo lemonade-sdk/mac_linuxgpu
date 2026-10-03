@@ -709,16 +709,24 @@ IMPL(MacLinuxGPU, Start)
 
     // Compute sessions become KFD processes when the device supports them;
     // a personality may turn that off ("MacLinuxGPUKFDSessions" = false).
+    // Display (upstream amdgpu_dm/DC) is off unless a personality sets
+    // "MacLinuxGPUDisplay" = true.
     {
         OSDictionary *properties = nullptr;
         bool kfdSessions = true;
+        bool display = false;
         if (CopyProperties(&properties) == kIOReturnSuccess && properties) {
             if (properties->getObject("MacLinuxGPUKFDSessions") == kOSBooleanFalse)
                 kfdSessions = false;
+            if (properties->getObject("MacLinuxGPUDisplay") == kOSBooleanTrue)
+                display = true;
             properties->release();
         }
         dext_compute_set_kfd_policy(kfdSessions);
         MACLINUXGPU_LOG("KFD compute sessions %s", kfdSessions ? "enabled when supported" : "disabled");
+        const int displayRet = linuxu_driver_set_display(display ? 1 : 0);
+        MACLINUXGPU_LOG("display %s%s", display ? "requested (amdgpu.dc=-1)" : "off (amdgpu.dc=0)",
+                        displayRet ? " - modules already running, unchanged" : "");
     }
 
     pci->retain();

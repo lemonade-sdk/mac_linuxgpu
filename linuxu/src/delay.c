@@ -46,11 +46,6 @@ void msleep(unsigned int msecs)
 	mdelay(msecs);
 }
 
-void ssleep(unsigned int seconds)
-{
-	nanosleep(&(struct timespec) { .tv_sec = seconds }, NULL);
-}
-
 void usleep_range(unsigned long min, unsigned long max)
 {
 	(void)min;

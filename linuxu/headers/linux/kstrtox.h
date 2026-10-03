@@ -64,6 +64,9 @@ static inline int __must_check kstrtou64(const char *s, unsigned int base,
 	return kstrtoull(s, base, (unsigned long long *)res);
 }
 
+int __must_check kstrtobool(const char *s, bool *res);
+int __must_check kstrtobool_from_user(const char __user *s, size_t count, bool *res);
+
 /* Linux process addresses require a process-aware copy backend. */
 static inline int __must_check kstrtol_from_user(const char __user *s,
 						 size_t count, unsigned int base,

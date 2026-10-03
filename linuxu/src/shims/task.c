@@ -7,6 +7,7 @@
 
 #include <rt/task.h>
 #include <linux/list.h>
+#include <linux/percpu.h>
 #include <linux/pid.h>
 
 static int next_pid = 1;
@@ -192,6 +193,69 @@ int task_pid_vnr(const struct task_struct *task)
 	return task ? task->pid : 0;
 }
 
+/* Per-CPU copies owned by a task (linux/percpu.h). A task only ever looks
+ * up its own copies; a task shared by several threads (an adopted process
+ * task) may insert concurrently, so insertion publishes with a CAS and
+ * lookups read the list with acquire loads. Copies live until the task is
+ * released. */
+struct linuxu_percpu_copy {
+	struct linuxu_percpu_copy *next;
+	const void *var;
+	size_t size;
+	unsigned char data[] __attribute__((aligned(16)));
+};
+
+unsigned long linuxu_percpu_alloc_failures;
+
+void *linuxu_this_cpu_ptr(const void *var, size_t size)
+{
+	struct task_struct *task = linuxu_current_task();
+	struct linuxu_percpu_copy *head, *copy;
+
+	head = __atomic_load_n((struct linuxu_percpu_copy **)&task->linuxu_percpu,
+			       __ATOMIC_ACQUIRE);
+	for (copy = head; copy; copy = copy->next)
+		if (copy->var == var)
+			return copy->data;
+	copy = malloc(sizeof(*copy) + size);
+	if (!copy) {
+		/* Out of memory: fall back to the shared boot copy, the
+		 * single-CPU behaviour, rather than fail an accessor that
+		 * cannot report errors. */
+		__atomic_add_fetch(&linuxu_percpu_alloc_failures, 1, __ATOMIC_RELAXED);
+		return (void *)var;
+	}
+	copy->var = var;
+	copy->size = size;
+	memcpy(copy->data, var, size);
+	do {
+		struct linuxu_percpu_copy *seen;
+		for (seen = head; seen; seen = seen->next) {
+			if (seen->var == var) {
+				free(copy);
+				return seen->data;
+			}
+		}
+		copy->next = head;
+	} while (!__atomic_compare_exchange_n(
+			(struct linuxu_percpu_copy **)&task->linuxu_percpu, &head,
+			copy, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE));
+	return copy->data;
+}
+
+void linuxu_percpu_task_release(struct task_struct *task)
+{
+	struct linuxu_percpu_copy *copy =
+		__atomic_exchange_n((struct linuxu_percpu_copy **)&task->linuxu_percpu,
+				    NULL, __ATOMIC_ACQ_REL);
+
+	while (copy) {
+		struct linuxu_percpu_copy *next = copy->next;
+		free(copy);
+		copy = next;
+	}
+}
+
 static void task_detach_pid(struct task_struct *task)
 {
 	struct pid *pid;
@@ -209,6 +273,7 @@ void put_task_struct(struct task_struct *task)
 {
 	if (task && refcount_dec_and_test(&task->usage)) {
 		task_detach_pid(task);
+		linuxu_percpu_task_release(task);
 		if (task->linuxu_release)
 			task->linuxu_release(task);
 	}

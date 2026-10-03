@@ -90,14 +90,6 @@ void fwnode_handle_put(struct fwnode_handle *fwnode) { (void)fwnode; }
 
 
 
-/* The compute profile does not provide a virtual display encoder. */
-int drm_simple_encoder_init(struct drm_device *dev,
-		struct drm_encoder *encoder, int encoder_type)
-{
-	(void)dev; (void)encoder; (void)encoder_type;
-	return -ENOSYS;
-}
-
 /* ---- pci / pcie ---- */
 struct pci_dev *pcie_find_root_port(struct pci_dev *dev)
 {

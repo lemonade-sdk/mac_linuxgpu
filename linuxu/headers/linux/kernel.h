@@ -32,6 +32,9 @@
 #include <linux/array_size.h>
 #include <linux/overflow.h>
 #include <linux/math64.h>
+#include <asm/byteorder.h>	/* upstream kernel.h includes it too */
+/* Upstream reaches str_*() through deep module.h/seq_file.h chains. */
+#include <linux/string_choices.h>
 
 
 #include <stdarg.h>
@@ -65,7 +68,7 @@
 #define stringify(a)		__stringify(a)
 
 /* ---- type helpers ---- */
-#define typecheck(type, x)	((typeof(x) *)0)
+#include <linux/typecheck.h>
 #define __typecheck(type, x)	__builtin_types_compatible_p(typeof(x), type)
 
 /* ---- alignment / rounding ---- */

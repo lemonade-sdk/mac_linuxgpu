@@ -718,7 +718,7 @@ static bool queue_work_caller(struct workqueue_struct *wq,
 		return false;
 	pthread_mutex_lock(&work_lock);
 	struct work_execution *execution = running_work(work);
-	if (!(state(work) & WORK_PENDING) &&
+	if (!(state(work) & WORK_PENDING) && !work->disable &&
 	    !(execution && execution->cancelling) &&
 	    !stopping_refuses(wq, 0, "queue_work", caller)) {
 		add_pending(wq, work, false, 0);
@@ -762,7 +762,7 @@ static bool queue_delayed_caller(struct workqueue_struct *wq,
 		return false;
 	pthread_mutex_lock(&work_lock);
 	struct work_execution *execution = running_work(&dwork->work);
-	if (!(state(&dwork->work) & WORK_PENDING) &&
+	if (!(state(&dwork->work) & WORK_PENDING) && !dwork->work.disable &&
 	    !(execution && execution->cancelling) &&
 	    !stopping_refuses(wq, delay, "queue_delayed_work", caller)) {
 		add_pending(wq, &dwork->work, delay != 0, jiffies + delay);
@@ -810,7 +810,10 @@ static bool mod_delayed_caller(struct workqueue_struct *wq,
 		was = (state(work) & WORK_PENDING) != 0;
 		if (was)
 			remove_pending(work, true);
-		add_pending(wq, work, delay != 0, jiffies + delay);
+		/* Linux steals the pending instance but does not requeue a
+		 * disabled item (clear_pending_if_disabled). */
+		if (!work->disable)
+			add_pending(wq, work, delay != 0, jiffies + delay);
 	}
 	pthread_mutex_unlock(&work_lock);
 	return was;
@@ -995,6 +998,87 @@ static bool cancel_sync(struct work_struct *work, void *caller)
 bool cancel_work_sync(struct work_struct *work)
 {
 	return cancel_sync(work, __builtin_return_address(0));
+}
+
+/* Linux __cancel_work(WORK_CANCEL_DISABLE): take the disable reference and
+ * steal a pending instance; the _sync form also waits for a running one. */
+static bool disable_locked_caller(struct work_struct *work, bool sync, void *caller)
+{
+	bool was;
+
+	pthread_mutex_lock(&work_lock);
+	if (work->disable == ~0u) {
+		pthread_mutex_unlock(&work_lock);
+		wq_warn("work %p disable count overflow (caller %p)", (void *)work, caller);
+		return false;
+	}
+	work->disable++;
+	pthread_mutex_unlock(&work_lock);
+	if (sync)
+		return cancel_sync(work, caller);
+	pthread_mutex_lock(&work_lock);
+	was = !!(state(work) & WORK_PENDING);
+	if (was)
+		remove_pending(work, true);
+	pthread_mutex_unlock(&work_lock);
+	return was;
+}
+
+bool disable_work(struct work_struct *work)
+{
+	return disable_locked_caller(work, false, __builtin_return_address(0));
+}
+
+bool disable_work_sync(struct work_struct *work)
+{
+	return disable_locked_caller(work, true, __builtin_return_address(0));
+}
+
+bool enable_work(struct work_struct *work)
+{
+	bool enabled;
+
+	pthread_mutex_lock(&work_lock);
+	if (!work->disable)
+		wq_warn("enable_work(%p) without a matching disable (caller %p)",
+			(void *)work, __builtin_return_address(0));
+	else
+		work->disable--;
+	enabled = !work->disable;
+	pthread_mutex_unlock(&work_lock);
+	return enabled;
+}
+
+bool disable_delayed_work(struct delayed_work *dw)
+{
+	return disable_locked_caller(&dw->work, false, __builtin_return_address(0));
+}
+
+bool disable_delayed_work_sync(struct delayed_work *dw)
+{
+	return disable_locked_caller(&dw->work, true, __builtin_return_address(0));
+}
+
+bool enable_delayed_work(struct delayed_work *dw)
+{
+	return enable_work(&dw->work);
+}
+
+struct work_struct *current_work(void)
+{
+	struct work_execution *execution;
+	struct work_struct *work = NULL;
+	pthread_t self = pthread_self();
+
+	pthread_mutex_lock(&work_lock);
+	for (execution = executions; execution; execution = execution->next) {
+		if (pthread_equal(execution->thread, self)) {
+			work = execution->work;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&work_lock);
+	return work;
 }
 
 bool cancel_delayed_work_sync(struct delayed_work *dw)

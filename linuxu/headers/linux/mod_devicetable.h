@@ -3,6 +3,7 @@
 #define __LINUX_MOD_DEVICETABLE_H
 
 #include <linux/types.h>
+#include <linux/uuid.h>
 #include <linux/pci_ids.h>
 
 /* PCI device table (subset) */

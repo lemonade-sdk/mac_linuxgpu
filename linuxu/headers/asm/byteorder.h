@@ -70,4 +70,12 @@ static inline u64  __be64_to_cpu(u64 x) { return __cpu_to_be64(x); }
 #define be32_to_cpu(x)  ((__u32) __be32_to_cpu((__be32) (x)))
 #define be64_to_cpu(x)  ((__u64) __be64_to_cpu((__be64) (x)))
 
+/* linux/byteorder/generic.h in-place helpers. */
+static inline void le16_add_cpu(__le16 *var, u16 val) { *var = cpu_to_le16(le16_to_cpu(*var) + val); }
+static inline void le32_add_cpu(__le32 *var, u32 val) { *var = cpu_to_le32(le32_to_cpu(*var) + val); }
+static inline void le64_add_cpu(__le64 *var, u64 val) { *var = cpu_to_le64(le64_to_cpu(*var) + val); }
+static inline void be16_add_cpu(__be16 *var, u16 val) { *var = cpu_to_be16(be16_to_cpu(*var) + val); }
+static inline void be32_add_cpu(__be32 *var, u32 val) { *var = cpu_to_be32(be32_to_cpu(*var) + val); }
+static inline void be64_add_cpu(__be64 *var, u64 val) { *var = cpu_to_be64(be64_to_cpu(*var) + val); }
+
 #endif	/* __ASM_BYTEORDER_H */

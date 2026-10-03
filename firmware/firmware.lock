@@ -8,7 +8,9 @@
 # repository.
 #
 # The default set is what the AMD Radeon AI PRO R9700 (GFX12, PSP 14, SMU 14,
-# SDMA 7, VCN 5) path loads today. Add files for other GPUs with
+# SDMA 7, VCN 5) path loads today, plus its DCN 4.0.1 display microcontroller
+# (DMCUB) image, which amdgpu_dm requests only when display is enabled. Add
+# files for other GPUs with
 #   scripts/fetch-firmware.sh --add amdgpu/<name>.bin ...
 # which records them here, or fetch the whole amdgpu/ directory at the same
 # commit with
@@ -58,3 +60,4 @@ file  amdgpu/smu_14_0_3.bin             3221ef2ddb341570eeb727e1e16f170bfb2ea123
 file  amdgpu/smu_14_0_3_kicker.bin      0decd44fc95c5bf71a4f3905b5e125e39cd99d63ce38073d9843d5c0ed137efb  327424
 file  amdgpu/vcn_5_0_0.bin              52180adaa4692d5c84e825b7e6ccc77ff925f87208b85ca49217dca9b65fe0a0  438288
 file  amdgpu/vcn_5_0_1.bin              b9d53491d5d23a3391a677ff4ff4c7fa8d58b88087a96f990696def92ab48199  217680
+file  amdgpu/dcn_4_0_1_dmcub.bin       4195d418c212e6e02b6db4ff5aeaabc2f418df98eb7eedc316c50c0d5eaea564  368160
