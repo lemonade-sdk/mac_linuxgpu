@@ -17,7 +17,7 @@ enum Word : unsigned {
     LastTransitionMicroseconds, SessionGeneration, Reserved,
 };
 
-enum class State : uint32_t { Active = 0, Suspending = 1, Suspended = 2, Resuming = 3, Lost = 4 };
+enum class PowerState : uint32_t { Active = 0, Suspending = 1, Suspended = 2, Resuming = 3, Lost = 4 };
 
 enum Flag : uint32_t {
     VRAMPreserved = 1u << 0,

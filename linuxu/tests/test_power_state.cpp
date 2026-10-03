@@ -15,11 +15,11 @@ namespace pw = amdgpu::power;
 static_assert(pw::kQueryTag == MLG_QUERY_POWER_STATE);
 static_assert(pw::kSelector == MLG_SELECTOR_POWER);
 static_assert(pw::kVersion == MLG_POWER_STATE_VERSION && pw::kWords == MLG_POWER_STATE_WORDS);
-static_assert(uint32_t(pw::State::Active) == MLG_POWER_ACTIVE &&
-              uint32_t(pw::State::Suspending) == MLG_POWER_SUSPENDING &&
-              uint32_t(pw::State::Suspended) == MLG_POWER_SUSPENDED &&
-              uint32_t(pw::State::Resuming) == MLG_POWER_RESUMING &&
-              uint32_t(pw::State::Lost) == MLG_POWER_LOST);
+static_assert(uint32_t(pw::PowerState::Active) == MLG_POWER_ACTIVE &&
+              uint32_t(pw::PowerState::Suspending) == MLG_POWER_SUSPENDING &&
+              uint32_t(pw::PowerState::Suspended) == MLG_POWER_SUSPENDED &&
+              uint32_t(pw::PowerState::Resuming) == MLG_POWER_RESUMING &&
+              uint32_t(pw::PowerState::Lost) == MLG_POWER_LOST);
 #define SAME(a, b) (uint64_t(a) == uint64_t(b))
 static_assert(SAME(pw::VRAMPreserved, MLG_POWER_FLAG_VRAM_PRESERVED) &&
               SAME(pw::SystemSleep, MLG_POWER_FLAG_SYSTEM_SLEEP) &&

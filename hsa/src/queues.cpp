@@ -1,6 +1,7 @@
 #include "runtime_state.h"
 #include "mac_hsa.h"
 #include <hsa/amd_hsa_queue.h>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <new>
@@ -9,6 +10,8 @@
 #include <system_error>
 
 namespace mac_hsa::detail {
+struct RuntimeQueue;
+static bool pausedNow(const std::weak_ptr<RuntimeQueue> &weak);
 struct RuntimeQueue {
     amd_queue_t hostABI{};
     amd_queue_t *abi=&hostABI;
@@ -22,6 +25,13 @@ struct RuntimeQueue {
     bool errorDelivered=false;
     bool everKicked=false;
     uint64_t profilingFrequency=0;
+    // Device power (power.h): while the device takes no work (or the client
+    // prepared for low power), doorbells wait here, the highest value rung,
+    // and are rung again once it does. lastKicked is the highest value the
+    // driver accepted, what a drain waits for.
+    std::atomic<bool> paused{false};
+    int64_t pendingDoorbell=-1;
+    int64_t lastKicked=-1;
     struct ServiceState {
         std::atomic<bool> stop{false};
         std::mutex waitMutex;
@@ -50,14 +60,30 @@ struct RuntimeQueue {
             if (!active || !hardwareHandle || errorDelivered) return;
             uint64_t inactive=0;
             status=connection->serviceQueue(hardwareHandle,inactive);
+            if (status==kDeviceSuspendedStatus) {paused=true;return;}
+            // Taking work again: ring what waited.
+            if (status==HSA_STATUS_SUCCESS && paused && !submissionsHeld(connection.get())) {
+                paused=false;
+                status=replayLocked();
+                if (status==kDeviceSuspendedStatus) return;
+            }
             if (status!=HSA_STATUS_SUCCESS) {errorDelivered=true;notify=true;}
         }
         // Callbacks may query or destroy this queue; never hold its mutex here.
         if (notify) {
             if (serviceState) serviceState->stop=true;
+            status=deviceStatus(connection,status);
             invalidateGPUSignals(connection);
             if (errorCallback) errorCallback(status,&abi->hsa_queue,errorData);
         }
+    }
+    // Caller holds mutex. Rings the doorbell that waited, if any.
+    hsa_status_t replayLocked() {
+        if (pendingDoorbell<0) return HSA_STATUS_SUCCESS;
+        const auto status=connection->kickQueue(hardwareHandle,uint64_t(pendingDoorbell));
+        if (status==kDeviceSuspendedStatus) {paused=true;return status;}
+        if (status==HSA_STATUS_SUCCESS) {lastKicked=std::max(lastKicked,pendingDoorbell);pendingDoorbell=-1;}
+        return status;
     }
     void startService(const std::shared_ptr<RuntimeQueue> &self) {
         serviceState=std::make_shared<ServiceState>();
@@ -70,8 +96,10 @@ struct RuntimeQueue {
                     if (!queue) break;
                     queue->service();
                 }
+                // Paused for device power: poll at a gentler pace.
+                const auto pace=std::chrono::milliseconds(pausedNow(weak) ? 20 : 1);
                 std::unique_lock lock(state->waitMutex);
-                state->changed.wait_for(lock,std::chrono::milliseconds(1),[&] {return state->stop.load();});
+                state->changed.wait_for(lock,pace,[&] {return state->stop.load();});
             }
         });
     }
@@ -93,11 +121,17 @@ struct RuntimeQueue {
             std::lock_guard lock(mutex);
             if (!active || !hardwareHandle || errorDelivered) return;
             everKicked=true;
-            if (connection->kickQueue(hardwareHandle,uint64_t(value))!=HSA_STATUS_SUCCESS) {
-                errorDelivered=true;notify=true;
+            // Held for device power: the doorbell waits (the packet is in
+            // the ring already) and is rung on resume.
+            if (paused || submissionsHeld(connection.get())) {
+                pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;
             }
+            const auto status=connection->kickQueue(hardwareHandle,uint64_t(value));
+            if (status==kDeviceSuspendedStatus) {pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;}
+            if (status!=HSA_STATUS_SUCCESS) {errorDelivered=true;notify=true;}
+            else lastKicked=std::max(lastKicked,value);
         }
-        if (notify && errorCallback) errorCallback(HSA_STATUS_ERROR,&abi->hsa_queue,errorData);
+        if (notify && errorCallback) errorCallback(deviceStatus(connection,HSA_STATUS_ERROR),&abi->hsa_queue,errorData);
     }
     std::shared_ptr<Signal> doorbell;
     bool active = true;
@@ -110,6 +144,10 @@ struct RuntimeQueue {
         } else std::free(abi->hsa_queue.base_address);
     }
 };
+static bool pausedNow(const std::weak_ptr<RuntimeQueue> &weak) {
+    const auto queue=weak.lock();
+    return queue && queue->paused.load();
+}
 namespace {
 RetiredQueueSet queues;
 std::shared_ptr<RuntimeQueue> findQueue(const hsa_queue_t *pointer) {
@@ -128,6 +166,55 @@ RetiredQueueSet clearQueues() {
 }
 void stopQueueServices(RetiredQueueSet &retired) {
     for (auto &[pointer,queue]:retired) {(void)pointer;queue->stopService();}
+}
+
+// Device power (power.cpp): this connection's runtime queues.
+static std::vector<std::shared_ptr<RuntimeQueue>> connectionQueues(const std::shared_ptr<Connection> &connection) {
+    std::vector<std::shared_ptr<RuntimeQueue>> found;
+    std::lock_guard lock(runtimeMutex);
+    for (const auto &[pointer,queue]:queues) {
+        (void)pointer;
+        if (queue->connection==connection) found.push_back(queue);
+    }
+    return found;
+}
+bool drainQueues(const std::shared_ptr<Connection> &connection, std::chrono::steady_clock::time_point deadline) {
+    for (const auto &queue:connectionQueues(connection)) {
+        for (;;) {
+            int64_t kicked;
+            {
+                std::lock_guard lock(queue->mutex);
+                if (!queue->active || queue->errorDelivered) break;
+                kicked=queue->lastKicked;
+            }
+            // Every packet the driver was asked to run has been read.
+            if (kicked<0 || int64_t(index(queue->abi->read_dispatch_id).load(std::memory_order_acquire))>kicked)
+                break;
+            if (std::chrono::steady_clock::now()>=deadline) return false;
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+    }
+    return true;
+}
+void replayQueues(const std::shared_ptr<Connection> &connection) {
+    for (const auto &queue:connectionQueues(connection)) {
+        bool notify=false;
+        hsa_status_t status=HSA_STATUS_SUCCESS;
+        {
+            std::lock_guard lock(queue->mutex);
+            if (!queue->active || !queue->hardwareHandle || queue->errorDelivered || !queue->paused) continue;
+            queue->paused=false;
+            status=queue->replayLocked();
+            if (status!=HSA_STATUS_SUCCESS && status!=kDeviceSuspendedStatus) {queue->errorDelivered=true;notify=true;}
+        }
+        if (notify && queue->errorCallback)
+            queue->errorCallback(deviceStatus(connection,status),&queue->abi->hsa_queue,queue->errorData);
+    }
+}
+uint32_t pausedQueues(const std::shared_ptr<Connection> &connection) {
+    uint32_t paused=0;
+    for (const auto &queue:connectionQueues(connection)) paused+=queue->paused.load();
+    return paused;
 }
 
 namespace {

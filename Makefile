@@ -1095,6 +1095,12 @@ test-kfd-power:
 test-power-state:
 	bash scripts/test-power-state.sh
 
-test: test-kfd-power test-power-state
-CRASH_PATH_TESTS += test-kfd-power test-power-state
-.PHONY: test-kfd-power test-power-state
+# The runtime's IOKit transport under device power (offline refusals, the
+# power snapshot and requests). The runtime's behaviour itself is
+# hsa/tests/test_power.cpp in make hsa-test.
+test-hsa-power-transport:
+	bash scripts/test-hsa-power-transport.sh
+
+test: test-kfd-power test-power-state test-hsa-power-transport
+CRASH_PATH_TESTS += test-kfd-power test-power-state test-hsa-power-transport
+.PHONY: test-kfd-power test-power-state test-hsa-power-transport

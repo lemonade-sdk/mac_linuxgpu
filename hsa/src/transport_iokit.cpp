@@ -188,6 +188,9 @@ public:
                          unsigned(result), count, outputs);
         if (result == kIOReturnNoDevice || result == kIOReturnNotAttached ||
             result == MACH_SEND_INVALID_DEST) return HSA_STATUS_ERROR_INVALID_AGENT;
+        // The device is suspending, suspended or resuming (power.h): the
+        // driver submitted nothing; the call is retried after resume.
+        if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
         if (result == kIOReturnBusy || result == kIOReturnNoMemory || result == kIOReturnNoSpace || result == kIOReturnNoResources)
             return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         if (result == kIOReturnBadArgument) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
@@ -400,7 +403,8 @@ public:
         status=scalar(56,input,output);
         // These RPC errors are returned before any queue map is attempted.
         // Exhausting the driver's queue slots must not poison existing queues.
-        if (status==HSA_STATUS_ERROR_OUT_OF_RESOURCES || status==HSA_STATUS_ERROR_INVALID_ARGUMENT) {
+        if (status==HSA_STATUS_ERROR_OUT_OF_RESOURCES || status==HSA_STATUS_ERROR_INVALID_ARGUMENT ||
+            status==kDeviceSuspendedStatus) {
             hardwareQueues.erase(record);return status;
         }
         if (status!=HSA_STATUS_SUCCESS || output[0] || !output[1] || hardwareQueues.contains(output[1])) {
@@ -416,6 +420,7 @@ public:
         const std::array<uint64_t,2> input={handle,packet};std::array<uint64_t,1> output{};
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const auto status=scalar(57,input,output);
+        if (status==kDeviceSuspendedStatus) return status; // nothing rung; replayed after resume
         if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
         return HSA_STATUS_SUCCESS;
     }
@@ -435,6 +440,7 @@ public:
         if (!handle || !hardwareQueues.contains(handle)) return HSA_STATUS_ERROR_INVALID_QUEUE;
         std::array<uint64_t,2> output{};
         const auto status=scalar(59,{&handle,1},output);
+        if (status==kDeviceSuspendedStatus) return status;
         if (status!=HSA_STATUS_SUCCESS) {state=State::Faulted;return status;}
         inactive=output[1];
         // A suspended queue can still be removed safely after a resource error.
@@ -463,6 +469,7 @@ public:
         // held (possibly by another client) and the driver refused before
         // reserving one or touching hardware, so the session stays healthy.
         if (linuxShim && status == kIOReturnNoResources) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        if (status == kIOReturnOffline) return kDeviceSuspendedStatus;
         if (status != KERN_SUCCESS || count != output.size() || output[0] || output[1] ||
             output[2]!=5 || output[3] || output[4]!=1) {
             state=State::Faulted; return HSA_STATUS_ERROR;
@@ -495,6 +502,7 @@ public:
         // queue slot is held and the driver refused before reserving one or
         // touching hardware. Nothing was submitted; the session stays healthy.
         if (linuxShim && status == kIOReturnNoResources) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        if (status == kIOReturnOffline) return kDeviceSuspendedStatus;
         if (status != KERN_SUCCESS || count != output.size() || output[0] ||
             output[2] != 3 || !output[1] || output[1] <= lastComputeFence) {
             // A failed or malformed response cannot prove completion. The
@@ -618,8 +626,38 @@ public:
         }
         buffer = {output[0], output[1], output[2]}; return HSA_STATUS_SUCCESS;
     }
+    // Device power (power.h). Cached state on the driver side: callable in
+    // any session state, without the session lock (a PREPARE can take as
+    // long as the driver's quiesce; the port lives as long as this object).
+    hsa_status_t powerState(PowerSnapshot &out) override {
+        return powerCall(21, amdgpu::power::kQueryTag, out);
+    }
+    hsa_status_t requestPower(uint64_t op, PowerSnapshot &out) override {
+        if (op != amdgpu::power::Prepare && op != amdgpu::power::Resume) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return powerCall(amdgpu::power::kSelector, op, out);
+    }
 
 private:
+    hsa_status_t powerCall(uint32_t selector, uint64_t input, PowerSnapshot &out) {
+        io_connect_t port;
+        {
+            std::lock_guard lock(sessionMutex);
+            port = ownerPort;
+        }
+        if (!port || !linuxShim) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        PowerSnapshot snapshot;
+        uint32_t raw = 0, count = 0;
+        const auto status = call(port, selector, &input, 1, snapshot.words.data(),
+                                 uint32_t(snapshot.words.size()), &raw, &count);
+        // Drivers before the protocol: an unknown tag or selector.
+        if (raw == uint32_t(kIOReturnUnsupported) || raw == uint32_t(kIOReturnBadArgument) ||
+            raw == uint32_t(kIOReturnNotPermitted))
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!snapshot.valid()) return HSA_STATUS_ERROR;
+        out = snapshot;
+        return HSA_STATUS_SUCCESS;
+    }
     const bool linuxShim;
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     std::mutex sessionMutex;
@@ -1039,6 +1077,7 @@ private:
         uint64_t operation = UINT64_MAX;
         const auto status = scalar(48, input, {&operation, 1});
         if (status == HSA_STATUS_SUCCESS && !operation) return status;
+        if (status == kDeviceSuspendedStatus) return status; // refused before submission
         // A failed submission may still reference staging. Never free/reuse it.
         state = State::Faulted;
         return status == HSA_STATUS_SUCCESS ? HSA_STATUS_ERROR : status;
@@ -1088,6 +1127,7 @@ private:
                     size_t returned = span;
                     const auto result = IOConnectCallMethod(ownerPort, 50, io.data(), 3, nullptr, 0,
                                                             nullptr, nullptr, chunk, &returned);
+                    if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
                     if (result != KERN_SUCCESS || returned != span) { state = State::Faulted; return HSA_STATUS_ERROR; }
                 }
             }
@@ -1098,6 +1138,7 @@ private:
                 } else {
                     const auto result = IOConnectCallMethod(ownerPort, 49, io.data(), 3, chunk, span,
                                                             nullptr, nullptr, nullptr, nullptr);
+                    if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
                     if (result != KERN_SUCCESS) { state = State::Faulted; return HSA_STATUS_ERROR; }
                 }
                 status = copyRaw(stagingHandle, 0, buffer.handle, aligned, span);

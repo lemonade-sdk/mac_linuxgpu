@@ -96,6 +96,10 @@ public:
     hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &fence) override;
     hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &request, uint64_t &fence) override;
 
+    // ---- Connection: device power (power.h) ----
+    hsa_status_t powerState(PowerSnapshot &out) override;
+    hsa_status_t requestPower(uint64_t op, PowerSnapshot &out) override;
+
     // ---- InitializationRPC (used by device_init.cpp) ----
     hsa_status_t scalar(uint32_t selector, std::span<const uint64_t> input,
                         std::span<uint64_t> output) override;
@@ -115,6 +119,15 @@ public:
     // executed on a runtime queue.
     uint64_t codeSyncCount() const;
     uint64_t queueCodeSyncCount() const;
+    // Device power, as the driver reports it. While the state is
+    // suspending, suspended or resuming, GPU work (kicks, queue service and
+    // creation, allocation, launches) is refused with
+    // kDeviceSuspendedStatus and nothing happens; while lost, the closed
+    // session's calls fail. PREPARE from active suspends with memory kept;
+    // the last RESUME makes it active again. Every change bumps the
+    // generation.
+    void setPowerState(amdgpu::power::PowerState state, bool vramPreserved = true);
+    uint64_t powerRequests(uint64_t op) const;
     const FakeDeviceConfig &config() const { return config_; }
 
 private:
@@ -151,6 +164,12 @@ private:
     std::array<uint64_t, 10> tag6_{};
     bool queueSlotsExhaustedLocked() const;
     void processQueueLocked(Queue &queue);
+    PowerSnapshot power_;
+    uint64_t powerRequests_[4]{};
+    // kDeviceSuspendedStatus or HSA_STATUS_ERROR when the power state
+    // refuses GPU work, HSA_STATUS_SUCCESS otherwise.
+    hsa_status_t powerRefusalLocked() const;
+    void setPowerLocked(amdgpu::power::PowerState state, uint32_t flags);
     bool codeSyncKernelLocked(uint64_t kernelObject) const;
 };
 
