@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 static int failures = 0;
 #define CHECK(cond, msg) do { \
@@ -129,6 +130,24 @@ int main() {
     status = hsa_memory_free(buf2);
     CHECK(status == HSA_STATUS_SUCCESS, "hsa_memory_free [2nd]");
     CHECK(fake->bufferCount() == before, "buffer count restored after 2nd free");
+
+    // 12b. An engine's worth of device and shared buffers, released the way
+    //      an engine that is closing releases them: every buffer goes back to
+    //      the driver, and doing it again starts from the same count.
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        const auto baseline = fake->bufferCount();
+        std::vector<void *> held;
+        for (int i = 0; i < 24; ++i) {
+            void *p = nullptr;
+            const auto r = (i % 3 == 2) ? mac_hsa_memory_allocate_shared(gpu, 65536, &p)
+                                        : hsa_memory_allocate(region, size_t(1) << (12 + i % 8), &p);
+            if (r == HSA_STATUS_SUCCESS && p) held.push_back(p);
+        }
+        CHECK(held.size() == 24, "engine-sized allocation set");
+        CHECK(fake->bufferCount() == baseline + held.size(), "every allocation is one driver buffer");
+        for (void *p : held) CHECK(hsa_memory_free(p) == HSA_STATUS_SUCCESS, "free");
+        CHECK(fake->bufferCount() == baseline, "driver buffer count back to baseline after release");
+    }
 
     // 13. Free a null pointer is a no-op success.
     status = hsa_memory_free(nullptr);
