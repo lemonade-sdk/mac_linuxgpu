@@ -1087,3 +1087,12 @@ test-drm-selftest:
 test: test-drm-selftest
 CRASH_PATH_TESTS += test-drm-selftest
 .PHONY: test-drm-selftest
+
+# The hardware display test runner (scripts/display-test.py) against a fake
+# Display selector.
+test-display-test:
+	bash scripts/test-display-test.sh
+
+test: test-display-test
+CRASH_PATH_TESTS += test-display-test
+.PHONY: test-display-test
