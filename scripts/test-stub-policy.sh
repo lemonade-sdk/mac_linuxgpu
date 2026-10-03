@@ -51,23 +51,23 @@ POLICY = dict(_base.POLICY)
 $1
 EOF
 }
-write_policy 'POLICY["hrtimer_setup"] = ("implement", "probe")'
-expect_fail "an implement entry" "hrtimer_setup: classified .implement." --policy "$work/policy.py"
+write_policy 'POLICY["irq_domain_remove"] = ("implement", "probe")'
+expect_fail "an implement entry" "irq_domain_remove: classified .implement." --policy "$work/policy.py"
 write_policy 'POLICY["linuxu_stale_probe_symbol"] = ("noop", "probe")'
 expect_fail "a stale policy entry" "not in UNDEFINED_SYMBOLS.txt: linuxu_stale_probe_symbol" \
 	--policy "$work/policy.py"
-write_policy 'POLICY["hrtimer_forward"] = ("enosys", "probe")'
-expect_fail "-ENOSYS through u64" "hrtimer_forward: .enosys. needs a signed" --policy "$work/policy.py"
-write_policy 'POLICY["hrtimer_active"] = {"cat": "unreachable", "ret": "-ENODEV"}'
-expect_fail "a negative bool" "hrtimer_active: negative value" --policy "$work/policy.py"
-write_policy 'POLICY["drm_gem_fb_get_obj"] = {"cat": "unreachable", "ret": "ERR_PTR(-ENOSYS)"}'
-expect_fail "an ERR_PTR through a pointer stub" "drm_gem_fb_get_obj: negative value" \
+write_policy 'POLICY["amdgpu_ras_mgr_gen_ras_event_seqno"] = ("enosys", "probe")'
+expect_fail "-ENOSYS through u64" "amdgpu_ras_mgr_gen_ras_event_seqno: .enosys. needs a signed" --policy "$work/policy.py"
+write_policy 'POLICY["amdgpu_ras_mgr_is_rma"] = {"cat": "unreachable", "ret": "-ENODEV"}'
+expect_fail "a negative bool" "amdgpu_ras_mgr_is_rma: negative value" --policy "$work/policy.py"
+write_policy 'POLICY["irq_domain_create_linear"] = {"cat": "unreachable", "ret": "ERR_PTR(-ENOSYS)"}'
+expect_fail "an ERR_PTR through a pointer stub" "irq_domain_create_linear: negative value" \
 	--policy "$work/policy.py"
 write_policy 'POLICY["ndelay"] = ("noop", "probe")'
 expect_fail "a stub shadowing a real definition" "ndelay: classified noop but already defined" \
 	--policy "$work/policy.py"
-write_policy 'POLICY["hrtimer_cancel"] = ("noop", "probe")'
-expect_fail "noop on an int function" "hrtimer_cancel: .noop. requires a void" --policy "$work/policy.py"
+write_policy 'POLICY["irq_create_mapping"] = ("noop", "probe")'
+expect_fail "noop on an int function" "irq_create_mapping: .noop. requires a void" --policy "$work/policy.py"
 
 # Reachability: no generated stub reached from the probe/open/KFD roots
 # returns a negative value.

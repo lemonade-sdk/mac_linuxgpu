@@ -25,6 +25,8 @@
 #include <drm/drm_utils.h>
 #include <drm/drm_probe_helper.h>
 #include <rt/task.h>
+#include <linux/component.h>
+#include "amdgpu_ras_mgr.h"
 
 static int failures;
 
@@ -378,8 +380,10 @@ static void test_generated(void)
 {
 	CHECK(vga_client_register(NULL, NULL) == 0);	/* disabled-inline */
 	vga_client_unregister(NULL);
-	CHECK(!hrtimer_active(NULL));			/* unreachable: benign */
-	CHECK(!hrtimer_active(NULL));			/* warns once only */
+	CHECK(!amdgpu_ras_mgr_is_rma(NULL));		/* unreachable: benign */
+	CHECK(!amdgpu_ras_mgr_is_rma(NULL));		/* warns once only */
+	CHECK(component_add(NULL, NULL) == 0);		/* ok-zero */
+	/* Upstream drm_probe_helper.c now: not called from the poll worker. */
 	CHECK(!drm_kms_helper_is_poll_worker());
 }
 
