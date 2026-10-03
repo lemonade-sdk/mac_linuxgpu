@@ -99,6 +99,9 @@ struct MacLinuxGPUUserClient_IVars;
 struct MacLinuxGPU : IOService {
     void FinishSession();
     void FinishStop(IOService *provider);
+    kern_return_t Stop(IOService *provider);
+    kern_return_t Stop(IOService *, int) { assert(false); return kIOReturnError; }
+    kern_return_t Terminate(uint64_t options);
 };
 struct MacLinuxGPUUserClient : IOService {
     MacLinuxGPUUserClient_IVars *ivars = nullptr;
@@ -533,6 +536,21 @@ static void checkObserverPolicy() {
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOffPattern, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayBadOp, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, nullptr, 0));
+    // Retire: a known op, only the FORCE flag, the confirmation word.
+    const uint64_t retire[] = {MLG_RETIRE_OP_TERMINATE, MLG_RETIRE_FORCE, MLG_RETIRE_CONFIRM};
+    const uint64_t retireQuiesce[] = {MLG_RETIRE_OP_QUIESCE, 0, MLG_RETIRE_CONFIRM};
+    const uint64_t retireResume[] = {MLG_RETIRE_OP_RESUME, 0, MLG_RETIRE_CONFIRM};
+    const uint64_t retireBadOp[] = {MLG_RETIRE_OP_RESUME + 1, 0, MLG_RETIRE_CONFIRM};
+    const uint64_t retireBadFlags[] = {MLG_RETIRE_OP_QUIESCE, 2, MLG_RETIRE_CONFIRM};
+    const uint64_t retireNoConfirm[] = {MLG_RETIRE_OP_TERMINATE, 0, 0};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retire, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireQuiesce, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireResume, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retire, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireBadOp, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireBadFlags, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireNoConfirm, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, nullptr, 0));
     char path[MLG_SYSFS_PATH_MAX + 1];
     assert(mlg_sysfs_path_copy(path, "gpu_metrics", 11, false) && !std::strcmp(path, "gpu_metrics"));
     assert(mlg_sysfs_path_copy(path, "hwmon/hwmon0/temp1_input", 25, false) &&
@@ -719,6 +737,252 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
                 held ? "surprise-removal-held" : quarantined ? "surprise-removal-quarantined" : "surprise-removal");
 }
 
+// ----------------------------------------------------------------
+// Driver upgrade. macOS does not stop a running dext when an activation
+// request replaces it: the replacement attaches only once every instance of
+// the old one is gone. The installer sends Retire (TERMINATE) after the
+// replacement was accepted; IOKit then stops the clients and the driver.
+// These run the production Stop and Retire paths and require that each one
+// finishes every Stop and releases the service and provider, without a
+// quarantine the session did not already need.
+// ----------------------------------------------------------------
+static int terminateError;
+static unsigned terminations;
+kern_return_t MacLinuxGPU::Terminate(uint64_t options) {
+    // Only an instance with nothing of a session left asks for termination.
+    assert(!options && session_idle() && !s_stopping);
+    events.push_back("terminate");
+    ++terminations;
+    return terminateError;
+}
+
+struct UpgradeRig {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    MacLinuxGPUUserClient client, observer, next;
+    MacLinuxGPUUserClient_IVars clientIvars{}, observerIvars{}, nextIvars{};
+    int device = 0;
+    uint64_t out[MLG_RETIRE_WORDS]{};
+    explicit UpgradeRig(bool session) {
+        s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+        // An idle observer (a monitor, the installer): never a participant.
+        observer.ivars = &observerIvars;
+        observerIvars.ownerDriver = &driver; observerIvars.clientID = 3; observerIvars.observer = true;
+        driver.retain();
+        if (session) {
+            s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
+            s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
+            bar0Aliases = 1;
+            client.ivars = &clientIvars;
+            clientIvars.ownerDriver = &driver; clientIvars.clientID = 1;
+            clientIvars.sessionGeneration = s_sessionGeneration;
+            driver.retain(); s_participants = 1;
+        } else {
+            // Nothing was ever opened: no interrupt source, DMA or PCI claim.
+            irqDrained = dmaCompleted = true;
+        }
+        next.ivars = &nextIvars;
+        nextIvars.ownerDriver = &driver; nextIvars.clientID = 2;
+    }
+    void deliverIRQDrain() {
+        assert(irqCompletion);
+        auto callback = irqCompletion; auto context = irqContext;
+        irqCompletion = nullptr; irqContext = nullptr;
+        irqDrained = true; events.push_back("irq_drained");
+        callback(context);
+        queue.drain();
+    }
+    void retire(uint64_t op, bool force = false, uint32_t others = 0) {
+        out[0] = out[1] = out[2] = UINT64_MAX;
+        retire_driver(&driver, op, force, others, out);
+    }
+    // IOKit terminates the clients first, then the driver (an upgrade's
+    // Retire, a deactivation): Stop only, no other call.
+    void kernelStops(bool sessionClient) {
+        assert(observer.Stop(&driver) == kIOReturnSuccess);
+        assert(!observer.ivars && observer.superStops == 1);
+        if (sessionClient) assert(client.Stop(&driver) == kIOReturnSuccess);
+        assert(driver.Stop(&provider) == kIOReturnSuccess);
+    }
+    void assertReleased() const {
+        assert(driverStops == 1 && !s_stopProvider && !s_stoppingClients);
+        assert(!s_pciOpen && !s_sessionClosing && !s_dmaQuarantined && !s_quarantineRetained);
+        assert(driver.references == 1 && provider.references == 1);
+    }
+};
+
+static const std::vector<std::string> kNormalClose{
+    "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
+    "irq_drained", "enqueue_finish", "device_free", "release_bar0",
+    "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset"};
+
+static std::vector<std::string> concat(std::vector<std::string> a, const std::vector<std::string> &b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+
+// Stop during an upgrade. "idle": no session, an observer attached: the
+// observer's and the driver's Stop finish at once, no queue hop. "session":
+// a client's session is open: it closes the normal way and every Stop
+// finishes. "quarantined": the close fails to reset the endpoint once (a
+// quiescent quarantine): the driver's Stop releases it and finishes.
+// "quarantined-held": the compute stop's outcome is uncertain: nothing can
+// be released in this process, Stop stays pending with every owner kept and
+// the state says restart, never kill.
+static void upgradeStop(const std::string &kind) {
+    const bool session = kind != "idle";
+    if (kind == "quarantined") { resetError = -5; resetFailures = 1; }
+    if (kind == "quarantined-held") computeError = -11006;
+    UpgradeRig rig(session);
+    rig.kernelStops(session);
+    if (!session) {
+        assert(events == (std::vector<std::string>{"observer_stop", "super_driver_stop"}));
+        assert(!irqCompletion && !lxTeardowns && clientStops == 0);
+        rig.assertReleased();
+        expectLog("stop: no session; provider released at once");
+        std::puts("PASS production upgrade stop: idle driver with an observer stops at once");
+        return;
+    }
+    // The client's Stop began the close; the driver's Stop joined it.
+    assert(s_stopping && s_stopProvider == &rig.provider && s_stoppingClients == &rig.client);
+    assert(!driverStops && !clientStops);
+    rig.deliverIRQDrain();
+    if (kind == "session") {
+        assert(events == concat({"observer_stop"}, concat(kNormalClose, {"super_client_stop", "super_driver_stop"})));
+        assert(!saw("pci_quarantine") && clientStops == 1);
+        rig.assertReleased();
+        expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
+        std::puts("PASS production upgrade stop: open session closes normally, every Stop finishes");
+        return;
+    }
+    if (kind == "quarantined") {
+        // The reset failed once while the client stopped; the stopping
+        // driver found the quarantine quiescent and released it.
+        assert(saw("pci_quarantine") && saw("lift_dma_quarantine") && saw("reopen_pci"));
+        assert(events.back() == "super_driver_stop" && saw("super_client_stop") && saw("pci_close"));
+        rig.assertReleased();
+        expectLog("quarantine released after endpoint reset; provider closed");
+        std::puts("PASS production upgrade stop: quiescent quarantine released, every Stop finishes");
+        return;
+    }
+    // Held: owners kept, Stop pending, the readers say restart.
+    assert(s_dmaQuarantined && s_sessionClosing && s_quarantineRetained && s_modulesRunning && s_rtDevice);
+    assert(!driverStops && !clientStops && s_stopProvider == &rig.provider);
+    assert(!saw("pci_close") && !saw("terminate"));
+    const auto snapshot = state();
+    assert(snapshot[1] & MLG_SESSION_FLAG_RESTART_REQUIRED);
+    assert(snapshot[6] == MLG_RELEASE_UPSTREAM_RETAINED);
+    expectLog("restart required, do not kill the driver");
+    std::puts("PASS production upgrade stop: uncertain session keeps its owners, Stop pending, restart reported");
+}
+
+static void retireScenario(const std::string &kind) {
+    if (kind == "idle") {
+        UpgradeRig rig(false);
+        rig.retire(MLG_RETIRE_OP_TERMINATE);
+        assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_TERMINATING && !rig.out[2]);
+        assert(events == std::vector<std::string>{"terminate"} && s_retiring && s_terminateRequested);
+        assert(state()[1] & MLG_SESSION_FLAG_RETIRING);
+        // Asked again: still terminating, no second request; never resumed.
+        rig.retire(MLG_RETIRE_OP_TERMINATE);
+        assert(rig.out[1] == MLG_RETIRE_TERMINATING && terminations == 1);
+        rig.retire(MLG_RETIRE_OP_RESUME);
+        assert(rig.out[0] == kIOReturnNotPermitted && s_retiring);
+        // No new session on the retiring instance.
+        assert(ensure_open(&rig.next) == kIOReturnNotAttached && !pciOpens);
+        rig.kernelStops(false);
+        assert(events == (std::vector<std::string>{"terminate", "observer_stop", "super_driver_stop"}));
+        rig.assertReleased();
+        rig.retire(MLG_RETIRE_OP_TERMINATE);
+        assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_STOPPING);
+        expectLog("asking IOKit to terminate this driver instance");
+        std::puts("PASS production retire: idle instance terminates, refuses sessions, stops at once");
+        return;
+    }
+    if (kind == "quiesce-resume") {
+        UpgradeRig rig(true);
+        // Another session client is attached: refused unless forced.
+        rig.retire(MLG_RETIRE_OP_QUIESCE, false, 1);
+        assert(rig.out[0] == kIOReturnBusy && rig.out[1] == MLG_RETIRE_CLIENTS && rig.out[2] == 1);
+        assert(events.empty() && !s_retiring && s_pciOpen);
+        rig.retire(MLG_RETIRE_OP_QUIESCE, true, 1);
+        assert(rig.out[0] == kIOReturnNotReady && rig.out[1] == MLG_RETIRE_CLOSING);
+        assert(s_retiring && s_sessionClosing);
+        rig.deliverIRQDrain();
+        assert(events == kNormalClose && !terminations && !s_dmaQuarantined);
+        // The client lost its session; it stays attached, as after any close.
+        assert(rig.client.ivars && !s_participants && s_sessionGeneration == 2);
+        rig.retire(MLG_RETIRE_OP_QUIESCE);
+        assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_IDLE);
+        assert(ensure_open(&rig.next) == kIOReturnNotAttached && !pciOpens);
+        // The replacement was deferred: the old driver takes sessions again.
+        rig.retire(MLG_RETIRE_OP_RESUME);
+        assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_RESUMED && !s_retiring);
+        assert(!(state()[1] & MLG_SESSION_FLAG_RETIRING));
+        pciOpenExpected = true;
+        assert(ensure_open(&rig.next) == kIOReturnSuccess && pciOpens == 1 && saw("pci_open"));
+        expectLog("retire: closing the session for a driver upgrade (1 other client(s))");
+        expectLog("retire: cancelled; new sessions are admitted again");
+        std::puts("PASS production retire: quiesce closes the session normally, resume reopens admission");
+        return;
+    }
+    if (kind == "session") {
+        UpgradeRig rig(true);
+        rig.retire(MLG_RETIRE_OP_TERMINATE, true, 1);
+        assert(rig.out[1] == MLG_RETIRE_CLOSING && !terminations);
+        rig.deliverIRQDrain();
+        // Termination is requested only after the close released everything.
+        assert(events == concat(kNormalClose, {"terminate"}));
+        // IOKit stops the clients (the session client is no longer a
+        // participant) and then the driver, which has nothing left.
+        rig.kernelStops(true);
+        assert(events == concat(kNormalClose, {"terminate", "observer_stop", "super_client_stop", "super_driver_stop"}));
+        assert(clientStops == 1 && !saw("pci_quarantine"));
+        rig.assertReleased();
+        std::puts("PASS production retire: open session closes, then the instance terminates and stops");
+        return;
+    }
+    if (kind == "raw-bar") {
+        UpgradeRig rig(true);
+        assert(s_rawBARLease.claim(1, true, 1) && s_rawBARLease.markMapped(1));
+        rig.retire(MLG_RETIRE_OP_TERMINATE, true, 0);
+        // A close now would have to quarantine: refused, nothing changes.
+        assert(rig.out[0] == kIOReturnBusy && rig.out[1] == MLG_RETIRE_RAW_BAR);
+        assert(events.empty() && !s_retiring && !s_dmaQuarantined && s_pciOpen);
+        std::puts("PASS production retire: a raw BAR mapping refuses the close instead of quarantining");
+        return;
+    }
+    // A session already quarantined by its close. "quarantined": quiescent
+    // (one failed reset), released by Retire, then terminated.
+    // "quarantined-held": uncertain compute; Retire reports the permanent
+    // blocker and leaves everything (restart, never kill).
+    const bool held = kind == "quarantined-held";
+    assert(kind == "quarantined" || held);
+    if (held) computeError = -11006; else { resetError = -5; resetFailures = 1; }
+    UpgradeRig rig(true);
+    s_participants = 0; // the client exited; its close quarantined
+    close_session(&rig.driver);
+    rig.deliverIRQDrain();
+    assert(s_dmaQuarantined && saw("pci_quarantine"));
+    rig.retire(MLG_RETIRE_OP_TERMINATE);
+    if (held) {
+        assert(rig.out[0] == kIOReturnError && rig.out[1] == MLG_RETIRE_QUARANTINED);
+        assert(rig.out[2] == MLG_RELEASE_UPSTREAM_RETAINED && !terminations && !s_retiring);
+        assert(s_dmaQuarantined && s_quarantineRetained && s_modulesRunning);
+        expectLog("quarantine release refused");
+        std::puts("PASS production retire: an uncertain quarantine is reported, kept and never terminated");
+        return;
+    }
+    assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_TERMINATING);
+    assert(events.back() == "terminate" && saw("lift_dma_quarantine") && saw("pci_close"));
+    assert(!s_dmaQuarantined && !s_quarantineRetained && s_retiring);
+    rig.kernelStops(true);
+    assert(events.back() == "super_driver_stop" && clientStops == 1);
+    rig.assertReleased();
+    std::puts("PASS production retire: a quiescent quarantine is released, then the instance terminates");
+}
+
 static rt_drm_info observerDrm;
 int main(int argc, char **argv) {
     alarm(15);
@@ -731,6 +995,14 @@ int main(int argc, char **argv) {
     if (scenario == "surprise-removal" || scenario == "surprise-removal-quarantined" ||
         scenario == "surprise-removal-held") {
         surpriseRemoval(scenario != "surprise-removal", scenario == "surprise-removal-held");
+        return 0;
+    }
+    if (scenario.rfind("upgrade-stop-", 0) == 0) {
+        upgradeStop(scenario.substr(13));
+        return 0;
+    }
+    if (scenario.rfind("retire-", 0) == 0) {
+        retireScenario(scenario.substr(7));
         return 0;
     }
     Fixture fixture;

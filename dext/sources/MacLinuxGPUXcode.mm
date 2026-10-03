@@ -166,6 +166,8 @@ static_assert(MLG_SELECTOR_SYSFS_READ > kMacAMDGPUMethodReleaseQuarantine &&
               MLG_SELECTOR_DRM_INFO > kMacAMDGPUMethodReleaseQuarantine, "Linux read selectors");
 static_assert(MLG_SELECTOR_DISPLAY > MLG_SELECTOR_DRM_SELFTEST &&
               MLG_SELECTOR_DISPLAY < MLG_SELECTOR_LX_OPEN, "display selector");
+static_assert(MLG_SELECTOR_RETIRE > MLG_SELECTOR_DISPLAY &&
+              MLG_SELECTOR_RETIRE < MLG_SELECTOR_LX_OPEN, "retire selector");
 static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               MLG_DISPLAY_PATTERN_BARS == RT_DISPLAY_PATTERN_BARS &&
               MLG_DISPLAY_PATTERN_WHITE == RT_DISPLAY_PATTERN_WHITE &&
@@ -284,6 +286,12 @@ static bool             s_irqDrainFailed = false;
 static bool             s_releaseFailed = false;
 // Surprise removal: the GPU left the bus (a Thunderbolt unplug).
 static bool             s_deviceRemoved = false;
+// Retire (session_state.h): an upgrade hands the GPU to the new driver. No
+// new session is admitted; with s_retireTerminate this instance asks IOKit
+// to terminate it once its session is gone, so its process exits.
+static bool             s_retiring = false;
+static bool             s_retireTerminate = false;
+static bool             s_terminateRequested = false;
 static bool             s_creatingObserver = false;
 static bool             s_creatingLinuxFile = false;
 // DriverKit runs a new user client's Start after NewUserClient returns, not
@@ -584,6 +592,7 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_rtDevice) flags |= MLG_SESSION_FLAG_RUNTIME_DEVICE;
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
+    if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
     out[0] = MLG_SESSION_STATE_VERSION;
     out[1] = flags;
     out[2] = s_quarantineCause;
@@ -593,6 +602,33 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     out[6] = blocker;
     out[7] = s_sessionGeneration;
     out[8] = s_participants;
+}
+
+// Nothing of a session exists: no PCI claim, interrupt source, DMA hold,
+// upstream driver, runtime device, participant or pending client Stop.
+static bool session_idle()
+{
+    return !s_pciOpen && !s_sessionClosing && !s_dmaQuarantined && !s_dmaShutdownPrepared &&
+           !s_modulesRunning && !s_rtDevice && !s_irqReady && !s_participants &&
+           !s_stoppingClients && !s_rawBARLease.hasMappings();
+}
+
+// Retire TERMINATE: with the session gone, ask IOKit to terminate this
+// instance. IOKit stops its clients, then the driver (MacLinuxGPU::Stop
+// finds nothing left and finishes at once), and the process exits, which
+// lets macOS attach the replacement driver to the GPU.
+static void request_termination(MacLinuxGPU *driver)
+{
+    if (s_terminateRequested || s_stopping || !session_idle()) return;
+    s_terminateRequested = true;
+    MACLINUXGPU_LOG("retire: no session left; asking IOKit to terminate this driver instance "
+                    "so its replacement can attach");
+    const kern_return_t ret = driver->Terminate(0);
+    if (ret != kIOReturnSuccess) {
+        s_terminateRequested = false;
+        MACLINUXGPU_LOG("retire: Terminate failed (%#x); the idle instance stays until its "
+                        "device leaves or the Mac restarts", ret);
+    }
 }
 
 // Shared tail once the endpoint was reset with bus mastering off and every
@@ -628,7 +664,9 @@ static void complete_session_close(MacLinuxGPU *driver)
         IOService *provider = s_stopProvider;
         s_stopProvider = nullptr;
         driver->FinishStop(provider);
+        return;
     }
+    if (s_retireTerminate) request_termination(driver);
 }
 
 // Release a quarantined session without process death. Only cached state
@@ -852,13 +890,103 @@ static void release_removed(MacLinuxGPU *driver)
     complete_session_close(driver);
 }
 
+// Retire (session_state.h): what an upgrade asks of the running driver. On
+// the owner's queue. @others counts session clients besides the caller.
+// Only the normal close runs; a step whose outcome is uncertain quarantines
+// as it would for any close, and nothing here adds a reason to.
+static void retire_driver(MacLinuxGPU *driver, uint64_t op, bool force, uint32_t others,
+                          uint64_t out[MLG_RETIRE_WORDS])
+{
+    out[0] = kIOReturnSuccess;
+    out[2] = 0;
+    if (op == MLG_RETIRE_OP_RESUME) {
+        if (s_stopping || s_terminateRequested) {
+            out[0] = kIOReturnNotPermitted;
+            out[1] = s_stopping ? MLG_RETIRE_STOPPING : MLG_RETIRE_TERMINATING;
+            return;
+        }
+        if (s_retiring) MACLINUXGPU_LOG("retire: cancelled; new sessions are admitted again");
+        s_retiring = s_retireTerminate = false;
+        out[1] = MLG_RETIRE_RESUMED;
+        return;
+    }
+    if (s_stopping) { out[1] = MLG_RETIRE_STOPPING; return; }
+    if (s_terminateRequested) { out[1] = MLG_RETIRE_TERMINATING; return; }
+    const bool terminate = op == MLG_RETIRE_OP_TERMINATE;
+    if (s_dmaQuarantined) {
+        // Only a provably quiescent quarantine is released, and only by the
+        // normal release; anything else needs a restart, never a kill.
+        const bool wasRetiring = s_retiring, wasTerminate = s_retireTerminate;
+        s_retiring = true;
+        s_retireTerminate = wasTerminate || terminate;
+        const uint32_t blocker = release_quarantine(driver);
+        if (blocker != MLG_RELEASE_READY) {
+            s_retiring = wasRetiring;
+            s_retireTerminate = wasTerminate;
+            out[0] = mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady;
+            out[1] = MLG_RETIRE_QUARANTINED;
+            out[2] = blocker;
+            return;
+        }
+    } else if (s_sessionClosing) {
+        // A close already runs (a client exit, a sleep): follow it.
+        s_retiring = true;
+        s_retireTerminate = s_retireTerminate || terminate;
+        out[0] = kIOReturnNotReady;
+        out[1] = MLG_RETIRE_CLOSING;
+        return;
+    } else if (s_pciOpen) {
+        if (s_rawBARLease.hasMappings()) {
+            out[0] = kIOReturnBusy;
+            out[1] = MLG_RETIRE_RAW_BAR;
+            return;
+        }
+        if (others && !force) {
+            out[0] = kIOReturnBusy;
+            out[1] = MLG_RETIRE_CLIENTS;
+            out[2] = others;
+            return;
+        }
+        s_retiring = true;
+        s_retireTerminate = s_retireTerminate || terminate;
+        MACLINUXGPU_LOG("retire: closing the session for a driver upgrade (%u other client(s))", others);
+        close_session(driver);
+        if (s_dmaQuarantined) {
+            const uint32_t blocker = release_blocker();
+            out[0] = mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady;
+            out[1] = MLG_RETIRE_QUARANTINED;
+            out[2] = blocker;
+            return;
+        }
+        out[0] = kIOReturnNotReady;
+        out[1] = MLG_RETIRE_CLOSING;
+        return;
+    }
+    // No session (left): idle, and terminated when asked.
+    if (!s_retiring) MACLINUXGPU_LOG("retire: no session; new sessions are refused");
+    s_retiring = true;
+    s_retireTerminate = s_retireTerminate || terminate;
+    if (s_retireTerminate) {
+        request_termination(driver);
+        if (!s_terminateRequested && !s_stopping) {
+            out[0] = kIOReturnError;
+            out[1] = MLG_RETIRE_IDLE;
+            return;
+        }
+        out[1] = s_stopping ? MLG_RETIRE_STOPPING : MLG_RETIRE_TERMINATING;
+        return;
+    }
+    out[1] = MLG_RETIRE_IDLE;
+}
+
 static kern_return_t ensure_open(MacLinuxGPUUserClient *client)
 {
     if (!client->ivars || !client->ivars->ownerDriver || s_stopping ||
         client->ivars->stopping || !s_retainedPCI)
         return kIOReturnNotAttached;
     if (client->ivars->observer) return kIOReturnNotPermitted;
-    if (s_deviceRemoved) return kIOReturnNotAttached;
+    // Retiring for an upgrade: the replacement driver takes the next session.
+    if (s_deviceRemoved || s_retiring) return kIOReturnNotAttached;
     if (s_sessionClosing || s_dmaQuarantined) return kIOReturnNotReady;
     if (!s_rawBARLease.allowsJoin(client->ivars->clientID)) return kIOReturnBusy;
     if (client->ivars->sessionGeneration == s_sessionGeneration)
@@ -1446,6 +1574,7 @@ IMPL(MacLinuxGPU, Start)
     s_retainedPCI = pci;
     s_driver = this;
     s_stopping = false;
+    s_retiring = s_retireTerminate = s_terminateRequested = false;
     dext_compute_set_pci_open(false);
 
     uint8_t bus = 0, device = 0, function = 0;
@@ -1477,6 +1606,15 @@ IMPL(MacLinuxGPU, Stop)
     s_stopping = true;
     retain();
     provider->retain();
+    // Termination (an upgrade's Retire, a deactivation, an unplug) of a
+    // driver with no session: nothing holds the provider, so release it now
+    // and let the process exit. Clients were stopped first.
+    if (session_idle()) {
+        observer_reads_close();
+        MACLINUXGPU_LOG("stop: no session; provider released at once");
+        FinishStop(provider);
+        return kIOReturnSuccess;
+    }
     s_stopProvider = provider;
     // An unplug terminates the provider: see whether the device is gone
     // before anything else touches it.
@@ -1607,7 +1745,7 @@ IMPL(MacLinuxGPU, NewUserClient)
     // closes or stays quarantined; session clients still may not.
     const bool observer = type == MLG_USER_CLIENT_OBSERVER;
     const bool linuxFile = type == MLG_USER_CLIENT_LINUX_FILE;
-    if (s_stopping || s_driver != this || (s_sessionClosing && !observer))
+    if (s_stopping || s_driver != this || ((s_sessionClosing || s_retiring) && !observer))
         return kIOReturnNotAttached;
     if (type != MLG_USER_CLIENT_SESSION && !observer && !linuxFile) {
         MACLINUXGPU_LOG("unsupported user-client type %u", (unsigned)type);
@@ -1728,7 +1866,7 @@ IMPL(MacLinuxGPUUserClient, Start)
     const bool observer = s_creatingObserver || pending_role_take(s_pendingObservers, this);
     const bool linuxFile = !observer &&
         (s_creatingLinuxFile || pending_role_take(s_pendingLinuxFiles, this));
-    if (s_driver != driver || s_stopping || (s_sessionClosing && !observer))
+    if (s_driver != driver || s_stopping || ((s_sessionClosing || s_retiring) && !observer))
         return kIOReturnNotAttached;
     IODispatchQueue *ownerQueue = nullptr;
     ret = driver->CopyDispatchQueue(kIOServiceDefaultQueueName, &ownerQueue);
@@ -2813,7 +2951,8 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     } else if (s_sessionClosing && selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodQueryInfo &&
         selector != kMacAMDGPUMethodRuntimeBuild && selector != kMacAMDGPUMethodPing &&
-        selector != kMacAMDGPUMethodReleaseQuarantine && selector != MLG_SELECTOR_POWER)
+        selector != kMacAMDGPUMethodReleaseQuarantine && selector != MLG_SELECTOR_POWER &&
+        selector != MLG_SELECTOR_RETIRE)
         return kIOReturnBusy;
     if (!ivars->observer && selector >= kMacAMDGPUMethodBOAlloc &&
         selector != kMacAMDGPUMethodQueryInfo &&
@@ -2821,7 +2960,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodHostWindow &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodReleaseQuarantine &&
-        selector != MLG_SELECTOR_POWER &&
+        selector != MLG_SELECTOR_POWER && selector != MLG_SELECTOR_RETIRE &&
         ivars->sessionGeneration != s_sessionGeneration)
         return kIOReturnNotOpen;
     // Suspending, suspended or resuming: no new work for the GPU. Nothing
@@ -3598,6 +3737,28 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                  (mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady);
         out[1] = blocker;
         arguments->scalarOutputCount = 2;
+        return kIOReturnSuccess;
+    }
+
+    case MLG_SELECTOR_RETIRE: {
+        // Hand the GPU to a replacement driver (session_state.h). Entitled:
+        // it ends every client's session.
+        if (!mlg_retire_args_valid(in, arguments->scalarInputCount) ||
+            arguments->structureInput || arguments->structureInputDescriptor || !out ||
+            arguments->scalarOutputCount < MLG_RETIRE_WORDS) return kIOReturnBadArgument;
+        OSDictionary *entitlements = nullptr;
+        bool entitled = false;
+        if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
+            entitled = entitlements->getObject(MLG_SESSION_RELEASE_ENTITLEMENT) == kOSBooleanTrue;
+            entitlements->release();
+        }
+        if (!entitled) return kIOReturnNotPrivileged;
+        const bool participant = !ivars->observer && ivars->sessionGeneration == s_sessionGeneration;
+        const uint32_t others = s_participants - (participant && s_participants ? 1u : 0u);
+        uint64_t result[MLG_RETIRE_WORDS] = {};
+        retire_driver(ivars->ownerDriver, in[0], (in[1] & MLG_RETIRE_FORCE) != 0, others, result);
+        for (uint32_t i = 0; i < MLG_RETIRE_WORDS; ++i) out[i] = result[i];
+        arguments->scalarOutputCount = MLG_RETIRE_WORDS;
         return kIOReturnSuccess;
     }
 

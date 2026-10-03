@@ -40,6 +40,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_RUNTIME_DEVICE      = 1u << 9,
 	MLG_SESSION_FLAG_ISOLATION_ATTEMPTED = 1u << 10,
 	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
+	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
 };
 
 /* Which close/probe step quarantined the session. */
@@ -98,7 +99,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * power-request selectors, the two Linux read paths below,
  * which run upstream callbacks while the driver runs and never claim PCI,
  * join the session or touch queues, the self-contained submission
- * self-test (DrmSelfTest) and the display test (Display). Linux-file clients are type 2
+ * self-test (DrmSelfTest), the display test (Display) and the entitlement-checked
+ * Retire an installer sends before a driver upgrade. Linux-file clients are type 2
  * (MLG_USER_CLIENT_LINUX_FILE, linuxu/headers/rt/lx_abi.h). */
 #define MLG_USER_CLIENT_SESSION  0u
 #define MLG_USER_CLIENT_OBSERVER 1u
@@ -114,6 +116,65 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 /* 83 is MLG_SELECTOR_POWER (power_state.h). 96-103 are the Linux-file selectors
  * (linuxu/headers/rt/lx_abi.h). */
 #define MLG_SELECTOR_DISPLAY             84u
+#define MLG_SELECTOR_RETIRE              85u
+
+/* Retire: hand the GPU to a replacement driver (a system extension upgrade).
+ *
+ * macOS does not stop a running driver extension when an activation request
+ * replaces it: the old version stays "terminating for upgrade via delegate"
+ * and the new one attaches only after every instance of the old one is gone.
+ * Retire is how the installer makes an instance go, without killing it:
+ *
+ *   QUIESCE    admit no new session, close an open one through the normal
+ *              close (upstream removal, interrupt drain, endpoint reset,
+ *              provider close). The instance stays attached and idle.
+ *   TERMINATE  QUIESCE, then ask IOKit to terminate this driver instance
+ *              (IOService::Terminate) once nothing of the session is left:
+ *              its clients and the driver are stopped and the process exits.
+ *              Send it only once macOS accepted the replacement; otherwise
+ *              the GPU stays without a driver until it is attached again.
+ *   RESUME     undo QUIESCE (a replacement that failed or was deferred).
+ *
+ * Nothing is forced into quarantine: a client holding a raw BAR mapping
+ * refuses the close (RAW_BAR), and so do other session clients unless
+ * MLG_RETIRE_FORCE is given (their next call fails NotAttached or NotOpen,
+ * as after any close). A quarantined session is released when it is
+ * provably quiescent; otherwise it stays (QUARANTINED, out[2] the blocker):
+ * restart the Mac, never kill the driver. Requires the session-release
+ * entitlement; observers may call it.
+ *   scalar in:  [0] MLG_RETIRE_OP_*, [1] MLG_RETIRE_FORCE or 0,
+ *               [2] MLG_RETIRE_CONFIRM
+ *   scalar out: [0] IOReturn: Success (IDLE, TERMINATING, STOPPING,
+ *               RESUMED), NotReady (CLOSING; QUARANTINED with a blocker that
+ *               can clear), Busy (CLIENTS, RAW_BAR), Error (QUARANTINED for
+ *               good, or Terminate failed)
+ *               [1] MLG_RETIRE_*
+ *               [2] CLIENTS: the other session clients; QUARANTINED: the
+ *               MLG_RELEASE_* blocker; else 0
+ * Repeat the call to follow a close; session state flag RETIRING shows it. */
+#define MLG_RETIRE_OP_QUIESCE   0u
+#define MLG_RETIRE_OP_TERMINATE 1u
+#define MLG_RETIRE_OP_RESUME    2u
+#define MLG_RETIRE_FORCE        1u
+#define MLG_RETIRE_CONFIRM      0x52455452ULL /* "RETR" */
+#define MLG_RETIRE_WORDS        3u
+
+enum mlg_retire_state {
+	MLG_RETIRE_IDLE        = 0, /* no session; new sessions refused */
+	MLG_RETIRE_TERMINATING = 1, /* termination requested: stops, then the process exits */
+	MLG_RETIRE_CLOSING     = 2, /* the session is closing; what was asked follows it */
+	MLG_RETIRE_CLIENTS     = 3, /* other session clients attached (no MLG_RETIRE_FORCE) */
+	MLG_RETIRE_RAW_BAR     = 4, /* a client maps a BAR: a close now would quarantine */
+	MLG_RETIRE_QUARANTINED = 5, /* quarantined and not releasable now */
+	MLG_RETIRE_STOPPING    = 6, /* IOKit is already stopping this instance */
+	MLG_RETIRE_RESUMED     = 7, /* RESUME: sessions admitted again */
+};
+
+static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_count)
+{
+	return input && input_count == 3 && input[0] <= MLG_RETIRE_OP_RESUME &&
+	       !(input[1] & ~(uint64_t)MLG_RETIRE_FORCE) && input[2] == MLG_RETIRE_CONFIRM;
+}
 
 /* SysfsRead: the amdgpu device's sysfs directory, read as Linux sysfs reads
  * it (the attribute's show(), or a bin_attribute's read()), or listed.
@@ -301,6 +362,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_RUNTIME_BUILD:
 	case MLG_SELECTOR_RELEASE_QUARANTINE:
 		return true;
+	case MLG_SELECTOR_RETIRE: /* entitlement-checked in the handler */
+		return mlg_retire_args_valid(input, input_count);
 	case MLG_SELECTOR_QUERY_INFO:
 		if (!input || !input_count)
 			return false;

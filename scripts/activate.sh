@@ -18,8 +18,10 @@
 #      /Library/Application Support/MacLinuxGPU/firmware/amdgpu, from where
 #      the GPU-initializing process serves the driver's firmware requests.
 #   7. Enables developer-mode dext staging (sudo).
-#   8. Launches the host app, waits for approval/registration, and checks
-#      that its UserClient responds to ping.
+#   8. Launches the host app, waits for approval/registration, has any
+#      previous driver instance close its session and terminate (Retire;
+#      never a kill), and checks that the new driver's UserClient responds
+#      to ping.
 #
 # Usage:
 #   scripts/activate.sh                          # Debug build (default)
@@ -608,10 +610,22 @@ if [[ $enabled -ne 1 ]]; then
   exit 2
 fi
 
-echo "==> extension enabled; checking actual UserClient attachment and ping"
+# macOS does not stop the previous driver: the new one attaches only after
+# every instance of the old one is gone. The host app asks it to close its
+# session and terminate (Retire); never kill it, a driver that dies holding
+# the GPU can panic the Mac.
+echo "==> extension enabled; handing the GPU from any previous driver instance"
+if ! "$host_exe" retire-previous --wait 90; then
+  echo "The previous driver is still attached, so ${DEXT_BUNDLE_ID} ${expected_version} cannot attach yet." >&2
+  echo "Do not kill it. Follow the steps above, then run: $host_exe retire-previous" >&2
+  echo "The previous app is backed up at $backup_app." >&2
+  exit 3
+fi
+
+echo "==> checking that the new driver's UserClient is attached and answers ping"
 attached=0
-for attempt in {1..15}; do
-  if "$host_exe" ping >/dev/null 2>&1; then
+for attempt in {1..30}; do
+  if "$host_exe" ping-bundled >/dev/null 2>&1; then
     attached=1
     break
   fi
@@ -624,7 +638,7 @@ if [[ $attached -ne 1 ]]; then
   exit 3
 fi
 sleep 5
-if ! "$host_exe" ping; then
+if ! "$host_exe" ping-bundled; then
   echo "UserClient stopped responding after its initial ping." >&2
   echo "The previous app is backed up at $backup_app." >&2
   exit 3
