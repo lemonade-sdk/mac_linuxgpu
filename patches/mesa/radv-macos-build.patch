@@ -1,0 +1,88 @@
+radv: build for macOS against a user-space libdrm
+
+macOS has no kernel DRM, so Mesa's build never looks for libdrm there and
+RADV cannot be configured. mac_linuxgpu runs the Linux amdgpu driver in a
+DriverKit extension and provides libdrm and libdrm_amdgpu over its
+transport (libmlg_drm/libdrm); with it, RADV's stock amdgpu winsys works.
+
+- meson.build: on Darwin with the AMD Vulkan driver, take libdrm from
+  pkg-config as Linux builds do.
+- addrlib and amd/common: on Darwin addrlib includes the Apple kernel
+  driver's private type header unless HAVE_TSERVER selects its portable
+  definitions; define it.
+- RADV: link with -undefined dynamic_lookup on Darwin, as KosmicKrisp
+  does: the entrypoint tables reference optional layer entrypoints as weak
+  symbols, which Mach-O cannot leave undefined.
+
+diff --git a/meson.build b/meson.build
+index b8e1b86..b45bb33 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1928,6 +1928,10 @@ if system_has_kms_drm
+       'amdgpu' : _libdrm_checks[1][1] ? 'enabled' : 'disabled',
+     },
+   )
++elif host_machine.system() == 'darwin' and with_amd_vk
++  # No kernel DRM, but a libdrm in user space can reach an amdgpu driver
++  # running elsewhere (mac_linuxgpu's DriverKit extension); RADV needs it.
++  dep_libdrm = dependency('libdrm', version : '>=' + _drm_ver)
+ else
+   # We should prevent libdrm from being available when the target doesn't have it to avoid transitive
+   # dependencies (such as vk-runtime) linking to it
+diff --git a/src/amd/addrlib/meson.build b/src/amd/addrlib/meson.build
+index 35ac568..d084237 100644
+--- a/src/amd/addrlib/meson.build
++++ b/src/amd/addrlib/meson.build
+@@ -51,6 +51,12 @@ files_addrlib = files(
+ # Skip the addrlib definition of ADDR_FASTCALL so as not to use regparm.
+ cpp_args_addrlib = ['-DADDR_FASTCALL=']
+ 
++# On macOS addrlib expects the Apple kernel driver's private type header
++# unless HAVE_TSERVER selects its portable definitions.
++if host_machine.system() == 'darwin'
++  cpp_args_addrlib += '-DHAVE_TSERVER'
++endif
++
+ # The SIMD path in addrlib only supports x86 and Aarch64 (NEON).
+ if host_machine.cpu_family() in ['x86', 'x86_64', 'aarch64']
+   cpp_args_addrlib += '-DADDR_ALLOW_SIMD=1'
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+index d0ff6c7..4180607 100644
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -206,6 +206,9 @@ endif
+ 
+ link_with = [ libamdgpu_addrlib ]
+ c_args = ['-DADDR_FASTCALL=']
++if host_machine.system() == 'darwin'
++  c_args += '-DHAVE_TSERVER'
++endif
+ if with_amdgpu_virtio
+   c_args += ['-DHAVE_AMDGPU_VIRTIO', '-DENABLE_DRM_AMDGPU']
+   amd_common_files += files(
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+index 3969ca0..5975c08 100644
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -270,6 +270,13 @@ if radv_build_id != ''
+   radv_flags += '-DRADV_BUILD_ID_OVERRIDE="' + radv_build_id + '"'
+ endif
+ 
++radv_link_args = []
++if host_machine.system() == 'darwin'
++  # As for KosmicKrisp: Mach-O has no undefined weak symbols, and the
++  # entrypoint tables reference the optional layer entrypoints weakly.
++  radv_link_args += '-Wl,-undefined,dynamic_lookup'
++endif
++
+ radv_u_trace = get_option('radv-u_trace')
+ if radv_u_trace
+   radv_flags += '-DRADV_U_TRACE=1'
+@@ -297,6 +304,7 @@ libvulkan_radeon = shared_library(
+   cpp_args : [radv_flags, cpp_msvc_compat_args],
+   link_args : [
+     ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
++    radv_link_args,
+   ],
+   link_depends : vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',

@@ -239,7 +239,7 @@ $(DK_FW_OBJ): $(FW_GEN) linuxu/src/fw/fw_rodata.h
 	@mkdir -p $(dir $@)
 	$(CC) $(DK_CFLAGS) $(INCPATHS) -Ilinuxu/src -c $< -o $@
 
-lib-dext: verify-source $(DK_DRIVER_OBJS) $(DK_LINUXU_OBJS)
+lib-dext: verify-linux $(DK_DRIVER_OBJS) $(DK_LINUXU_OBJS)
 	@echo "== lib-dext: $(DK_LIB) ($(words $(DK_DRIVER_OBJS)) upstream + $(words $(DK_LINUXU_OBJS)) linuxu objects incl. firmware rodata, driverKit platform) =="
 	@mkdir -p $(DK_BUILD)
 	@rm -f $(DK_LIB).tmp
@@ -560,6 +560,11 @@ test-dext-alloc:
 
 verify-source:
 	python3 scripts/verify-upstream.py
+
+# What the driver is built from: the Linux tree alone (Mesa and llama.cpp,
+# when checked out, are verified by verify-source and their own builds).
+verify-linux:
+	python3 scripts/verify-upstream.py --only linux
 
 test-dext-time:
 	@mkdir -p $(BUILD)/tests
@@ -975,7 +980,7 @@ test: test-queue-partition
 
 .PHONY: test-crash-paths test-kmem-cache-lifecycle test-probe-cleanup test-iokit-dma test-upstream-pci-failure test-workqueue-lifetime test-atomic-semantics test-aql-storage-bounds
 
-.PHONY: test-ttm-device-pool test-page-alloc-dk all test dext clean config-check hsa hsa-test hsa-ios test-dext-alloc verify-source test-dext-time test-dext-stdio test-pci-dext test-pci-lifecycle test-platform-devres test-dext-sync test-dma-mask test-rwsem test-debugfs-lifecycle test-task-kthread test-rbtree test-dext-threads test-mutex-completion test-rcu-dk test-bootstrap test-driver-bootstrap-integration test-pseudo-fs test-jiffies test-spinlock test-wait-event test-chrdev test-class-device test-platform-policy test-xarray-limit test-drm-lifecycle
+.PHONY: test-ttm-device-pool test-page-alloc-dk all test dext clean config-check hsa hsa-test hsa-ios test-dext-alloc verify-source verify-linux test-dext-time test-dext-stdio test-pci-dext test-pci-lifecycle test-platform-devres test-dext-sync test-dma-mask test-rwsem test-debugfs-lifecycle test-task-kthread test-rbtree test-dext-threads test-mutex-completion test-rcu-dk test-bootstrap test-driver-bootstrap-integration test-pseudo-fs test-jiffies test-spinlock test-wait-event test-chrdev test-class-device test-platform-policy test-xarray-limit test-drm-lifecycle
 
 test: test-bitmap-contracts test-file-lifetime test-lock-headers test-clock-domains test-srcu-lifetime test-memory-containers test-string-contracts test-pci-mmio-bounds test-rt-memory-ownership
 .PHONY: test-bitmap-contracts test-file-lifetime test-lock-headers test-clock-domains test-srcu-lifetime test-memory-containers test-string-contracts test-pci-mmio-bounds test-rt-memory-ownership

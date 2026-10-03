@@ -75,5 +75,65 @@
       "kconfig": "drivers/gpu/drm/amd/display/Kconfig",
       "reason": "Kconfig selects DRM_AMD_DC_FP only when ARCH_HAS_KERNEL_FPU_SUPPORT && !(CC_IS_CLANG && ARM64), because arm64 kernel code is built with -mgeneral-regs-only and clang cannot confine FP use to the kernel_fpu_begin()/kernel_fpu_end() sections. linuxu builds the DCN, DML and DML2 objects as ordinary userspace code: the FP/SIMD registers are always usable and preserved by the OS across context switches, kernel_fpu_begin()/kernel_fpu_end() (linuxu/headers/linux/fpu.h) track the section per task, and dc_fpu.c's per-CPU recursion depth is per task (linuxu/headers/linux/percpu.h). Without it every DCN (dcn10 and later, including DCN 4.0.1) is compiled out and amdgpu_dm cannot create a DC instance for any RDNA GPU."
     }
-  ]
+  ],
+  "mesa": {
+    "path": "third_party/mesa",
+    "url": "https://gitlab.freedesktop.org/mesa/mesa.git",
+    "tag": "mesa-26.2.4",
+    "pin": "96cb43121031992b85767f9c1be8f3f48e22b1d2",
+    "optional": true,
+    "reason": "Mesa's RADV Vulkan driver for macOS (scripts/build-radv.sh), on the upstream amdgpu DRM interface through libdrm-mlg. Fetched only for the Vulkan build: scripts/bootstrap.sh --with-mesa or --mesa-only.",
+    "sparse_checkout": [
+      "/VERSION",
+      "/README.rst",
+      "/docs/license.rst",
+      "/licenses/",
+      "/meson.build",
+      "/meson.options",
+      "/bin/",
+      "/include/",
+      "/src/meson.build",
+      "/src/amd/",
+      "/src/android_stub/",
+      "/src/c11/",
+      "/src/compiler/",
+      "/src/gtest/",
+      "/src/tool/",
+      "/src/util/",
+      "/src/virtio/virtio-gpu/",
+      "/src/vulkan/",
+      "/src/mesa/main/extensions_table.c",
+      "/src/mesa/program/prog_parameter.c",
+      "/src/mesa/program/symbol_table.c",
+      "/src/mesa/program/dummy_errors.c",
+      "/src/gallium/include/",
+      "/src/gallium/auxiliary/meson.build",
+      "/src/gallium/frontends/dri/meson.build",
+      "/src/gallium/drivers/llvmpipe/meson.build"
+    ],
+    "patches": [
+      {
+        "patch": "patches/mesa/radv-macos-build.patch",
+        "sha256": "009b5d6385d8ad19aedfa7e0d78d066425226350dac64204ba8c899985fd9ef8",
+        "files": [
+          "meson.build",
+          "src/amd/addrlib/meson.build",
+          "src/amd/common/meson.build",
+          "src/amd/vulkan/meson.build"
+        ],
+        "reason": "Build wiring for macOS: find libdrm through pkg-config on Darwin when RADV is built (Mesa only looks for it on kernel-DRM systems), select addrlib's portable type definitions (HAVE_TSERVER) instead of the Apple kernel driver's private header, and link RADV with -undefined dynamic_lookup as KosmicKrisp does, because Mach-O cannot leave the entrypoint tables' weak layer symbols undefined."
+      },
+      {
+        "patch": "patches/mesa/drm-file-ops.patch",
+        "sha256": "c16b453226b8a5f0b7ef9c32982794260c575dd07ff74a5ad248e6693b710089",
+        "files": [
+          "src/util/os_drm.h",
+          "src/amd/vulkan/radv_device.c",
+          "src/amd/vulkan/radv_physical_device.c",
+          "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c"
+        ],
+        "reason": "RADV opens and stats render nodes, maps buffers and issues requests with the system calls, which cannot reach a driver outside the kernel. When libdrm defines LIBDRM_FILE_OPS (libdrm-mlg), util/os_drm.h routes ioctl through drmIoctl and new os_drm_open/stat/mmap/munmap wrappers through libdrm's drmFile* functions; RADV's six call sites use the wrappers. Without LIBDRM_FILE_OPS nothing changes."
+      }
+    ]
+  }
 }

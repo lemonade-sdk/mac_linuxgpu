@@ -9,6 +9,9 @@
 #      working tree (already-applied patches are detected and skipped).
 #   4. Fetches and verifies the locked linux-firmware files (build/firmware).
 #   5. Writes the setup stamp the Makefile checks (build/setup/).
+#   6. With --with-mesa (or once third_party/mesa is checked out), does 2-3
+#      for the pinned Mesa (third_party/mesa, patches/mesa/), which only the
+#      Vulkan driver build (scripts/build-radv.sh) needs.
 #
 # `make`, scripts/activate.sh and the Xcode build run this automatically when
 # the stamp is missing or stale.
@@ -17,6 +20,10 @@
 #   --skip-firmware   do not fetch firmware (offline builds with EMBED_FIRMWARE=0)
 #   --reset-linux     discard every change in the submodule working tree, then
 #                     re-apply the patches (use after editing a patch)
+#   --with-mesa       also fetch and patch the pinned Mesa (about 60 MB)
+#   --mesa-only       only set up Mesa (scripts/build-radv.sh): Linux, the
+#                     firmware and the setup stamp are left alone
+#   --reset-mesa      as --reset-linux, for third_party/mesa
 #   --from-make       quieter tool check; used by the Makefile
 #   -h, --help        show this help
 
@@ -26,11 +33,17 @@ ROOT="$(pwd)"
 
 skip_firmware=0
 reset_linux=0
+with_mesa=0
+mesa_only=0
+reset_mesa=0
 from_make=0
 for arg in "$@"; do
   case "$arg" in
     --skip-firmware) skip_firmware=1 ;;
     --reset-linux) reset_linux=1 ;;
+    --with-mesa) with_mesa=1 ;;
+    --mesa-only) with_mesa=1; mesa_only=1 ;;
+    --reset-mesa) reset_mesa=1 ;;
     --from-make) from_make=1 ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap: unknown argument: $arg (see --help)" >&2; exit 2 ;;
@@ -61,9 +74,6 @@ else:
     print(value)
 PY
 }
-
-SUB="$(manifest linux.path)"
-PIN="$(manifest linux.pin)"
 
 # ---------------------------------------------------------------------------
 step "Checking tools"
@@ -97,19 +107,11 @@ if (( ! from_make )); then
 fi
 
 # ---------------------------------------------------------------------------
-step "Upstream Linux submodule ($SUB @ ${PIN:0:12})"
+# An upstream submodule, pinned, partial, sparse and patched: set up with
+# setup_upstream KEY (a manifest section: linux or mesa).
 # ---------------------------------------------------------------------------
-gitlink="$(git ls-files -s -- "$SUB" | awk '{ print $2 }')"
-[[ -n "$gitlink" ]] || die "$SUB is not a submodule in this checkout"
-[[ "$gitlink" == "$PIN" ]] ||
-  die "$SUB is recorded at $gitlink but patches/manifest.json pins $PIN; update one to match"
-
-git submodule init -- "$SUB" >/dev/null
-url="$(git config "submodule.$SUB.url")"
-gitdir="$(git rev-parse --git-path "modules/$SUB")"
 sparse_file="$(mktemp)"
 trap 'rm -f "$sparse_file"' EXIT
-manifest linux.sparse_checkout > "$sparse_file"
 
 # Prepare the submodule repository before git checks anything out, so the
 # first checkout is already sparse and fetches only the blobs it needs.
@@ -130,84 +132,133 @@ configure_gitdir() {
 # update --depth 1` then finds it locally and only checks it out, fetching
 # just the blobs of the sparse set.
 fetch_pin() {
-  say "fetching $PIN (shallow, by SHA; the first run downloads about 70 MB)"
+  say "fetching $PIN (shallow, by SHA; the first run downloads about $SIZE)"
   git --git-dir="$gitdir" fetch --quiet --depth 1 --filter=blob:none --no-tags \
     origin "+$PIN:refs/remotes/origin/pinned"
 }
 
+# Optional submodules are marked update = none in .gitmodules, so a plain
+# `git submodule update` skips them; setup checks them out explicitly.
+submodule_update() {
+  git -c "submodule.$SUB.update=checkout" submodule update --init "$@" -- "$SUB"
+}
+
 update_submodule() {
   if fetch_pin; then
-    git submodule update --init --depth 1 -- "$SUB" ||
-      die "git submodule update failed for $SUB"
+    submodule_update --depth 1 || die "git submodule update failed for $SUB"
   else
     # The server refused a fetch by SHA: let git locate the commit itself.
     # This downloads the full commit history (without file contents).
     warn "fetching the pinned commit by SHA failed; falling back to a full-history submodule update"
-    git submodule update --init -- "$SUB" || die "could not fetch $PIN from $url"
+    submodule_update || die "could not fetch $PIN from $url"
   fi
 }
 
-if [[ ! -e "$SUB/.git" ]]; then
-  if [[ ! -d "$gitdir" ]]; then
-    say "creating a partial, sparse repository for $url"
-    mkdir -p "$(dirname "$gitdir")"
-    git init --quiet --bare "$gitdir"
-    git --git-dir="$gitdir" config core.bare false
-    git --git-dir="$gitdir" remote add origin "$url"
+declared_patches() { # KEY -> one declared patch path per line
+  python3 - "$1" <<'PY'
+import json, sys
+m = json.load(open("patches/manifest.json"))
+for p in (m["patches"] if sys.argv[1] == "linux" else m[sys.argv[1]]["patches"]):
+    print(p["patch"])
+PY
+}
+
+setup_upstream() { # KEY RESET SIZE
+  local key="$1" reset="$2"
+  SUB="$(manifest "$key.path")"
+  PIN="$(manifest "$key.pin")"
+  SIZE="$3"
+  local gitlink head was_sparse applied=0 already=0 patch
+
+  gitlink="$(git ls-files -s -- "$SUB" | awk '{ print $2 }')"
+  [[ -n "$gitlink" ]] || die "$SUB is not a submodule in this checkout"
+  [[ "$gitlink" == "$PIN" ]] ||
+    die "$SUB is recorded at $gitlink but patches/manifest.json pins $PIN; update one to match"
+
+  git submodule init -- "$SUB" >/dev/null
+  url="$(git config "submodule.$SUB.url")"
+  gitdir="$(git rev-parse --git-path "modules/$SUB")"
+  manifest "$key.sparse_checkout" > "$sparse_file"
+
+  if [[ ! -e "$SUB/.git" ]]; then
+    if [[ ! -d "$gitdir" ]]; then
+      say "creating a partial, sparse repository for $url"
+      mkdir -p "$(dirname "$gitdir")"
+      git init --quiet --bare "$gitdir"
+      git --git-dir="$gitdir" config core.bare false
+      git --git-dir="$gitdir" remote add origin "$url"
+    fi
+    configure_gitdir
+    update_submodule
   fi
+
+  [[ -e "$SUB/.git" ]] || die "$SUB was not populated"
+  # A plain `git clone --recurse-submodules` or `git submodule update --init`
+  # produces a full checkout. On case-insensitive APFS that checkout already
+  # shows the kernel's case-only filename pairs as modified, and
+  # `sparse-checkout reapply` keeps modified files. Clear the working tree once
+  # and check out only the sparse set from the objects already downloaded.
+  was_sparse="$(git --git-dir="$gitdir" config --bool core.sparseCheckout 2>/dev/null || true)"
   configure_gitdir
-  update_submodule
+  if [[ "$was_sparse" != "true" ]]; then
+    say "converting the full checkout of $SUB to the sparse set"
+    git -C "$SUB" ls-files -z | (cd "$SUB" && xargs -0 rm -f)
+    git -C "$SUB" reset --quiet --hard
+  fi
+  head="$(git -C "$SUB" rev-parse HEAD 2>/dev/null || true)"
+  if [[ -n "$head" ]] && { (( reset )) || [[ "$head" != "$PIN" ]]; }; then
+    if [[ -n "$(git -C "$SUB" status --porcelain --untracked-files=no)" ]]; then
+      say "discarding working-tree changes in $SUB (patches are re-applied below)"
+    fi
+    git -C "$SUB" reset --quiet --hard
+  fi
+  if [[ "$head" != "$PIN" ]]; then
+    say "moving $SUB from ${head:-nothing} to $PIN"
+    update_submodule
+  fi
+  # Apply the sparse pattern set (a no-op when it is unchanged).
+  git -C "$SUB" sparse-checkout reapply
+  [[ "$(git -C "$SUB" rev-parse HEAD)" == "$PIN" ]] || die "$SUB is not at $PIN"
+  say "checked out $(git -C "$SUB" ls-files -t | grep -c '^H ') files ($(du -sh "$SUB" | cut -f1))"
+
+  while IFS= read -r patch; do
+    [[ -n "$patch" ]] || continue
+    [[ -f "$patch" ]] || die "declared patch missing: $patch"
+    if git -C "$SUB" apply --check "$ROOT/$patch" 2>/dev/null; then
+      git -C "$SUB" apply "$ROOT/$patch"
+      say "applied $(basename "$patch")"
+      applied=$((applied + 1))
+    elif git -C "$SUB" apply --check --reverse "$ROOT/$patch" 2>/dev/null; then
+      already=$((already + 1))
+    else
+      die "$patch neither applies nor is already applied; run scripts/bootstrap.sh --reset-$key"
+    fi
+  done < <(declared_patches "$key")
+  say "patches: $applied applied, $already already present"
+}
+
+if (( ! mesa_only )); then
+# ---------------------------------------------------------------------------
+step "Upstream Linux submodule ($(manifest linux.path) @ $(manifest linux.pin | cut -c1-12))"
+# ---------------------------------------------------------------------------
+setup_upstream linux "$reset_linux" "70 MB"
 fi
 
-[[ -e "$SUB/.git" ]] || die "$SUB was not populated"
-# A plain `git clone --recurse-submodules` or `git submodule update --init`
-# produces a full checkout. On case-insensitive APFS that checkout already
-# shows the kernel's case-only filename pairs as modified, and
-# `sparse-checkout reapply` keeps modified files. Clear the working tree once
-# and check out only the sparse set from the objects already downloaded.
-was_sparse="$(git --git-dir="$gitdir" config --bool core.sparseCheckout 2>/dev/null || true)"
-configure_gitdir
-if [[ "$was_sparse" != "true" ]]; then
-  say "converting the full checkout of $SUB to the sparse set"
-  git -C "$SUB" ls-files -z | (cd "$SUB" && xargs -0 rm -f)
-  git -C "$SUB" reset --quiet --hard
+# Mesa: on request, or kept at its pin and patched once it is checked out.
+if (( with_mesa )) || [[ -e "$(manifest mesa.path)/.git" ]]; then
+  # ---------------------------------------------------------------------------
+  step "Upstream Mesa submodule ($(manifest mesa.path) @ $(manifest mesa.tag))"
+  # ---------------------------------------------------------------------------
+  setup_upstream mesa "$reset_mesa" "60 MB"
 fi
-head="$(git -C "$SUB" rev-parse HEAD 2>/dev/null || true)"
-if [[ -n "$head" ]] && { (( reset_linux )) || [[ "$head" != "$PIN" ]]; }; then
-  if [[ -n "$(git -C "$SUB" status --porcelain --untracked-files=no)" ]]; then
-    say "discarding working-tree changes in $SUB (patches are re-applied below)"
-  fi
-  git -C "$SUB" reset --quiet --hard
-fi
-if [[ "$head" != "$PIN" ]]; then
-  say "moving $SUB from ${head:-nothing} to $PIN"
-  update_submodule
-fi
-# Apply the sparse pattern set (a no-op when it is unchanged).
-git -C "$SUB" sparse-checkout reapply
-[[ "$(git -C "$SUB" rev-parse HEAD)" == "$PIN" ]] || die "$SUB is not at $PIN"
-say "checked out $(git -C "$SUB" ls-files -t | grep -c '^H ') files ($(du -sh "$SUB" | cut -f1))"
 
-# ---------------------------------------------------------------------------
-step "Applying patches (patches/linux)"
-# ---------------------------------------------------------------------------
-applied=0
-already=0
-while IFS= read -r patch; do
-  [[ -n "$patch" ]] || continue
-  [[ -f "$patch" ]] || die "declared patch missing: $patch"
-  if git -C "$SUB" apply --check "$ROOT/$patch" 2>/dev/null; then
-    git -C "$SUB" apply "$ROOT/$patch"
-    say "applied $(basename "$patch")"
-    applied=$((applied + 1))
-  elif git -C "$SUB" apply --check --reverse "$ROOT/$patch" 2>/dev/null; then
-    already=$((already + 1))
-  else
-    die "$patch neither applies nor is already applied; run scripts/bootstrap.sh --reset-linux"
-  fi
-done < <(python3 -c 'import json
-for p in json.load(open("patches/manifest.json"))["patches"]: print(p["patch"])')
-say "$applied applied, $already already present"
+if (( mesa_only )); then
+  step "Verifying the Mesa tree"
+  python3 scripts/verify-upstream.py --only mesa
+  step "Mesa setup complete"
+  say "next: scripts/build-radv.sh"
+  exit 0
+fi
 
 # ---------------------------------------------------------------------------
 step "Firmware (firmware/firmware.lock)"
@@ -219,10 +270,11 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step "Verifying the upstream tree"
+step "Verifying the upstream trees"
 # ---------------------------------------------------------------------------
 python3 scripts/verify-upstream.py
 
+PIN="$(manifest linux.pin)"
 mkdir -p build/setup
 rm -f build/setup/bootstrap-*.mk
 {
