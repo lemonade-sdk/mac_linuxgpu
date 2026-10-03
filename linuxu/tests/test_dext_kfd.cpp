@@ -214,12 +214,34 @@ int main()
     assert(!dext_kfd_dispatch_bounded(c, codeVA, kernargVA, &request, sizeof(request), out, &uncertain));
     assert(out[2] == 5);
 
-    /* Destroy one queue, then close the client with the other alive. */
+    /* A launch whose wave neither finishes nor preempts: DESTROY_QUEUE's
+     * MES removal fails, the session resets the hung queue through MES and
+     * removes it, and the client stays healthy. */
+    fixture_cp_stop();
+    fixture_mes_hang_all(true);
+    unsigned failedRemoves = fixture_mes_failed_removes(), hangResets = fixture_mes_hang_resets();
+    request.timeoutUS = 2000;
+    assert(dext_kfd_dispatch_bounded(c, codeVA, kernargVA, &request, sizeof(request), out, &uncertain) ==
+           -ETIMEDOUT);
+    assert(!uncertain && !dext_kfd_uncertain(c));
+    assert(fixture_mes_failed_removes() == failedRemoves + 1 &&
+           fixture_mes_hang_resets() == hangResets + 1);
+    assert(fixture_mes_adds() == fixture_mes_removes() + 2);
+    fixture_mes_hang_all(false);
+    fixture_cp_start();
+    request.timeoutUS = 1000000;
+
+    /* Destroy one queue, then the client dies with the other alive and
+     * hung: its close recovers that queue as well and completes. */
     assert(!dext_kfd_queue_destroy(q0.queue));
     assert(dext_kfd_queue_count(c) == 1);
     assert(!dext_kfd_bo_free(c, q0.ring) && !dext_kfd_bo_free(c, q0.metadata));
+    fixture_mes_hang_all(true);
+    hangResets = fixture_mes_hang_resets();
     assert(!dext_kfd_close(c));
+    assert(fixture_mes_hang_resets() == hangResets + 1);
     assert(fixture_mes_adds() == fixture_mes_removes());
+    fixture_mes_hang_all(false);
 
     fixture_cp_stop();
     fixture_kfd_release_processes();
