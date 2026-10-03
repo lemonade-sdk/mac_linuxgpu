@@ -14,9 +14,9 @@
 #include "mlg_transport.h"
 #include <rt/lx_abi.h>
 
-/* MacAMDGPU selector numbers the Linux-file client also takes. */
+/* MacAMDGPU selector numbers the Linux-file client also takes (and
+ * mlg_transport.h's). */
 #define MLG_SELECTOR_PING	0u
-#define MLG_SELECTOR_INIT_DEVICE 9u
 
 struct iokit {
 	pthread_mutex_t lock;
@@ -108,6 +108,13 @@ static int scalar(uint32_t selector, const uint64_t *in, uint32_t nin, uint64_t 
 	return from_ioreturn(IOConnectCallScalarMethod(c, selector, in, nin, out, out ? &n : NULL));
 }
 
+static int scalar_call(void *ctx, uint32_t selector, const uint64_t *in, uint32_t nin,
+		       uint64_t *out, uint32_t nout)
+{
+	(void)ctx;
+	return scalar(selector, in, nin, out, nout);
+}
+
 static int t_open(void *ctx, uint32_t dev, uint32_t flags)
 {
 	uint64_t in[2] = { dev, flags }, out[1] = { 0 };
@@ -117,8 +124,11 @@ static int t_open(void *ctx, uint32_t dev, uint32_t flags)
 	r = scalar(MLG_SELECTOR_LX_OPEN, in, 2, out, 1);
 	if (r == -MLG_LX_ENODEV) {
 		/* The driver is attached but the GPU is not initialized yet:
-		 * initialize it, as a session client does, then retry. */
-		if (!scalar(MLG_SELECTOR_INIT_DEVICE, NULL, 0, NULL, 0))
+		 * initialize it, as a session client does (host window, then
+		 * InitDevice), then retry; the open fails with the reason the
+		 * initialization did. */
+		r = mlg_init_device(scalar_call, NULL);
+		if (!r)
 			r = scalar(MLG_SELECTOR_LX_OPEN, in, 2, out, 1);
 	}
 	return r ? r : (int)(int64_t)out[0];

@@ -1061,7 +1061,7 @@ CRASH_PATH_TESTS += test-cs-selftest
 # shared, for a Mesa winsys or libdrm shim. Shares the frame code and ioctl
 # tables with the dext (linuxu/src/amdgpu-rt/lx_frame.c, lx_describe.c).
 MLG_DRM_BUILD := $(BUILD)/libmlg_drm
-MLG_DRM_SRCS := libmlg_drm/src/mlg_drm.c libmlg_drm/src/mlg_transport_iokit.c \
+MLG_DRM_SRCS := libmlg_drm/src/mlg_drm.c libmlg_drm/src/mlg_transport_iokit.c libmlg_drm/src/mlg_init.c \
 	linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c
 MLG_DRM_OBJS := $(addprefix $(MLG_DRM_BUILD)/,$(notdir $(MLG_DRM_SRCS:.c=.o)))
 MLG_DRM_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -MMD -MP -DMLG_LX_CLIENT_BUILD \
