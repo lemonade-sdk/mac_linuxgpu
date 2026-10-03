@@ -1124,8 +1124,17 @@ hsa_status_t discover(std::vector<std::shared_ptr<Connection>> &connections) {
                                    sizeof(className), kCFStringEncodingUTF8);
             if (bundle) CFRelease(bundle);
             if (userClass) CFRelease(userClass);
-            const auto protocol = metadataValid ? driverProtocol(bundleName, className)
-                                                : DriverProtocol::Unknown;
+            auto protocol = metadataValid ? driverProtocol(bundleName, className)
+                                          : DriverProtocol::Unknown;
+            // An iOS app's sandbox hides the registry properties of an
+            // embedded driver's service, but its registry name stays
+            // readable. The RuntimeBuild handshake still proves identity.
+            if (!metadataValid) {
+                io_name_t registryName{};
+                if (IORegistryEntryGetName(service, registryName) == KERN_SUCCESS &&
+                    std::string_view(registryName) == "MacLinuxGPU")
+                    protocol = DriverProtocol::LinuxShim;
+            }
             if (protocol == DriverProtocol::Unknown) continue;
             uint64_t registryID = 0;
             if (IORegistryEntryGetRegistryEntryID(service, &registryID) != KERN_SUCCESS)
