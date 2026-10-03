@@ -14,7 +14,7 @@ spec.loader.exec_module(tool)
 assert tool.LAYOUT.size == 240 and len(tool.STEPS) == 20 and len(tool.FIELDS) == 22
 assert tool.LAYOUT_V1.size == 200 and len(tool.STEPS_V1) == 18 and len(tool.FIELDS_V1) == 16
 COMMON = (152, 0x40, 0x7551, 4, 1, 3, 0x400000, 0xc00000, 7, 9, 1_500_000, 2_000_000,
-          0xc0de0001, 0xc0de0002, 0x5eed5eed, 7)
+          0xc0de0001, 0xc0de0002, 0x5e5e5e5e, 7)
 
 
 def blob(status, failed, passed, version=2, steps=20):

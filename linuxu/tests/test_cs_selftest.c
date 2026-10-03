@@ -55,7 +55,7 @@ int main(void)
 		CHECK(res.family == 152 /* AMDGPU_FAMILY_GC_12_0_0 */ && res.device_id == 0x7551);
 		CHECK(res.compute_rings == 1 && res.sdma_rings == 1);
 		CHECK(res.compute_value == 0xc0de0001u && res.vram_value == 0xc0de0002u &&
-		      res.fill_value == 0x5eed5eedu && res.user_fence == (uint32_t)res.compute_seq);
+		      res.fill_value == 0x5e5e5e5eu && res.user_fence == (uint32_t)res.compute_seq);
 		/* The VRAM buffer went to GTT through TTM (a GART window) and
 		 * its copy from there still holds what it held. */
 		CHECK(res.version == 2 && res.steps == RT_CS_STEP_COUNT);

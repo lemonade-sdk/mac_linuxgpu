@@ -44,7 +44,11 @@
 
 #define ST_COMPUTE_GTT_VALUE	0xc0de0001u
 #define ST_COMPUTE_VRAM_VALUE	0xc0de0002u
-#define ST_FILL_VALUE		0x5eed5eedu
+/* Upstream's SDMA 5.2, 6 and 7 emit_fill_buffer is a CONSTANT_FILL with
+ * FILLSIZE 0: it writes the value's low byte to every byte (upstream only
+ * ever clears with 0). The fill value repeats one byte, so the check holds
+ * on every generation, whichever fill size its packet uses. */
+#define ST_FILL_VALUE		0x5e5e5e5eu
 
 enum { BO_DATA, BO_IB, BO_FENCE, BO_VRAM, BO_COUNT };
 
