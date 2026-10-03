@@ -23,6 +23,8 @@
 #   --with-mesa       also fetch and patch the pinned Mesa (about 60 MB)
 #   --mesa-only       only set up Mesa (scripts/build-radv.sh): Linux, the
 #                     firmware and the setup stamp are left alone
+#   --llama-only      only set up the pinned llama.cpp (third_party/llama.cpp,
+#                     scripts/build-llama-vulkan.sh), likewise
 #   --reset-mesa      as --reset-linux, for third_party/mesa
 #   --from-make       quieter tool check; used by the Makefile
 #   -h, --help        show this help
@@ -35,6 +37,7 @@ skip_firmware=0
 reset_linux=0
 with_mesa=0
 mesa_only=0
+llama_only=0
 reset_mesa=0
 from_make=0
 for arg in "$@"; do
@@ -43,6 +46,7 @@ for arg in "$@"; do
     --reset-linux) reset_linux=1 ;;
     --with-mesa) with_mesa=1 ;;
     --mesa-only) with_mesa=1; mesa_only=1 ;;
+    --llama-only) llama_only=1 ;;
     --reset-mesa) reset_mesa=1 ;;
     --from-make) from_make=1 ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -236,6 +240,15 @@ setup_upstream() { # KEY RESET SIZE
   done < <(declared_patches "$key")
   say "patches: $applied applied, $already already present"
 }
+
+if (( llama_only )); then
+  # ---------------------------------------------------------------------------
+  step "Upstream llama.cpp submodule ($(manifest llama_cpp.path) @ $(manifest llama_cpp.tag))"
+  # ---------------------------------------------------------------------------
+  setup_upstream llama_cpp 0 "40 MB"
+  python3 scripts/verify-upstream.py --only llama_cpp
+  exit 0
+fi
 
 if (( ! mesa_only )); then
 # ---------------------------------------------------------------------------

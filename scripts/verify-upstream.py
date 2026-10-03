@@ -21,11 +21,12 @@ Checks, against patches/manifest.json:
     it and is set in linuxu/headers/linux/autoconf.h, so a declaration cannot
     go stale.
 
-For the optional upstream, Mesa (manifest "mesa", patches/mesa/): the
-gitlink, pin and .gitmodules agree; once checked out, the sparse set, the
-declared patches and the working tree are checked as Linux's are.
+For the optional upstreams, Mesa (manifest "mesa", patches/mesa/) and
+llama.cpp (manifest "llama_cpp", unpatched): the gitlink, pin and
+.gitmodules agree; once checked out, the sparse set, the declared patches
+and the working tree are checked as Linux's are.
 
-  --only linux|mesa   verify one tree
+  --only linux|mesa|llama_cpp   verify one tree
 """
 
 import hashlib
@@ -280,6 +281,8 @@ def verify_linux(manifest):
 # The optional upstreams: manifest key, name, patch directory, how to fetch.
 OPTIONAL = {
     "mesa": ("Mesa", "mesa", "scripts/bootstrap.sh --with-mesa", "meson.build"),
+    "llama_cpp": ("llama.cpp", "llama.cpp", "scripts/bootstrap.sh --llama-only",
+                  "CMakeLists.txt"),
 }
 
 

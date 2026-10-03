@@ -19,6 +19,7 @@
 #                     arm64 devices (build/hsa-ios/libhsa-runtime64.a)
 #   make libdrm-mlg   libdrm and libdrm_amdgpu over libmlg_drm, for Mesa
 #   make radv         Mesa's RADV Vulkan driver for macOS (build/radv/install)
+#   make llama-vulkan llama.cpp with its Vulkan backend, to run on RADV
 #   make verify-source  check the submodule pin, patches and interventions
 #   make config-check report CONFIG table vs autoconf.h mismatches
 #   make clean        remove build outputs (keeps build/setup, build/firmware)
@@ -1147,17 +1148,25 @@ test: test-libdrm-mlg
 CRASH_PATH_TESTS += test-libdrm-mlg
 
 # The Vulkan path: Mesa's RADV for macOS on libdrm-mlg (pinned Mesa in
-# third_party/mesa, fetched on demand).
+# third_party/mesa, fetched on demand), and llama.cpp's Vulkan backend on it.
 # test-radv-offline runs RADV on the CS fixture's software GPU; it skips
 # when RADV has not been built (make radv).
 radv:
 	bash scripts/build-radv.sh
 
+llama-vulkan:
+	bash scripts/build-llama-vulkan.sh
+
 test-radv-offline: lib
 	bash scripts/test-radv-offline.sh
 
-test: test-radv-offline
-.PHONY: libdrm-mlg test-libdrm-mlg radv test-radv-offline
+# llama.cpp's Vulkan backend on RADV on the fixture (the fixture brought up
+# inside the llama.cpp program); skips unless both are built.
+test-llama-offline: lib
+	bash scripts/test-llama-offline.sh
+
+test: test-radv-offline test-llama-offline
+.PHONY: libdrm-mlg test-libdrm-mlg radv llama-vulkan test-radv-offline test-llama-offline
 
 # The hardware CS self-test runner (scripts/drm-selftest.py) against a fake
 # DrmSelfTest selector.

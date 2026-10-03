@@ -135,5 +135,20 @@
         "reason": "RADV opens and stats render nodes, maps buffers and issues requests with the system calls, which cannot reach a driver outside the kernel. When libdrm defines LIBDRM_FILE_OPS (libdrm-mlg), util/os_drm.h routes ioctl through drmIoctl and new os_drm_open/stat/mmap/munmap wrappers through libdrm's drmFile* functions; RADV's six call sites use the wrappers. Without LIBDRM_FILE_OPS nothing changes."
       }
     ]
+  },
+  "llama_cpp": {
+    "path": "third_party/llama.cpp",
+    "url": "https://github.com/ggml-org/llama.cpp.git",
+    "tag": "b11379",
+    "pin": "1537a0a8b2f8711d840878b0a0677ab2213c882c",
+    "optional": true,
+    "reason": "llama.cpp, the first application of the Vulkan path: its Vulkan backend on RADV (scripts/build-llama-vulkan.sh). Fetched only for that build: scripts/bootstrap.sh --llama-only. Unmodified.",
+    "sparse_checkout": [
+      "/*",
+      "!/models/",
+      "!/docs/",
+      "!/media/"
+    ],
+    "patches": []
   }
 }
