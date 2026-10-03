@@ -742,7 +742,7 @@ private:
     // with its embedded firmware only; that is reported once per process.
     // Empty selects the servicer's default ($MAC_LINUXGPU_FIRMWARE_ROOT, else
     // the installed root). An iOS app cannot read outside its container, so
-    // there the default is the firmware directory inside the app bundle.
+    // there the default is the Firmware directory inside the app bundle.
     static std::string firmwareRoot() {
 #if TARGET_OS_IOS
         if (const char *configured = std::getenv("MAC_LINUXGPU_FIRMWARE_ROOT"); configured && *configured) return {};
@@ -751,7 +751,7 @@ private:
             if (const auto url = CFBundleCopyResourcesDirectoryURL(bundle)) {
                 char path[PATH_MAX];
                 if (CFURLGetFileSystemRepresentation(url, true, reinterpret_cast<UInt8 *>(path), sizeof(path)))
-                    root = std::string(path) + "/firmware";
+                    root = std::string(path) + "/Firmware";
                 CFRelease(url);
             }
         }
