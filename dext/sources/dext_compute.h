@@ -101,6 +101,8 @@ void dext_compute_reset(void);
 /* ---- the compute seam C API (one function per compute selector) ---- */
 struct pci_dev;
 int dext_compute_start(struct pci_dev *pdev);
+/* The step and error of the last failed dext_compute_start (NULL, 0 if none). */
+void dext_compute_start_failure(const char **step, int *error);
 int dext_compute_stop(void);
 /* Serialized by the driver lifecycle queue. Handles and mapped memory types
  * belong to the selected client; client zero is reserved for internal use. */

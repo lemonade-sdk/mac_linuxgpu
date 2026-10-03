@@ -311,38 +311,63 @@ int dext_compute_release_client(uint64_t client)
     return 0;
 }
 
+static const char *start_failed_step;
+static int start_failed_error;
+
+void dext_compute_start_failure(const char **step, int *error)
+{
+    if (step) *step = start_failed_step;
+    if (error) *error = start_failed_error;
+}
+
 int dext_compute_start(struct pci_dev *pdev)
 {
     struct rt_compute_ctx *ctx = NULL;
     struct rt_compute_properties properties = {0};
+    const char *step = "gart status";
     int r;
     if (!pdev)
         return -EINVAL_L;
     if (production.ctx)
         return production_ready() ? 0 : -EBUSY_L;
     r = rt_compute_open(pdev, &ctx);
-    if (r)
+    start_failed_step = NULL;
+    start_failed_error = 0;
+    if (r) {
+        start_failed_step = "open";
+        start_failed_error = r;
         return -ENOTREADY_L;
+    }
     production.ctx = ctx;
     if (rt_gart_status() != 0)
         r = -ENODEV;
     if (!r) {
         uint64_t base = 0, size = 0;
+        step = "gart window";
         r = rt_gart_get_window(&base, &size);
         if (!r && (!base || !size)) r = -ENODEV;
     }
-    if (!r) r = rt_compute_verify_host_memory(ctx);
-    if (!r)
+    if (!r) {
+        step = "host memory check";
+        r = rt_compute_verify_host_memory(ctx);
+    }
+    if (!r) {
+        step = "status";
         r = rt_compute_status(ctx);
-    if (!r)
+    }
+    if (!r) {
+        step = "properties";
         r = rt_compute_properties(ctx, &properties);
+    }
     if (!r) {
         struct rt_compute_memory_usage usage;
+        step = "memory usage";
         r = rt_compute_memory_usage(ctx, &usage);
         if (!r && (!usage.usable_bytes || !usage.free_bytes)) r = -ENODEV;
     }
     if (!r) {
         uint64_t base = 0, size = 0;
+        step = "gart window matches properties";
         r = rt_gart_get_window(&base, &size);
         if (!r && (!properties_valid(&properties) ||
                    properties.gart_start != base ||
@@ -355,11 +380,14 @@ int dext_compute_start(struct pci_dev *pdev)
     production.legacy_queues = false;
     if (!r) {
         const int legacy = dext_aql_available(ctx);
+        step = "runtime queues";
         production.legacy_queues = legacy == 0;
         if (legacy && (production.kfd_disabled || dext_kfd_supported(ctx) != 0))
             r = legacy;
     }
     if (r) {
+        start_failed_step = step;
+        start_failed_error = r;
         if (rt_compute_close(ctx) != 0) {
             production.uncertain = true;
             return -EBUSY_L;

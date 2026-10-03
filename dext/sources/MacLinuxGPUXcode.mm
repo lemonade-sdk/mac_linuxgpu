@@ -1462,7 +1462,11 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         int computeResult = dext_compute_start(
             static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         if (computeResult != 0) {
-            MACLINUXGPU_LOG("compute initialization failed: %d", computeResult);
+            const char *failedStep = NULL;
+            int failedError = 0;
+            dext_compute_start_failure(&failedStep, &failedError);
+            MACLINUXGPU_LOG("compute initialization failed: %d (%s: %d)", computeResult,
+                            failedStep ? failedStep : "unknown", failedError);
             close_session(ivars->ownerDriver);
             return kIOReturnNotReady;
         }
