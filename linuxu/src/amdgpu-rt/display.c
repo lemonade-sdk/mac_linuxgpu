@@ -6,6 +6,11 @@
 #include <linux/iosys-map.h>
 #include <linux/ktime.h>
 #include <linux/mutex.h>
+#include <drm/drm_file.h>
+#include <drm/drm_vblank.h>
+#include <linux/dma-fence.h>
+#include <linux/wait.h>
+#include <linux/kthread.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -39,7 +44,7 @@ _Static_assert(sizeof(struct rt_display_mode) == 16 && sizeof(struct rt_display_
 	       "rt_display_modes layout");
 
 /* host/DisplayAgent.swift decodes these. */
-_Static_assert(sizeof(struct rt_display_present_stats) == 56, "rt_display_present_stats layout");
+_Static_assert(sizeof(struct rt_display_present_stats) == 120, "rt_display_present_stats layout");
 _Static_assert(sizeof(struct rt_surface_verify_result) == 64, "rt_surface_verify_result layout");
 
 static DEFINE_MUTEX(rt_display_lock);
@@ -68,6 +73,53 @@ struct display_snapshot {
 	} *connector;
 };
 
+#define OUTPUT_BUFFERS		3
+#define OUTPUT_DAMAGE_MAX	128u
+#define OUTPUT_FLIP_TIMEOUT_MS	200u
+
+extern struct dma_fence *drm_crtc_create_fence(struct drm_crtc *crtc);
+
+struct output_damage {
+	struct rt_surface_rect rect[OUTPUT_DAMAGE_MAX];
+	uint32_t count;
+	bool full;
+};
+
+struct output_frame {
+	uint64_t capture_ns, received_ns, submitted_ns, bytes;
+	struct dma_fence *copy[RT_SURFACE_ENGINES_MAX];
+};
+
+struct display_output {
+	struct drm_device *dev;
+	struct amdgpu_device *adev;
+	struct drm_crtc *crtc;
+	struct drm_plane *plane;
+	uint32_t width, height;
+	struct drm_client_buffer *fb[OUTPUT_BUFFERS];
+	uint64_t fb_address[OUTPUT_BUFFERS];
+	bool pinned[OUTPUT_BUFFERS];
+	struct output_damage missed[OUTPUT_BUFFERS];
+	struct rt_surface_engines engines;
+	/* The worker's own state. */
+	int front, pending;
+	struct dma_fence *pending_flip;
+	struct dma_fence_cb flip_cb;
+	struct output_frame pending_frame;
+	struct task_struct *worker;
+	wait_queue_head_t wake;
+	/* Under lock: the mailbox, the stats, the flip's signal. */
+	spinlock_t lock;
+	struct rt_surface *next;
+	struct output_damage next_damage;
+	uint64_t next_capture_ns, next_received_ns;
+	bool flip_done;
+	struct rt_display_present_stats stats;
+};
+
+static void output_stop(struct display_output *o);
+static void output_free(struct display_output *o);
+
 /* Guarded by rt_display_lock. */
 static struct {
 	struct drm_device *dev;
@@ -77,15 +129,8 @@ static struct {
 	uint32_t pattern;
 	uint64_t fill_ns, commit_ns;
 	int restore_status;
-	/* An output (rt_display_output): the second framebuffer, which one is
-	 * on screen, which needs a whole frame, and the last frame's damage. */
-	bool output;
-	struct drm_client_buffer *back;
-	bool stale[2];			/* [0] buffer, [1] back */
-	struct rt_surface_rect last[RT_DISPLAY_PRESENT_RECTS_MAX];
-	uint32_t last_count;
-	bool last_overflow;
-	uint64_t frames;
+	/* An output a display agent feeds (rt_display_output). */
+	struct display_output *output;
 } rt_display;
 static int rt_display_on;	/* atomic copy of "a pattern is showing" */
 
@@ -476,6 +521,9 @@ static int display_off_locked(void)
 
 	if (!dev)
 		return 0;
+	/* An output's worker stops first: no flip of its may follow. */
+	if (rt_display.output)
+		output_stop(rt_display.output);
 	if (rt_display.saved && rt_removal_active(drm_to_adev(dev))) {
 		/* The device left the bus: there is no screen to restore. The
 		 * buffers and the client go as on a Linux unplug, where the
@@ -502,12 +550,10 @@ static int display_off_locked(void)
 		drm_client_buffer_delete(rt_display.buffer);
 		rt_display.buffer = NULL;
 	}
-	if (rt_display.back) {
-		drm_client_buffer_delete(rt_display.back);
-		rt_display.back = NULL;
+	if (rt_display.output) {
+		output_free(rt_display.output);
+		rt_display.output = NULL;
 	}
-	rt_display.output = false;
-	rt_display.frames = 0;
 	drm_client_release(&rt_display.client);
 	memset(&rt_display.client, 0, sizeof(rt_display.client));
 	rt_display.dev = NULL;
@@ -576,11 +622,22 @@ static void report_state(struct drm_device *dev, struct rt_display_report *repor
 	report->showing = rt_display.dev == dev && rt_display.saved;
 	report->restore_status = rt_display.restore_status;
 	report->commit_ns = rt_display.commit_ns;
-	if (report->showing && rt_display.buffer) {
+	if (report->showing)
+		report->pattern = rt_display.pattern;
+	if (report->showing && rt_display.output) {
+		struct display_output *o = rt_display.output;
+		/* The buffer the output started on (the worker owns which is
+		 * on screen now; their geometry is the same). */
+		struct drm_framebuffer *fb = o->fb[0]->fb;
+
+		report->fb_width = fb->width;
+		report->fb_height = fb->height;
+		report->fb_pitch = fb->pitches[0];
+		report->fb_gpu_addr = o->fb_address[0];
+	} else if (report->showing && rt_display.buffer) {
 		struct drm_framebuffer *fb = rt_display.buffer->fb;
 		struct amdgpu_bo *bo = gem_to_amdgpu_bo(fb->obj[0]);
 
-		report->pattern = rt_display.pattern;
 		report->fb_width = fb->width;
 		report->fb_height = fb->height;
 		report->fb_pitch = fb->pitches[0];
@@ -937,11 +994,372 @@ static int modeset_use_mode(struct drm_client_dev *client, uint32_t width, uint3
 	return ret;
 }
 
+/* ---- the output pipeline ----
+ *
+ * PRESENT is a mailbox: it queues the newest frame (its surface, damage and
+ * capture time), merging a frame the worker has not taken yet, wakes the
+ * worker and returns. The worker copies into a framebuffer that is neither
+ * on screen nor waiting for its flip (three of them), with SDMA and no CPU
+ * wait, and flips to it with a nonblocking atomic commit: the copy's fence
+ * is on the buffer, so the commit waits for it (an implicit in-fence), and
+ * the commit's out-fence (a CRTC fence on a kernel flip event) signals at
+ * the flip with its vblank timestamp. The worker sleeps on interrupts (the
+ * flip's fence callback, a new frame) and never polls; its waits are
+ * bounded as a backstop. Each buffer remembers the damage it missed while
+ * others were drawn, so a copy is that plus the frame's own. */
+static void damage_add(struct output_damage *d, const struct rt_surface_rect *rects, uint32_t count)
+{
+	if (d->full)
+		return;
+	if (count > OUTPUT_DAMAGE_MAX - d->count) {
+		d->full = true;
+		d->count = 0;
+		return;
+	}
+	memcpy(&d->rect[d->count], rects, count * sizeof(*rects));
+	d->count += count;
+}
+
+static void damage_merge(struct output_damage *d, const struct output_damage *add)
+{
+	if (add->full) {
+		d->full = true;
+		d->count = 0;
+	} else {
+		damage_add(d, add->rect, add->count);
+	}
+}
+
+static void output_flip_signaled(struct dma_fence *fence, struct dma_fence_cb *cb)
+{
+	struct display_output *o = container_of(cb, struct display_output, flip_cb);
+	unsigned long flags;
+
+	(void)fence;
+	spin_lock_irqsave(&o->lock, flags);
+	o->flip_done = true;
+	spin_unlock_irqrestore(&o->lock, flags);
+	wake_up(&o->wake);
+}
+
+static void output_error(struct display_output *o, int error)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&o->lock, flags);
+	if (!o->stats.error)
+		o->stats.error = error;
+	spin_unlock_irqrestore(&o->lock, flags);
+	drm_err(o->dev, "display output: worker stopped by error %d\n", error);
+}
+
+/* The pending flip happened: account it, its buffer is on screen. */
+static void output_flip_account(struct display_output *o)
+{
+	struct output_frame *f = &o->pending_frame;
+	uint64_t flip_ns = ktime_to_ns(o->pending_flip->timestamp);
+	uint64_t gpu_ns = 0, latency = 0;
+	unsigned long flags;
+
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+		if (!f->copy[i])
+			continue;
+		if (dma_fence_is_signaled(f->copy[i]) &&
+		    test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &f->copy[i]->flags)) {
+			uint64_t done = ktime_to_ns(f->copy[i]->timestamp);
+
+			if (done > f->submitted_ns && done - f->submitted_ns > gpu_ns)
+				gpu_ns = done - f->submitted_ns;
+		}
+		dma_fence_put(f->copy[i]);
+		f->copy[i] = NULL;
+	}
+	if (f->capture_ns && flip_ns > f->capture_ns)
+		latency = flip_ns - f->capture_ns;
+	spin_lock_irqsave(&o->lock, flags);
+	o->stats.frames_flipped++;
+	o->stats.copy_gpu_ns += gpu_ns;
+	o->stats.last_copy_gpu_ns = gpu_ns;
+	o->stats.last_bytes = f->bytes;
+	o->stats.latency_ns += latency;
+	o->stats.last_latency_ns = latency;
+	if (latency > o->stats.latency_max_ns)
+		o->stats.latency_max_ns = latency;
+	o->flip_done = false;
+	spin_unlock_irqrestore(&o->lock, flags);
+	dma_fence_put(o->pending_flip);
+	o->pending_flip = NULL;
+	o->front = o->pending;
+	o->pending = -1;
+}
+
+/* Wait (bounded) for the pending flip; 0 when it happened. */
+static int output_flip_wait(struct display_output *o)
+{
+	long left;
+
+	if (!o->pending_flip)
+		return 0;
+	left = dma_fence_wait_timeout(o->pending_flip, false, msecs_to_jiffies(OUTPUT_FLIP_TIMEOUT_MS));
+	if (left <= 0)
+		return left < 0 ? (int)left : -ETIME;
+	output_flip_account(o);
+	return 0;
+}
+
+/* A nonblocking commit of buffer @b on the primary plane, with a CRTC
+ * fence that signals at the flip. */
+static int output_commit(struct display_output *o, int b, struct dma_fence **out)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_state *state;
+	struct dma_fence *fence = NULL;
+	int ret;
+
+	*out = NULL;
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_state_alloc(o->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto fini;
+	}
+	state->acquire_ctx = &ctx;
+retry:
+	{
+		struct drm_plane_state *ps = drm_atomic_get_plane_state(state, o->plane);
+		struct drm_crtc_state *cs;
+		struct drm_pending_vblank_event *e;
+
+		ret = PTR_ERR_OR_ZERO(ps);
+		if (ret)
+			goto backoff;
+		drm_atomic_set_fb_for_plane(ps, o->fb[b]->fb);
+		cs = drm_atomic_get_crtc_state(state, o->crtc);
+		ret = PTR_ERR_OR_ZERO(cs);
+		if (ret)
+			goto backoff;
+		e = kzalloc(sizeof(*e), GFP_KERNEL);
+		fence = drm_crtc_create_fence(o->crtc);
+		if (!e || !fence) {
+			kfree(e);
+			if (fence)
+				dma_fence_put(fence);
+			fence = NULL;
+			ret = -ENOMEM;
+			goto put;
+		}
+		e->pipe = drm_crtc_index(o->crtc);
+		e->event.base.type = DRM_EVENT_FLIP_COMPLETE;
+		e->event.base.length = sizeof(e->event);
+		e->event.vbl.crtc_id = o->crtc->base.id;
+		e->base.event = &e->event.base;
+		e->base.fence = dma_fence_get(fence);	/* signalled and put at the flip */
+		cs->event = e;
+		ret = drm_atomic_nonblocking_commit(state);
+		if (ret) {
+			/* As the atomic ioctl's failure path does. */
+			cs->event = NULL;
+			drm_event_cancel_free(o->dev, &e->base);
+			dma_fence_put(fence);
+			fence = NULL;
+		}
+	}
+backoff:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+put:
+	drm_atomic_state_put(state);
+fini:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	*out = fence;
+	return ret;
+}
+
+/* One frame: copy into a free buffer, wait for the previous flip, flip. */
+static int output_frame(struct display_output *o, struct rt_surface *surface,
+			struct output_damage *damage, uint64_t capture_ns, uint64_t received_ns)
+{
+	struct rt_surface_rect full = { 0, 0, o->width, o->height };
+	struct output_damage copy;
+	struct rt_surface_copy_stats cs;
+	struct output_frame frame = { .capture_ns = capture_ns, .received_ns = received_ns };
+	struct dma_fence *flip;
+	unsigned long flags;
+	int b = 0, r;
+	u64 start = ktime_get_ns();
+
+	while (b == o->front || b == o->pending)
+		b++;
+	copy = o->missed[b];
+	damage_merge(&copy, damage);
+	r = rt_surface_copy_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b], o->fb[b]->fb->pitches[0],
+				   copy.full ? &full : copy.rect, copy.full ? 1 : copy.count, &o->engines,
+				   frame.copy, &cs);
+	rt_surface_release(surface);
+	if (r)
+		return r;
+	frame.submitted_ns = ktime_get_ns();
+	frame.bytes = cs.bytes;
+	memset(&o->missed[b], 0, sizeof(o->missed[b]));
+	for (int i = 0; i < OUTPUT_BUFFERS; i++)
+		if (i != b)
+			damage_merge(&o->missed[i], damage);
+	spin_lock_irqsave(&o->lock, flags);
+	o->stats.copy_jobs += cs.jobs;
+	o->stats.bytes += cs.bytes;
+	o->stats.copy_submit_ns += frame.submitted_ns - start;
+	o->stats.full_frames += copy.full;
+	spin_unlock_irqrestore(&o->lock, flags);
+
+	/* One flip in flight per CRTC: the previous one first. */
+	r = output_flip_wait(o);
+	if (!r)
+		r = output_commit(o, b, &flip);
+	if (r) {
+		for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+			if (frame.copy[i])
+				dma_fence_put(frame.copy[i]);
+		return r;
+	}
+	o->pending = b;
+	o->pending_flip = flip;
+	o->pending_frame = frame;
+	spin_lock_irqsave(&o->lock, flags);
+	o->flip_done = false;
+	spin_unlock_irqrestore(&o->lock, flags);
+	if (dma_fence_add_callback(flip, &o->flip_cb, output_flip_signaled))
+		output_flip_signaled(flip, &o->flip_cb);	/* already signalled */
+	return 0;
+}
+
+static bool output_has_work(struct display_output *o)
+{
+	unsigned long flags;
+	bool work;
+
+	spin_lock_irqsave(&o->lock, flags);
+	work = o->next || o->flip_done;
+	spin_unlock_irqrestore(&o->lock, flags);
+	return work || kthread_should_stop();
+}
+
+static int output_worker(void *arg)
+{
+	struct display_output *o = arg;
+
+	while (!kthread_should_stop()) {
+		struct output_damage damage;
+		struct rt_surface *surface;
+		uint64_t capture_ns, received_ns;
+		unsigned long flags;
+		bool done;
+		int r;
+
+		/* Nothing outstanding: sleep until a frame or a flip arrives.
+		 * A pending flip is also checked after a bounded wait, the
+		 * backstop for a lost flip interrupt. */
+		if (o->pending_flip)
+			wait_event_timeout(o->wake, output_has_work(o), msecs_to_jiffies(OUTPUT_FLIP_TIMEOUT_MS));
+		else
+			wait_event(o->wake, output_has_work(o));
+		if (kthread_should_stop())
+			break;
+		spin_lock_irqsave(&o->lock, flags);
+		done = o->flip_done;
+		surface = o->next;
+		o->next = NULL;
+		damage = o->next_damage;
+		memset(&o->next_damage, 0, sizeof(o->next_damage));
+		capture_ns = o->next_capture_ns;
+		received_ns = o->next_received_ns;
+		spin_unlock_irqrestore(&o->lock, flags);
+		if ((done || (o->pending_flip && dma_fence_is_signaled(o->pending_flip))) && o->pending_flip)
+			output_flip_account(o);
+		if (!surface)
+			continue;
+		if (rt_removal_active(o->adev)) {
+			rt_surface_release(surface);
+			output_error(o, -ENODEV);
+			break;
+		}
+		r = output_frame(o, surface, &damage, capture_ns, received_ns);
+		if (r) {
+			output_error(o, r);
+			break;
+		}
+	}
+	/* Whatever is left in the mailbox is not shown. */
+	{
+		unsigned long flags;
+		struct rt_surface *left;
+
+		spin_lock_irqsave(&o->lock, flags);
+		left = o->next;
+		o->next = NULL;
+		spin_unlock_irqrestore(&o->lock, flags);
+		rt_surface_release(left);
+	}
+	while (!kthread_should_stop())
+		wait_event_timeout(o->wake, kthread_should_stop(), msecs_to_jiffies(1000));
+	return 0;
+}
+
+static void output_stop(struct display_output *o)
+{
+	if (o->worker) {
+		kthread_stop(o->worker);
+		o->worker = NULL;
+	}
+	/* The last flip lands before the screen is restored, unless the
+	 * device is gone (nothing will flip). */
+	if (o->pending_flip) {
+		if (!rt_removal_active(o->adev))
+			(void)output_flip_wait(o);
+		if (o->pending_flip) {
+			dma_fence_remove_callback(o->pending_flip, &o->flip_cb);
+			dma_fence_put(o->pending_flip);
+			o->pending_flip = NULL;
+			for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+				if (o->pending_frame.copy[i]) {
+					dma_fence_put(o->pending_frame.copy[i]);
+					o->pending_frame.copy[i] = NULL;
+				}
+		}
+	}
+}
+
+/* After the screen was restored: the engines, the pins, the buffers. */
+static void output_free(struct display_output *o)
+{
+	output_stop(o);
+	if (o->engines.count)
+		rt_surface_engines_fini(&o->engines);
+	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
+		if (!o->fb[i])
+			continue;
+		if (o->pinned[i]) {
+			struct amdgpu_bo *bo = gem_to_amdgpu_bo(o->fb[i]->fb->obj[0]);
+
+			if (!amdgpu_bo_reserve(bo, true)) {
+				amdgpu_bo_unpin(bo);
+				amdgpu_bo_unreserve(bo);
+			}
+		}
+		drm_client_buffer_delete(o->fb[i]);
+	}
+	kfree(o);
+}
+
 int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t width,
 		      uint32_t height, uint32_t refresh_mhz, struct rt_display_report *report)
 {
 	struct drm_device *dev = display_device(pdev);
-	struct drm_client_buffer *buffers[2] = { NULL, NULL };
+	struct display_output *o;
+	struct drm_mode_set *modeset;
 	unsigned int lit;
 	u64 start;
 	int ret;
@@ -965,6 +1383,20 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 	}
 	rt_display.dev = dev;
 	rt_display.pattern = RT_DISPLAY_PATTERN_OUTPUT;
+	o = kzalloc(sizeof(*o), GFP_KERNEL);
+	if (!o) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+	rt_display.output = o;
+	o->dev = dev;
+	o->adev = drm_to_adev(dev);
+	o->width = width;
+	o->height = height;
+	o->front = o->pending = -1;
+	spin_lock_init(&o->lock);
+	init_waitqueue_head(&o->wake);
+	o->stats.version = 2;
 	ret = drm_client_modeset_probe(&rt_display.client, 0, 0);
 	if (report)
 		report->probe_status = ret;
@@ -981,21 +1413,49 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 			 height, refresh_mhz);
 		goto fail;
 	}
-	/* amdgpu clears new dumb buffers with SDMA: both start black. */
-	for (int i = 0; i < 2; i++) {
-		buffers[i] = drm_client_buffer_create_dumb(&rt_display.client, width, height,
-							   DRM_FORMAT_XRGB8888);
-		if (IS_ERR(buffers[i])) {
-			ret = PTR_ERR(buffers[i]);
-			buffers[i] = NULL;
+	mutex_lock(&rt_display.client.modeset_mutex);
+	drm_client_for_each_modeset(modeset, &rt_display.client)
+		if (modeset->mode && modeset->num_connectors)
+			o->crtc = modeset->crtc;
+	mutex_unlock(&rt_display.client.modeset_mutex);
+	o->plane = o->crtc ? o->crtc->primary : NULL;
+	if (!o->plane) {
+		ret = -ENOENT;
+		goto fail;
+	}
+	/* Three buffers, pinned in VRAM for the output's life (amdgpu clears
+	 * new dumb buffers with SDMA: they start black). */
+	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
+		struct amdgpu_bo *bo;
+
+		o->fb[i] = drm_client_buffer_create_dumb(&rt_display.client, width, height,
+							 DRM_FORMAT_XRGB8888);
+		if (IS_ERR(o->fb[i])) {
+			ret = PTR_ERR(o->fb[i]);
+			o->fb[i] = NULL;
 			goto fail;
 		}
-		if (!i)
-			rt_display.buffer = buffers[0];
-		else
-			rt_display.back = buffers[1];
+		bo = gem_to_amdgpu_bo(o->fb[i]->fb->obj[0]);
+		ret = amdgpu_bo_reserve(bo, false);
+		if (!ret) {
+			ret = amdgpu_bo_pin(bo, AMDGPU_GEM_DOMAIN_VRAM);
+			if (!ret) {
+				o->pinned[i] = true;
+				o->fb_address[i] = amdgpu_bo_gpu_offset(bo);
+			}
+			amdgpu_bo_unreserve(bo);
+		}
+		if (ret)
+			goto fail;
+		o->missed[i].full = true;
 	}
-	modesets_attach(&rt_display.client, rt_display.buffer->fb);
+	ret = rt_surface_engines_init(o->adev, &o->engines);
+	if (ret) {
+		drm_err(dev, "display output: no SDMA engine to copy with (%d)\n", ret);
+		goto fail;
+	}
+	o->stats.engines = o->engines.count;
+	modesets_attach(&rt_display.client, o->fb[0]->fb);
 	ret = state_save(dev, &rt_display.saved);
 	if (ret)
 		goto fail;
@@ -1008,14 +1468,19 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 		drm_err(dev, "display output: commit failed (%d)\n", ret);
 		goto fail;
 	}
-	rt_display.output = true;
-	rt_display.stale[0] = rt_display.stale[1] = true;
-	rt_display.last_count = 0;
-	rt_display.last_overflow = false;
-	rt_display.frames = 0;
+	o->front = 0;
+	o->worker = kthread_run(output_worker, o, "display-output");
+	if (IS_ERR_OR_NULL(o->worker)) {
+		ret = o->worker ? PTR_ERR(o->worker) : -ENOMEM;
+		o->worker = NULL;
+		goto fail;
+	}
+	/* Its buffer is drawn by the first frame: the black one stays until then. */
+	rt_display.buffer = NULL;
 	__atomic_store_n(&rt_display_on, 1, __ATOMIC_RELEASE);
-	drm_info(dev, "display output: %s at %ux%u (%u mHz), two framebuffers (commit %llu ms)\n",
-		 connector, width, height, refresh_mhz, rt_display.commit_ns / 1000000);
+	drm_info(dev, "display output: %s at %ux%u (%u mHz), %d framebuffers, %u SDMA engine(s) (commit %llu ms)\n",
+		 connector, width, height, refresh_mhz, OUTPUT_BUFFERS, o->engines.count,
+		 rt_display.commit_ns / 1000000);
 	report_state(dev, report);
 	mutex_unlock(&rt_display_lock);
 	return 0;
@@ -1035,87 +1500,83 @@ out:
 }
 
 int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
-		       const struct rt_surface_rect *rects, uint32_t count,
+		       const struct rt_surface_rect *rects, uint32_t count, uint64_t capture_ns,
 		       struct rt_display_present_stats *stats)
 {
 	struct drm_device *dev = display_device(pdev);
-	struct rt_surface_rect list[2 * RT_DISPLAY_PRESENT_RECTS_MAX];
-	struct rt_display_present_stats local = { 0 };
-	struct rt_surface_copy_stats copied = { 0 };
-	struct drm_client_buffer *back;
-	uint32_t width, height, pitch, n = 0;
-	bool full;
-	u64 start;
-	int ret;
+	struct display_output *o;
+	struct rt_surface *replaced = NULL;
+	uint32_t width, height, pitch;
+	unsigned long flags;
+	int ret = 0;
 
-	if (!stats)
-		stats = &local;
-	memset(stats, 0, sizeof(*stats));
-	stats->version = 1;
-	if (!dev)
+	if (stats)
+		memset(stats, 0, sizeof(*stats));
+	if (!dev) {
+		rt_surface_release(surface);
 		return -ENODEV;
-	if (!surface || (count && !rects))
+	}
+	if (!surface || (count && !rects)) {
+		rt_surface_release(surface);
 		return -EINVAL;
+	}
 	mutex_lock(&rt_display_lock);
-	if (!rt_display.output || rt_display.dev != dev) {
+	o = rt_display.dev == dev ? rt_display.output : NULL;
+	if (!o) {
 		mutex_unlock(&rt_display_lock);
+		rt_surface_release(surface);
 		return -ENOENT;
 	}
 	rt_surface_geometry(surface, &width, &height, &pitch);
-	back = rt_display.back;
-	if (width != back->fb->width || height != back->fb->height) {
-		mutex_unlock(&rt_display_lock);
+	spin_lock_irqsave(&o->lock, flags);
+	if (o->stats.error) {
+		ret = o->stats.error;
+	} else if (width != o->width || height != o->height) {
+		ret = -EINVAL;
+	} else if (count) {
+		struct output_damage add = { .count = 0 };
+
+		/* The newest frame replaces one not yet taken; damage adds up. */
+		replaced = o->next;
+		if (replaced)
+			o->stats.frames_replaced++;
+		damage_add(&add, rects, count);
+		damage_merge(&o->next_damage, &add);
+		o->next = surface;
+		surface = NULL;
+		o->next_capture_ns = capture_ns;
+		o->next_received_ns = ktime_get_ns();
+		o->stats.frames_received++;
+	}
+	if (stats)
+		*stats = o->stats;
+	spin_unlock_irqrestore(&o->lock, flags);
+	mutex_unlock(&rt_display_lock);
+	if (!surface)
+		wake_up(&o->wake);
+	rt_surface_release(surface);
+	rt_surface_release(replaced);
+	return ret;
+}
+
+int rt_display_stats(struct pci_dev *pdev, struct rt_display_present_stats *stats)
+{
+	struct drm_device *dev = pdev ? pci_get_drvdata(pdev) : NULL;
+	struct display_output *o;
+	unsigned long flags;
+	int ret = -ENOENT;
+
+	if (!stats)
 		return -EINVAL;
+	memset(stats, 0, sizeof(*stats));
+	mutex_lock(&rt_display_lock);
+	o = dev && rt_display.dev == dev ? rt_display.output : NULL;
+	if (o) {
+		spin_lock_irqsave(&o->lock, flags);
+		*stats = o->stats;
+		spin_unlock_irqrestore(&o->lock, flags);
+		ret = 0;
 	}
-	stats->frames = rt_display.frames;
-	if (!count) {
-		mutex_unlock(&rt_display_lock);
-		return 0;
-	}
-	/* The back buffer holds the frame before the one on screen: it needs
-	 * this frame's damage and the last one's, or a whole frame. */
-	full = rt_display.stale[1] || rt_display.last_overflow || count > RT_DISPLAY_PRESENT_RECTS_MAX;
-	if (full) {
-		list[n++] = (struct rt_surface_rect){ 0, 0, width, height };
-	} else {
-		memcpy(list, rects, count * sizeof(*rects));
-		memcpy(list + count, rt_display.last, rt_display.last_count * sizeof(*rects));
-		n = count + rt_display.last_count;
-	}
-	stats->full = full;
-	stats->rects = n;
-	start = ktime_get_ns();
-	ret = rt_surface_copy(surface, back->fb->obj[0], back->fb->pitches[0], list, n, 1000, &copied);
-	stats->copy_ns = ktime_get_ns() - start;
-	stats->copy_status = ret;
-	stats->jobs = copied.jobs;
-	stats->bytes = copied.bytes;
-	if (ret)
-		goto out;
-	modesets_attach(&rt_display.client, back->fb);
-	start = ktime_get_ns();
-	ret = drm_client_modeset_commit(&rt_display.client);
-	stats->flip_ns = ktime_get_ns() - start;
-	stats->flip_status = ret;
-	if (ret) {
-		/* The screen still shows the front buffer. */
-		modesets_attach(&rt_display.client, rt_display.buffer->fb);
-		goto out;
-	}
-	rt_display.back = rt_display.buffer;
-	rt_display.buffer = back;
-	rt_display.stale[1] = rt_display.stale[0];
-	rt_display.stale[0] = false;
-	if (count > RT_DISPLAY_PRESENT_RECTS_MAX) {
-		rt_display.last_overflow = true;
-		rt_display.last_count = 0;
-	} else {
-		rt_display.last_overflow = false;
-		memcpy(rt_display.last, rects, count * sizeof(*rects));
-		rt_display.last_count = count;
-	}
-	stats->frames = ++rt_display.frames;
-out:
 	mutex_unlock(&rt_display_lock);
 	return ret;
 }

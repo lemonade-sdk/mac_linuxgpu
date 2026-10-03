@@ -152,34 +152,46 @@ int rt_display_modes(struct pci_dev *pdev, const char *connector, struct rt_disp
  * rt_display_stop() restore it. While it runs, report->pattern is
  * RT_DISPLAY_PATTERN_OUTPUT.
  *
- * rt_display_present() copies the dirty rectangles of an imported surface
- * (rt/surface.h, the output's size) into the framebuffer not on screen,
- * with SDMA, together with the rectangles of the frame before (that
- * buffer is one frame behind), then flips to it with an atomic commit
- * (drm_client_modeset_commit: a plane update that completes on vblank).
- * No rectangle means nothing changed: nothing is copied or flipped. */
+ * rt_display_present() hands a frame to the output's worker and returns:
+ * it takes over one hold on @surface (rt_surface_get_hold; released even
+ * on failure), the dirty rectangles and the capture time (CLOCK_UPTIME_RAW
+ * ns, the clock ktime_get_ns() reads, for the latency statistics), and
+ * replaces a frame the worker has not taken yet (their damage adds up).
+ * The worker copies into one of three framebuffers with SDMA and flips to
+ * it with a nonblocking commit (display.c describes the pipeline). No
+ * rectangle means nothing changed: only the statistics come back. A
+ * worker error is returned by every later call. */
 #define RT_DISPLAY_PATTERN_OUTPUT	0xffu
-#define RT_DISPLAY_PRESENT_RECTS_MAX	64u
 
 struct rt_surface;
 struct rt_surface_rect;
 
 struct rt_display_present_stats {
-	uint32_t version;		/* 1 */
-	uint32_t rects;			/* rectangles copied */
-	uint32_t jobs;			/* SDMA jobs */
-	uint32_t full;			/* the whole frame was copied */
-	uint64_t bytes;
-	uint64_t copy_ns, flip_ns;
-	int32_t copy_status, flip_status;
-	uint64_t frames;		/* frames presented since the output started */
+	uint32_t version;		/* 2 */
+	uint32_t engines;		/* SDMA engines the output copies with */
+	uint64_t frames_received;	/* presents with damage */
+	uint64_t frames_flipped;	/* frames that reached the screen */
+	uint64_t frames_replaced;	/* replaced in the mailbox by a newer frame */
+	uint64_t copy_jobs;
+	uint64_t bytes;			/* copied */
+	uint64_t copy_submit_ns;	/* the worker's CPU time building and submitting copies */
+	uint64_t copy_gpu_ns;		/* submit to the copies' fences, summed over flipped frames */
+	uint64_t latency_ns;		/* capture to flip (vblank timestamp), summed */
+	uint64_t latency_max_ns;
+	uint64_t last_bytes, last_copy_gpu_ns, last_latency_ns;	/* the last flipped frame */
+	int32_t error;			/* the worker's first error, 0 */
+	uint32_t full_frames;		/* frames copied whole */
+	uint64_t reserved;
 };
 
 int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t width,
 		      uint32_t height, uint32_t refresh_mhz, struct rt_display_report *report);
 int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
-		       const struct rt_surface_rect *rects, uint32_t count,
+		       const struct rt_surface_rect *rects, uint32_t count, uint64_t capture_ns,
 		       struct rt_display_present_stats *stats);
+
+/* The output's statistics; -ENOENT without an output. */
+int rt_display_stats(struct pci_dev *pdev, struct rt_display_present_stats *stats);
 
 /* Whether a pattern is showing (cached; takes no lock). */
 int rt_display_showing(void);

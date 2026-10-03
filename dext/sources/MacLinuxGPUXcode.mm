@@ -176,6 +176,8 @@ static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               sizeof(struct rt_surface_verify_result) <= MLG_DISPLAY_REPORT_MAX &&
               sizeof(struct rt_display_present_stats) <= MLG_DISPLAY_REPORT_MAX &&
               sizeof(struct mlg_display_rect) == sizeof(struct rt_surface_rect) &&
+              sizeof(struct rt_display_present_stats) == 120 &&
+              offsetof(struct mlg_display_present, rect) == 16 &&
               sizeof(struct mlg_display_present) + MLG_DISPLAY_PRESENT_RECTS_MAX *
                   sizeof(struct mlg_display_rect) <= 4096, "display ABI");
 static_assert(DEXT_COMPUTE_QUERY_SESSION_STATE == MLG_QUERY_SESSION_STATE &&
@@ -2607,16 +2609,23 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
         if (request->count > MLG_DISPLAY_PRESENT_RECTS_MAX ||
             data->getLength() != sizeof(*request) + request->count * sizeof(struct mlg_display_rect))
             return kIOReturnBadArgument;
-        struct rt_surface *surface = rt_surface_get(clientID, (uint32_t)in[1]);
         struct rt_display_present_stats stats{};
         int r = -kLinuxENOENT;
-        if (surface && __atomic_load_n(&s_displayOwner, __ATOMIC_ACQUIRE) == clientID)
-            r = rt_display_present(pdev, surface,
-                                   reinterpret_cast<const struct rt_surface_rect *>(request->rect),
-                                   request->count, &stats);
+        if (__atomic_load_n(&s_displayOwner, __ATOMIC_ACQUIRE) != clientID) {
+            /* Only the client that lit the output presents or reads it. */
+        } else if (!request->count) {
+            r = rt_display_stats(pdev, &stats);
+        } else {
+            /* The hold goes to the output's worker, which releases it once
+             * the frame is copied (or replaced by a newer one). */
+            struct rt_surface *surface = rt_surface_get_hold(clientID, (uint32_t)in[1]);
+            if (surface)
+                r = rt_display_present(pdev, surface,
+                                       reinterpret_cast<const struct rt_surface_rect *>(request->rect),
+                                       request->count, request->capture_ns, &stats);
+        }
         if (r && r != -kLinuxENOENT)
-            MACLINUXGPU_LOG("display: PRESENT failed %d (copy %d, flip %d)", r, stats.copy_status,
-                            stats.flip_status);
+            MACLINUXGPU_LOG("display: PRESENT failed %d (worker error %d)", r, stats.error);
         a->structureOutput = OSData::withBytes(&stats, sizeof(stats));
         if (!a->structureOutput) return kIOReturnNoMemory;
         out[0] = (uint64_t)(int64_t)r;

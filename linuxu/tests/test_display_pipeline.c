@@ -1,0 +1,332 @@
+/* The display output pipeline offline (rt/display.h, rt/surface.h): the CS
+ * fixture device (GART, VM, rings, two software SDMA engines that execute
+ * what upstream submits) with the fixture DCN 4.0.1 display of
+ * test-dm-offline on it, the unmodified amdgpu_dm and Display Core.
+ *
+ * A client surface (three host allocations as DMA segments) is imported,
+ * an output is lit on a sink, and frames are presented: each PRESENT only
+ * queues; the output's worker copies with SDMA into one of three
+ * framebuffers and flips with a nonblocking commit whose out-fence the
+ * fixture's "vblank" signals: a thread that raises the HUBP flip
+ * interrupts through amdgpu's interrupt source, as the IH would, every
+ * 16 ms. Checked: the scanned-out buffer holds the frame; damage-only
+ * copies; frames replaced in the mailbox while no flip can happen; a whole
+ * frame split over both SDMA engines; latency and counters; the output
+ * stopped and the screen restored. */
+#include <assert.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+extern int usleep(unsigned int usec);
+
+#include <linux/pci.h>
+#include <drm/drm_connector.h>
+#include <drm/drm_device.h>
+#include <drm/drm_edid.h>
+#include <drm/drm_mode_config.h>
+#include <rt/dart.h>
+#include <rt/display.h>
+#include <rt/surface.h>
+
+#include "amdgpu.h"
+#include "amdgpu_dm.h"
+#include "dcn/dcn_4_1_0_offset.h"
+#include "ivsrcid/dcn/irqsrcs_dcn_1_0.h"
+#include "soc15_ih_clientid.h"
+#include "cs_fixture.h"
+#include "dcn401_fixture.h"
+
+#define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
+	__FILE__, __LINE__, #c); abort(); } } while (0)
+
+extern const struct amdgpu_ip_block_version dm_ip_block;
+extern int fw_table_register_embedded(void);
+extern int drm_edid_override_set(struct drm_connector *connector, const void *edid, size_t size);
+extern u64 ktime_get_ns(void);
+
+#define W	1920u
+#define H	1080u
+#define PITCH	(W * 4)
+#define PAGE	(16u * 1024u)
+
+static struct amdgpu_device *adev;
+
+static void display_init(struct amdgpu_device *a)
+{
+	struct amdgpu_ip_block block = { .adev = a, .version = &dm_ip_block };
+
+	drm_mode_config_init(adev_to_drm(a));
+	a->firmware.load_type = AMDGPU_FW_LOAD_PSP;
+	a->ip_versions[MMHUB_HWIP][0] = IP_VERSION(4, 1, 0);
+	dcn401_fixture_attach(a);
+	dcn401_fixture_vbios(a);
+	CHECK(block.version->funcs->early_init(&block) == 0);
+	CHECK(block.version->funcs->sw_init(&block) == 0);
+	CHECK(block.version->funcs->hw_init(&block) == 0);
+}
+
+/* ---- the fixture's vblank: flip interrupts and frame counters ---- */
+static volatile int vblank_run = 1, vblank_hold;
+static unsigned long vblanks;
+
+static void raise_irq(unsigned int src_id)
+{
+	struct amdgpu_irq_src *src = adev->irq.client[SOC15_IH_CLIENTID_DCE].sources ?
+		adev->irq.client[SOC15_IH_CLIENTID_DCE].sources[src_id] : NULL;
+	struct amdgpu_iv_entry entry = { .client_id = SOC15_IH_CLIENTID_DCE, .src_id = src_id };
+
+	if (src && src->funcs && src->funcs->process)
+		src->funcs->process(adev, src, &entry);
+}
+
+static void *vblank_main(void *arg)
+{
+	(void)arg;
+	while (vblank_run) {
+		usleep(16000);
+		if (vblank_hold)
+			continue;
+		for (int i = 0; i < 4; i++) {
+			uint32_t reg = dcn401_dce_base[regOTG0_OTG_STATUS_FRAME_COUNT_BASE_IDX] +
+				       regOTG0_OTG_STATUS_FRAME_COUNT + i * (regOTG1_OTG_H_TOTAL - regOTG0_OTG_H_TOTAL);
+
+			WREG32(reg, RREG32(reg) + 1);
+		}
+		for (int i = 0; i < 4; i++)
+			raise_irq(DCN_1_0__SRCID__HUBP0_FLIP_INTERRUPT + i);
+		__atomic_add_fetch(&vblanks, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+/* ---- a client surface in three DMA segments ---- */
+struct fake_surface {
+	uint8_t *run[3];
+	uint64_t run_bytes[3], size;
+	struct rt_surface_segment segment[3];
+	int releases;
+};
+
+static uint32_t *pixel(struct fake_surface *s, uint32_t x, uint32_t y)
+{
+	uint64_t offset = (uint64_t)y * PITCH + x * 4;
+
+	for (int i = 0; i < 3; i++) {
+		if (offset < s->run_bytes[i])
+			return (uint32_t *)(s->run[i] + offset);
+		offset -= s->run_bytes[i];
+	}
+	return NULL;
+}
+
+static void fake_init(struct fake_surface *s)
+{
+	uint64_t pages = ((uint64_t)PITCH * H + PAGE - 1) / PAGE;
+	const uint64_t split[3] = { pages / 3, pages / 3, pages - 2 * (pages / 3) };
+
+	memset(s, 0, sizeof(*s));
+	s->size = pages * PAGE;
+	for (int i = 0; i < 3; i++) {
+		s->run_bytes[i] = split[i] * PAGE;
+		s->run[i] = aligned_alloc(PAGE, s->run_bytes[i]);
+		CHECK(s->run[i]);
+		s->segment[i] = (struct rt_surface_segment){ (uint64_t)(uintptr_t)s->run[i], s->run_bytes[i] };
+	}
+}
+
+static void fake_fill(struct fake_surface *s, uint32_t value, const struct rt_surface_rect *r)
+{
+	struct rt_surface_rect all = { 0, 0, W, H };
+
+	if (!r)
+		r = &all;
+	for (uint32_t y = r->y; y < r->y + r->height; y++)
+		for (uint32_t x = r->x; x < r->x + r->width; x++)
+			*pixel(s, x, y) = value ^ (x << 12) ^ y;
+}
+
+static void provider_release(void *context)
+{
+	((struct fake_surface *)context)->releases++;
+}
+
+/* The buffer HUBP0 scans out, as the CPU sees it. */
+static uint32_t screen_pixel(uint32_t x, uint32_t y)
+{
+	uint32_t lo = RREG32(dcn401_dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_BASE_IDX] +
+			     regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS);
+	uint32_t hi = RREG32(dcn401_dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH_BASE_IDX] +
+			     regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH);
+	uint8_t *fb = cs_fixture_vram_host(((uint64_t)hi << 32) | lo);
+
+	CHECK(fb);
+	return *(uint32_t *)(fb + (size_t)y * PITCH + x * 4);
+}
+
+static struct rt_display_present_stats wait_flipped(struct pci_dev *pdev, uint64_t flipped)
+{
+	struct rt_display_present_stats st;
+
+	for (int i = 0; i < 400; i++) {
+		usleep(5000);
+		CHECK(rt_display_stats(pdev, &st) == 0);
+		if (st.frames_flipped >= flipped || st.error)
+			break;
+	}
+	return st;
+}
+
+int main(void)
+{
+	struct fake_surface surf;
+	struct rt_surface_provider provider = { provider_release, &surf };
+	struct rt_display_report report;
+	struct rt_display_present_stats st;
+	struct cs_fixture_stats before, after;
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector, *hdmi = NULL;
+	struct rt_surface *surface;
+	struct pci_dev *pdev;
+	pthread_t vblank;
+	uint32_t handle;
+	int r;
+
+	CHECK(fw_table_register_embedded() == 0);
+	cs_fixture_sdma_instances = 2;
+	cs_fixture_display = display_init;
+	pdev = cs_fixture_init();
+	adev = cs_fixture_adev();
+
+	/* A sink on HDMI-A-1 (forced on with a synthetic EDID). */
+	dcn401_fixture_build_edid();
+	drm_connector_list_iter_begin(adev_to_drm(adev), &iter);
+	drm_for_each_connector_iter(connector, &iter)
+		if (!strcmp(connector->name, "HDMI-A-1"))
+			hdmi = connector;
+	drm_connector_list_iter_end(&iter);
+	CHECK(hdmi);
+	hdmi->force = DRM_FORCE_ON;
+	CHECK(drm_edid_override_set(hdmi, dcn401_fixture_edid, sizeof(dcn401_fixture_edid)) == 0);
+	CHECK(rt_display_probe(pdev, &report) == 0);
+
+	CHECK(pthread_create(&vblank, NULL, vblank_main, NULL) == 0);
+	r = rt_display_output(pdev, "HDMI-A-1", W, H, 60000, &report);
+	printf("pipeline: output -> %d (commit %d)\n", r, report.commit_status);
+	CHECK(r == 0 && report.showing && report.pattern == RT_DISPLAY_PATTERN_OUTPUT);
+
+	fake_init(&surf);
+	fake_fill(&surf, 0x00a00000u, NULL);
+	CHECK(rt_surface_import(pdev, surf.segment, 3, surf.size, W, H, PITCH, &provider, &surface) == 0);
+	handle = rt_surface_add(1, surface);
+	CHECK(handle);
+
+	/* Frame 1: the whole frame (every buffer starts stale), on both
+	 * engines. PRESENT returns before anything ran. */
+	{
+		const struct rt_surface_rect all = { 0, 0, W, H };
+		u64 t0 = ktime_get_ns(), dt;
+
+		cs_fixture_stats(&before);
+		r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1, ktime_get_ns(), &st);
+		dt = ktime_get_ns() - t0;
+		printf("pipeline: present 1 -> %d in %llu us (queued: received %llu, flipped %llu)\n", r,
+		       (unsigned long long)dt / 1000, (unsigned long long)st.frames_received,
+		       (unsigned long long)st.frames_flipped);
+		CHECK(r == 0 && st.version == 2 && st.engines == 2 && st.frames_received == 1);
+		st = wait_flipped(pdev, 1);
+		cs_fixture_stats(&after);
+		printf("pipeline: frame 1 flipped: %llu bytes in %llu job(s), copy %llu us, latency %llu us, "
+		       "%lu SDMA copy packets\n", (unsigned long long)st.bytes, (unsigned long long)st.copy_jobs,
+		       (unsigned long long)st.last_copy_gpu_ns / 1000,
+		       (unsigned long long)st.last_latency_ns / 1000, after.copies - before.copies);
+		CHECK(!st.error && st.frames_flipped == 1 && st.full_frames == 1);
+		CHECK(st.bytes == (uint64_t)PITCH * H && st.copy_jobs == 2);
+		CHECK(st.last_latency_ns > 0 && after.faults == 0 && after.dart_faults == 0);
+		CHECK(screen_pixel(0, 0) == (0x00a00000u ^ 0) && screen_pixel(W - 1, H - 1) ==
+		      (0x00a00000u ^ ((W - 1) << 12) ^ (H - 1)));
+	}
+
+	/* Frames 2-4, one at a time (each flips before the next): the worker
+	 * alternates between the two buffers not on screen. Frame 2 lands in
+	 * the buffer the output started on, stale, so it is copied whole;
+	 * frame 3 in frame 1's buffer: frame 2's damage and its own; frame 4
+	 * in frame 2's: frame 3's damage and its own. */
+	{
+		const struct rt_surface_rect box[3] = { { 100, 100, 200, 50 }, { 400, 300, 64, 64 },
+							{ 0, 1000, W, 80 } };
+
+		for (int f = 0; f < 3; f++) {
+			fake_fill(&surf, 0x00b00000u + (uint32_t)f, &box[f]);
+			r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &box[f], 1, ktime_get_ns(), &st);
+			CHECK(r == 0);
+			st = wait_flipped(pdev, 2 + (uint64_t)f);
+			printf("pipeline: frame %d flipped: %llu bytes total, last %llu, full frames %u\n", 2 + f,
+			       (unsigned long long)st.bytes, (unsigned long long)st.last_bytes, st.full_frames);
+			CHECK(!st.error && st.frames_flipped == 2 + (uint64_t)f);
+			if (f == 1)
+				CHECK(st.last_bytes == 200 * 4 * 50 + 64 * 4 * 64);
+		}
+		CHECK(st.full_frames == 2);
+		CHECK(st.last_bytes == (uint64_t)W * 4 * 80 + 64 * 4 * 64);
+		CHECK(screen_pixel(150, 120) == ((0x00b00000u) ^ (150u << 12) ^ 120u));
+		CHECK(screen_pixel(410, 310) == ((0x00b00001u) ^ (410u << 12) ^ 310u));
+		CHECK(screen_pixel(5, 1010) == ((0x00b00002u) ^ (5u << 12) ^ 1010u));
+		CHECK(screen_pixel(1000, 500) == ((0x00a00000u) ^ (1000u << 12) ^ 500u));
+	}
+
+	/* No vblank: frames pile up in the mailbox, the newest wins, the
+	 * damage of the replaced ones is kept. */
+	{
+		const struct rt_surface_rect a = { 10, 10, 10, 10 }, b = { 50, 50, 10, 10 };
+		uint64_t flipped;
+
+		st = wait_flipped(pdev, 4);
+		flipped = st.frames_flipped;
+		vblank_hold = 1;
+		usleep(40000);
+		for (int f = 0; f < 4; f++) {
+			fake_fill(&surf, 0x00c00000u + (uint32_t)f, (f & 1) ? &b : &a);
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), (f & 1) ? &b : &a, 1,
+						 ktime_get_ns(), &st) == 0);
+			usleep(5000);
+		}
+		CHECK(st.frames_replaced >= 1);
+		vblank_hold = 0;
+		st = wait_flipped(pdev, flipped + 2);
+		usleep(100000);
+		CHECK(rt_display_stats(pdev, &st) == 0);
+		printf("pipeline: 4 frames while no flip: received %llu, replaced %llu, flipped %llu\n",
+		       (unsigned long long)st.frames_received, (unsigned long long)st.frames_replaced,
+		       (unsigned long long)st.frames_flipped);
+		CHECK(!st.error && st.frames_flipped < flipped + 4);
+		CHECK(screen_pixel(15, 15) == ((0x00c00002u) ^ (15u << 12) ^ 15u));
+		CHECK(screen_pixel(55, 55) == ((0x00c00003u) ^ (55u << 12) ^ 55u));
+	}
+
+	/* A frame of another size is refused; nothing breaks. */
+	CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+	printf("pipeline: average copy %llu us, latency %llu us (max %llu), worker submit %llu us per frame\n",
+	       (unsigned long long)(st.copy_gpu_ns / st.frames_flipped / 1000),
+	       (unsigned long long)(st.latency_ns / st.frames_flipped / 1000),
+	       (unsigned long long)st.latency_max_ns / 1000,
+	       (unsigned long long)(st.copy_submit_ns / st.frames_flipped / 1000));
+
+	/* Off: the worker stops, the screen is restored, no frame is lost
+	 * in flight. */
+	CHECK(rt_display_off(pdev, &report) == 0 && !report.showing && !rt_display_showing());
+	CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), NULL, 0, 0, &st) == -ENOENT);
+	CHECK(rt_surface_remove(1, handle) == 0);
+	for (int i = 0; i < 5000 && !surf.releases; i++)
+		usleep(1000);
+	CHECK(surf.releases == 1);
+	vblank_run = 0;
+	pthread_join(vblank, NULL);
+	cs_fixture_stats(&after);
+	CHECK(after.faults == 0 && after.dart_faults == 0);
+	printf("PASS display pipeline: queued presents, SDMA copies on two engines into three buffers, "
+	       "nonblocking flips on the flip interrupt, damage tracking, mailbox, stop (%lu vblanks)\n",
+	       vblanks);
+	cs_fixture_stop();
+	return 0;
+}

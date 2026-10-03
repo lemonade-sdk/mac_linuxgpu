@@ -1216,6 +1216,12 @@ test-surface-import:
 test: test-surface-import
 .PHONY: test-surface-import
 
+test-display-pipeline:
+	bash scripts/test-display-pipeline.sh
+
+test: test-display-pipeline
+.PHONY: test-display-pipeline
+
 # The display agent's model (host/DisplayAgent.swift): decoding, the
 # virtual-display plan for a monitor, and the changes a probe makes.
 test-display-agent:

@@ -202,11 +202,14 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  *           struct out: struct rt_surface_verify_result
  *   RELEASE [1] handle
  *   OUTPUT  [1] refresh in mHz; struct in: struct mlg_display_output; the
- *           connector at that mode with two framebuffers (rt_display_output)
+ *           connector at that mode with three framebuffers and a worker
+ *           that copies and flips (rt_display_output)
  *           struct out: struct rt_display_report
- *   PRESENT [1] handle; struct in: struct mlg_display_present; the dirty
- *           rectangles copied and flipped (rt_display_present)
- *           struct out: struct rt_display_present_stats */
+ *   PRESENT [1] handle; struct in: struct mlg_display_present; queues the
+ *           frame (its dirty rectangles and capture time) for the worker
+ *           and returns without waiting for the copy or the flip
+ *           (rt_display_present); no rectangle only reads the statistics
+ *           struct out: struct rt_display_present_stats (version 2) */
 #define MLG_DISPLAY_OP_IMPORT   5u
 #define MLG_DISPLAY_OP_VERIFY   6u
 #define MLG_DISPLAY_OP_RELEASE  7u
@@ -226,6 +229,7 @@ struct mlg_display_rect {
 struct mlg_display_present {
 	uint32_t count;
 	uint32_t reserved;
+	uint64_t capture_ns; /* when the frame was captured, mach_absolute_time in ns */
 	struct mlg_display_rect rect[]; /* count, at most MLG_DISPLAY_PRESENT_RECTS_MAX */
 };
 #define MLG_DISPLAY_PATTERN_BARS     0u
