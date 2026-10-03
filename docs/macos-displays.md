@@ -216,6 +216,27 @@ Apple GPU. The AMD GPU only scans out.
   display. It needs Screen Recording permission for the process that runs
   it.
 
+### 1e. First hardware results (R9700 over TB5, MacBook Pro M5 Max, build 233)
+
+- **Pinning.** `display-pin-test`: a 2560x1440 IOSurface (14.7 MB,
+  pitch 10240) imported once. For 10 s the agent rewrote it every
+  second, and each SDMA readback matched the new pattern exactly (0 of
+  4096 sampled dwords different) and the previous pattern in none
+  (4096 of 4096 different). Each readback took about 1.1 ms. The client's
+  pages stay mapped for the device after the call returns.
+  - The dext's own CPU mapping of the descriptor is a snapshot taken at
+    the import call, so it is not used.
+- **Mirroring.** `display-agent --create --seconds 60` on a DELL UP2716D:
+  - the virtual display came online as display 6;
+  - DP-4 was lit at 2560x1440 @ 59.950 Hz;
+  - ScreenCaptureKit used a pool of 4 surfaces, each imported once;
+  - 977 frames were captured and 976 presented, with an average SDMA
+    copy of 2.94 ms and an average flip of 10.60 ms (the flip waits for
+    vblank);
+  - 2.2 GB was copied, and the agent used 0.55 s of CPU in 60 s;
+  - teardown restored the monitor and removed the display, with no
+    quarantine.
+
 ## 4. Increments
 
 1. **Done on feature/display-c:** STATUS (cached state, hotplug epoch via
