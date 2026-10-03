@@ -223,6 +223,7 @@ static void test_i2c(void)
 	strcpy(bare->name, "no-algo");
 	CHECK(i2c_add_adapter(bare) == 0);
 	CHECK(i2c_transfer(bare, &msg, 1) == -EOPNOTSUPP);
+	CHECK(bare->nr != adap->nr && !strcmp(dev_name(&bare->dev), "i2c-1") == (bare->nr == 1));
 	i2c_del_adapter(bare);
 	i2c_del_adapter(adap);
 	free(bare);

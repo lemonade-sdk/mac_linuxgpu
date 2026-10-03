@@ -2,8 +2,11 @@
  * the pinned drivers/i2c/i2c-core-base.c: registration initializes the
  * bus locks and default lock operations, and i2c_transfer() runs the
  * adapter's master_xfer under the segment lock with arbitration-loss
- * retries. There is no i2c bus device model, client enumeration or SMBus
- * emulation; those entry points stay inert. */
+ * retries. Each adapter is a device named i2c-<nr> under its parent, as
+ * i2c_register_adapter() registers it, so sysfs links to it (a DRM
+ * connector's "ddc") resolve; unregistering waits for its release. There
+ * is no i2c bus type, client enumeration or SMBus emulation; those entry
+ * points stay inert. */
 #include <linux/i2c.h>
 #include <linux/i2c-algo-bit.h>
 #include <linux/device.h>
@@ -15,6 +18,9 @@
 #include <linux/rtmutex.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
+#include <linux/string.h>
+#include <linux/completion.h>
+#include <linux/ida.h>
 
 /* ---- adapter locking (i2c-core-base.c) ---- */
 static void i2c_adapter_lock_bus(struct i2c_adapter *adapter,
@@ -44,9 +50,20 @@ static const struct i2c_lock_operations i2c_adapter_lock_ops = {
 	.unlock_bus =  i2c_adapter_unlock_bus,
 };
 
-/* ---- adapter lifecycle ---- */
-int i2c_add_adapter(struct i2c_adapter *adap)
+/* ---- adapter lifecycle (i2c-core-base.c) ---- */
+static DEFINE_IDA(i2c_adapter_ida);
+
+static void i2c_adapter_dev_release(struct device *dev)
 {
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+
+	complete(&adap->dev_released);
+}
+
+static int i2c_register_nr(struct i2c_adapter *adap, int nr)
+{
+	int r;
+
 	if (!adap)
 		return -EINVAL;
 	if (!adap->lock_ops)
@@ -61,7 +78,33 @@ int i2c_add_adapter(struct i2c_adapter *adap)
 	/* Set default timeout to 1 second if not already set */
 	if (adap->timeout == 0)
 		adap->timeout = HZ;
+
+	nr = nr < 0 ? ida_alloc(&i2c_adapter_ida, GFP_KERNEL) :
+		      ida_alloc_range(&i2c_adapter_ida, nr, nr, GFP_KERNEL);
+	if (nr < 0)
+		return nr;
+	adap->nr = nr;
+	init_completion(&adap->dev_released);
+	r = dev_set_name(&adap->dev, "i2c-%d", adap->nr);
+	if (r)
+		goto out_ida;
+	adap->dev.release = i2c_adapter_dev_release;
+	r = device_register(&adap->dev);
+	if (r) {
+		put_device(&adap->dev);
+		wait_for_completion(&adap->dev_released);
+		goto out_ida;
+	}
 	return 0;
+
+out_ida:
+	ida_free(&i2c_adapter_ida, nr);
+	return r;
+}
+
+int i2c_add_adapter(struct i2c_adapter *adap)
+{
+	return i2c_register_nr(adap, -1);
 }
 
 int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
@@ -72,12 +115,25 @@ int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
 
 void i2c_del_adapter(struct i2c_adapter *adap)
 {
-	(void)adap;
+	if (!adap || !adap->dev.release)
+		return;
+	/* As i2c_del_adapter: unregister, wait until the last reference is
+	 * gone (the caller frees the adapter next), then free its number. */
+	device_unregister(&adap->dev);
+	wait_for_completion(&adap->dev_released);
+	ida_free(&i2c_adapter_ida, adap->nr);
+	/* Ready for i2c_add_adapter() again, under the same parent. */
+	{
+		struct device *parent = adap->dev.parent;
+
+		memset(&adap->dev, 0, sizeof(adap->dev));
+		adap->dev.parent = parent;
+	}
 }
 
 int i2c_add_numbered_adapter(struct i2c_adapter *adap)
 {
-	return i2c_add_adapter(adap);
+	return i2c_register_nr(adap, adap ? adap->nr : -1);
 }
 
 int i2c_register_adapter(struct i2c_adapter *adap)
