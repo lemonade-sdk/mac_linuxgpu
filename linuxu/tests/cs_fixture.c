@@ -14,8 +14,11 @@
  * executes it, translating GPU addresses as the hardware does: VMID 0
  * through the GART table upstream filled (or the VRAM aperture), other
  * VMIDs by walking the page tables upstream wrote through the SDMA engine.
- * The compute engine executes PM4 (INDIRECT_BUFFER, WRITE_DATA, NOP and a
- * fence release); the SDMA engine executes the fixture's own packet set
+ * The compute engine executes PM4 (INDIRECT_BUFFER, WRITE_DATA, DMA_DATA,
+ * NOP, RELEASE_MEM in IBs and the ring's fence release); with
+ * cs_fixture_model_driver_streams() it also follows chained IBs and skips
+ * what it does not model, as a full driver's streams need. The SDMA
+ * engine executes the fixture's own packet set
  * that its buffer functions and VM PTE functions emit (fill, copy, PTE
  * writes). A fence with an interrupt runs amdgpu_fence_process, as the
  * EOP/trap interrupt handlers do.
@@ -40,6 +43,8 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_ioctl.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/bootstrap.h>
+#include <rt/compute.h>
+#include <rt/dart.h>
 
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
@@ -82,11 +87,13 @@ enum {
 
 static struct pci_dev *pdev;
 static struct amdgpu_device *adev;
+uint64_t cs_fixture_visible_vram;
 static uint8_t *vram;		/* the VRAM behind the aperture */
 static uint64_t *doorbells;
 static struct amdgpu_irq_src fence_irq;
 static struct cs_fixture_stats stats;
 static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool driver_streams;
 
 #define STAT(field) do { pthread_mutex_lock(&stats_lock); stats.field++; \
 	pthread_mutex_unlock(&stats_lock); } while (0)
@@ -96,6 +103,22 @@ static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t pte_address(uint64_t entry)
 {
 	return entry & 0x0000fffffffff000ULL;
+}
+
+/* System memory at DMA address @dma, as the IOMMU passes it: a GPU page
+ * outside every live DMA mapping is a DART fault (a write to it, behind a
+ * Thunderbolt tunnel, can cost the device). Host DMA addresses are host
+ * pointers. */
+static uint8_t *system_page(uint64_t dma)
+{
+	if (!linuxu_dart_contains(dma & ~(uint64_t)(AMDGPU_GPU_PAGE_SIZE - 1),
+				  AMDGPU_GPU_PAGE_SIZE)) {
+		STAT(dart_faults);
+		fprintf(stderr, "cs fixture: DART fault, DMA address 0x%llx is not mapped\n",
+			(unsigned long long)dma);
+		return NULL;
+	}
+	return (uint8_t *)(uintptr_t)dma;
 }
 
 /* Host address of MC address @mc (VMID 0): VRAM or GART. */
@@ -109,7 +132,7 @@ static uint8_t *mc_to_host(uint64_t mc)
 
 		if (!(entry & AMDGPU_PTE_VALID))
 			return NULL;
-		return (uint8_t *)(uintptr_t)(pte_address(entry) + (mc & (AMDGPU_GPU_PAGE_SIZE - 1)));
+		return system_page(pte_address(entry) + (mc & (AMDGPU_GPU_PAGE_SIZE - 1)));
 	}
 	return NULL;
 }
@@ -118,7 +141,7 @@ static uint8_t *mc_to_host(uint64_t mc)
 static uint8_t *entry_to_host(uint64_t entry, uint64_t offset)
 {
 	if (entry & AMDGPU_PTE_SYSTEM)
-		return (uint8_t *)(uintptr_t)(pte_address(entry) + offset);
+		return system_page(pte_address(entry) + offset);
 	return mc_to_host(pte_address(entry) + offset);
 }
 
@@ -151,7 +174,7 @@ static uint8_t *vm_to_host(uint64_t pd, uint64_t va)
 	for (unsigned int level = adev->vm_manager.root_level;; ++level) {
 		unsigned int shift = level_shift(level);
 		uint64_t index = (pfn >> shift) & (level_entries(level) - 1);
-		uint8_t *at = system ? (uint8_t *)(uintptr_t)table : mc_to_host(table);
+		uint8_t *at = system ? system_page(table) : mc_to_host(table);
 		uint64_t entry;
 
 		if (!at)
@@ -294,6 +317,40 @@ static void fence_write(struct engine *e, uint64_t addr, uint64_t seq, bool wide
 
 static void pm4_run(struct engine *e, const uint32_t *dw, uint64_t count, uint32_t vmid, int depth);
 
+/* PM4 opcodes of a driver's streams the fixture recognizes but does not
+ * model as such (sid.h numbering). */
+#define FX_PM4_DISPATCH_DIRECT			0x15
+#define FX_PM4_DISPATCH_INDIRECT		0x16
+#define FX_PM4_DMA_DATA				0x50
+#define FX_PM4_DISPATCH_DIRECT_INTERLEAVED	0xa7
+
+/* CP DMA (DMA_DATA): fill with immediate data or copy, a page at a time. */
+static void pm4_dma_data(struct engine *e, const uint32_t *dw, uint32_t vmid)
+{
+	const uint32_t src_sel = (dw[1] >> 29) & 3, dst_sel = (dw[1] >> 20) & 3;
+	const uint64_t src = ((uint64_t)dw[3] << 32) | dw[2];
+	const uint64_t dst = ((uint64_t)dw[5] << 32) | dw[4];
+	const uint32_t bytes = dw[6] & 0x3ffffff;
+	uint8_t chunk[4096];
+
+	STAT(dma_data);
+	if (dst_sel == 2)	/* DST_NOWHERE: a prefetch */
+		return;
+	for (uint32_t off = 0; off < bytes;) {
+		uint32_t n = bytes - off < sizeof(chunk) ? bytes - off : sizeof(chunk);
+
+		if (src_sel == 2) {	/* DATA: the immediate dword */
+			for (uint32_t i = 0; i < n; i += 4)
+				memcpy(chunk + i, &dw[2], 4);
+		} else if (!gpu_access(e, vmid, src + off, chunk, n, false)) {
+			return;
+		}
+		if (!gpu_access(e, vmid, dst + off, chunk, n, true))
+			return;
+		off += n;
+	}
+}
+
 static uint64_t pm4_packet(struct engine *e, const uint32_t *dw, uint64_t avail, uint32_t vmid,
 			   int depth)
 {
@@ -310,10 +367,11 @@ static uint64_t pm4_packet(struct engine *e, const uint32_t *dw, uint64_t avail,
 		break;
 	case PACKET3_INDIRECT_BUFFER: {
 		uint64_t va = ((uint64_t)(dw[2] & 0xffff) << 32) | (dw[1] & ~3u);
-		uint32_t len = dw[3] & 0xfffff, ib_vmid = dw[3] >> 24;
+		uint32_t len = dw[3] & 0xfffff, ib_vmid = depth ? vmid : dw[3] >> 24;
 		uint32_t *ib = calloc(len ? len : 1, 4);
 
-		if (depth)
+		/* Inside an IB: a chained (or nested) IB of the same VMID. */
+		if (depth && (!driver_streams || depth > 4))
 			FX_ABORT("chained IB");
 		STAT(compute_ibs);
 		if (!ib || !gpu_access(e, ib_vmid, va, ib, (uint64_t)len * 4, false))
@@ -326,28 +384,68 @@ static uint64_t pm4_packet(struct engine *e, const uint32_t *dw, uint64_t avail,
 	case PACKET3_WRITE_DATA: {
 		uint64_t va = ((uint64_t)dw[3] << 32) | dw[2];
 
-		if (((dw[1] >> 8) & 0xf) != 5)
-			FX_ABORT("WRITE_DATA to a non-memory destination");
+		if (((dw[1] >> 8) & 0xf) != 5) {
+			if (!driver_streams)
+				FX_ABORT("WRITE_DATA to a non-memory destination");
+			STAT(skipped);	/* a register write */
+			break;
+		}
 		STAT(write_data);
 		gpu_access(e, vmid, va, (void *)(uintptr_t)&dw[4], (uint64_t)(n - 3) * 4, true);
 		break;
 	}
+	case FX_PM4_DMA_DATA:
+		if (n != 6)
+			FX_ABORT("DMA_DATA of %u dwords", n);
+		pm4_dma_data(e, dw, vmid);
+		break;
 	case PACKET3_RELEASE_MEM: {
-		/* The fixture's fence: flags, address, sequence. */
-		uint64_t addr = ((uint64_t)dw[3] << 32) | dw[2];
-		uint64_t seq = ((uint64_t)dw[5] << 32) | dw[4];
+		uint64_t addr, seq;
 
+		if (n == 7) {
+			/* A driver's end-of-pipe release (GFX9+ layout):
+			 * event, DST/INT/DATA_SEL, address, data. Work is
+			 * done in order here, so the event has happened. */
+			uint32_t data_sel = dw[2] >> 29;
+
+			addr = ((uint64_t)dw[4] << 32) | dw[3];
+			seq = ((uint64_t)dw[6] << 32) | dw[5];
+			STAT(release_mem);
+			if (data_sel == 3)	/* the GPU clock */
+				seq = (uint64_t)ktime_get_ns() / 10;
+			if (data_sel >= 1 && data_sel <= 3)
+				gpu_access(e, vmid, addr, &seq, data_sel == 1 ? 4 : 8, true);
+			break;
+		}
+		/* The fixture's fence: flags, address, sequence. */
+		addr = ((uint64_t)dw[3] << 32) | dw[2];
+		seq = ((uint64_t)dw[5] << 32) | dw[4];
 		fence_write(e, addr, seq, dw[1] & AMDGPU_FENCE_FLAG_64BIT);
 		if (dw[1] & AMDGPU_FENCE_FLAG_INT)
 			interrupt(e->ring);
 		break;
 	}
 	case FX_PM4_VM_FLUSH:
+		if (depth)
+			goto unmodeled;	/* opcode 0x7e in an IB is not ours */
 		STAT(vm_flushes);
 		hub_set_pd(e, dw[1], ((uint64_t)dw[3] << 32) | dw[2]);
 		break;
+	case FX_PM4_DISPATCH_DIRECT:
+	case FX_PM4_DISPATCH_INDIRECT:
+	case FX_PM4_DISPATCH_DIRECT_INTERLEAVED:
+		if (!driver_streams || !depth)
+			FX_ABORT("dispatch packet 0x%02x", op);
+		STAT(dispatches);
+		break;
 	default:
-		FX_ABORT("unexpected PM4 opcode 0x%02x", op);
+	unmodeled:
+		if (!driver_streams || !depth)
+			FX_ABORT("unexpected PM4 opcode 0x%02x", op);
+		if (getenv("CS_FIXTURE_TRACE"))
+			fprintf(stderr, "skip PM4 opcode 0x%02x (%u dwords)\n", op, n + 1);
+		STAT(skipped);
+		break;
 	}
 	return n + 1;
 }
@@ -753,9 +851,75 @@ static uint32_t fx_get_xclk(struct amdgpu_device *a)
 	return 10000;	/* 100 MHz in 10 kHz units */
 }
 
+/* The R9700's (Navi 48, gfx1201) GB_ADDR_CONFIG, as Mesa's gfx1201
+ * profile (src/amd/common/amdgpu_devices.c) records it. */
+#define FX_MM_GB_ADDR_CONFIG	0x263e
+#define FX_GB_ADDR_CONFIG	0x08200545
+
+/* AMDGPU_INFO_READ_MMR_REG: the registers userspace drivers ask for. */
+static int fx_read_register(struct amdgpu_device *a, u32 se, u32 sh, u32 reg, u32 *value)
+{
+	(void)a; (void)se; (void)sh;
+	if (reg != FX_MM_GB_ADDR_CONFIG)
+		return -EINVAL;
+	*value = FX_GB_ADDR_CONFIG;
+	return 0;
+}
+
 static const struct amdgpu_asic_funcs fx_asic_funcs = {
+	.read_register = fx_read_register,
 	.get_xclk = fx_get_xclk,
 };
+
+/* The shader array layout, caches and firmware versions gfx_v12_0 reads
+ * from an R9700 (Mesa's gfx1201 profile): what AMDGPU_INFO_DEV_INFO and
+ * AMDGPU_INFO_FW_VERSION report, so a userspace driver sizes itself as it
+ * would on the GPU. */
+static void fx_gfx_config(void)
+{
+	struct amdgpu_gfx_config *c = &adev->gfx.config;
+	struct amdgpu_cu_info *cu = &adev->gfx.cu_info;
+
+	c->max_shader_engines = 4;
+	c->max_sh_per_se = 2;
+	c->max_cu_per_sh = 8;
+	c->max_backends_per_se = 4;
+	c->backend_enable_mask = 0xffff;
+	c->max_hw_contexts = 8;
+	c->max_gprs = 1536;
+	c->max_texture_channel_caches = 32;
+	c->gs_vgt_table_depth = 32;
+	c->gs_prim_buffer_depth = 1792;
+	c->max_gs_threads = 32;
+	c->double_offchip_lds_buf = 64;
+	c->gb_addr_config = FX_GB_ADDR_CONFIG;
+	c->gc_tcp_l1_size = 32;
+	c->gc_num_sqc_per_wgp = 1;
+	c->gc_l1_data_cache_size_per_sqc = 16;
+	c->gc_l1_instruction_cache_size_per_sqc = 32;
+	c->gc_gl1c_size_per_instance = 256;
+	c->gc_gl1c_per_sa = 1;
+	c->gc_gl2c_per_gpu = 8192;
+	adev->gmc.mall_size = 64ULL << 20;
+	cu->number = 64;
+	cu->wave_front_size = 32;
+	cu->simd_per_cu = 2;
+	cu->max_waves_per_simd = 16;
+	cu->lds_size = 128;
+	for (int se = 0; se < 4; ++se)
+		for (int sh = 0; sh < 2; ++sh)
+			cu->bitmap[0][se][sh] = 0xff;
+	adev->clock.default_sclk = 246000;	/* 10 kHz units */
+	adev->clock.default_mclk = 125800;
+	adev->rev_id = 0x01;
+	adev->external_rev_id = 0x51;
+	adev->gfx.me_fw_version = 2590;
+	adev->gfx.me_feature_version = 29;
+	adev->gfx.pfp_fw_version = 2630;
+	adev->gfx.pfp_feature_version = 29;
+	adev->gfx.mec_fw_version = 2800;
+	adev->gfx.mec_feature_version = 29;
+}
 
 static const struct amdgpu_gfx_funcs fx_gfx_funcs;
 static const struct amdgpu_rlc_funcs fx_rlc_funcs;
@@ -943,6 +1107,7 @@ struct pci_dev *cs_fixture_init(void)
 	adev->ip_blocks[1].adev = adev;
 	adev->ip_blocks[1].status.valid = true;
 	adev->num_ip_blocks = 2;
+	fx_gfx_config();
 
 	/* The GMC's sw_init: memory layout, VM sizes, the GART table. */
 	vram = calloc(1, FX_VRAM_BYTES);
@@ -951,7 +1116,10 @@ struct pci_dev *cs_fixture_init(void)
 		FX_ABORT("fixture memory");
 	adev->gmc.gmc_funcs = &fx_gmc_funcs;
 	adev->gmc.mc_vram_size = adev->gmc.real_vram_size = FX_VRAM_BYTES;
-	adev->gmc.visible_vram_size = FX_VRAM_BYTES;
+	/* A BAR narrower than VRAM when asked (the iPad's is 256 MiB of
+	 * 32 GiB): TTM then cannot fall back to a CPU copy of invisible VRAM. */
+	adev->gmc.visible_vram_size = cs_fixture_visible_vram ? cs_fixture_visible_vram :
+				      FX_VRAM_BYTES;
 	adev->gmc.aper_base = FX_BAR0;
 	adev->gmc.aper_size = FX_VRAM_BYTES;
 	adev->gmc.vram_start = FX_VRAM_START;
@@ -1024,6 +1192,10 @@ struct pci_dev *cs_fixture_init(void)
 	adev->vm_manager.vm_pte_num_scheds = 1;
 	amdgpu_ttm_set_buffer_funcs_status(adev, true);
 	adev->accel_working = true;
+	/* As rt_compute_open does for a session: DMA releases wait while an
+	 * engine is stalled. */
+	if (!getenv("CS_FIXTURE_NO_DMA_HOLD"))	/* the negative control */
+		rt_dma_hold_attach(adev);
 
 	r = drm_dev_register(adev_to_drm(adev), 0);
 	if (r)
@@ -1049,6 +1221,34 @@ void cs_fixture_stats(struct cs_fixture_stats *out)
 	pthread_mutex_lock(&stats_lock);
 	*out = stats;
 	pthread_mutex_unlock(&stats_lock);
+}
+
+struct amdgpu_device *cs_fixture_adev(void)
+{
+	return adev;
+}
+
+void cs_fixture_hold_sdma(int hold)
+{
+	pthread_mutex_lock(&sdma_engine.lock);
+	sdma_engine.hold = hold;
+	pthread_cond_signal(&sdma_engine.kick);
+	pthread_mutex_unlock(&sdma_engine.lock);
+}
+
+void *cs_fixture_bar_memory(uint32_t bar, uint64_t offset, uint64_t bytes)
+{
+	/* Only what the BAR shows (cs_fixture_visible_vram narrows it). */
+	const uint64_t visible = adev->gmc.visible_vram_size;
+
+	if (bar != 0 || offset > visible || bytes > visible - offset)
+		return NULL;
+	return vram + offset;
+}
+
+void cs_fixture_model_driver_streams(int on)
+{
+	driver_streams = on;
 }
 
 void cs_fixture_hold_compute(int hold)

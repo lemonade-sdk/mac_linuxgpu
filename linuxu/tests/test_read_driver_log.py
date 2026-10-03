@@ -103,6 +103,26 @@ for values, count in (([1] * 9, 8), ([2] + [0] * 8, 9), ([1, -1] + [0] * 7, 9)):
         continue
     raise AssertionError("malformed session snapshot accepted")
 
+# Power snapshot decoding (dext/sources/power_state.h).
+fields, advice = reader.describe_power([1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 1, 0], 12)
+assert fields["power_state"] == "active" and fields["power_flags"] == ["vram_preserved"]
+assert advice is None
+fields, advice = reader.describe_power([1, 2, 3, 0b11001, 1, 0, 1, 1, 0, 2500, 1, 0], 12)
+assert fields["power_state"] == "suspended" and fields["power_cause"] == "client prepare"
+assert fields["power_flags"] == ["vram_preserved", "client_hold", "kfd_quiesced"]
+assert fields["low_power_holds"] == 1 and fields["last_transition_us"] == 2500
+assert advice == "suspended: GPU work waits for resume (VRAM kept)"
+fields, advice = reader.describe_power([1, 4, 7, 0, 8, (1 << 64) - 5, 0, 1, 1, 0, 2, 0], 12)
+assert fields["power_state"] == "lost" and fields["power_cause"] == "KFD suspend failed"
+assert fields["power_error"] == -5 and fields["memory_losses"] == 1
+assert advice.startswith("device memory was lost")
+for values, count in (([1] * 12, 11), ([2] + [0] * 11, 12), ([1, -1] + [0] * 10, 12)):
+    try:
+        reader.describe_power(values, count)
+    except RuntimeError:
+        continue
+    raise AssertionError("malformed power snapshot accepted")
+
 print("cached session snapshot: flags, cause, blocker and advice decoding passed")
 
 # --display keeps display bring-up and display-test lines only.
@@ -119,4 +139,6 @@ sample = "\n".join([
 ])
 kept = reader.display_lines(sample)
 assert kept == [sample.split("\n")[i] for i in (1, 2, 3, 4, 6, 7)], kept
+
+print("cached power snapshot: state, flags, cause and advice decoding passed")
 print("cached log reader: append/resume, ring wrap, overwrite, empty/future cursors and malformed ABI passed")

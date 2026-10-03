@@ -13,6 +13,7 @@
 #include <sys/ioccom.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "mlg_drm.h"
 #include "mlg_uapi.h"
@@ -41,6 +42,7 @@ static struct {
 	uint8_t out_fill;		/* the bytes the "kernel" writes to OUT segments */
 	int transport_error;		/* the call does not reach the driver */
 	int mmaps, munmaps;
+	uint64_t mmap_length, munmap_length;
 	uint8_t page[16384];
 } rec;
 
@@ -98,6 +100,7 @@ static int r_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t 
 {
 	(void)ctx; (void)fd; (void)offset; (void)prot;
 	CHECK(flags == MLG_LX_MAP_SHARED && length <= sizeof(rec.page));
+	rec.mmap_length = length;
 	*addr = rec.page;
 	*handle = MLG_LX_MMAP_TYPE_BASE + (uint64_t)rec.mmaps++;
 	return 0;
@@ -105,14 +108,25 @@ static int r_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t 
 
 static int r_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 {
-	(void)ctx; (void)length;
+	(void)ctx;
 	CHECK(handle >= MLG_LX_MMAP_TYPE_BASE && addr == rec.page);
+	rec.munmap_length = length;
 	rec.munmaps++;
+	return 0;
+}
+
+static int r_identity(void *ctx, struct mlg_pci_identity *out)
+{
+	(void)ctx;
+	*out = (struct mlg_pci_identity){ .bus = 0xc3, .vendor_id = 0x1002, .device_id = 0x7551,
+					  .subvendor_id = 0x1002, .subdevice_id = 0x0e3b,
+					  .revision_id = 0xc0 };
 	return 0;
 }
 
 static const struct mlg_transport recording = {
 	.open = r_open, .close = r_close, .ioctl = r_ioctl, .mmap = r_mmap, .munmap = r_munmap,
+	.identity = r_identity,
 };
 
 /* The frame's segments, for checks. */
@@ -310,14 +324,48 @@ int main(void)
 	CHECK(mlg_mmap(rec.page, 16384, PROT_READ, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED);
 	CHECK(mlg_mmap(NULL, 16384, PROT_READ, MAP_SHARED, 9, 0) == MAP_FAILED && errno == EBADF);
 	CHECK(mlg_munmap(p, 4096) == -1 && errno == EINVAL);
+	CHECK(mlg_is_mapping(p, 16384) && !mlg_is_mapping(p, 4096));
 	CHECK(mlg_munmap(p, 16384) == 0 && rec.munmaps == 1);
-	CHECK(mlg_munmap(p, 16384) == -1);
+	CHECK(mlg_munmap(p, 16384) == -1 && !mlg_is_mapping(p, 16384));
+	/* A length short of a page maps the whole page, as mmap(2) does;
+	 * munmap takes the caller's length and unmaps the page. */
+	p = mlg_mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 1 << 20);
+	CHECK(p == rec.page && rec.mmap_length == (uint64_t)getpagesize());
+	CHECK(mlg_munmap(p, 4096) == 0 && rec.munmap_length == (uint64_t)getpagesize());
+
+	/* A request encoded with more directions than the driver's table
+	 * declares (Mesa issues GEM_VA read-write; the table says write)
+	 * goes out in the table's encoding, as the DRM core would take it. */
+	struct drm_amdgpu_gem_va va_rw = { .handle = 1, .operation = AMDGPU_VA_OP_MAP,
+		.va_address = 1 << 21, .map_size = 1 << 16 };
+	const unsigned long gem_va_rw = (DRM_IOCTL_AMDGPU_GEM_VA & ~(3ul << 30)) | (3ul << 30);
+	rec.result = 0;
+	CHECK(mlg_ioctl(fd, gem_va_rw, &va_rw) == 0 && rec.cmd == DRM_IOCTL_AMDGPU_GEM_VA);
+	/* KFD requests are known by range: no such rewriting there. */
+	const unsigned long svm_read = (AMDKFD_IOC_SVM & ~(3ul << 30)) | (2ul << 30);
+	CHECK(mlg_ioctl(kfd, svm_read, &apn) == -1 && errno == ENOTTY);
+
+	/* The GPU's PCI identity: the transport's when it has one... */
+	struct mlg_pci_identity id;
+	CHECK(mlg_pci_identity(&id) == 0 && id.vendor_id == 0x1002 && id.device_id == 0x7551 &&
+	      id.bus == 0xc3 && id.subvendor_id == 0x1002);
 
 	CHECK(mlg_close(kfd) == 0 && rec.closed == kfd);
 	CHECK(mlg_ioctl(kfd, AMDKFD_IOC_GET_VERSION, &apn) == -1 && errno == EBADF);
 	CHECK(mlg_close(fd) == 0);
+	/* ... else what AMDGPU_INFO_DEV_INFO reports, on a render node it
+	 * opens and closes. */
+	struct mlg_transport plain = recording;
+	plain.identity = NULL;
+	CHECK(mlg_drm_set_transport(&plain) == 0);
+	rec.result = 0;
+	rec.out_fill = 0x51;
+	CHECK(mlg_pci_identity(&id) == 0 && id.vendor_id == 0x1002 && id.device_id == 0x5151 &&
+	      id.revision_id == 0x51 && id.bus == 0 && rec.open_dev == MLG_LX_DEV_RENDER);
+	CHECK(rec.cmd == DRM_IOCTL_AMDGPU_INFO && rec.closed == rec.next_fd - 1);
 	CHECK(mlg_drm_set_transport(NULL) == 0);
 	puts("PASS libmlg_drm: Linux request numbers and structures, BSD conversion, errnos, "
-	     "paths and flags, nested request memory, waits and deadlines, replies, mmap");
+	     "paths and flags, nested request memory, waits and deadlines, replies, mmap, "
+	     "table encodings, PCI identity");
 	return 0;
 }

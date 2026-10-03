@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Verify the upstream Linux tree the build compiles.
+"""Verify the upstream trees the build compiles: Linux, and Mesa when it is
+checked out (the Vulkan driver build fetches it; it is optional).
 
 Checks, against patches/manifest.json:
   * the submodule gitlink, the manifest pin and the submodule HEAD agree, and
@@ -19,6 +20,13 @@ Checks, against patches/manifest.json:
     Kconfig would select for this target) names a Kconfig file that defines
     it and is set in linuxu/headers/linux/autoconf.h, so a declaration cannot
     go stale.
+
+For the optional upstreams, Mesa (manifest "mesa", patches/mesa/) and
+llama.cpp (manifest "llama_cpp", unpatched): the gitlink, pin and
+.gitmodules agree; once checked out, the sparse set, the declared patches
+and the working tree are checked as Linux's are.
+
+  --only linux|mesa|llama_cpp   verify one tree
 """
 
 import hashlib
@@ -56,10 +64,12 @@ def report(label, items):
         print(f"{label}: {item}", file=sys.stderr)
 
 
-def check_pin(linux):
+def check_pin(linux, key="linux", required=True):
+    """The gitlink, pin and .gitmodules agree. Returns the checkout, or None
+    when an optional tree (required=False) is not checked out."""
     path, pin = linux["path"], linux["pin"]
     if not OID.fullmatch(pin):
-        raise Failure("manifest linux.pin must be a 40-digit commit")
+        raise Failure(f"manifest {key}.pin must be a 40-digit commit")
     stage = git("ls-files", "-s", "--", path).split()
     if len(stage) < 2 or stage[0] != "160000":
         raise Failure(f"{path} is not a submodule gitlink")
@@ -70,6 +80,8 @@ def check_pin(linux):
         raise Failure(f".gitmodules url for {path} differs from {linux['url']}")
     sub = ROOT / path
     if not (sub / ".git").exists():
+        if not required:
+            return None
         raise Failure(f"{path} is not checked out; run scripts/bootstrap.sh")
     head = git("rev-parse", "HEAD", cwd=sub).strip()
     if head != pin:
@@ -77,10 +89,10 @@ def check_pin(linux):
     return sub
 
 
-def check_sparse(sub, linux):
+def check_sparse(sub, linux, sources=True):
     configured = git("sparse-checkout", "list", cwd=sub).splitlines()
     if configured != linux["sparse_checkout"]:
-        raise Failure("submodule sparse-checkout patterns differ from the manifest; "
+        raise Failure(f"{linux['path']} sparse-checkout patterns differ from the manifest; "
                       "run scripts/bootstrap.sh")
     present = [line[2:] for line in git("ls-files", "-t", cwd=sub).splitlines()
                if line.startswith("H ")]
@@ -92,6 +104,8 @@ def check_sparse(sub, linux):
         report("case collision in sparse checkout", collisions)
         raise Failure("the sparse checkout contains case-colliding paths")
     present = set(present)
+    if not sources:
+        return present, 0
     text = SOURCES_MK.read_text().replace("\\\n", " ")
     needed = set(re.findall(r"\$\(LINUX\)/(\S+)", text))
     for match in re.finditer(r"^UPSTREAM_HELPERS\s*:=(.*)$", text, re.M):
@@ -107,11 +121,11 @@ def patch_paths(text):
     return {m.group(1) for m in re.finditer(r"^diff --git a/(\S+) b/\S+$", text, re.M)}
 
 
-def check_patches(sub, patches, present):
+def check_patches(sub, patches, present, tree="linux"):
     declared = {}
     for item in patches:
         patch, files, reason = item.get("patch"), item.get("files"), item.get("reason")
-        if (not isinstance(patch, str) or not patch.startswith("patches/linux/") or
+        if (not isinstance(patch, str) or not patch.startswith(f"patches/{tree}/") or
                 not patch.endswith(".patch") or ".." in Path(patch).parts or
                 patch in declared or not isinstance(files, list) or not files or
                 not isinstance(reason, str) or not reason.strip() or
@@ -130,7 +144,7 @@ def check_patches(sub, patches, present):
         if outside:
             raise Failure(f"{patch} touches files outside the sparse checkout: {sorted(outside)}")
         declared[patch] = item
-    on_disk = {p.relative_to(ROOT).as_posix() for p in (ROOT / "patches" / "linux").glob("*")}
+    on_disk = {p.relative_to(ROOT).as_posix() for p in (ROOT / "patches" / tree).glob("*")}
     if on_disk != set(declared):
         raise Failure(f"undeclared or missing patch files: {sorted(on_disk ^ set(declared))}")
     for patch in declared:
@@ -249,24 +263,74 @@ def check_config_interventions(sub, declared):
     return len(seen)
 
 
-def main():
-    try:
-        manifest = json.loads(MANIFEST.read_text())
-        linux = manifest["linux"]
-        sub = check_pin(linux)
-        present, sources = check_sparse(sub, linux)
-        declared = check_patches(sub, manifest["patches"], present)
-        patched = check_working_tree(sub, declared)
-        copies = check_copies(sub, manifest["verified_copies"])
-        interventions = check_interventions(manifest["compile_interventions"])
-        configs = check_config_interventions(sub, manifest.get("config_interventions", []))
-    except (Failure, KeyError, OSError, ValueError) as error:
-        print(f"upstream verification failed: {error}", file=sys.stderr)
-        return 1
+def verify_linux(manifest):
+    linux = manifest["linux"]
+    sub = check_pin(linux)
+    present, sources = check_sparse(sub, linux)
+    declared = check_patches(sub, manifest["patches"], present)
+    patched = check_working_tree(sub, declared)
+    copies = check_copies(sub, manifest["verified_copies"])
+    interventions = check_interventions(manifest["compile_interventions"])
+    configs = check_config_interventions(sub, manifest.get("config_interventions", []))
     print(f"Verified Linux {linux['pin']}: {len(present)} files checked out, "
           f"{sources} built sources present, {len(declared)} patch(es) on "
           f"{patched} file(s) and nothing else changed, {copies} verbatim copies, "
           f"{interventions} compile interventions, {configs} config interventions")
+
+
+# The optional upstreams: manifest key, name, patch directory, how to fetch.
+OPTIONAL = {
+    "mesa": ("Mesa", "mesa", "scripts/bootstrap.sh --with-mesa", "meson.build"),
+    "llama_cpp": ("llama.cpp", "llama.cpp", "scripts/bootstrap.sh --llama-only",
+                  "CMakeLists.txt"),
+}
+
+
+def verify_optional(manifest, key):
+    name, tree, fetch, marker = OPTIONAL[key]
+    up = manifest[key]
+    if not up.get("reason", "").strip() or not up.get("tag") or not up.get("optional"):
+        raise Failure(f"manifest {key} needs a tag, a reason and optional: true")
+    listed = {item.get("patch") for item in up["patches"]}
+    on_disk = {p.relative_to(ROOT).as_posix() for p in (ROOT / "patches" / tree).glob("*")}
+    if on_disk != listed:
+        raise Failure(f"undeclared or missing patch files: {sorted(on_disk ^ listed)}")
+    sub = check_pin(up, key, required=False)
+    if sub is None:
+        print(f"{name} {up['tag']} ({up['pin'][:12]}) is not checked out (optional: {fetch})")
+        return
+    present, _ = check_sparse(sub, up, sources=False)
+    if marker not in present:
+        raise Failure(f"{up['path']} has no {marker} in its sparse checkout")
+    declared = check_patches(sub, up["patches"], present, tree=tree)
+    patched = check_working_tree(sub, declared) if declared else 0
+    if not declared:
+        status = git("status", "--porcelain=v1", "--untracked-files=all",
+                     "--ignore-submodules=all", cwd=sub)
+        if status.strip():
+            report(f"changed in {up['path']}", status.splitlines())
+            raise Failure(f"{up['path']} differs from its pin and declares no patches")
+    print(f"Verified {name} {up['tag']} ({up['pin']}): {len(present)} files checked out, "
+          f"{len(declared)} patch(es) on {patched} file(s) and nothing else changed")
+
+
+def main():
+    only = None
+    if len(sys.argv) == 3 and sys.argv[1] == "--only" and sys.argv[2] in ("linux", *OPTIONAL):
+        only = sys.argv[2]
+    elif len(sys.argv) != 1:
+        print(f"usage: verify-upstream.py [--only linux|{'|'.join(OPTIONAL)}]", file=sys.stderr)
+        return 2
+    try:
+        manifest = json.loads(MANIFEST.read_text())
+        if only in (None, "linux"):
+            verify_linux(manifest)
+        for key in OPTIONAL:
+            if only in (None, key):
+                verify_optional(manifest, key)
+    except (Failure, KeyError, OSError, ValueError) as error:
+        print(f"upstream verification failed: {error}", file=sys.stderr)
+        return 1
     return 0
 
 

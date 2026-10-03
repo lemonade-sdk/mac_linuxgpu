@@ -226,12 +226,30 @@ int dext_kfd_open(struct rt_compute_ctx *ctx, int pid, const char *comm, struct 
     return -ENOMEM;
 }
 int dext_kfd_uncertain(const struct dext_kfd_client *c) { assert(c && c->live); return c->uncertain; }
+/* As dext_kfd.mm: the close destroys the client's queue records (retrying
+ * one whose removal failed), then the session; a removal that still fails
+ * keeps the client. */
 int dext_kfd_close(struct dext_kfd_client *c)
 {
-    assert(c && c->live && !c->queues); ++kfd_closes;
-    if (c->uncertain) return -EBUSY;
+    assert(c && c->live);
+    for (unsigned i=0;i<8;++i) if (kfd_queues[i].live && kfd_queues[i].c==c) {
+        ++kfd_queue_destroys;
+        if (kfd_destroy_error) { c->uncertain=true; return -EBUSY; }
+        kfd_queues[i].live=false; --c->queues;
+    }
+    c->uncertain=false;
+    ++kfd_closes;
     for (unsigned i=0;i<32;++i) if (kfd_bos[i].live && kfd_bos[i].c==c) kfd_bos[i].live=false;
     c->live=false; return 0;
+}
+int dext_kfd_settle(struct dext_kfd_client *c, unsigned int wait_ms)
+{
+    (void)wait_ms;
+    assert(c && c->live);
+    for (unsigned i=0;i<8;++i) if (kfd_queues[i].live && kfd_queues[i].c==c && kfd_destroy_error)
+        return -EBUSY;
+    c->uncertain=false;
+    return 0;
 }
 int dext_kfd_info(struct dext_kfd_client *c, struct dext_kfd_info *out)
 {
@@ -634,6 +652,34 @@ int main(int argc, char **argv)
         dext_compute_select_client(0);
         expect_frozen(payload);
         assert(!kfd_closes);
+    } else if (!strcmp(argv[1],"kfd-death-recovered") || !strcmp(argv[1],"kfd-death-kept")) {
+        /* The client dies after MES failed to confirm a removal. Its close
+         * (which retries the recovery) runs anyway: when the GPU let go the
+         * device thaws, otherwise the client is kept and a later stop
+         * retries. */
+        uint64_t words[8], window[3], r0, m0, q0, status;
+        const bool recovered=!strcmp(argv[1],"kfd-death-recovered");
+        kfd_supported_error=0;
+        dext_compute_select_client(13);
+        assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        assert(!dext_compute_host_window(1ULL<<37,window));
+        r0=alloc_bo(2); m0=alloc_bo(2);
+        assert(!dext_compute_aql_queue_create(r0,m0,64,&status,&q0));
+        kfd_destroy_error=-ETIMEDOUT;
+        assert(dext_compute_aql_queue_destroy(q0,&status)==-EBUSY_L);
+        dext_compute_select_client(0);
+        assert(dext_compute_bo_free(payload)==-EBUSY_L);
+        if (recovered) kfd_destroy_error=0;
+        assert(dext_compute_release_client(13)==(recovered ? 0 : -EBUSY_L));
+        assert(kfd_closes==(recovered ? 1u : 0u));
+        if (recovered) {
+            /* Thawed: the device works again. */
+            assert(!dext_compute_bo_free(payload));
+        } else {
+            assert(dext_compute_stop()==-EBUSY_L && !dext_compute_quiescent());
+            kfd_destroy_error=0;
+        }
+        assert(dext_compute_stop()==0 && kfd_closes==1 && dext_compute_quiescent());
     } else if (!strcmp(argv[1],"allocation-cleanup")) {
         alloc_info_error=-EIO; free_error=-EBUSY;
         assert(dext_compute_bo_alloc(4096,1,4096,0,out,NULL,NULL)==-ENOTREADY_L);

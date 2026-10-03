@@ -33,6 +33,7 @@
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_object.h"
 #include "amdgpu_res_cursor.h"
+#include "amdgpu_reset.h"
 #include "amdgpu_ttm.h"
 #include "kfd_priv.h"
 #include "kfd_device_queue_manager.h"
@@ -48,7 +49,14 @@
 #define RT_KFD_LARGE_PAGE	(2ULL << 20)
 /* libhsakmt's priority_map[] entry for HSA_QUEUE_PRIORITY_NORMAL. */
 #define RT_KFD_PRIORITY_NORMAL	7
+#ifndef RT_KFD_COPY_TIMEOUT_MS
 #define RT_KFD_COPY_TIMEOUT_MS	5000
+#endif
+/* How long a session about to close waits for a copy that outlived its
+ * timeout before it keeps the memory the copy may still touch. */
+#ifndef RT_KFD_SETTLE_MS
+#define RT_KFD_SETTLE_MS	RT_KFD_COPY_TIMEOUT_MS
+#endif
 
 struct va_range {
 	struct va_range *next;
@@ -77,6 +85,20 @@ struct rt_kfd_queue {
 	uint32_t queue_id;
 	uint32_t doorbell_index;
 	uint64_t doorbell_offset;
+	/* What MES knows the queue by (remove_queue_mes's input), read from
+	 * KFD's queue when it was created. */
+	uint32_t mes_doorbell;
+	uint64_t mes_gang_ctx;
+	bool mes_known;
+	/* DESTROY_QUEUE failed: MES may still run the queue. */
+	bool failed;
+	/* ... after KFD had already let go of it (destroy_queue_cpsch takes
+	 * the queue off its lists before MES confirms the removal). Only MES
+	 * itself can finish such a queue; DESTROY_QUEUE must not run again. */
+	bool detached;
+	/* Off the GPU (destroyed, or recovered by a settle) but still linked
+	 * until its owner destroys it or the session closes. */
+	bool gone;
 };
 
 struct rt_kfd_session {
@@ -99,7 +121,15 @@ struct rt_kfd_session {
 	struct rt_compute_bo *staging;
 	void *staging_cpu;
 	uint64_t staging_mc;
+	/* A copy that outlived RT_KFD_COPY_TIMEOUT_MS: the staging and the BO
+	 * stay retained until its fence signals. */
+	struct dma_fence *pending_copy;
+	/* Something the GPU may still be using: a pending copy or a queue MES
+	 * did not confirm removing. Every call but teardown is refused. */
 	bool uncertain;
+	/* The first teardown step that could not confirm the GPU let go. */
+	enum rt_kfd_step fail_step;
+	int fail_error;
 };
 
 /* ---- VA allocation ---- */
@@ -403,6 +433,7 @@ static int session_handshake(struct rt_kfd_session *s)
 
 static void session_free(struct rt_kfd_session *s)
 {
+	dma_fence_put(s->pending_copy);
 	va_clear(&s->window);
 	va_clear(&s->private_range);
 	pthread_mutex_destroy(&s->lock);
@@ -470,6 +501,13 @@ int rt_kfd_session_open(struct amdgpu_device *adev, struct rt_compute_ctx *ctx,
 int rt_kfd_session_uncertain(const struct rt_kfd_session *s)
 {
 	return s && s->uncertain;
+}
+
+int rt_kfd_session_failure(const struct rt_kfd_session *s, int *error)
+{
+	if (error)
+		*error = s ? s->fail_error : 0;
+	return s ? (int)s->fail_step : RT_KFD_STEP_NONE;
 }
 
 int rt_kfd_session_pid(const struct rt_kfd_session *s)
@@ -549,6 +587,146 @@ unsigned int rt_kfd_session_queue_count(struct rt_kfd_session *s)
 	n = s->queue_count;
 	pthread_mutex_unlock(&s->lock);
 	return n;
+}
+
+/* ---- confirming that the GPU let go ---- */
+
+static int session_pid(const struct rt_kfd_session *s)
+{
+	return s->proc ? linuxu_process_leader(s->proc)->pid : 0;
+}
+
+/* The first step that could not confirm the GPU let go names the failure. */
+static void note_failure(struct rt_kfd_session *s, enum rt_kfd_step step, int error)
+{
+	if (s->fail_step == RT_KFD_STEP_NONE) {
+		s->fail_step = step;
+		s->fail_error = error;
+	}
+}
+
+/* Uncertain while a copy may still run or a queue may still be scheduled.
+ * Caller holds s->lock. */
+static void reassess_locked(struct rt_kfd_session *s)
+{
+	bool failed = false;
+
+	for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
+		failed |= q->failed;
+	s->uncertain = s->pending_copy || failed;
+}
+
+/* A copy that outlived its timeout holds the staging and its BO until its
+ * fence signals: wait for it up to @wait_ms more. A late completion, even
+ * with an error, means the engine is done with that memory. Caller holds
+ * s->lock. */
+static void settle_copy_locked(struct rt_kfd_session *s, unsigned int wait_ms)
+{
+	struct dma_fence *f = s->pending_copy;
+
+	if (!f)
+		return;
+	if (!dma_fence_is_signaled(f) &&
+	    dma_fence_wait_timeout(f, false, msecs_to_jiffies(wait_ms)) <= 0 &&
+	    !dma_fence_is_signaled(f))
+		return;
+	pr_warn("kfd session %d: an SDMA copy that timed out has completed (status %d); "
+		"releasing what it held\n", session_pid(s), dma_fence_get_status(f));
+	dma_fence_put(f);
+	s->pending_copy = NULL;
+}
+
+/* Whether KFD still lists the queue in its device queue manager. A failed
+ * DESTROY_QUEUE either changed nothing (the queue is still scheduled and
+ * DESTROY_QUEUE may run again) or failed in MES's removal, after
+ * destroy_queue_cpsch took the queue off its lists and freed its MQD.
+ * Caller holds s->lock. */
+static bool queue_listed(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	struct kfd_process_device *pdd;
+	struct queue *kq, *it;
+	bool listed = false;
+
+	mutex_lock(&s->process->mutex);
+	kq = pqm_get_user_queue(&s->process->pqm, q->queue_id);
+	pdd = kfd_process_device_data_by_id(s->process, s->ap.gpu_id);
+	if (kq && pdd && pdd->dev && pdd->dev->dqm) {
+		dqm_lock(pdd->dev->dqm);
+		list_for_each_entry(it, &pdd->qpd.queues_list, list) {
+			if (it == kq) {
+				listed = true;
+				break;
+			}
+		}
+		dqm_unlock(pdd->dev->dqm);
+	}
+	mutex_unlock(&s->process->mutex);
+	return listed;
+}
+
+/* Upstream's recovery of a hung MES user queue (amdgpu_userq: the
+ * detect_and_reset before the unmap). MES resets the compute queues it
+ * finds hung, then removes this one again, which it now does even after a
+ * reset (remove_queue_after_reset). MES confirming the removal means it no
+ * longer schedules the queue. The device queue manager's lock is held as
+ * for remove_queue_mes; every MES call is bounded by MES's API timeout.
+ * Caller holds s->lock. */
+static int queue_recover(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct kfd_node *node = session_node(adev);
+	struct device_queue_manager *dqm = node ? node->dqm : NULL;
+	struct mes_remove_queue_input remove;
+	uint32_t hung[8];
+	unsigned int nhung = 0, mine = 0;
+	int reset = -EOPNOTSUPP, r;
+
+	if (!q->mes_known || !dqm || !adev->enable_mes || !adev->mes.funcs ||
+	    !adev->mes.funcs->remove_hw_queue)
+		return -ENODEV;
+	memset(hung, 0xff, sizeof(hung));
+	memset(&remove, 0, sizeof(remove));
+	dqm_lock(dqm);
+	/* As remove_queue_mes: no MES queue operation while the queue manager
+	 * is stopped (KFD suspended, rt/power.h) or halted. The stop's own
+	 * removals cover only the queues KFD still lists, so this one stays
+	 * failed, with its memory, until the manager schedules again. */
+	if (!dqm->sched_running || dqm->sched_halt) {
+		dqm_unlock(dqm);
+		return -EAGAIN;
+	}
+	if (!down_read_trylock(&adev->reset_domain->sem)) {
+		dqm_unlock(dqm);
+		return -EIO;
+	}
+	if (adev->mes.funcs->detect_and_reset_hung_queues &&
+	    adev->mes.hung_queue_db_array_size > 0 &&
+	    adev->mes.hung_queue_db_array_size <= (int)ARRAY_SIZE(hung)) {
+		amdgpu_mes_lock(&adev->mes);
+		reset = amdgpu_mes_detect_and_reset_hung_queues(adev, AMDGPU_RING_TYPE_COMPUTE,
+								false, &nhung, hung, 0);
+		amdgpu_mes_unlock(&adev->mes);
+		for (unsigned int i = 0; !reset && i < ARRAY_SIZE(hung); ++i)
+			mine += hung[i] == q->mes_doorbell;
+		if (reset)
+			note_failure(s, RT_KFD_STEP_MES_RESET, reset);
+	}
+	remove.xcc_id = ffs(node->xcc_mask) - 1;
+	remove.doorbell_offset = q->mes_doorbell;
+	remove.gang_context_addr = q->mes_gang_ctx;
+	remove.remove_queue_after_reset = true;
+	amdgpu_mes_lock(&adev->mes);
+	r = adev->mes.funcs->remove_hw_queue(&adev->mes, &remove);
+	amdgpu_mes_unlock(&adev->mes);
+	/* As upstream: scheduling resumes once a hung queue was reset. */
+	if (!reset && nhung)
+		(void)amdgpu_mes_resume(adev);
+	up_read(&adev->reset_domain->sem);
+	dqm_unlock(dqm);
+	pr_warn("kfd session %d: queue %u (MES doorbell %#x): hung-queue reset %d "
+		"(%u hung, %s), removal after reset %d\n", session_pid(s), q->queue_id,
+		q->mes_doorbell, reset, nhung, mine ? "this one among them" : "not this one", r);
+	return r;
 }
 
 /* ---- memory ---- */
@@ -913,7 +1091,15 @@ static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint6
 		r = r > 0 ? 0 : (r == 0 ? -EIO : r);
 	}
 	if (r && fence) {
-		/* The copy may still run: staging and the BO stay retained. */
+		/* The copy may still run: staging and the BO stay retained until
+		 * its fence signals (settle_copy_locked). Copies on the entity
+		 * complete in order, so the latest one covers every earlier one. */
+		pr_err("kfd session %d: SDMA copy of %llu bytes did not complete (%d); "
+		       "keeping the staging and the buffer\n", session_pid(s),
+		       (unsigned long long)bytes, r);
+		note_failure(s, RT_KFD_STEP_COPY, r);
+		dma_fence_put(s->pending_copy);
+		s->pending_copy = dma_fence_get(fence);
 		s->uncertain = true;
 	}
 	dma_fence_put(fence);
@@ -1244,6 +1430,25 @@ static int fill_ctx_header(struct rt_kfd_session *s, struct rt_kfd_bo *ctx)
 	return 0;
 }
 
+/* What MES knows the new queue by: KFD's doorbell offset and gang context,
+ * as remove_queue_mes passes them. Caller holds s->lock. */
+static void queue_identity(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	struct queue *kq;
+
+	mutex_lock(&s->process->mutex);
+	kq = pqm_get_user_queue(&s->process->pqm, q->queue_id);
+	if (kq) {
+		q->mes_doorbell = kq->properties.doorbell_off;
+		q->mes_gang_ctx = kq->gang_ctx_gpu_addr;
+		q->mes_known = true;
+	}
+	mutex_unlock(&s->process->mutex);
+}
+
+static int queue_destroy_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
+static void queue_free_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
+
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out)
 {
@@ -1301,32 +1506,25 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 		args.ctl_stack_size = s->limits.ctl_stack_bytes;
 		r = session_ioctl(s, AMDKFD_IOC_CREATE_QUEUE, &args, sizeof(args));
 	}
-	if (!r) {
-		r = map_doorbells(s);
-		if (r) {
-			struct kfd_ioctl_destroy_queue_args destroy = { .queue_id = args.queue_id };
-
-			if (session_ioctl(s, AMDKFD_IOC_DESTROY_QUEUE, &destroy, sizeof(destroy)))
-				s->uncertain = true;
-		}
-	}
 	if (r) {
-		if (!s->uncertain) {
-			if (q->ctx)
-				(void)bo_free_locked(s, q->ctx);
-			if (q->eop)
-				(void)bo_free_locked(s, q->eop);
-		}
+		if (q->ctx)
+			(void)bo_free_locked(s, q->ctx);
+		if (q->eop)
+			(void)bo_free_locked(s, q->eop);
 		linuxu_process_leave(&saved);
 		pthread_mutex_unlock(&s->lock);
 		kfree(q);
 		return (int)r;
 	}
 	q->queue_id = args.queue_id;
-	q->doorbell_offset = args.doorbell_offset;
-	q->doorbell_index = s->doorbell_first +
-		(uint32_t)((args.doorbell_offset & (s->limits.doorbell_slice_bytes - 1)) /
-			   sizeof(u32));
+	queue_identity(s, q);
+	r = map_doorbells(s);
+	if (!r) {
+		q->doorbell_offset = args.doorbell_offset;
+		q->doorbell_index = s->doorbell_first +
+			(uint32_t)((args.doorbell_offset & (s->limits.doorbell_slice_bytes - 1)) /
+				   sizeof(u32));
+	}
 	q->ring->queue_uses++;
 	if (q->eop)
 		q->eop->queue_uses++;
@@ -1347,6 +1545,15 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 	q->next = s->queues;
 	s->queues = q;
 	s->queue_count++;
+	if (r) {
+		/* No doorbell: the queue goes again, as any queue does. One MES
+		 * cannot confirm removing stays linked and failed. */
+		if (!queue_destroy_locked(s, q))
+			queue_free_locked(s, q);
+		linuxu_process_leave(&saved);
+		pthread_mutex_unlock(&s->lock);
+		return (int)r;
+	}
 	linuxu_process_leave(&saved);
 	pthread_mutex_unlock(&s->lock);
 	*out = q;
@@ -1398,6 +1605,8 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 		r = -EBUSY;
 	else if (!queue_owned(s, q))
 		r = -ENOENT;
+	else if (q->gone || q->failed)
+		r = -ENODEV;
 	else if (!adev->doorbell.cpu_addr ||
 		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
 		r = -ERANGE;
@@ -1412,22 +1621,69 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 	return r;
 }
 
+/* Take @q off the GPU: DESTROY_QUEUE, as libhsakmt's hsaKmtDestroyQueue;
+ * when MES does not confirm the removal, the hung-queue recovery (once KFD
+ * let go of the queue) or, when KFD did not, a later retry of
+ * DESTROY_QUEUE. Success marks @q gone; failure marks it failed, and it
+ * keeps everything it uses. Caller holds s->lock and is inside the
+ * process. */
+static int queue_release_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	long r = 0;
+
+	if (q->gone)
+		return 0;
+	if (!q->detached) {
+		struct kfd_ioctl_destroy_queue_args destroy = { .queue_id = q->queue_id };
+
+		r = session_ioctl(s, AMDKFD_IOC_DESTROY_QUEUE, &destroy, sizeof(destroy));
+		if (r) {
+			note_failure(s, RT_KFD_STEP_DESTROY_QUEUE, (int)r);
+			q->detached = !queue_listed(s, q);
+			pr_err("kfd session %d: DESTROY_QUEUE %u (MES doorbell %#x) failed (%ld); %s\n",
+			       session_pid(s), q->queue_id, q->mes_doorbell, r,
+			       q->detached ? "KFD let go of it, recovering it through MES" :
+					     "KFD still schedules it");
+		}
+	}
+	if (q->detached) {
+		r = queue_recover(s, q);
+		if (r == -EAGAIN)
+			pr_warn("kfd session %d: queue %u: KFD's queue manager is stopped; its "
+				"recovery waits for the resume, keeping its memory\n",
+				session_pid(s), q->queue_id);
+		else if (r) {
+			note_failure(s, RT_KFD_STEP_MES_REMOVE, (int)r);
+			pr_err("kfd session %d: queue %u: MES did not let go (%ld); keeping the "
+			       "queue and the memory it uses\n", session_pid(s), q->queue_id, r);
+		}
+	}
+	if (r) {
+		q->failed = true;
+		s->uncertain = true;
+		return (int)r;
+	}
+	if (q->failed)
+		pr_warn("kfd session %d: queue %u recovered\n", session_pid(s), q->queue_id);
+	q->failed = false;
+	q->gone = true;
+	return 0;
+}
+
+/* Take @q off the GPU and unlink it; the caller frees it
+ * (queue_free_locked). Caller holds s->lock and is inside the process. */
 static int queue_destroy_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 {
-	struct kfd_ioctl_destroy_queue_args destroy = { .queue_id = q->queue_id };
 	struct rt_kfd_queue **link;
-	long r;
+	int r;
 
 	for (link = &s->queues; *link && *link != q; link = &(*link)->next)
 		;
 	if (!*link)
 		return -ENOENT;
-	r = session_ioctl(s, AMDKFD_IOC_DESTROY_QUEUE, &destroy, sizeof(destroy));
-	if (r) {
-		/* MES may still run the queue: keep everything it references. */
-		s->uncertain = true;
-		return (int)r;
-	}
+	r = queue_release_locked(s, q);
+	if (r)
+		return r;
 	*link = q->next;
 	s->queue_count--;
 	for (unsigned int i = 0; i < ARRAY_SIZE(q->pointers); ++i)
@@ -1437,7 +1693,18 @@ static int queue_destroy_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q
 	if (q->eop)
 		q->eop->queue_uses--;
 	q->ctx->queue_uses--;
+	reassess_locked(s);
 	return 0;
+}
+
+/* The buffers the session allocated for a destroyed queue, then the record.
+ * Caller holds s->lock and is inside the process. */
+static void queue_free_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	(void)bo_free_locked(s, q->ctx);
+	if (q->eop)
+		(void)bo_free_locked(s, q->eop);
+	kfree(q);
 }
 
 int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q)
@@ -1448,9 +1715,9 @@ int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 	if (!s || !q)
 		return -EINVAL;
 	pthread_mutex_lock(&s->lock);
-	if (s->uncertain)
-		r = -EBUSY;
-	else if (!queue_owned(s, q))
+	/* Allowed while uncertain: destroying a queue only lets go of it, and
+	 * retries the recovery of one whose removal failed. */
+	if (!queue_owned(s, q))
 		r = -ENOENT;
 	else
 		r = session_enter(s, &saved);
@@ -1459,13 +1726,40 @@ int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 		return r;
 	}
 	r = queue_destroy_locked(s, q);
-	if (!r) {
-		(void)bo_free_locked(s, q->ctx);
-		if (q->eop)
-			(void)bo_free_locked(s, q->eop);
-		kfree(q);
-	}
+	if (!r)
+		queue_free_locked(s, q);
 	linuxu_process_leave(&saved);
+	pthread_mutex_unlock(&s->lock);
+	return r;
+}
+
+/* Retry what made the session uncertain: the copy that outlived its
+ * timeout, then every queue whose removal failed. A queue recovered here is
+ * no longer scheduled but stays linked, since its owner may still name it.
+ * Caller holds s->lock and is inside the process. */
+static void settle_locked(struct rt_kfd_session *s, unsigned int wait_ms)
+{
+	settle_copy_locked(s, wait_ms);
+	for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
+		if (q->failed)
+			(void)queue_release_locked(s, q);
+	reassess_locked(s);
+}
+
+int rt_kfd_session_settle(struct rt_kfd_session *s, unsigned int wait_ms)
+{
+	struct linuxu_process_saved saved;
+	int r;
+
+	if (!s)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	r = session_enter(s, &saved);
+	if (!r) {
+		settle_locked(s, wait_ms);
+		linuxu_process_leave(&saved);
+		r = s->uncertain ? -EBUSY : 0;
+	}
 	pthread_mutex_unlock(&s->lock);
 	return r;
 }
@@ -1478,28 +1772,33 @@ int rt_kfd_session_close(struct rt_kfd_session *s)
 	if (!s)
 		return -EINVAL;
 	pthread_mutex_lock(&s->lock);
-	if (s->uncertain) {
-		pthread_mutex_unlock(&s->lock);
-		return -EBUSY;
-	}
 	r = session_enter(s, &saved);
 	if (r) {
 		pthread_mutex_unlock(&s->lock);
 		return r;
 	}
-	/* DESTROY_QUEUE for every queue first: no BO may be freed while MES
-	 * could still run a queue that references it. */
-	while (s->queues && !s->uncertain) {
-		struct rt_kfd_queue *q = s->queues;
-
-		if (queue_destroy_locked(s, q))
-			break;
-		(void)bo_free_locked(s, q->ctx);
-		if (q->eop)
-			(void)bo_free_locked(s, q->eop);
-		kfree(q);
+	/* What a previous call left uncertain first: a copy that outlived its
+	 * timeout gets one more bounded wait. */
+	settle_copy_locked(s, RT_KFD_SETTLE_MS);
+	/* Every queue off the GPU before any memory goes: no BO may be freed
+	 * while MES could still run a queue that references it. As when a
+	 * Linux process dies with live queues, each queue is removed, and one
+	 * MES does not confirm removing is recovered (queue_release_locked).
+	 * Every queue is tried even after one fails. */
+	for (struct rt_kfd_queue *q = s->queues, *next; q; q = next) {
+		next = q->next;
+		if (!queue_destroy_locked(s, q))
+			queue_free_locked(s, q);
 	}
+	reassess_locked(s);
 	if (s->uncertain) {
+		int error = 0;
+		int step = rt_kfd_session_failure(s, &error);
+
+		pr_err("kfd session %d: close kept the session: %s (first failed step %d, "
+		       "error %d)\n", session_pid(s),
+		       s->pending_copy ? "an SDMA copy is still running" :
+					 "MES did not confirm removing a queue", step, error);
 		linuxu_process_leave(&saved);
 		pthread_mutex_unlock(&s->lock);
 		return -EBUSY;
@@ -1517,6 +1816,9 @@ int rt_kfd_session_close(struct rt_kfd_session *s)
 	}
 	linuxu_process_leave(&saved);
 	pthread_mutex_unlock(&s->lock);
+	if (s->fail_step != RT_KFD_STEP_NONE)
+		pr_warn("kfd session %d: closed cleanly after recovering from step %d "
+			"(error %d)\n", session_pid(s), s->fail_step, s->fail_error);
 	/* exit_mm then exit_files, as when the process dies: the notifier
 	 * release dequeues and tears down the KFD process, closing the KFD and
 	 * render descriptors drops the open's and ACQUIRE_VM's references,

@@ -75,6 +75,11 @@ the next steps.
   `gpu_busy_percent`, `mem_busy_percent`, `gpu_metrics` and hwmon, and
   `AMDGPU_INFO`. That's the same data `amdgpu_top` reads on Linux, and what
   [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg) displays.
+- **Vulkan (in progress).** Mesa's RADV builds for macOS on the same
+  upstream amdgpu DRM interface, through a libdrm over the driver's
+  Linux-file transport, and runs offline on the test suite's software GPU.
+  llama.cpp's Vulkan backend builds against it. See
+  [vulkan/README.md](vulkan/README.md).
 - **Nothing hard-coded to one GPU.** The driver matches by AMD vendor ID and
   display/compute PCI class, and upstream's PCI ID table and IP discovery
   decide what is supported. Queue layout, MQDs, firmware names, ISA and limits
@@ -165,6 +170,11 @@ downloaded and 1.7 GB on disk, against about 70 MB with the setup script. The
 first `make` (or `scripts/bootstrap.sh`) then converts the checkout to the
 sparse set the build uses, applies the patches and fetches the firmware.
 
+Mesa (`third_party/mesa`) and llama.cpp (`third_party/llama.cpp`) are
+optional submodules for the Vulkan build only. They are marked
+`update = none`, so neither option fetches them; `make radv` and
+`make llama-vulkan` do (`scripts/bootstrap.sh --mesa-only`, `--llama-only`).
+
 To keep the kernel at the right commit when you pull updates, use
 `git pull --recurse-submodules`, or set it once with:
 
@@ -194,6 +204,9 @@ scripts/activate.sh      # build, sign, install and activate the driver
 | `make dext` | links the dext with make (unsigned unless `DIDENTITY` is set) |
 | `make test` | the offline test suite |
 | `make hsa`, `make hsa-test` | the HSA runtime (`build/hsa`) and its unit tests |
+| `make libdrm-mlg` | libdrm and libdrm_amdgpu over the Linux-file transport (`build/libdrm-mlg`) |
+| `make radv` | Mesa's RADV Vulkan driver and its ICD (`build/radv/install`) |
+| `make llama-vulkan` | llama.cpp with its Vulkan backend (`build/llama.cpp/bin`) |
 | `make verify-source` | checks the upstream tree against the pin and patch set |
 | `make clean` | removes build outputs, keeps setup and firmware |
 | `make distclean` | removes `build/` and `build-dk/` |
@@ -260,6 +273,8 @@ component serves it from
 dext/              DriverKit extension sources, Info.plist, entitlements
 host/              host app: installer, activation, firmware servicer, CLI
 hsa/               userspace HSA runtime (CMake) and its tests
+libmlg_drm/        the Linux-file client library, and libdrm over it (libdrm/)
+vulkan/            the Vulkan path: RADV notes, offline test
 linuxu/headers/    Linux kernel API headers for userspace
 linuxu/src/        their implementation: memory, locking, PCI, DMA, ...
 linuxu/tests/      unit and integration tests
@@ -269,6 +284,8 @@ firmware/          firmware.lock (the files themselves are fetched)
 scripts/           setup, firmware fetch, verifier, installers, tests
 tools/             CONFIG table consistency checks
 third_party/linux  pinned upstream Linux (submodule)
+third_party/mesa   pinned Mesa for RADV (optional submodule)
+third_party/llama.cpp  pinned llama.cpp (optional submodule)
 ```
 
 ## Known limitations
@@ -280,8 +297,19 @@ third_party/linux  pinned upstream Linux (submodule)
   owns a PCI device, macOS runs PCI crash recovery, and that can panic the
   machine (`IOPCIFamily`). If `scripts/read-driver-log.py` reports a
   quarantined session, restart the Mac instead.
-- **Compute only.** The display stack is not built.
-- **No GPU reset recovery and no suspend/resume** over Thunderbolt yet.
+- **Compute only.** The display stack is not built. Vulkan has no
+  presentation yet (headless WSI only).
+- **No GPU reset recovery.**
+- **Sleep loses device memory.** When the host sleeps, the Thunderbolt link
+  goes down and the GPU is reset, so the driver closes the compute session
+  through its normal close path before the sleep, and clients reload after
+  wake (the HSA runtime reports `MAC_HSA_STATUS_DEVICE_LOST`). Upstream's
+  only suspend path for a discrete GPU evicts all of VRAM to system memory,
+  which doesn't fit a large model on the iPad. A low-power period without
+  host sleep keeps VRAM: compute is quiesced through upstream KFD suspend
+  and resumes where it left off (`mac_hsa_agent_prepare_low_power` /
+  `mac_hsa_agent_resume`, or `MacLinuxGPUHostApp power-watch` on a Mac).
+  See `dext/sources/power_state.h`.
 - **One GPU per driver instance.**
 - **No PCIe atomics over Thunderbolt.** Linux has the same limit with this card
   over Thunderbolt, and upstream's non-atomic firmware path is used.

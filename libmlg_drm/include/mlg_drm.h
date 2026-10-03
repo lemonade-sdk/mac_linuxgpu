@@ -49,6 +49,9 @@ int mlg_close(int fd);
 int mlg_ioctl(int fd, unsigned long request, void *arg);
 void *mlg_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
 int mlg_munmap(void *addr, size_t length);
+/* Whether [@addr, @addr + @length) is a mapping mlg_mmap made (and
+ * mlg_munmap is the call that undoes it). */
+int mlg_is_mapping(const void *addr, size_t length);
 
 /* A request number in BSD encoding (what <sys/ioccom.h> builds, as a
  * macOS build of the DRM headers does) in Linux encoding. */
@@ -57,6 +60,22 @@ unsigned long mlg_ioctl_from_bsd(unsigned long request);
 int mlg_errno_from_linux(int linux_errno);
 /* The Linux errno of this thread's last failed call. */
 int mlg_last_linux_errno(void);
+
+/* The PCI function of the GPU the render node belongs to, as Linux shows
+ * it in sysfs (/sys/dev/char/226:128/device): what libdrm's device
+ * enumeration reports. Location fields the platform does not expose are
+ * zero. */
+struct mlg_pci_identity {
+	uint16_t domain;
+	uint8_t bus, dev, func;
+	uint16_t vendor_id, device_id;
+	uint16_t subvendor_id, subdevice_id;
+	uint8_t revision_id;
+};
+/* 0, or -1 with errno set (ENODEV when there is no driver). Asks the
+ * transport; a transport that cannot tell gets the vendor, device and
+ * revision from the driver's AMDGPU_INFO_DEV_INFO. */
+int mlg_pci_identity(struct mlg_pci_identity *out);
 
 /* ---- transports ----
  * The default transport is the DriverKit extension's IOKit user client
@@ -79,6 +98,8 @@ struct mlg_transport {
 	int (*mmap)(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t linux_prot,
 		    uint32_t linux_flags, void **addr, uint64_t *handle);
 	int (*munmap)(void *ctx, uint64_t handle, void *addr, uint64_t length);
+	/* Optional: the GPU's PCI identity (0 or -errno). */
+	int (*identity)(void *ctx, struct mlg_pci_identity *out);
 };
 /* Install @t (copied) for every later call; NULL restores the default.
  * Returns -1 with EBUSY once descriptors are open. */

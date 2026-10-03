@@ -103,6 +103,38 @@ def display_lines(text):
     return [line for line in text.splitlines()
             if any(marker in line.lower() for marker in DISPLAY_MARKERS)]
 
+POWER_STATE_TAG = 0x4c505752
+POWER_STATE_WORDS = 12
+# Names follow dext/sources/power_state.h.
+POWER_STATES = ["active", "suspending", "suspended", "resuming", "lost"]
+POWER_FLAGS = ["vram_preserved", "system_sleep", "device_low", "client_hold", "kfd_quiesced",
+               "session_closed", "ack_pending", "link_down"]
+POWER_CAUSES = ["none", "client prepare", "client resume", "holding client closed", "system sleep",
+                "system wake", "device low power", "device on", "KFD suspend failed",
+                "KFD resume failed", "device gone after wake", "re-probed", "session closed"]
+
+
+def describe_power(values, count):
+    """Decode the cached power-state snapshot; return (fields, advice or None)."""
+    if count != POWER_STATE_WORDS or len(values) < count or values[0] != 1:
+        raise RuntimeError("invalid power snapshot")
+    if any(not 0 <= value <= (1 << 64) - 1 for value in values[:count]):
+        raise RuntimeError("invalid power scalar")
+    def name(table, value):
+        return table[value] if value < len(table) else f"unknown ({value})"
+    fields = {"power_state": name(POWER_STATES, values[1]), "power_generation": values[2],
+              "power_flags": [flag for bit, flag in enumerate(POWER_FLAGS) if values[3] >> bit & 1],
+              "power_cause": name(POWER_CAUSES, values[4]), "power_error": signed(values[5]),
+              "low_power_holds": values[6], "quiesces": values[7], "memory_losses": values[8],
+              "last_transition_us": values[9]}
+    advice = None
+    if values[1] == 4:
+        advice = "device memory was lost (host sleep or a failed transition): clients reload; the next one re-probes"
+    elif values[1] == 2:
+        advice = "suspended: GPU work waits for resume" + (
+            " (VRAM kept)" if values[3] & 1 else "")
+    return fields, advice
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -169,6 +201,15 @@ def main():
         except RuntimeError as error:
             # Older drivers have no session snapshot; the log is still readable.
             print(f"session state unavailable: {error}", file=sys.stderr)
+        else:
+            print(json.dumps(fields), file=sys.stderr)
+            if advice:
+                print(advice, file=sys.stderr)
+        try:
+            fields, advice = describe_power(*query([POWER_STATE_TAG], POWER_STATE_WORDS))
+        except RuntimeError as error:
+            # Drivers before the power state decline the tag.
+            print(f"power state unavailable: {error}", file=sys.stderr)
         else:
             print(json.dumps(fields), file=sys.stderr)
             if advice:

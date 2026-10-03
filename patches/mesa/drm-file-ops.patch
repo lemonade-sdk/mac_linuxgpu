@@ -1,0 +1,191 @@
+util/os_drm: system calls on DRM files through libdrm when it says so
+
+RADV opens DRM nodes, stats them, maps DRM files and issues requests with
+the system calls. mac_linuxgpu's libdrm hands out DRM files of a driver
+that runs outside the kernel: the descriptors are sockets of the process
+(close, dup and fcntl work on them), but open by path, stat, mmap and
+ioctl cannot reach the driver. That libdrm defines LIBDRM_FILE_OPS and
+provides drmFileOpen, drmFileStat, drmFileMmap, drmFileMunmap and
+drmIoctl for them.
+
+- util/os_drm.h: drm_ioctl uses drmIoctl under LIBDRM_FILE_OPS; new
+  os_drm_open, os_drm_stat, os_drm_mmap and os_drm_munmap wrap the system
+  calls or the libdrm functions.
+- RADV: open and stat render nodes, and map and unmap buffers, with them.
+  Without LIBDRM_FILE_OPS the code is unchanged.
+
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index 2e249de..bd422f5 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -32,6 +32,7 @@
+ #include "vk_pipeline_cache.h"
+ #include "vk_util.h"
+ #ifndef _WIN32
++#include "util/os_drm.h"
+ #include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
+ #endif
+ #include "util/mesa-blake3.h"
+@@ -1334,7 +1335,7 @@ radv_create_winsys(struct radv_device *device)
+ 
+       const char *path = drm_device->nodes[DRM_NODE_RENDER];
+ 
+-      fd = open(path, O_RDWR | O_CLOEXEC);
++      fd = os_drm_open(path, O_RDWR | O_CLOEXEC);
+       drmFreeDevice(&drm_device);
+       if (fd < 0)
+          return VK_ERROR_INITIALIZATION_FAILED;
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index e23d375..18fdc37 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -2529,7 +2529,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    enum radv_drm_device_type drm_device_type;
+    drmVersionPtr version;
+ 
+-   fd = open(path, O_RDWR | O_CLOEXEC);
++   fd = os_drm_open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+       return vk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER, "Could not open device %s: %m", path);
+    }
+@@ -2776,7 +2776,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    pdev->bus_info = *drm_device->businfo.pci;
+ 
+    if ((drm_device->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
+-       stat(drm_device->nodes[DRM_NODE_PRIMARY], &primary_stat) != 0) {
++       os_drm_stat(drm_device->nodes[DRM_NODE_PRIMARY], &primary_stat) != 0) {
+       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "failed to stat DRM primary node %s",
+                          drm_device->nodes[DRM_NODE_PRIMARY]);
+       goto fail_perfcounters;
+@@ -2784,7 +2784,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    pdev->primary_devid = primary_stat.st_rdev;
+ 
+    if ((drm_device->available_nodes & (1 << DRM_NODE_RENDER)) &&
+-       stat(drm_device->nodes[DRM_NODE_RENDER], &render_stat) != 0) {
++       os_drm_stat(drm_device->nodes[DRM_NODE_RENDER], &render_stat) != 0) {
+       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "failed to stat DRM render node %s",
+                          drm_device->nodes[DRM_NODE_RENDER]);
+       goto fail_perfcounters;
+@@ -3184,7 +3184,7 @@ radv_create_drm_device_locked(struct radv_physical_device *pdev)
+ 
+       const char *path = drm_device->nodes[DRM_NODE_RENDER];
+ 
+-      fd = open(path, O_RDWR | O_CLOEXEC);
++      fd = os_drm_open(path, O_RDWR | O_CLOEXEC);
+       drmFreeDevice(&drm_device);
+       if (fd < 0)
+          return;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index 8e66ef8..4398d6e 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -378,7 +378,7 @@ radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo
+    }
+ 
+    if (bo->cpu_map)
+-      munmap(bo->cpu_map, bo->base.size);
++      os_drm_munmap(bo->cpu_map, bo->base.size);
+ 
+    if (ws->debug_all_bos)
+       radv_amdgpu_global_bo_list_del(ws, bo);
+@@ -741,8 +741,9 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
+    if (ret)
+       return NULL;
+ 
+-   void *data = mmap(fixed_addr, bo->base.size, PROT_READ | PROT_WRITE, MAP_SHARED | (use_fixed_addr ? MAP_FIXED : 0),
+-                     radv_amdgpu_winsys(_ws)->fd, args.out.addr_ptr);
++   void *data = os_drm_mmap(fixed_addr, bo->base.size, PROT_READ | PROT_WRITE,
++                            MAP_SHARED | (use_fixed_addr ? MAP_FIXED : 0), radv_amdgpu_winsys(_ws)->fd,
++                            args.out.addr_ptr);
+    if (data == MAP_FAILED)
+       return NULL;
+ 
+@@ -769,7 +770,7 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+          ac_drm_bo_cpu_unmap(ws->dev, bo->bo);
+       else
+ #endif
+-         munmap(bo->cpu_map, bo->base.size);
++         os_drm_munmap(bo->cpu_map, bo->base.size);
+    }
+    bo->cpu_map = NULL;
+ }
+diff --git a/src/util/os_drm.h b/src/util/os_drm.h
+index 0390ecd..9dfc6e8 100644
+--- a/src/util/os_drm.h
++++ b/src/util/os_drm.h
+@@ -15,12 +15,23 @@
+ #endif
+ 
+ #include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
+ #include <errno.h>
++#include <fcntl.h>
+ #include <xf86drm.h>
+ 
++/* A libdrm that defines LIBDRM_FILE_OPS (mac_linuxgpu's, over a driver
++ * that runs outside the kernel) hands out DRM files that the system calls
++ * cannot open by path, stat, map or issue requests on; it provides those
++ * operations instead. These wrappers pick the right ones. */
++
+ static inline int
+ drm_ioctl(int fd, uint32_t request, void *arg)
+ {
++#ifdef LIBDRM_FILE_OPS
++   return drmIoctl(fd, request, arg) ? -errno : 0;
++#else
+    int ret;
+ 
+    do {
+@@ -28,6 +39,51 @@ drm_ioctl(int fd, uint32_t request, void *arg)
+    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+ 
+    return ret ? -errno : 0;
++#endif
++}
++
++/* open(2) of a DRM node. */
++static inline int
++os_drm_open(const char *path, int flags)
++{
++#ifdef LIBDRM_FILE_OPS
++   return drmFileOpen(path, flags);
++#else
++   return open(path, flags);
++#endif
++}
++
++/* stat(2) of a DRM node. */
++static inline int
++os_drm_stat(const char *path, struct stat *st)
++{
++#ifdef LIBDRM_FILE_OPS
++   return drmFileStat(path, st);
++#else
++   return stat(path, st);
++#endif
++}
++
++/* mmap(2) of a DRM file. */
++static inline void *
++os_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
++{
++#ifdef LIBDRM_FILE_OPS
++   return drmFileMmap(addr, length, prot, flags, fd, offset);
++#else
++   return mmap(addr, length, prot, flags, fd, offset);
++#endif
++}
++
++/* munmap(2) of what os_drm_mmap mapped. */
++static inline int
++os_drm_munmap(void *addr, size_t length)
++{
++#ifdef LIBDRM_FILE_OPS
++   return drmFileMunmap(addr, length);
++#else
++   return munmap(addr, length);
++#endif
+ }
+ 
+ static inline int

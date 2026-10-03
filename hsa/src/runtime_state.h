@@ -4,6 +4,7 @@
 #include "signal_state.h"
 #include <hsa/hsa_ext_amd.h>
 #include <hsa/hsa_ven_amd_loader.h>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -97,6 +98,18 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &, int64_t
 void invalidateGPUSignals(const std::shared_ptr<Connection> &);
 hsa_status_t reclaimGPUSignalService(const std::shared_ptr<Connection> &,std::shared_ptr<void> *lease=nullptr);
 hsa_status_t createIPCSignal(hsa_signal_value_t initial, uint32_t count, const hsa_agent_t *consumers, hsa_signal_t *out);
+// Device power (power.h, power.cpp). Submissions a client's prepare holds
+// back on a connection; the status a failure on @connection reports
+// (kDeviceLostStatus once the device lost its memory); and, for the
+// connection's runtime queues: wait until every packet the driver was asked
+// to run has been read (false at @deadline), ring doorbells that waited,
+// and count the queues holding one.
+bool submissionsHeld(const Connection *connection);
+void holdSubmissions(const Connection *connection, bool hold);
+hsa_status_t deviceStatus(const std::shared_ptr<Connection> &connection, hsa_status_t status);
+bool drainQueues(const std::shared_ptr<Connection> &connection, std::chrono::steady_clock::time_point deadline);
+void replayQueues(const std::shared_ptr<Connection> &connection);
+uint32_t pausedQueues(const std::shared_ptr<Connection> &connection);
 
 template<typename T> hsa_status_t writeValue(void *output, T value) {
     std::memcpy(output, &value, sizeof(value));

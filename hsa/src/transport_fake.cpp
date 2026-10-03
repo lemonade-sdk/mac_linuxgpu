@@ -18,6 +18,9 @@ std::shared_ptr<FakeConnection> g_fake;
 FakeConnection::FakeConnection() : FakeConnection(FakeDeviceConfig{}) {}
 
 FakeConnection::FakeConnection(const FakeDeviceConfig &config) : config_(config) {
+    power_.words[amdgpu::power::Version] = amdgpu::power::kVersion;
+    power_.words[amdgpu::power::Generation] = 1;
+    power_.words[amdgpu::power::Flags] = amdgpu::power::VRAMPreserved;
     // The QueryInfo payloads a driver would return for this device; read()
     // and properties() decode them with the same helpers as the IOKit
     // transport, so the runtime sees exactly what a real driver reports.
@@ -87,6 +90,7 @@ bool FakeConnection::queueSlotsExhausted() {
 
 hsa_status_t FakeConnection::allocateBuffer(uint64_t size, DeviceBuffer &out) {
     std::lock_guard lock(mutex_);
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     if (!size || size > (64ull << 30)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     auto *host = std::calloc(1, size);
     if (!host) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -186,6 +190,7 @@ hsa_status_t FakeConnection::memoryAvailable(uint64_t &available) {
 
 hsa_status_t FakeConnection::allocateSharedBuffer(uint64_t size, SharedBuffer &out) {
     std::lock_guard lock(mutex_);
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     if (!size || size > (64ull << 30)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     auto *host = std::calloc(1, size);
     if (!host) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -227,6 +232,7 @@ hsa_status_t FakeConnection::createQueue(const SharedBuffer &ring, const SharedB
                                          uint32_t size, uint64_t &handle) {
     (void)ring; (void)metadata;
     std::lock_guard lock(mutex_);
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     if (!size) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     // The driver owns deviceQueueSlots() hardware queues; a create beyond
     // them fails before anything is mapped.
@@ -238,6 +244,7 @@ hsa_status_t FakeConnection::createQueue(const SharedBuffer &ring, const SharedB
 
 hsa_status_t FakeConnection::kickQueue(uint64_t handle, uint64_t doorbell) {
     std::lock_guard lock(mutex_);
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     const auto it = queues_.find(handle);
     if (it == queues_.end() || !it->second.active) return HSA_STATUS_ERROR;
     it->second.doorbell = doorbell;
@@ -303,6 +310,7 @@ hsa_status_t FakeConnection::destroyQueue(uint64_t handle) {
 
 hsa_status_t FakeConnection::serviceQueue(uint64_t handle, uint64_t &inactive) {
     std::lock_guard lock(mutex_);
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     const auto it = queues_.find(handle);
     if (it == queues_.end()) return HSA_STATUS_ERROR;
     inactive = 0; // queue is "active" (not idle)
@@ -312,6 +320,7 @@ hsa_status_t FakeConnection::serviceQueue(uint64_t handle, uint64_t &inactive) {
 hsa_status_t FakeConnection::dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &fence) {
     {
         std::lock_guard lock(mutex_);
+        if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
         // The bounded launch borrows a hardware queue slot for its duration.
         if (queueSlotsExhaustedLocked()) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         lastAQL_ = request;
@@ -363,6 +372,7 @@ hsa_status_t FakeConnection::dispatchAQL(const amdgpu::AQLDispatchRequest &reque
 hsa_status_t FakeConnection::dispatch(const amdgpu::ComputeDispatchRequest &request, uint64_t &fence) {
     {
         std::lock_guard lock(mutex_);
+        if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
         // Selector 51 is a bounded launch that borrows a queue slot; with
         // every slot held it is refused before submission (not a fault).
         if (queueSlotsExhaustedLocked()) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -370,6 +380,64 @@ hsa_status_t FakeConnection::dispatch(const amdgpu::ComputeDispatchRequest &requ
         hasLastCompute_ = true;
     }
     fence = 1;
+    return HSA_STATUS_SUCCESS;
+}
+
+// ---- device power: what the driver's power state machine reports ----
+hsa_status_t FakeConnection::powerRefusalLocked() const {
+    switch (power_.state()) {
+    case amdgpu::power::PowerState::Active: return HSA_STATUS_SUCCESS;
+    case amdgpu::power::PowerState::Lost: return HSA_STATUS_ERROR; // the session was closed
+    default: return kDeviceSuspendedStatus;
+    }
+}
+
+void FakeConnection::setPowerLocked(amdgpu::power::PowerState state, uint32_t flags) {
+    using namespace amdgpu::power;
+    if (state != power_.state()) {
+        ++power_.words[Generation];
+        if (state == PowerState::Lost) ++power_.words[Losses];
+    }
+    power_.words[State] = uint64_t(state);
+    power_.words[Flags] = flags;
+}
+
+void FakeConnection::setPowerState(amdgpu::power::PowerState state, bool vramPreserved) {
+    std::lock_guard lock(mutex_);
+    uint32_t flags = vramPreserved && state != amdgpu::power::PowerState::Lost ? amdgpu::power::VRAMPreserved : 0;
+    if (state == amdgpu::power::PowerState::Suspended && vramPreserved) flags |= amdgpu::power::KFDQuiesced;
+    setPowerLocked(state, flags);
+}
+
+uint64_t FakeConnection::powerRequests(uint64_t op) const {
+    std::lock_guard lock(mutex_);
+    return op < 4 ? powerRequests_[op] : 0;
+}
+
+hsa_status_t FakeConnection::powerState(PowerSnapshot &out) {
+    std::lock_guard lock(mutex_);
+    out = power_;
+    return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t FakeConnection::requestPower(uint64_t op, PowerSnapshot &out) {
+    using namespace amdgpu::power;
+    std::lock_guard lock(mutex_);
+    if (op != Prepare && op != Resume) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    ++powerRequests_[op];
+    auto &holds = power_.words[Holds];
+    if (op == Prepare) {
+        ++holds;
+        if (power_.state() == amdgpu::power::PowerState::Active) {
+            setPowerLocked(amdgpu::power::PowerState::Suspended, VRAMPreserved | KFDQuiesced);
+            ++power_.words[Quiesces];
+        }
+    } else if (holds) {
+        --holds;
+        if (!holds && power_.state() == amdgpu::power::PowerState::Suspended)
+            setPowerLocked(amdgpu::power::PowerState::Active, VRAMPreserved);
+    }
+    out = power_;
     return HSA_STATUS_SUCCESS;
 }
 

@@ -27,12 +27,16 @@
 #define ST_COMPUTE_OFF		0u
 #define ST_COPY_OFF		4096u	/* the VRAM copy lands here */
 #define ST_COPY_BYTES		2048u
+#define ST_MOVE_GTT_OFF		8192u	/* the copy made from GTT lands here */
+#define ST_MOVE_VRAM_OFF	12288u	/* ... and the one after the move back */
 /* The user fence: AMDGPU_CS wants a buffer of exactly one page for it. */
 #define ST_USER_FENCE_OFF	64u
 /* IB buffer layout (IB start alignments are at most 256 bytes). */
 #define ST_IB_COMPUTE		0u
 #define ST_IB_FILL		4096u
 #define ST_IB_COPY		8192u
+#define ST_IB_MOVE_GTT		12288u
+#define ST_IB_MOVE_VRAM		16384u
 #define ST_IB_SLOT_BYTES	4096u
 /* VRAM buffer: the compute value at 0, the fill from ST_FILL_OFF. */
 #define ST_FILL_OFF		1024u
@@ -70,6 +74,7 @@ struct st {
 		struct drm_syncobj_wait syncobj_wait;
 		union drm_amdgpu_gem_create gem_create;
 		union drm_amdgpu_gem_mmap gem_mmap;
+		struct drm_amdgpu_gem_op gem_op;
 		struct drm_amdgpu_gem_va gem_va;
 		struct drm_gem_close gem_close;
 		union drm_amdgpu_cs cs;
@@ -85,7 +90,7 @@ struct st {
 	struct drm_amdgpu_cs_chunk chunks[5];
 	uint64_t chunk_ptrs[5];
 	/* Submissions made, for the check that none is still running. */
-	struct { uint32_t ip_type; uint64_t seq; } subs[4];
+	struct { uint32_t ip_type; uint64_t seq; } subs[8];
 	unsigned int nsubs;
 	struct rt_cs_selftest_result parked_res;
 	/* An async wait's completion. */
@@ -581,17 +586,15 @@ static int step_sdma_wait(struct st *s)
 	return r;
 }
 
-static int step_sdma_result(struct st *s)
+/* A copy of the VRAM buffer's start: the compute value, then zeros (the
+ * buffer was created cleared), then the fill. */
+static int check_vram_copy(const uint8_t *copy)
 {
-	const uint8_t *copy = s->cpu[BO_DATA] + ST_COPY_OFF;
 	uint32_t word;
 	int r = 0;
 
-	memcpy(&s->res->vram_value, copy, 4);
-	memcpy(&s->res->fill_value, copy + ST_FILL_OFF, 4);
-	/* The compute value, then zeros (the buffer was created cleared),
-	 * then the fill. */
-	if (s->res->vram_value != ST_COMPUTE_VRAM_VALUE)
+	memcpy(&word, copy, 4);
+	if (word != ST_COMPUTE_VRAM_VALUE)
 		r = RT_CS_MISMATCH;
 	for (uint32_t off = 4; off < ST_COPY_BYTES; off += 4) {
 		memcpy(&word, copy + off, 4);
@@ -600,6 +603,79 @@ static int step_sdma_result(struct st *s)
 			r = RT_CS_MISMATCH;
 	}
 	return r;
+}
+
+static int step_sdma_result(struct st *s)
+{
+	const uint8_t *copy = s->cpu[BO_DATA] + ST_COPY_OFF;
+
+	memcpy(&s->res->vram_value, copy, 4);
+	memcpy(&s->res->fill_value, copy + ST_FILL_OFF, 4);
+	return check_vram_copy(copy);
+}
+
+/* Move the VRAM buffer to @domain as a client's submission moves it: set
+ * its placement (AMDGPU_GEM_OP SET_PLACEMENT), then submit an SDMA copy of
+ * it into the data buffer; AMDGPU_CS validates the buffer list, so TTM
+ * moves the buffer (amdgpu_move_blit) before the copy runs, and the VM
+ * maps it where it went. Into GTT the move's destination goes through a
+ * GART transfer window, as an eviction's does: SDMA uploads the window's
+ * PTEs, flushes VMID 0 and copies. The wait is bounded; a move or copy
+ * that never completes fails the step with -ETIME and parks the test. */
+static int step_ttm_move(struct st *s, uint32_t domain, uint32_t ib_off, uint32_t data_off,
+			 uint64_t *moved, uint64_t *ns, uint32_t *value)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct amdgpu_ring *ring = adev->mman.buffer_funcs_ring;
+	struct amdgpu_ib ib = { .ptr = ib_at(s, ib_off), .gpu_addr = s->va[BO_IB] + ib_off };
+	const uint64_t before = atomic64_read(&adev->num_bytes_moved);
+	uint64_t seq = 0;
+	int r;
+
+	*ns = ktime_get_ns();
+	memset(&s->arg.gem_op, 0, sizeof(s->arg.gem_op));
+	s->arg.gem_op.handle = s->bo[BO_VRAM];
+	s->arg.gem_op.op = AMDGPU_GEM_OP_SET_PLACEMENT;
+	s->arg.gem_op.value = domain;
+	r = (int)st_ioctl(s, DRM_IOCTL_AMDGPU_GEM_OP, &s->arg.gem_op);
+	if (r)
+		return r;
+	memset(s->cpu[BO_DATA] + data_off, 0, ST_COPY_BYTES);
+	amdgpu_emit_copy_buffer(adev, &ib, s->va[BO_VRAM], s->va[BO_DATA] + data_off,
+				ST_COPY_BYTES, 0);
+	ring->funcs->pad_ib(ring, &ib);
+	if (ib.length_dw > ST_IB_SLOT_BYTES / 4)
+		return -E2BIG;
+	r = submit(s, AMDGPU_HW_IP_DMA, s->va[BO_IB] + ib_off, ib.length_dw * 4, false, -1, -1,
+		   &seq);
+	/* Other clients' moves count too: this is at least the buffer's. */
+	*moved = atomic64_read(&adev->num_bytes_moved) - before;
+	if (!r)
+		r = wait_cs(s, AMDGPU_HW_IP_DMA, seq);
+	*ns = ktime_get_ns() - *ns;
+	if (r)
+		return r;
+	memcpy(value, s->cpu[BO_DATA] + data_off, 4);
+	return check_vram_copy(s->cpu[BO_DATA] + data_off);
+}
+
+static int step_ttm_gtt(struct st *s)
+{
+	int r = step_ttm_move(s, AMDGPU_GEM_DOMAIN_GTT, ST_IB_MOVE_GTT, ST_MOVE_GTT_OFF,
+			      &s->res->gtt_moved, &s->res->gtt_ns, &s->res->gtt_value);
+
+	/* VRAM is no longer allowed: validation had to move the buffer. */
+	if (!r && s->res->gtt_moved < ST_BO_BYTES)
+		r = RT_CS_MISMATCH;
+	return r;
+}
+
+static int step_ttm_vram(struct st *s)
+{
+	/* Whether the buffer moves back now depends on the submission's move
+	 * budget (GTT stays allowed); the copy is checked either way. */
+	return step_ttm_move(s, AMDGPU_GEM_DOMAIN_VRAM, ST_IB_MOVE_VRAM, ST_MOVE_VRAM_OFF,
+			     &s->res->vram_moved, &s->res->vram_ns, &s->res->vram_back_value);
 }
 
 /* Undo everything that was done, in reverse; the first error counts. */
@@ -791,6 +867,13 @@ int rt_cs_selftest_run(struct pci_dev *pdev, struct rt_cs_selftest_result *out)
 			r = out->status[RT_CS_STEP_SDMA_FILL] ? RT_CS_SKIPPED :
 				!out->status[RT_CS_STEP_COMPUTE_RESULT] ? step_sdma_result(s) :
 				RT_CS_SKIPPED;
+			break;
+		case RT_CS_STEP_TTM_GTT:
+			/* The VRAM buffer's known contents are what moves. */
+			r = out->status[RT_CS_STEP_SDMA_RESULT] ? RT_CS_SKIPPED : step_ttm_gtt(s);
+			break;
+		case RT_CS_STEP_TTM_VRAM:
+			r = out->status[RT_CS_STEP_TTM_GTT] ? RT_CS_SKIPPED : step_ttm_vram(s);
 			break;
 		default:
 			r = -EINVAL;

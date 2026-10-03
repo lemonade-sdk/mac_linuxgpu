@@ -70,6 +70,13 @@ unsigned int cp_dispatches;
 static void cp_add(uint32_t doorbell, uint64_t wptr, uint32_t pasid)
 {
 	pthread_mutex_lock(&cp_lock);
+	/* A queue MES never removed (a failed removal) is mapped once. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
+		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell) {
+			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
+			pthread_mutex_unlock(&cp_lock);
+			return;
+		}
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (!cp_queues[i].live) {
 			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
@@ -86,14 +93,58 @@ static void cp_remove(uint32_t doorbell)
 	pthread_mutex_unlock(&cp_lock);
 }
 
-/* ---- MES ---- */
+/* ---- MES ----
+ * A queue can be made hung (a wave that never preempts): REMOVE_QUEUE then
+ * fails as MES's does when its preemption times out, until a hung-queue
+ * reset (RESET with hang_detect_then_reset) reset it and the removal says
+ * remove_queue_after_reset. A dead MES fails every call; a slow one takes
+ * its time but answers within the API timeout. */
 unsigned int mes_adds, mes_removes;
-uint32_t mes_doorbells[8];
-uint64_t mes_wptr[8], mes_page_table[8];
-uint32_t mes_pasid[8];
+uint32_t mes_doorbells[FIXTURE_MES_SLOTS];
+uint64_t mes_wptr[FIXTURE_MES_SLOTS], mes_page_table[FIXTURE_MES_SLOTS];
+uint32_t mes_pasid[FIXTURE_MES_SLOTS];
+/* REMOVE_QUEUEs to fail once each (MES timing out): the queue stays on
+ * the CP and MES keeps scheduling it. */
+unsigned int mes_fail_removes;
+static bool mes_hung[FIXTURE_MES_SLOTS], mes_was_reset[FIXTURE_MES_SLOTS],
+	mes_live[FIXTURE_MES_SLOTS];
+bool mes_dead;
+unsigned int mes_remove_delay_us, mes_failed_removes, mes_hang_resets, mes_resumes,
+	gpu_reset_requests;
+static uint32_t mes_hung_db_array[8];
+/* The queue MES knows by @doorbell: the latest added (KFD reuses the
+ * doorbells of destroyed queues). */
+static int mes_slot(uint32_t doorbell)
+{
+	for (unsigned int i = mes_adds; i-- > 0;)
+		if (mes_doorbells[i] == doorbell)
+			return (int)i;
+	return -1;
+}
+void fixture_mes_hang(uint32_t doorbell, bool hung)
+{
+	int i = mes_slot(doorbell);
+
+	assert(i >= 0);
+	mes_hung[i] = hung;
+}
+/* Every queue MES schedules now, and every one added from now on while
+ * @hung, has a wave that does not preempt. */
+static bool mes_hang_new;
+void fixture_mes_hang_all(bool hung)
+{
+	for (unsigned int i = 0; i < mes_adds; ++i)
+		if (mes_live[i])
+			mes_hung[i] = hung;
+	mes_hang_new = hung;
+}
+unsigned int fixture_mes_failed_removes(void) { return mes_failed_removes; }
+unsigned int fixture_mes_hang_resets(void) { return mes_hang_resets; }
 static int fake_add_hw_queue(struct amdgpu_mes *mes, struct mes_add_queue_input *in)
 {
 	(void)mes;
+	if (mes_dead)
+		return -ETIMEDOUT;
 	assert(mes_adds < ARRAY_SIZE(mes_doorbells));
 	assert(in->is_kfd_process && in->is_aql_queue);
 	assert(in->queue_type == MES_QUEUE_TYPE_COMPUTE);
@@ -101,19 +152,55 @@ static int fake_add_hw_queue(struct amdgpu_mes *mes, struct mes_add_queue_input 
 	mes_wptr[mes_adds] = in->wptr_addr;
 	mes_page_table[mes_adds] = in->page_table_base_addr;
 	mes_pasid[mes_adds] = in->process_id;
+	mes_live[mes_adds] = true;
+	mes_hung[mes_adds] = mes_hang_new;
+	mes_was_reset[mes_adds] = false;
 	mes_adds++;
 	cp_add(in->doorbell_offset, in->wptr_addr, in->process_id);
 	return 0;
 }
 static int fake_remove_hw_queue(struct amdgpu_mes *mes, struct mes_remove_queue_input *in)
 {
+	int i = mes_slot(in->doorbell_offset);
+
 	(void)mes;
-	bool known = false;
-	for (unsigned int i = 0; i < mes_adds; ++i)
-		known |= mes_doorbells[i] == in->doorbell_offset;
-	assert(known);
+	assert(i >= 0);
+	if (mes_remove_delay_us)
+		usleep(mes_remove_delay_us);
+	if (mes_fail_removes) {
+		mes_fail_removes--;
+		mes_failed_removes++;
+		return -ETIMEDOUT;
+	}
+	/* A queue MES does not schedule cannot be removed again. */
+	if (mes_dead || !mes_live[i] ||
+	    (mes_hung[i] && !(mes_was_reset[i] && in->remove_queue_after_reset))) {
+		mes_failed_removes++;
+		return -ETIMEDOUT;
+	}
+	mes_live[i] = false;
 	mes_removes++;
 	cp_remove(in->doorbell_offset);
+	return 0;
+}
+/* MES_SCH_API_RESET, hang_detect_then_reset: every hung compute queue is
+ * reset and reported in the hung-queue doorbell array. */
+static int fake_detect_and_reset_hung_queues(struct amdgpu_mes *mes,
+					     struct mes_detect_and_reset_queue_input *in)
+{
+	unsigned int n = 0;
+
+	(void)mes;
+	assert(in->queue_type == AMDGPU_RING_TYPE_COMPUTE && !in->detect_only);
+	if (mes_dead)
+		return -ETIMEDOUT;
+	for (unsigned int i = 0; i < mes_adds; ++i) {
+		if (mes_live[i] && mes_hung[i] && n < 4) {
+			mes_was_reset[i] = true;
+			mes_hung_db_array[n++] = mes_doorbells[i];
+		}
+	}
+	mes_hang_resets++;
 	return 0;
 }
 static int fake_map_legacy_queue(struct amdgpu_mes *mes, struct mes_map_legacy_queue_input *in)
@@ -134,7 +221,40 @@ static const struct amdgpu_mes_funcs fake_mes_funcs = {
 	.suspend_gang = fake_suspend_gang,
 	.resume_gang = fake_resume_gang,
 	.misc_op = fake_misc_op,
+	.detect_and_reset_hung_queues = fake_detect_and_reset_hung_queues,
 };
+/* amdgpu_mes.c's wrappers the recovery calls (amdgpu_mes.c is not linked). */
+int amdgpu_mes_detect_and_reset_hung_queues(struct amdgpu_device *a, int queue_type,
+					    bool detect_only, unsigned int *hung_db_num,
+					    u32 *hung_db_array, uint32_t xcc_id)
+{
+	struct mes_detect_and_reset_queue_input input = {0};
+	u32 *db_array = a->mes.hung_queue_db_array_cpu_addr[xcc_id];
+	int r;
+
+	if (!hung_db_num || !hung_db_array)
+		return -EINVAL;
+	memset(db_array, 0xff, a->mes.hung_queue_db_array_size * sizeof(u32));
+	input.queue_type = queue_type;
+	input.detect_only = detect_only;
+	r = a->mes.funcs->detect_and_reset_hung_queues(&a->mes, &input);
+	if (!r) {
+		*hung_db_num = 0;
+		for (int i = 0; i < a->mes.hung_queue_hqd_info_offset; i++) {
+			if (db_array[i] != AMDGPU_MES_INVALID_DB_OFFSET) {
+				hung_db_array[i] = db_array[i];
+				*hung_db_num += 1;
+			}
+		}
+	}
+	return r;
+}
+int amdgpu_mes_resume(struct amdgpu_device *a)
+{
+	(void)a;
+	mes_resumes++;
+	return mes_dead ? -ETIMEDOUT : 0;
+}
 
 /* ---- BOs and the VM ---- */
 struct fake_bo {
@@ -518,8 +638,26 @@ int amdgpu_amdkfd_map_gtt_bo_to_gart(struct amdgpu_bo *bo, struct amdgpu_bo **bo
 	gart_maps++;
 	return 0;
 }
+/* A process restore after a KFD suspend (kfd_resume_all_processes): the
+ * buffers stay where they are; like upstream, a new eviction fence replaces
+ * the one the suspend signaled. Any other restore is a tripwire. */
+bool fixture_restores_allowed;
+unsigned int bo_restores;
 int amdgpu_amdkfd_gpuvm_restore_process_bos(void *process_info, struct dma_fence __rcu **ef)
-{ (void)process_info; (void)ef; TRIPWIRE("restore_process_bos (no eviction in this test)"); }
+{
+	struct dma_fence *fence, *old;
+
+	(void)process_info;
+	if (!fixture_restores_allowed)
+		TRIPWIRE("restore_process_bos (no eviction in this test)");
+	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	assert(fence);
+	dma_fence_init(fence, &eviction_fence_ops, &eviction_lock, 1, 2 + bo_restores);
+	old = rcu_replace_pointer(*ef, fence, true);
+	dma_fence_put(old);
+	bo_restores++;
+	return 0;
+}
 void amdgpu_amdkfd_gpuvm_destroy_process_info_fixture(void);
 
 /* KFD's kernel-owned GTT (amdgpu_amdkfd_alloc_kernel_mem): MES process and
@@ -591,7 +729,9 @@ int kfd_gtt_sa_free(struct kfd_node *n, struct kfd_mem_obj *mem_obj)
 
 /* ---- topology: one GPU node ---- */
 uint32_t kfd_gpu_node_num(void) { return 1; }
+#ifndef FIXTURE_UPSTREAM_KFD_DEVICE
 bool kfd_is_locked(struct kfd_dev *k) { (void)k; return false; }
+#endif
 uint32_t kfd_topology_get_num_devices(void) { return 1; }
 int kfd_topology_enum_kfd_devices(uint8_t idx, struct kfd_node **kdev)
 {
@@ -670,6 +810,13 @@ static void *mc_to_host(uint64_t mc, uint64_t bytes)
 	return vram + (mc - TEST_VRAM_START);
 }
 unsigned int sdma_copies;
+bool sdma_hold;
+static struct {
+	struct dma_fence *fence;
+	uint64_t src, dst;
+	uint32_t bytes;
+} sdma_pending[8];
+static unsigned int sdma_npending;
 static spinlock_t sdma_lock;
 static const char *sdma_name(struct dma_fence *f) { (void)f; return "sdma"; }
 static const struct dma_fence_ops sdma_fence_ops = {
@@ -685,11 +832,33 @@ int amdgpu_copy_buffer(struct amdgpu_device *a, struct amdgpu_ttm_buffer_entity 
 
 	(void)a; (void)vm_needs_flush; (void)copy_flags;
 	assert(entity == &adev->mman.default_entity && !resv);
-	memmove(mc_to_host(dst, bytes), mc_to_host(src, bytes), bytes);
 	dma_fence_init(f, &sdma_fence_ops, &sdma_lock, 2, ++sdma_copies);
-	dma_fence_signal(f);
+	if (sdma_hold) {
+		/* The engine has not got to it yet. */
+		assert(sdma_npending < ARRAY_SIZE(sdma_pending));
+		sdma_pending[sdma_npending].fence = dma_fence_get(f);
+		sdma_pending[sdma_npending].src = src;
+		sdma_pending[sdma_npending].dst = dst;
+		sdma_pending[sdma_npending++].bytes = bytes;
+	} else {
+		memmove(mc_to_host(dst, bytes), mc_to_host(src, bytes), bytes);
+		dma_fence_signal(f);
+	}
 	*fence = f;
 	return 0;
+}
+/* The held engine catches up: every pending copy runs and signals. */
+void fixture_sdma_release(void)
+{
+	for (unsigned int i = 0; i < sdma_npending; ++i) {
+		memmove(mc_to_host(sdma_pending[i].dst, sdma_pending[i].bytes),
+			mc_to_host(sdma_pending[i].src, sdma_pending[i].bytes),
+			sdma_pending[i].bytes);
+		dma_fence_signal(sdma_pending[i].fence);
+		dma_fence_put(sdma_pending[i].fence);
+	}
+	sdma_npending = 0;
+	sdma_hold = false;
 }
 
 
@@ -772,8 +941,18 @@ int amdgpu_amdkfd_remove_gws_from_process(void *info, void *mem)
 { (void)info; (void)mem; TRIPWIRE("remove_gws_from_process"); }
 void amdgpu_amdkfd_block_mmu_notifications(void *p) { (void)p; TRIPWIRE("criu block_mmu_notifications"); }
 int amdgpu_amdkfd_criu_resume(void *p) { (void)p; TRIPWIRE("criu_resume"); }
+/* kfd_hws_hang's GPU reset request, expected only after a failed MES call.
+ * With amdgpu_gpu_recovery = 0, as linuxu_driver_bootstrap sets it,
+ * amdgpu_device_should_recover_gpu only logs, so the request changes
+ * nothing. */
 void amdgpu_amdkfd_gpu_reset(struct amdgpu_device *a)
-{ (void)a; TRIPWIRE("gpu_reset"); }
+{
+	(void)a;
+	if (!mes_failed_removes && !mes_dead)
+		TRIPWIRE("gpu_reset");
+	gpu_reset_requests++;
+	fprintf(stderr, "kfd fixture: GPU reset requested; GPU recovery disabled.\n");
+}
 int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *a, uint32_t *payload)
 { (void)a; (void)payload; TRIPWIRE("send_close_event_drain_irq"); }
 int amdgpu_amdkfd_submit_ib(struct amdgpu_device *a, enum kgd_engine_type engine,
@@ -873,6 +1052,10 @@ void fixture_device_init(void)
 	adev->enable_mes = true;
 	adev->mes.funcs = &fake_mes_funcs;
 	mutex_init(&adev->mes.mutex_hidden);
+	/* mes_v12_0: [0:3] hung doorbells, [4:7] HQD info. */
+	adev->mes.hung_queue_db_array_size = 8;
+	adev->mes.hung_queue_hqd_info_offset = 4;
+	adev->mes.hung_queue_db_array_cpu_addr[0] = mes_hung_db_array;
 	adev->reset_domain = &reset_domain;
 	init_rwsem(&reset_domain.sem);
 	reset_domain.wq = alloc_ordered_workqueue("test-reset", 0);
@@ -922,6 +1105,9 @@ void fixture_device_init(void)
 	node.vm_info.vmid_num_kfd = 8;
 	node.compute_vmid_bitmap = 0xff00;
 	node.max_proc_per_quantum = 8;
+	/* kfd_init_node's SMI event list (queue eviction/restore events). */
+	INIT_LIST_HEAD(&node.smi_clients);
+	spin_lock_init(&node.smi_lock);
 	node.dqm = device_queue_manager_init(&node);
 	assert(node.dqm && node.dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS);
 	assert(!node.dqm->ops.start(node.dqm));

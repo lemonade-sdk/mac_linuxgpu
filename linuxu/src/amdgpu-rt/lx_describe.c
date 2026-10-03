@@ -120,20 +120,18 @@ static int amdgpu_known(uint32_t cmd)
 }
 
 /* The KFD ioctls a compute runtime issues. Checkpoint/restore, the
- * debugger and SVM are not carried. */
+ * debugger and SVM are not carried. kfd_ioctl dispatches by number alone
+ * (whatever direction and size the encoding carries), so these are
+ * refused by number too. */
 static int kfd_known(uint32_t cmd)
 {
-	if (_IOC_TYPE(cmd) != AMDKFD_IOCTL_BASE || _IOC_NR(cmd) < AMDKFD_COMMAND_START ||
-	    _IOC_NR(cmd) >= AMDKFD_COMMAND_END)
+	const uint32_t nr = _IOC_NR(cmd);
+
+	if (_IOC_TYPE(cmd) != AMDKFD_IOCTL_BASE || nr < AMDKFD_COMMAND_START ||
+	    nr >= AMDKFD_COMMAND_END)
 		return 0;
-	switch (cmd) {
-	case AMDKFD_IOC_SVM:
-	case AMDKFD_IOC_CRIU_OP:
-	case AMDKFD_IOC_DBG_TRAP:
-		return 0;
-	default:
-		return 1;
-	}
+	return nr != _IOC_NR(AMDKFD_IOC_SVM) && nr != _IOC_NR(AMDKFD_IOC_CRIU_OP) &&
+	       nr != _IOC_NR(AMDKFD_IOC_DBG_TRAP);
 }
 
 int mlg_lx_cmd_known(uint32_t dev, uint32_t cmd)

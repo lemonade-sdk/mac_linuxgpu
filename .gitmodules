@@ -3,3 +3,15 @@
 	url = https://github.com/torvalds/linux.git
 	shallow = true
 	ignore = dirty
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://gitlab.freedesktop.org/mesa/mesa.git
+	shallow = true
+	ignore = dirty
+	update = none
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true
+	ignore = dirty
+	update = none
