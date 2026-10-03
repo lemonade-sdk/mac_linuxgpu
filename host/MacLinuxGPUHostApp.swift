@@ -408,6 +408,7 @@ private let kSelAllocateDMABuffer: UInt32 = 6
 private let kSelFreeDMABuffer:    UInt32 = 7
 private let kSelResetDevice:      UInt32 = 8
 private let kSelInitDevice:       UInt32 = 9
+private let kSelHostWindow:       UInt32 = 54
 private let kSelLoadFirmware:     UInt32 = 10
 private let kSelSetIPBase:        UInt32 = 11
 private let kSelGetIPBase:        UInt32 = 12
@@ -763,7 +764,34 @@ final class MacLinuxGPUHost {
         if started != 0 {
             append("initDevice: firmware servicer unavailable (%d); embedded fallback only", started)
         }
+        // Place the host window before the probe, as the HSA runtime's
+        // initializeDevice does: query the GART aperture size (selector 54
+        // with 0), reserve that much of this process's address space aligned
+        // to its size, and hand the base to the driver. It is only a
+        // placement hint, released once InitDevice returns.
+        var reservation: (UnsafeMutableRawPointer, Int)?
+        let (queryKR, query) = callScalar(kSelHostWindow, inScalars: [0], outScalars: 3)
+        if queryKR == kIOReturnSuccess, query.count == 3 {
+            let bytes = query[1]
+            if bytes >= 16384, bytes & (bytes - 1) == 0, bytes <= 1 << 45,
+               let raw = mmap(nil, Int(bytes) * 2, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0),
+               raw != MAP_FAILED {
+                reservation = (raw, Int(bytes) * 2)
+                let base = (UInt64(UInt(bitPattern: raw)) + bytes - 1) & ~(bytes - 1)
+                let (setKR, set) = callScalar(kSelHostWindow, inScalars: [base], outScalars: 3)
+                if setKR == kIOReturnSuccess, set.count == 3, set[0] == base, set[1] == bytes {
+                    append(String(format: "initDevice: host window at %#llx, %llu MiB", base, bytes >> 20))
+                } else {
+                    append(String(format: "initDevice: host window not placed (kr=%#x)", setKR))
+                }
+            } else {
+                append(String(format: "initDevice: cannot reserve a %#llx-byte host window", bytes))
+            }
+        } else {
+            append(String(format: "initDevice: host window query failed (kr=%#x)", queryKR))
+        }
         let (kr, _) = callScalar(kSelInitDevice, inScalars: [], outScalars: 0)
+        if let (raw, length) = reservation { munmap(raw, length) }
         if let service {
             append("initDevice: firmware servicer served %llu file(s), %llu not found",
                    mlg_fw_service_served(service), mlg_fw_service_missing(service))

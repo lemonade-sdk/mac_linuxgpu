@@ -19,7 +19,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: scripts/build-installer-dmg.sh [--no-build] [--identity IDENTITY] [--output PATH]
+Usage: scripts/build-installer-dmg.sh [--no-build] [--display] [--identity IDENTITY] [--output PATH]
 
 Build and sign the Release host app and embedded dext, then package the app in
 a signed DMG. The host app presents the installation flow when opened.
@@ -32,6 +32,7 @@ otherwise the locked set from firmware/firmware.lock (build/firmware/amdgpu)
 is used.
 
   --no-build            Package an existing signed Release app
+  --display             Build the dext with Display Core enabled (activate.sh --display)
   --identity IDENTITY   Signing identity for the app and DMG (must match profiles)
   --output PATH         DMG path (default: build/installer/MacLinuxGPU-VERSION.dmg)
 EOF
@@ -41,6 +42,7 @@ output_path=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-build|--skip-build) skip_build=1; shift ;;
+    --display) display=1; shift ;;
     --identity|--output)
       option="$1"
       [[ $# -ge 2 && -n "$2" ]] || { echo "missing value for $option" >&2; exit 2; }
@@ -58,6 +60,9 @@ done
 
 if [[ $skip_build -eq 0 ]]; then
   build_args=(--release --install-hsa --build-only)
+  if [[ ${display:-0} -eq 1 ]]; then
+    build_args+=(--display)
+  fi
   if [[ $identity_explicit -eq 1 ]]; then
     build_args+=(--identity "$signing_identity")
   fi

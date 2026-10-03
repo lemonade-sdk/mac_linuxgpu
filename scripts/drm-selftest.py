@@ -32,7 +32,7 @@ import struct
 import sys
 
 SESSION_CLIENT, OBSERVER_CLIENT = 0, 1
-RUNTIME_BUILD, INIT_DEVICE = 43, 9
+RUNTIME_BUILD, INIT_DEVICE, HOST_WINDOW = 43, 9, 54
 DRM_SELFTEST = 82              # dext/sources/session_state.h MLG_SELECTOR_DRM_SELFTEST
 CONFIRM = 0x43535354           # MLG_DRM_SELFTEST_CONFIRM ("CSST")
 RESULT_MAX = 512               # MLG_DRM_SELFTEST_RESULT_MAX
@@ -164,9 +164,32 @@ def connect(init=False):
         build = (c.c_uint64 * 3)()
         count = c.c_uint(3)
         result = io.IOConnectCallScalarMethod(session, RUNTIME_BUILD, None, 0, build, c.byref(count))
+        reservation = None
+        if not result:
+            # Place the host window before the probe, as the HSA runtime does:
+            # query the GART aperture size, reserve that much address space
+            # aligned to its size, and hand the base to the driver.
+            window = (c.c_uint64 * 3)()
+            count = c.c_uint(3)
+            query = (c.c_uint64 * 1)(0)
+            result = io.IOConnectCallScalarMethod(session, HOST_WINDOW, query, 1, window, c.byref(count))
+            size = window[1]
+            if not result and size and not size & (size - 1):
+                system.mmap.argtypes = [c.c_void_p, c.c_size_t, c.c_int, c.c_int, c.c_int, c.c_long]
+                system.mmap.restype = c.c_void_p
+                system.munmap.argtypes = [c.c_void_p, c.c_size_t]
+                raw = system.mmap(None, size * 2, 0, 0x0002 | 0x1000, -1, 0)  # PROT_NONE, MAP_PRIVATE|MAP_ANON
+                if raw and raw != c.c_void_p(-1).value:
+                    reservation = (raw, size * 2)
+                    base = (raw + size - 1) & ~(size - 1)
+                    count = c.c_uint(3)
+                    request = (c.c_uint64 * 1)(base)
+                    result = io.IOConnectCallScalarMethod(session, HOST_WINDOW, request, 1, window, c.byref(count))
         if not result:
             count = c.c_uint(0)
             result = io.IOConnectCallScalarMethod(session, INIT_DEVICE, None, 0, None, c.byref(count))
+        if reservation:
+            system.munmap(reservation[0], reservation[1])
         if result:
             io.IOServiceClose(session)
             io.IOServiceClose(port)
