@@ -77,6 +77,9 @@ static struct {
     uint32_t next_memory_type;
     bool ready;
     bool uncertain;
+    /* Every cause of uncertain so far was a KFD client's: closing those
+     * clients (which retries their recovery) may clear it. */
+    bool uncertain_kfd_only;
     bool legacy_queues;	/* the queue partition left a legacy HQD */
     bool kfd_disabled;	/* policy: never open KFD sessions */
 } production;
@@ -86,6 +89,15 @@ uint64_t dext_compute_select_client(uint64_t client)
     uint64_t prior = production.selected_client;
     production.selected_client = client;
     return prior;
+}
+
+/* GPU completion uncertain: freeze the device. @kfd: the cause is a KFD
+ * client's, which its close may still resolve. */
+static void freeze(bool kfd)
+{
+    if (!production.uncertain) production.uncertain_kfd_only = kfd;
+    else if (!kfd) production.uncertain_kfd_only = false;
+    production.uncertain = true;
 }
 
 static int production_ready(void)
@@ -157,7 +169,7 @@ static struct production_client *selected_session(void)
             rec->mode = PRODUCTION_KFD;
         } else if (kfd) {
             rec->kfd = kfd;	/* retained: it may still own GPU memory */
-            production.uncertain = true;
+            freeze(true);
         }
     }
     return rec;
@@ -178,7 +190,7 @@ static struct dext_kfd_client *owner_kfd(uint64_t owner)
 /* KFD failures that leave GPU completion uncertain freeze the device. */
 static int kfd_error(struct dext_kfd_client *c, int r)
 {
-    if (dext_kfd_uncertain(c)) production.uncertain = true;
+    if (dext_kfd_uncertain(c)) freeze(true);
     if (production.uncertain) return -EBUSY_L;
     if (r == -ENOMEM || r == -ENOSPC) return -ENOMEM_L;
     if (r == -EINVAL || r == -ERANGE || r == -ENOENT) return -EINVAL_L;
@@ -186,22 +198,21 @@ static int kfd_error(struct dext_kfd_client *c, int r)
     return -ENOTREADY_L;
 }
 
-/* Tear a client's KFD process down: its queues (DESTROY_QUEUE), then its
- * BO records (the session frees the BOs), then the process. */
+/* Tear a client's KFD process down as Linux tears down a process that dies
+ * with live queues. The client is gone, so its queue and BO handles go with
+ * it; the dext client owns the queue records and its close destroys them
+ * (DESTROY_QUEUE, recovering a queue MES does not confirm removing), then
+ * frees the BOs and exits the process. A close that cannot confirm the GPU
+ * let go keeps the client, and closing it again retries. */
 static int kfd_release(struct production_client *rec)
 {
     struct dext_kfd_client *c = rec->kfd;
     for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
-        if (!q->kfd || q->owner != rec->client) continue;
-        if (dext_kfd_queue_destroy(q->kfd) != 0) {
-            production.uncertain = true;
-            return -EBUSY_L;
-        }
-        memset(q, 0, sizeof(*q));
+        if (q->kfd && q->owner == rec->client) memset(q, 0, sizeof(*q));
     }
     if (dext_kfd_close(c) != 0) {
-        production.uncertain = true;
+        freeze(true);
         return -EBUSY_L;
     }
     for (unsigned i = 0; i < DEXT_BO_SLOTS; ++i)
@@ -210,6 +221,27 @@ static int kfd_release(struct production_client *rec)
     rec->kfd = NULL;
     rec->mode = PRODUCTION_UNDECIDED;
     return 0;
+}
+
+/* A device frozen only by KFD clients thaws once none of them is uncertain
+ * any more: their sessions retry what they could not confirm (a copy that
+ * outlived its timeout, a queue MES did not remove) when settled. Every
+ * KFD client is settled; true when the device is no longer uncertain. */
+static bool thaw_kfd(unsigned int wait_ms)
+{
+    bool certain = true;
+    if (!production.uncertain) return true;
+    if (!production.uncertain_kfd_only) return false;
+    for (unsigned i = 0; i < DEXT_CLIENT_SLOTS; ++i) {
+        struct production_client *rec = &production.clients[i];
+        if (rec->kfd && dext_kfd_uncertain(rec->kfd) &&
+            dext_kfd_settle(rec->kfd, wait_ms) != 0)
+            certain = false;
+    }
+    if (!certain) return false;
+    production.uncertain = false;
+    production.uncertain_kfd_only = false;
+    return true;
 }
 
 /* Structural consistency only: any discovered GC, any geometry upstream's
@@ -275,7 +307,7 @@ static int production_bo_drop(struct production_bo *bo)
         }
     }
     if (rt_compute_bo_free(production.ctx, bo->object) != 0) {
-        production.uncertain = true;
+        freeze(false);
         return -EBUSY_L;
     }
     for (unsigned i = 0; i < DEXT_EXPORT_SLOTS; ++i)
@@ -289,16 +321,22 @@ int dext_compute_release_client(uint64_t client)
 {
     struct production_client *rec;
     if (!client) return -EINVAL_L;
-    if (production.uncertain) return -EBUSY_L;
     rec = client_record(client, false);
-    if (rec && rec->mode == PRODUCTION_KFD && kfd_release(rec) != 0)
+    /* A client that dies is torn down as a Linux process that dies: its KFD
+     * process is closed even when it is what froze the device, since the
+     * close retries what was left uncertain; the device thaws if that was
+     * all. Anything else uncertain refuses the release. */
+    if (production.uncertain && !production.uncertain_kfd_only) return -EBUSY_L;
+    /* A KFD client kept after its open failed is closed as well. */
+    if (rec && rec->kfd && kfd_release(rec) != 0)
         return -EBUSY_L;
+    if (!thaw_kfd(0)) return -EBUSY_L;
     if (rec) memset(rec, 0, sizeof(*rec));
     for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
         if (!q->object || q->owner != client) continue;
         if (dext_aql_destroy(q->object) != 0) {
-            production.uncertain = true;
+            freeze(false);
             return -EBUSY_L;
         }
         memset(q, 0, sizeof(*q));
@@ -389,7 +427,7 @@ int dext_compute_start(struct pci_dev *pdev)
         start_failed_step = step;
         start_failed_error = r;
         if (rt_compute_close(ctx) != 0) {
-            production.uncertain = true;
+            freeze(false);
             return -EBUSY_L;
         }
         production.ctx = NULL;
@@ -406,24 +444,34 @@ int dext_compute_stop(void)
     unsigned i;
     if (!production.ctx)
         return 0;
-    if (production.uncertain)
+    /* Only KFD clients may have frozen the device for closing them to be
+     * worth trying: their closes retry their recovery. */
+    if (production.uncertain && !production.uncertain_kfd_only)
         return -EBUSY_L;
     production.ready = false;
     /* KFD processes first: their queues leave MES and their memory is
      * freed before the kernel BOs and the context go. */
-    for (i = 0; i < DEXT_CLIENT_SLOTS; ++i) {
-        struct production_client *rec = &production.clients[i];
-        if (rec->mode == PRODUCTION_KFD && kfd_release(rec) != 0)
-            return -EBUSY_L;
-        if (rec->mode != PRODUCTION_KFD)
-            rec->mode = PRODUCTION_UNDECIDED;
+    {
+        bool kept = false;
+        /* Every client is tried, even after one is kept. */
+        for (i = 0; i < DEXT_CLIENT_SLOTS; ++i) {
+            struct production_client *rec = &production.clients[i];
+            if (rec->kfd && kfd_release(rec) != 0)
+                kept = true;
+            if (rec->mode != PRODUCTION_KFD)
+                rec->mode = PRODUCTION_UNDECIDED;
+        }
+        if (kept) return -EBUSY_L;
     }
+    /* Every KFD client closed: what froze the device has let go. */
+    if (production.uncertain && !thaw_kfd(0))
+        return -EBUSY_L;
     for (i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
         if (!q->object)
             continue;
         if (dext_aql_destroy(q->object) != 0) {
-            production.uncertain = true;
+            freeze(false);
             return -EBUSY_L;
         }
         memset(q, 0, sizeof(*q));
@@ -435,7 +483,7 @@ int dext_compute_stop(void)
         if (production_bo_drop(bo)) return -EBUSY_L;
     }
     if (rt_compute_close(production.ctx) != 0) {
-        production.uncertain = true;
+        freeze(false);
         return -EBUSY_L;
     }
     production.ctx = NULL;
@@ -700,7 +748,7 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
         (rt_domain == RT_COMPUTE_GTT &&
          (!info.cpu_address || !info.shared_descriptor_available))) {
         if (rt_compute_bo_free(production.ctx, object) != 0)
-            production.uncertain = true;
+            freeze(false);
         else
             memset(slot, 0, sizeof(*slot));
         return -ENOTREADY_L;
@@ -883,7 +931,7 @@ int dext_compute_bo_copy(uint64_t source, uint64_t destination,
     if (!r) r = rt_compute_fence_wait(fence);
     rt_compute_fence_put(fence);
     if (r && rt_compute_status(production.ctx) == -EBUSY)
-        production.uncertain = true;
+        freeze(false);
     return r ? (production.uncertain ? -EBUSY_L : -ENOTREADY_L) : 0;
 }
 
@@ -901,7 +949,7 @@ int dext_compute_bo_write(uint64_t handle, uint64_t offset,
     }
     int r = rt_compute_bo_write(production.ctx, bo->object, offset, source, bytes);
     if (r && rt_compute_status(production.ctx) == -EBUSY)
-        production.uncertain = true;
+        freeze(false);
     return r ? (production.uncertain ? -EBUSY_L : -ENOTREADY_L) : 0;
 }
 
@@ -920,7 +968,7 @@ int dext_compute_bo_read(uint64_t handle, uint64_t offset,
     int r = rt_compute_bo_read(production.ctx, bo->object, offset,
                                destination, bytes);
     if (r && rt_compute_status(production.ctx) == -EBUSY)
-        production.uncertain = true;
+        freeze(false);
     return r ? (production.uncertain ? -EBUSY_L : -ENOTREADY_L) : 0;
 }
 
@@ -989,7 +1037,8 @@ int dext_compute_dispatch(const void *request, size_t request_size, uint64_t *ou
                                    aql, &uncertain);
     }
     /* A submitted cache sync that did not complete may still be running. */
-    if (uncertain || (r && sync.submitted)) production.uncertain = true;
+    if (uncertain) freeze(code->kfd != NULL);
+    if (r && sync.submitted) freeze(false);
     if (r) {
         if (production.uncertain) return -EBUSY_L;
         if (r == -EINVAL) return -EINVAL_L;
@@ -997,7 +1046,7 @@ int dext_compute_dispatch(const void *request, size_t request_size, uint64_t *ou
         if (r == -ENOSPC) return -ENOMEM_L;
         return -ENOTREADY_L;
     }
-    if (!sync.fence) { production.uncertain = true; return -EBUSY_L; }
+    if (!sync.fence) { freeze(false); return -EBUSY_L; }
     out[0] = 0;
     out[1] = sync.fence;
     out[2] = 3;
@@ -1061,7 +1110,7 @@ int dext_compute_aql_queue_create(uint64_t ring_handle,
         slot->metadata_handle = metadata_handle;
     }
     if (r) {
-        if (queue) production.uncertain = true;
+        if (queue) freeze(false);
         /* Every DriverKit HQD is held: refused before any allocation or
          * hardware access, so nothing is uncertain. */
         if (!queue && r == -ENOSPC) return -ENOMEM_L;
@@ -1088,7 +1137,7 @@ int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
     }
     int r = dext_aql_kick(q->object, wptr);
     if (dext_aql_uncertain(q->object)) {
-        production.uncertain = true;
+        freeze(false);
         return -EBUSY_L;
     }
     if (r) return -ENOTREADY_L;
@@ -1102,9 +1151,10 @@ int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status)
     if (!q || !out_status) return -ENOENT_L;
     if (production.uncertain) return -EBUSY_L;
     if (q->kfd) {
-        /* DESTROY_QUEUE: a refused removal leaves MES running the queue. */
+        /* DESTROY_QUEUE: a removal MES did not confirm even after the
+         * session's hung-queue recovery leaves MES running the queue. */
         if (dext_kfd_queue_destroy(q->kfd) != 0) {
-            production.uncertain = true;
+            freeze(true);
             return -EBUSY_L;
         }
         memset(q, 0, sizeof(*q));
@@ -1112,7 +1162,7 @@ int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status)
         return 0;
     }
     if (dext_aql_destroy(q->object) != 0) {
-        production.uncertain = true;
+        freeze(false);
         return -EBUSY_L;
     }
     memset(q, 0, sizeof(*q));
@@ -1137,7 +1187,7 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
     }
     int r = dext_aql_service(q->object, &inactive);
     if (dext_aql_uncertain(q->object)) {
-        production.uncertain = true;
+        freeze(false);
         return -EBUSY_L;
     }
     if (r) return -ENOTREADY_L;
@@ -1208,7 +1258,7 @@ int dext_compute_aql_dispatch(const void *request, size_t request_size,
         r = dext_aql_dispatch_bounded(production.ctx, descriptor_va, kernarg_va,
                                       request, request_size, out, &uncertain);
     }
-    if (uncertain) production.uncertain = true;
+    if (uncertain) freeze(descriptor->kfd != NULL);
     if (r) {
         if (production.uncertain) return -EBUSY_L;
         if (r == -EINVAL || r == -ERANGE) return -EINVAL_L;

@@ -5,6 +5,8 @@
 #undef main
 #include "../src/amdgpu-rt/device.c"
 extern const struct dma_map_ops linuxu_dma_ops;
+static bool stalled;
+static bool test_stalled(void *arg) { return *(bool *)arg; }
 
 int main(void)
 {
@@ -39,5 +41,26 @@ int main(void)
     linuxu_dma_ops.free(&dev.pdev.dev, PAGE_SIZE, ops, ops_dma, 0);
     linuxu_dma_free_coherent(&dev.pdev.dev, PAGE_SIZE, standard, standard_dma);
     assert(!backing_live && !rt_dart_used(&dev));
+
+    /* A stalled engine holds DMA releases: the buffer stays mapped and
+     * allocated (the DART still translates it) until no engine is stalled. */
+    stalled = true;
+    linuxu_dart_set_hold(test_stalled, &stalled);
+    void *held = linuxu_dma_alloc_coherent(&dev.pdev.dev, PAGE_SIZE, &standard_dma, GFP_KERNEL);
+    assert(held && backing_live == 1);
+    linuxu_dma_free_coherent(&dev.pdev.dev, PAGE_SIZE, held, standard_dma);
+    assert(backing_live == 1 && linuxu_dart_held() == 1);
+    assert(linuxu_dart_contains(standard_dma, PAGE_SIZE));
+    assert(linuxu_dart_release_held() == 1 && backing_live == 1);
+    stalled = false;
+    assert(linuxu_dart_release_held() == 0 && !backing_live && !rt_dart_used(&dev));
+    assert(!linuxu_dart_contains(standard_dma, PAGE_SIZE));
+    /* Removing the predicate releases what is held as well. */
+    stalled = true;
+    held = linuxu_dma_alloc_coherent(&dev.pdev.dev, PAGE_SIZE, &standard_dma, GFP_KERNEL);
+    linuxu_dma_free_coherent(&dev.pdev.dev, PAGE_SIZE, held, standard_dma);
+    assert(backing_live == 1 && linuxu_dart_held() == 1);
+    linuxu_dart_set_hold(NULL, NULL);
+    assert(!backing_live && !linuxu_dart_held() && !rt_dart_used(&dev));
     return 0;
 }

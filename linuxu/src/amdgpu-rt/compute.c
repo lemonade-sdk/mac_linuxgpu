@@ -10,10 +10,13 @@
 #include <linux/errno.h>
 #include <linux/gfp.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/pci.h>
 #include <drm/amdgpu_drm.h>
+#include <drm/gpu_scheduler.h>
 #include <rt/compute.h>
+#include <rt/dart.h>
 #include <rt/rt.h>
 
 #include "amdgpu.h"
@@ -86,6 +89,42 @@ static int copy_ready(struct amdgpu_device *adev)
 	       adev->mman.buffer_funcs_ring->sched.ready;
 }
 
+/* ---- DMA releases while an engine is stalled (rt/dart.h) ----
+ * An engine is stalled when the oldest job its scheduler handed to the
+ * hardware has run longer than the job timeout: the scheduler's timeout
+ * handler has fired (or is about to), and with GPU recovery off nothing
+ * cancels that job, so whatever memory it targets must stay mapped. */
+static bool engines_stalled(void *arg)
+{
+	struct amdgpu_device *adev = arg;
+	const ktime_t now = ktime_get();
+
+	for (unsigned int i = 0; i < adev->num_rings; ++i) {
+		struct amdgpu_ring *ring = adev->rings[i];
+		struct drm_sched_job *job;
+		bool stalled = false;
+
+		if (!ring || ring->no_scheduler || !ring->sched.ops)
+			continue;
+		spin_lock(&ring->sched.job_list_lock);
+		job = list_first_entry_or_null(&ring->sched.pending_list, struct drm_sched_job, list);
+		if (job && job->s_fence &&
+		    test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &job->s_fence->scheduled.flags) &&
+		    !test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &job->s_fence->finished.flags))
+			stalled = ktime_ms_delta(now, job->s_fence->scheduled.timestamp) >
+				  (s64)jiffies_to_msecs(ring->sched.timeout);
+		spin_unlock(&ring->sched.job_list_lock);
+		if (stalled)
+			return true;
+	}
+	return false;
+}
+
+void rt_dma_hold_attach(struct amdgpu_device *adev)
+{
+	linuxu_dart_set_hold(adev ? engines_stalled : NULL, adev);
+}
+
 int rt_compute_open(struct pci_dev *pdev, struct rt_compute_ctx **out)
 {
 	struct drm_device *ddev;
@@ -114,6 +153,9 @@ int rt_compute_open(struct pci_dev *pdev, struct rt_compute_ctx **out)
 		return -ENOMEM;
 	}
 	ctx->vram_pinned_at_open = atomic64_read(&ctx->adev->vram_pin_size);
+	/* While the session runs, memory a stalled engine may still write
+	 * stays mapped (its close hands what is left to the shutdown hold). */
+	rt_dma_hold_attach(ctx->adev);
 	*out = ctx;
 	return 0;
 }
@@ -654,6 +696,9 @@ int rt_compute_close(struct rt_compute_ctx *ctx)
 	}
 	pthread_mutex_unlock(&ctx->lock);
 	pthread_mutex_destroy(&ctx->lock);
+	/* Session close holds every DMA release until the endpoint reset; the
+	 * device is about to go, so the predicate goes first. */
+	rt_dma_hold_attach(NULL);
 	free(ctx);
 	return 0;
 }

@@ -154,6 +154,126 @@ static void lx_kfd_client(void)
 	rt_lx_client_destroy(c);
 }
 
+/* ---- a client that dies with live queues (process death) ----
+ * The client's process is gone; the dext closes its session with its
+ * queues still mapped by MES and its memory still allocated, as Linux
+ * tears down a process that dies with live queues. */
+static struct rt_kfd_session *dying_client(const char *comm, struct queue_set *q,
+					   struct rt_kfd_bo **vram)
+{
+	struct rt_kfd_session *s;
+	uint64_t size;
+
+	assert(!rt_kfd_session_open(adev, &compute_ctx, 0, comm, &s));
+	size = rt_kfd_session_window_size(s);
+	assert(!rt_kfd_session_set_window(s, size * 4, 0));
+	make_queue(s, q, 64);
+	assert(!rt_kfd_queue_kick(s, q->q, 1));
+	assert(!rt_kfd_bo_alloc(s, 4 << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE, vram));
+	return s;
+}
+
+static void process_death(void)
+{
+	const unsigned int resets_before = gpu_reset_requests;
+	struct queue_set q;
+	struct rt_kfd_bo *vram;
+	struct rt_kfd_session *s;
+	unsigned int removes, failed, hang_resets, resumes, frees;
+	int error = 0;
+
+	/* 1. A wave that never preempts: MES's REMOVE_QUEUE times out inside
+	 * DESTROY_QUEUE (KFD asks for a GPU reset, which recovery-off turns
+	 * into a log line). The session recovers the queue as upstream
+	 * recovers a hung user queue (MES resets it, then removes it after
+	 * the reset), and the close completes. */
+	s = dying_client("killed-hung", &q, &vram);
+	fixture_mes_hang(q.info.doorbell_index, true);
+	removes = mes_removes;
+	failed = mes_failed_removes;
+	hang_resets = mes_hang_resets;
+	resumes = mes_resumes;
+	frees = kgd_frees;
+	assert(!rt_kfd_session_close(s));
+	assert(mes_failed_removes == failed + 1 && gpu_reset_requests == resets_before + 1);
+	assert(mes_hang_resets == hang_resets + 1 && mes_resumes == resumes + 1);
+	assert(mes_removes == removes + 1);
+	assert(kgd_frees > frees && kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+
+	/* 2. A slow MES acknowledgement within its API timeout is no failure. */
+	s = dying_client("killed-slow", &q, &vram);
+	mes_remove_delay_us = 200 * 1000;
+	removes = mes_removes;
+	failed = mes_failed_removes;
+	assert(!rt_kfd_session_close(s));
+	mes_remove_delay_us = 0;
+	assert(mes_removes == removes + 1 && mes_failed_removes == failed);
+	assert(kgd_frees == kgd_allocs);
+
+	/* 3. MES never answers: nothing confirms the queue is off the GPU, so
+	 * the close keeps the session, its queue and every buffer, and names
+	 * the step. Once MES answers again, closing again recovers the queue
+	 * and completes. */
+	s = dying_client("killed-mes-dead", &q, &vram);
+	frees = kgd_frees;
+	mes_dead = true;
+	assert(rt_kfd_session_close(s) == -EBUSY);
+	assert(rt_kfd_session_uncertain(s));
+	assert(rt_kfd_session_failure(s, &error) == RT_KFD_STEP_DESTROY_QUEUE &&
+	       error == -ETIMEDOUT);
+	assert(kgd_frees == frees);
+	{
+		struct rt_kfd_bo *more = NULL;
+
+		assert(rt_kfd_bo_alloc(s, 16384, 0, RT_KFD_GTT, RT_KFD_PLACE_PRIVATE, &more) == -EBUSY);
+		assert(rt_kfd_queue_kick(s, q.q, 2) == -EBUSY);
+	}
+	assert(rt_kfd_session_settle(s, 0) == -EBUSY);
+	mes_dead = false;
+	removes = mes_removes;
+	assert(!rt_kfd_session_close(s));
+	assert(mes_removes == removes + 1);
+	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+
+	/* 4. A queue the owner destroys while MES does not answer is retried
+	 * by a settle, which brings the session back into service. */
+	s = dying_client("hung-destroy", &q, &vram);
+	mes_dead = true;
+	assert(rt_kfd_queue_destroy(s, q.q) == -ETIMEDOUT);
+	assert(rt_kfd_session_uncertain(s));
+	mes_dead = false;
+	assert(!rt_kfd_session_settle(s, 0) && !rt_kfd_session_uncertain(s));
+	assert(rt_kfd_queue_kick(s, q.q, 3) == -ENODEV);	/* off the GPU */
+	assert(!rt_kfd_queue_destroy(s, q.q));
+	assert(rt_kfd_session_queue_count(s) == 0);
+	assert(!rt_kfd_bo_free(s, q.ring) && !rt_kfd_bo_free(s, q.meta));
+	assert(!rt_kfd_session_close(s));
+
+	/* 5. An SDMA copy that outlives its timeout keeps the staging and the
+	 * buffer; when the engine catches up the session works again, and a
+	 * close waits for it once more before keeping anything. */
+	s = dying_client("copy-timeout", &q, &vram);
+	{
+		unsigned char word[64];
+
+		sdma_hold = true;
+		assert(rt_kfd_bo_read(s, vram, 0, word, sizeof(word)) == -ETIMEDOUT);
+		assert(rt_kfd_session_uncertain(s));
+		assert(rt_kfd_session_failure(s, &error) == RT_KFD_STEP_COPY);
+		assert(rt_kfd_bo_read(s, vram, 0, word, sizeof(word)) == -EBUSY);
+		assert(rt_kfd_session_settle(s, 0) == -EBUSY);
+		assert(rt_kfd_session_close(s) == -EBUSY);	/* bounded */
+		fixture_sdma_release();
+		assert(!rt_kfd_session_settle(s, 0));
+		assert(!rt_kfd_bo_read(s, vram, 0, word, sizeof(word)));
+	}
+	assert(!rt_kfd_session_close(s));
+	assert(kgd_frees == kgd_allocs);
+	puts("KFD process death: hung queue recovered through MES reset, slow MES "
+	     "acknowledgement, MES that never answers (kept, then recovered), "
+	     "destroy retried by settle, SDMA copy that outlived its timeout");
+}
+
 int main(void)
 {
 	struct rt_kfd_session *s, *second;
@@ -311,6 +431,8 @@ int main(void)
 	/* ---- close: queues, memory, then the process exits ---- */
 	assert(!rt_kfd_session_close(s));
 	assert(mes_removes == 4);
+
+	process_death();
 	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
 	/* kfd_exit order: the release work frees the KFD process, which drops
 	 * the render file ACQUIRE_VM kept. */
