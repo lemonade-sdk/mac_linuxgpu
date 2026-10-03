@@ -79,7 +79,7 @@ struct rt_display_report {
 	int32_t probe_status;		/* drm_client_modeset_probe() */
 	int32_t commit_status;		/* drm_client_modeset_commit() */
 	int32_t restore_status;		/* commit of the recorded configuration */
-	uint32_t reserved;
+	uint32_t hotplug_epoch;		/* hotplug events seen (STATUS; 0 before the first) */
 	struct rt_display_connector connector[RT_DISPLAY_CONNECTORS_MAX];
 };
 
@@ -104,6 +104,41 @@ int rt_display_off(struct pci_dev *pdev, struct rt_display_report *report);
 
 /* rt_display_off() for the session close, before upstream removal. */
 void rt_display_stop(void);
+
+/* Cached connector state for a display agent: no detection, no AUX or DDC
+ * traffic, only what the last probe or hotplug left in each connector,
+ * plus report->hotplug_epoch, which counts hotplug events. The first call
+ * registers a monitor client (drm_client_register) whose hotplug callback
+ * counts them: DM's HPD interrupt handling (drm_kms_helper_connector_
+ * hotplug_event) reaches it. Upstream unregisters and frees it with the
+ * DRM device. A changed epoch means: probe again. */
+int rt_display_status(struct pci_dev *pdev, struct rt_display_report *report);
+
+#define RT_DISPLAY_MODES_MAX	56u
+#define RT_DISPLAY_MODE_PREFERRED	(1u << 0)
+#define RT_DISPLAY_MODE_INTERLACE	(1u << 1)
+
+struct rt_display_mode {
+	uint16_t width, height;
+	uint32_t refresh_mhz;		/* vertical refresh in mHz */
+	uint32_t clock_khz;
+	uint32_t flags;			/* RT_DISPLAY_MODE_* */
+};
+
+/* One connector's probed modes (connector->modes after the last probe), in
+ * the order upstream sorted them (preferred first). */
+struct rt_display_modes {
+	uint32_t version;		/* RT_DISPLAY_VERSION */
+	uint32_t status;		/* enum drm_connector_status */
+	uint32_t count;			/* entries of mode[] filled */
+	uint32_t total;			/* modes the connector has */
+	uint32_t width_mm, height_mm;	/* display_info physical size */
+	struct rt_display_mode mode[RT_DISPLAY_MODES_MAX];
+};
+
+/* The modes of the connector named @connector. -ENOENT for no such
+ * connector, -ENODEV without display. */
+int rt_display_modes(struct pci_dev *pdev, const char *connector, struct rt_display_modes *out);
 
 /* Whether a pattern is showing (cached; takes no lock). */
 int rt_display_showing(void);

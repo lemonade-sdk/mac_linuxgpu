@@ -166,13 +166,17 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  *   scalar in:  [0] MLG_DISPLAY_OP_*
  *               [1] pattern for SHOW (MLG_DISPLAY_PATTERN_*), else 0
  *               [2] MLG_DISPLAY_CONFIRM
- *   struct in:  SHOW only, optional: the connector name ("DP-1" or
- *               "card0-DP-1"), at most MLG_DISPLAY_NAME_MAX bytes with an
- *               optional trailing NUL; none means every connected output
- *   struct out: struct rt_display_report (MLG_DISPLAY_REPORT_MAX at most;
- *               its version field describes it)
+ *   struct in:  SHOW: optional connector name ("DP-1" or "card0-DP-1"), at
+ *               most MLG_DISPLAY_NAME_MAX bytes with an optional trailing
+ *               NUL; none means every connected output. MODES: required.
+ *   struct out: struct rt_display_report, or for MODES struct
+ *               rt_display_modes (MLG_DISPLAY_REPORT_MAX at most; the
+ *               version field describes it)
  *   scalar out: [0] 0 or the op's negative Linux errno, sign-extended
  * PROBE runs each connector's detect and mode probe and commits nothing.
+ * STATUS reads cached connector state with no detection and the hotplug
+ * epoch (a display agent polls it and probes when it changes). MODES lists
+ * one connector's probed modes.
  * SHOW records the current configuration, then commits the pattern at
  * each output's preferred mode; a failure restores what was recorded and
  * reports the failing step's errno (no other mechanism is tried). OFF
@@ -182,6 +186,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_DISPLAY_OP_PROBE    0u
 #define MLG_DISPLAY_OP_SHOW     1u
 #define MLG_DISPLAY_OP_OFF      2u
+#define MLG_DISPLAY_OP_STATUS   3u
+#define MLG_DISPLAY_OP_MODES    4u
 #define MLG_DISPLAY_PATTERN_BARS     0u
 #define MLG_DISPLAY_PATTERN_WHITE    1u
 #define MLG_DISPLAY_PATTERN_GRADIENT 2u
@@ -268,7 +274,7 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
 	case MLG_SELECTOR_DISPLAY:
 		return input && input_count == 3 && input[2] == MLG_DISPLAY_CONFIRM &&
-		       input[0] <= MLG_DISPLAY_OP_OFF &&
+		       input[0] <= MLG_DISPLAY_OP_MODES &&
 		       (input[0] == MLG_DISPLAY_OP_SHOW ? input[1] < MLG_DISPLAY_PATTERNS : !input[1]);
 	case MLG_SELECTOR_POWER:
 		/* QUERY and WAIT; PREPARE/RESUME check the release entitlement. */

@@ -169,7 +169,8 @@ static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               MLG_DISPLAY_PATTERN_WHITE == RT_DISPLAY_PATTERN_WHITE &&
               MLG_DISPLAY_PATTERN_GRADIENT == RT_DISPLAY_PATTERN_GRADIENT &&
               MLG_DISPLAY_NAME_MAX < RT_DISPLAY_NAME_BYTES &&
-              sizeof(struct rt_display_report) <= MLG_DISPLAY_REPORT_MAX, "display ABI");
+              sizeof(struct rt_display_report) <= MLG_DISPLAY_REPORT_MAX &&
+              sizeof(struct rt_display_modes) <= MLG_DISPLAY_REPORT_MAX, "display ABI");
 static_assert(DEXT_COMPUTE_QUERY_SESSION_STATE == MLG_QUERY_SESSION_STATE &&
               DEXT_COMPUTE_QUERY_PROBE_STATUS == MLG_QUERY_PROBE_STATUS &&
               DEXT_COMPUTE_QUERY_KERNEL_LOG == MLG_QUERY_KERNEL_LOG, "observer query tags");
@@ -2319,7 +2320,8 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
     if (nameData && nameData->getLength()) {
         const char *bytes = static_cast<const char *>(nameData->getBytesNoCopy());
         size_t length = nameData->getLength();
-        if (in[0] != MLG_DISPLAY_OP_SHOW || !bytes) return kIOReturnBadArgument;
+        if ((in[0] != MLG_DISPLAY_OP_SHOW && in[0] != MLG_DISPLAY_OP_MODES) || !bytes)
+            return kIOReturnBadArgument;
         if (bytes[length - 1] == '\0') --length;
         if (!length || length > MLG_DISPLAY_NAME_MAX) return kIOReturnBadArgument;
         for (size_t i = 0; i < length; ++i) {
@@ -2327,14 +2329,37 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
             name[i] = bytes[i];
         }
     }
+    if (in[0] == MLG_DISPLAY_OP_MODES && !name[0]) return kIOReturnBadArgument;
     if (__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
     if (!s_observerReads.enter()) {
         __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
         return kIOReturnNotReady;
     }
     auto *pdev = static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice));
+    if (in[0] == MLG_DISPLAY_OP_MODES) {
+        struct rt_display_modes modes;
+        const int r = rt_display_modes(pdev, name, &modes);
+        s_observerReads.leave();
+        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+        arguments->structureOutput = OSData::withBytes(&modes, sizeof(modes));
+        if (!arguments->structureOutput) return kIOReturnNoMemory;
+        out[0] = (uint64_t)(int64_t)r;
+        arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+        return kIOReturnSuccess;
+    }
     struct rt_display_report report;
     int r;
+    if (in[0] == MLG_DISPLAY_OP_STATUS) {
+        // Polled by a display agent: cached state only, not logged.
+        r = rt_display_status(pdev, &report);
+        s_observerReads.leave();
+        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+        arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
+        if (!arguments->structureOutput) return kIOReturnNoMemory;
+        out[0] = (uint64_t)(int64_t)r;
+        arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+        return kIOReturnSuccess;
+    }
     if (in[0] == MLG_DISPLAY_OP_PROBE) {
         r = rt_display_probe(pdev, &report);
     } else if (in[0] == MLG_DISPLAY_OP_SHOW) {

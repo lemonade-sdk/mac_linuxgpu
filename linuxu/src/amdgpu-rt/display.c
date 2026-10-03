@@ -33,6 +33,8 @@
 /* scripts/display-test.py decodes this layout. */
 _Static_assert(sizeof(struct rt_display_connector) == 80, "rt_display_connector layout");
 _Static_assert(sizeof(struct rt_display_report) == 72 + 8 * 80, "rt_display_report layout");
+_Static_assert(sizeof(struct rt_display_mode) == 16 && sizeof(struct rt_display_modes) == 24 + 56 * 16,
+	       "rt_display_modes layout");
 
 static DEFINE_MUTEX(rt_display_lock);
 
@@ -717,6 +719,134 @@ void rt_display_stop(void)
 	(void)display_off_locked();
 	rt_display.restore_status = 0;
 	mutex_unlock(&rt_display_lock);
+}
+
+/* ---- the monitor client: hotplug events for a display agent ---- */
+
+static struct drm_client_dev *rt_monitor;	/* registered; upstream owns its end */
+static uint32_t rt_hotplug_epoch;
+
+static int monitor_hotplug(struct drm_client_dev *client)
+{
+	(void)client;
+	__atomic_add_fetch(&rt_hotplug_epoch, 1, __ATOMIC_RELEASE);
+	return 0;
+}
+
+/* drm_client_dev_unregister(), with dev->clientlist_mutex held: release
+ * and free. Takes no lock of ours (show/probe take rt_display_lock, then
+ * clientlist_mutex when registering). */
+static void monitor_unregister(struct drm_client_dev *client)
+{
+	struct drm_client_dev *expected = client;
+
+	__atomic_compare_exchange_n(&rt_monitor, &expected, NULL, false,
+				    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+	drm_client_release(client);
+}
+
+static void monitor_free(struct drm_client_dev *client)
+{
+	kfree(client);
+}
+
+static const struct drm_client_funcs monitor_funcs = {
+	.owner = THIS_MODULE,
+	.hotplug = monitor_hotplug,
+	.unregister = monitor_unregister,
+	.free = monitor_free,
+};
+
+/* Caller holds rt_display_lock. */
+static int monitor_ensure(struct drm_device *dev)
+{
+	struct drm_client_dev *client;
+	int ret;
+
+	client = __atomic_load_n(&rt_monitor, __ATOMIC_ACQUIRE);
+	if (client && client->dev == dev)
+		return 0;
+	client = kzalloc(sizeof(*client), GFP_KERNEL);
+	if (!client)
+		return -ENOMEM;
+	ret = drm_client_init(dev, client, "linuxu-display-monitor", &monitor_funcs);
+	if (ret) {
+		kfree(client);
+		return ret;
+	}
+	__atomic_store_n(&rt_monitor, client, __ATOMIC_RELEASE);
+	/* Generates the first hotplug event (epoch 1). */
+	drm_client_register(client);
+	return 0;
+}
+
+int rt_display_status(struct pci_dev *pdev, struct rt_display_report *report)
+{
+	struct drm_device *dev = display_device(pdev);
+	int ret;
+
+	report_begin(report);
+	if (!dev)
+		return -ENODEV;
+	mutex_lock(&rt_display_lock);
+	ret = monitor_ensure(dev);
+	report_state(dev, report);
+	mutex_unlock(&rt_display_lock);
+	if (report)
+		report->hotplug_epoch = __atomic_load_n(&rt_hotplug_epoch, __ATOMIC_ACQUIRE);
+	return ret;
+}
+
+int rt_display_modes(struct pci_dev *pdev, const char *name, struct rt_display_modes *out)
+{
+	struct drm_device *dev = display_device(pdev);
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	int ret = -ENOENT;
+
+	if (!out)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	out->version = RT_DISPLAY_VERSION;
+	if (!dev)
+		return -ENODEV;
+	if (!name || !name[0])
+		return -EINVAL;
+	mutex_lock(&dev->mode_config.mutex);
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_client_for_each_connector_iter(connector, &iter) {
+		struct drm_display_mode *mode;
+
+		if (!connector_named(connector, name))
+			continue;
+		out->status = connector->status;
+		out->width_mm = connector->display_info.width_mm;
+		out->height_mm = connector->display_info.height_mm;
+		list_for_each_entry(mode, &connector->modes, head) {
+			struct rt_display_mode *m;
+			u64 total = (u64)mode->htotal * mode->vtotal;
+
+			out->total++;
+			if (out->count == RT_DISPLAY_MODES_MAX)
+				continue;
+			m = &out->mode[out->count++];
+			m->width = mode->hdisplay;
+			m->height = mode->vdisplay;
+			m->clock_khz = mode->clock;
+			m->refresh_mhz = total ? (u32)div64_u64((u64)mode->clock * 1000000ull, total) : 0;
+			if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+				m->refresh_mhz /= 2;
+			if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+				m->refresh_mhz *= 2;
+			m->flags = (mode->type & DRM_MODE_TYPE_PREFERRED ? RT_DISPLAY_MODE_PREFERRED : 0) |
+				   (mode->flags & DRM_MODE_FLAG_INTERLACE ? RT_DISPLAY_MODE_INTERLACE : 0);
+		}
+		ret = 0;
+		break;
+	}
+	drm_connector_list_iter_end(&iter);
+	mutex_unlock(&dev->mode_config.mutex);
+	return ret;
 }
 
 int rt_display_showing(void)

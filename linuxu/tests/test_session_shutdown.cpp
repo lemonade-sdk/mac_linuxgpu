@@ -453,7 +453,13 @@ static void checkObserverPolicy() {
     const uint64_t displayNoConfirm[] = {MLG_DISPLAY_OP_SHOW, 0, 0};
     const uint64_t displayBadPattern[] = {MLG_DISPLAY_OP_SHOW, MLG_DISPLAY_PATTERNS, MLG_DISPLAY_CONFIRM};
     const uint64_t displayOffPattern[] = {MLG_DISPLAY_OP_OFF, 1, MLG_DISPLAY_CONFIRM};
-    const uint64_t displayBadOp[] = {3, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayStatus[] = {MLG_DISPLAY_OP_STATUS, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayModes[] = {MLG_DISPLAY_OP_MODES, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayModesPattern[] = {MLG_DISPLAY_OP_MODES, 1, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayBadOp[] = {5, 0, MLG_DISPLAY_CONFIRM};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayStatus, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayModes, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayModesPattern, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayProbe, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayShow, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOff, 3));

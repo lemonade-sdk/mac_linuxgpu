@@ -59,6 +59,7 @@
 #include "amdgpu_reset.h"
 #include "amdgpu_vm.h"
 #include <drm/drm_edid.h>
+#include <drm/drm_probe_helper.h>
 #include <drm/drm_file.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/display.h>
@@ -669,6 +670,35 @@ static void display_test(void)
 	assert(!report.showing);
 	assert(sysfs_text("drm/card0/card0-DP-1/status", text, sizeof(text)) > 0);
 	assert(!strcmp(text, "disconnected\n"));
+
+	/* A display agent's view: cached status and the hotplug epoch (the
+	 * first call registers the monitor client: epoch 1), a hotplug event
+	 * as DM's HPD handler sends it, and one connector's modes. */
+	{
+		struct rt_display_modes modes;
+		uint32_t epoch;
+
+		assert(rt_display_status(&fixture_pdev, &report) == 0);
+		epoch = report.hotplug_epoch;
+		assert(epoch >= 1 && report_connector(&report, "DP-2")->status == connector_status_connected);
+		drm_kms_helper_hotplug_event(ddev);
+		assert(rt_display_status(&fixture_pdev, &report) == 0);
+		printf("dm-offline: display status: hotplug epoch %u -> %u\n", epoch, report.hotplug_epoch);
+		assert(report.hotplug_epoch == epoch + 1);
+		assert(rt_display_modes(&fixture_pdev, "HDMI-A-1", &modes) == 0);
+		printf("dm-offline: HDMI-A-1 modes: %u of %u, %ux%u mm, first %ux%u@%u.%03u flags %#x\n",
+		       modes.count, modes.total, modes.width_mm, modes.height_mm, modes.mode[0].width,
+		       modes.mode[0].height, modes.mode[0].refresh_mhz / 1000,
+		       modes.mode[0].refresh_mhz % 1000, modes.mode[0].flags);
+		assert(modes.status == connector_status_connected && modes.count > 1 &&
+		       modes.count == modes.total && modes.width_mm == 600 && modes.height_mm == 340);
+		assert(modes.mode[0].width == 1920 && modes.mode[0].height == 1080 &&
+		       modes.mode[0].refresh_mhz == 60000 && modes.mode[0].clock_khz == 148500 &&
+		       (modes.mode[0].flags & RT_DISPLAY_MODE_PREFERRED));
+		assert(rt_display_modes(&fixture_pdev, "DP-1", &modes) == 0 && !modes.count &&
+		       modes.status == connector_status_disconnected);
+		assert(rt_display_modes(&fixture_pdev, "DP-9", &modes) == -ENOENT);
+	}
 
 	/* drm_sysfs connector files, read as a Linux tool reads them. */
 	assert(sysfs_text("drm/card0/card0-HDMI-A-1/status", text, sizeof(text)) > 0);
