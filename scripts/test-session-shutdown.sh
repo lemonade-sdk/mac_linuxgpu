@@ -15,9 +15,10 @@ def section(start, end, limit):
     if len(text.splitlines()) > limit:
         raise SystemExit("shutdown fixture extraction exceeded its bounded section")
     return text
-state = section("static IODispatchQueue *s_bringupQueue", "class ComputeClientScope", 90)
-close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 380)
+state = section("static IODispatchQueue *s_bringupQueue", "class ComputeClientScope", 110)
+close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 520)
 opening = section("static kern_return_t ensure_open(MacLinuxGPUUserClient *client)", "static kern_return_t prepare_interrupts", 50)
+driver_stop = section("kern_return_t\nIMPL(MacLinuxGPU, Stop)", "void\nMacLinuxGPU::FinishSession()", 50)
 finish = section("void\nMacLinuxGPU::FinishSession()", "void\nMacLinuxGPU::FinishStop(IOService *provider)", 100)
 client_stop = section("kern_return_t\nIMPL(MacLinuxGPUUserClient, Stop)", "void\nMacLinuxGPUUserClient::FinishStop(IOService *provider)", 50)
 shutdown = section("    case kMacAMDGPUMethodShutdownGPU: {", "    case kMacAMDGPUMethodGetReBARInfo: {", 40)
@@ -39,7 +40,7 @@ kern_return_t MacLinuxGPUUserClient::failedProbe()
     return kIOReturnSuccess;
 }
 """
-pathlib.Path(sys.argv[1], "session_shutdown_production.inc").write_text(state + close + opening + finish + client_stop + wrapper + probe_wrapper)
+pathlib.Path(sys.argv[1], "session_shutdown_production.inc").write_text(state + close + opening + driver_stop + finish + client_stop + wrapper + probe_wrapper)
 PY
 clang -w -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
   -ffunction-sections -fdata-sections \
@@ -53,6 +54,8 @@ for scenario in log-format success hold-failure compute-failure irq-failure irq-
   reset-failure dma-fini-failure pre-quarantined isolation-failure raw-mapped shutdown-selector probe-retained \
   client-exit-reopen queue-exhaustion-exit observer-quarantined release-after-isolation-failure \
   release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads \
-  selftest-parked display-showing display-quarantined surprise-removal surprise-removal-quarantined surprise-removal-held; do
+  selftest-parked display-showing display-quarantined surprise-removal surprise-removal-quarantined surprise-removal-held \
+  upgrade-stop-idle upgrade-stop-session upgrade-stop-quarantined upgrade-stop-quarantined-held \
+  retire-idle retire-quiesce-resume retire-session retire-raw-bar retire-quarantined retire-quarantined-held; do
   "$test_dir/test_session_shutdown" "$scenario"
 done
