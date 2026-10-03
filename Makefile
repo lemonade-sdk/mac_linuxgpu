@@ -1004,7 +1004,9 @@ test-upstream-pm-sysfs:
 	bash scripts/test-upstream-pm-sysfs.sh
 
 # The unmodified amdgpu_dm IP block and Display Core against a fixture
-# DCN 4.0.1 device (synthetic VBIOS, register file, host VRAM).
+# DCN 4.0.1 device (synthetic VBIOS, register file, host VRAM), then the
+# registered DRM device: connector sysfs and the display test client
+# (probe, pattern commit, restore) on a forced sink with a synthetic EDID.
 test-dm-offline:
 	bash scripts/test-dm-offline.sh
 

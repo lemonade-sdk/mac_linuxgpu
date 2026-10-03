@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Offline Display Core probe: the unmodified amdgpu_dm IP block and Display
-# Core against a fixture DCN 4.0.1 device (linuxu/tests/test_dm_offline.c).
+# Offline Display Core probe and display test: the unmodified amdgpu_dm IP
+# block and Display Core against a fixture DCN 4.0.1 device, the registered
+# DRM device's connector sysfs, and the in-driver display test client
+# (linuxu/tests/test_dm_offline.c). The fixture runs no DMCUB firmware, so
+# DMUB and power-gate waits time out; a run takes a few minutes.
 # Links the host library (make lib).
 set -euo pipefail
 cd "$(dirname "$0")/.."
