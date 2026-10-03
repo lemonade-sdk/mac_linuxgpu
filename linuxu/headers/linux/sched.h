@@ -61,7 +61,12 @@ struct task_struct {
 	void (*linuxu_release)(struct task_struct *);
 	unsigned long pending_signals;
 	unsigned long wake_sequence;
+	/* This task's per-CPU copies (linux/percpu.h, linuxu/src/percpu.c). */
+	void *linuxu_percpu;
 };
+
+/* Frees the task's per-CPU copies; called when the last reference drops. */
+void linuxu_percpu_task_release(struct task_struct *task);
 
 char *linuxu_get_task_comm(char *buf, size_t size, const struct task_struct *task);
 #define get_task_comm(buf, task) ({ \

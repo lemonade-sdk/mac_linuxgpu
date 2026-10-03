@@ -55,10 +55,8 @@ static inline bool cpumask_test_cpu(int cpu, const struct cpumask *mask)
 #define smp_store_mb(p, v) do { WRITE_ONCE((p), (v)); smp_mb(); } while (0)
 #endif
 
-/* ---- per-cpu (host: plain variables) ---- */
-#define this_cpu_ptr(p)		(p)
-#define this_cpu_read(v)	(v)
-#define this_cpu_write(v, x)	((v) = (x))
+/* ---- per-cpu: per-task copies, see linux/percpu.h ---- */
+#include <linux/percpu.h>
 
 /* ---- cross-CPU (UP: run locally / no-op) ---- */
 static inline void on_each_cpu(smp_call_func_t func, void *info, int wait)
