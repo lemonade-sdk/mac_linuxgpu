@@ -1005,3 +1005,37 @@ test-cs-selftest: lib
 test: test-cs-selftest
 CRASH_PATH_TESTS += test-cs-selftest
 .PHONY: test-cs-selftest
+
+# libmlg_drm: the Linux-file RPC client library (open/ioctl/mmap/close on
+# the GPU's render node and /dev/kfd from a macOS process), static and
+# shared, for a Mesa winsys or libdrm shim. Shares the frame code and ioctl
+# tables with the dext (linuxu/src/amdgpu-rt/lx_frame.c, lx_describe.c).
+MLG_DRM_BUILD := $(BUILD)/libmlg_drm
+MLG_DRM_SRCS := libmlg_drm/src/mlg_drm.c libmlg_drm/src/mlg_transport_iokit.c \
+	linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c
+MLG_DRM_OBJS := $(addprefix $(MLG_DRM_BUILD)/,$(notdir $(MLG_DRM_SRCS:.c=.o)))
+MLG_DRM_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -MMD -MP -DMLG_LX_CLIENT_BUILD \
+	-Ilibmlg_drm/include -Ilibmlg_drm/compat -Ilibmlg_drm/src \
+	-I$(LINUX)/include/uapi -idirafter linuxu/headers
+
+$(MLG_DRM_BUILD)/%.o: libmlg_drm/src/%.c
+	@mkdir -p $(dir $@)
+	clang $(MLG_DRM_CFLAGS) -c $< -o $@
+
+$(MLG_DRM_BUILD)/%.o: linuxu/src/amdgpu-rt/%.c
+	@mkdir -p $(dir $@)
+	clang $(MLG_DRM_CFLAGS) -c $< -o $@
+
+libmlg_drm: $(MLG_DRM_OBJS)
+	@rm -f $(MLG_DRM_BUILD)/libmlg_drm.a
+	ar rcs $(MLG_DRM_BUILD)/libmlg_drm.a $(MLG_DRM_OBJS)
+	clang -dynamiclib -install_name @rpath/libmlg_drm.dylib $(MLG_DRM_OBJS) \
+		-framework IOKit -framework CoreFoundation -o $(MLG_DRM_BUILD)/libmlg_drm.dylib
+	@echo "libmlg_drm: OK ($(MLG_DRM_BUILD)/libmlg_drm.a, libmlg_drm.dylib)"
+
+test-mlg-drm: lib
+	bash scripts/test-mlg-drm.sh
+
+test: libmlg_drm test-mlg-drm
+CRASH_PATH_TESTS += test-mlg-drm
+.PHONY: libmlg_drm test-mlg-drm

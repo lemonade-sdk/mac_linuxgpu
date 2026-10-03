@@ -10,11 +10,11 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef MLG_LX_CLIENT_BUILD
+#include "mlg_uapi.h"
+#else
 #include <drm/drm.h>
 #include <drm/amdgpu_drm.h>
-#ifdef MLG_LX_CLIENT_BUILD
-#include <linux/kfd_ioctl.h>
-#else
 #include <uapi/linux/kfd_ioctl.h>
 #endif
 #include <rt/lx_abi.h>
