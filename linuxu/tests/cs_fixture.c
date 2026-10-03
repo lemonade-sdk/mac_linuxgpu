@@ -40,6 +40,8 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_ioctl.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/bootstrap.h>
+#include <rt/compute.h>
+#include <rt/dart.h>
 
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
@@ -82,6 +84,7 @@ enum {
 
 static struct pci_dev *pdev;
 static struct amdgpu_device *adev;
+uint64_t cs_fixture_visible_vram;
 static uint8_t *vram;		/* the VRAM behind the aperture */
 static uint64_t *doorbells;
 static struct amdgpu_irq_src fence_irq;
@@ -98,6 +101,22 @@ static uint64_t pte_address(uint64_t entry)
 	return entry & 0x0000fffffffff000ULL;
 }
 
+/* System memory at DMA address @dma, as the IOMMU passes it: a GPU page
+ * outside every live DMA mapping is a DART fault (a write to it, behind a
+ * Thunderbolt tunnel, can cost the device). Host DMA addresses are host
+ * pointers. */
+static uint8_t *system_page(uint64_t dma)
+{
+	if (!linuxu_dart_contains(dma & ~(uint64_t)(AMDGPU_GPU_PAGE_SIZE - 1),
+				  AMDGPU_GPU_PAGE_SIZE)) {
+		STAT(dart_faults);
+		fprintf(stderr, "cs fixture: DART fault, DMA address 0x%llx is not mapped\n",
+			(unsigned long long)dma);
+		return NULL;
+	}
+	return (uint8_t *)(uintptr_t)dma;
+}
+
 /* Host address of MC address @mc (VMID 0): VRAM or GART. */
 static uint8_t *mc_to_host(uint64_t mc)
 {
@@ -109,7 +128,7 @@ static uint8_t *mc_to_host(uint64_t mc)
 
 		if (!(entry & AMDGPU_PTE_VALID))
 			return NULL;
-		return (uint8_t *)(uintptr_t)(pte_address(entry) + (mc & (AMDGPU_GPU_PAGE_SIZE - 1)));
+		return system_page(pte_address(entry) + (mc & (AMDGPU_GPU_PAGE_SIZE - 1)));
 	}
 	return NULL;
 }
@@ -118,7 +137,7 @@ static uint8_t *mc_to_host(uint64_t mc)
 static uint8_t *entry_to_host(uint64_t entry, uint64_t offset)
 {
 	if (entry & AMDGPU_PTE_SYSTEM)
-		return (uint8_t *)(uintptr_t)(pte_address(entry) + offset);
+		return system_page(pte_address(entry) + offset);
 	return mc_to_host(pte_address(entry) + offset);
 }
 
@@ -151,7 +170,7 @@ static uint8_t *vm_to_host(uint64_t pd, uint64_t va)
 	for (unsigned int level = adev->vm_manager.root_level;; ++level) {
 		unsigned int shift = level_shift(level);
 		uint64_t index = (pfn >> shift) & (level_entries(level) - 1);
-		uint8_t *at = system ? (uint8_t *)(uintptr_t)table : mc_to_host(table);
+		uint8_t *at = system ? system_page(table) : mc_to_host(table);
 		uint64_t entry;
 
 		if (!at)
@@ -951,7 +970,10 @@ struct pci_dev *cs_fixture_init(void)
 		FX_ABORT("fixture memory");
 	adev->gmc.gmc_funcs = &fx_gmc_funcs;
 	adev->gmc.mc_vram_size = adev->gmc.real_vram_size = FX_VRAM_BYTES;
-	adev->gmc.visible_vram_size = FX_VRAM_BYTES;
+	/* A BAR narrower than VRAM when asked (the iPad's is 256 MiB of
+	 * 32 GiB): TTM then cannot fall back to a CPU copy of invisible VRAM. */
+	adev->gmc.visible_vram_size = cs_fixture_visible_vram ? cs_fixture_visible_vram :
+				      FX_VRAM_BYTES;
 	adev->gmc.aper_base = FX_BAR0;
 	adev->gmc.aper_size = FX_VRAM_BYTES;
 	adev->gmc.vram_start = FX_VRAM_START;
@@ -1024,6 +1046,10 @@ struct pci_dev *cs_fixture_init(void)
 	adev->vm_manager.vm_pte_num_scheds = 1;
 	amdgpu_ttm_set_buffer_funcs_status(adev, true);
 	adev->accel_working = true;
+	/* As rt_compute_open does for a session: DMA releases wait while an
+	 * engine is stalled. */
+	if (!getenv("CS_FIXTURE_NO_DMA_HOLD"))	/* the negative control */
+		rt_dma_hold_attach(adev);
 
 	r = drm_dev_register(adev_to_drm(adev), 0);
 	if (r)
@@ -1049,6 +1075,19 @@ void cs_fixture_stats(struct cs_fixture_stats *out)
 	pthread_mutex_lock(&stats_lock);
 	*out = stats;
 	pthread_mutex_unlock(&stats_lock);
+}
+
+struct amdgpu_device *cs_fixture_adev(void)
+{
+	return adev;
+}
+
+void cs_fixture_hold_sdma(int hold)
+{
+	pthread_mutex_lock(&sdma_engine.lock);
+	sdma_engine.hold = hold;
+	pthread_cond_signal(&sdma_engine.kick);
+	pthread_mutex_unlock(&sdma_engine.lock);
 }
 
 void cs_fixture_hold_compute(int hold)

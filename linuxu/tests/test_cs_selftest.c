@@ -34,7 +34,10 @@ static void report(const struct rt_cs_selftest_result *res)
 
 int main(void)
 {
-	struct pci_dev *pdev = cs_fixture_init();
+	struct pci_dev *pdev;
+	/* The BAR covers a quarter of VRAM, as the iPad's covers part of it. */
+	cs_fixture_visible_vram = 64ULL << 20;
+	pdev = cs_fixture_init();
 	struct rt_cs_selftest_result res;
 	struct cs_fixture_stats before, after;
 	int r;
@@ -59,8 +62,10 @@ int main(void)
 		CHECK(after.fills - before.fills >= 2 && after.copies - before.copies >= 1);
 		CHECK(after.vm_flushes > before.vm_flushes);
 		CHECK(after.interrupts > before.interrupts);
-		CHECK(after.faults == 0);
+		CHECK(after.faults == 0 && after.dart_faults == 0);
 	}
+
+	ttm_evict_check();
 
 	/* A compute queue that does not run: the wait times out, the rest is
 	 * skipped, and the test's process is kept (tearing it down would wait

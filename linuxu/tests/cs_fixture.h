@@ -16,6 +16,7 @@ struct cs_fixture_stats {
 	unsigned long fills, copies;		/* SDMA buffer operations */
 	unsigned long vm_flushes;
 	unsigned long faults;			/* GPU accesses that did not translate */
+	unsigned long dart_faults;		/* ... to system memory not DMA-mapped */
 };
 
 /* Bring up the linked DRM/amdgpu modules and the fixture device, and
@@ -26,5 +27,14 @@ void cs_fixture_stop(void);
 void cs_fixture_stats(struct cs_fixture_stats *out);
 /* Make the compute engine ignore its ring until resumed (a hung queue). */
 void cs_fixture_hold_compute(int hold);
+/* The same for the SDMA engine (TTM's moves, clears and PTE uploads). */
+void cs_fixture_hold_sdma(int hold);
+/* CPU-visible VRAM (the BAR), set before cs_fixture_init; 0: all VRAM. */
+extern uint64_t cs_fixture_visible_vram;
+struct amdgpu_device;
+struct amdgpu_device *cs_fixture_adev(void);
+/* TTM moves VRAM <-> GTT through the upstream code on this device
+ * (ttm_evict_check.c). */
+void ttm_evict_check(void);
 
 #endif
