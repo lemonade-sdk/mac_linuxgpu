@@ -985,6 +985,14 @@ test-sysfs-read:
 test-upstream-pm-sysfs:
 	bash scripts/test-upstream-pm-sysfs.sh
 
+# The unmodified amdgpu_dm IP block and Display Core against a fixture
+# DCN 4.0.1 device (synthetic VBIOS, register file, host VRAM).
+test-dm-offline:
+	bash scripts/test-dm-offline.sh
+
+test: test-dm-offline
+.PHONY: test-dm-offline
+
 test-drm-info:
 	bash scripts/test-drm-info.sh
 
