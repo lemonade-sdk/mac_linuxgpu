@@ -14,7 +14,11 @@ Checks, against patches/manifest.json:
   * the declared verbatim copies in linuxu/ still equal their upstream file;
   * the Makefile's compile interventions (lowercase -Dsymbol=replacement
     redirects and forced rt/ headers on upstream objects) match the declared
-    list.
+    list;
+  * every declared CONFIG intervention (a symbol set against what upstream
+    Kconfig would select for this target) names a Kconfig file that defines
+    it and is set in linuxu/headers/linux/autoconf.h, so a declaration cannot
+    go stale.
 """
 
 import hashlib
@@ -30,6 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "patches" / "manifest.json"
 SOURCES_MK = ROOT / "mk" / "upstream_sources.mk"
 MAKEFILE = ROOT / "Makefile"
+AUTOCONF = ROOT / "linuxu" / "headers" / "linux" / "autoconf.h"
 INTERVENTION = re.compile(r"-D[a-z_][A-Za-z0-9_]*=\S+|-include\s+rt/\S+")
 OID = re.compile(r"[0-9a-f]{40}\Z")
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -223,6 +228,27 @@ def check_interventions(declared):
     return len(flags)
 
 
+def check_config_interventions(sub, declared):
+    if not isinstance(declared, list):
+        raise Failure("manifest config_interventions must be a list")
+    autoconf = AUTOCONF.read_text()
+    seen = set()
+    for item in declared:
+        config, kconfig, reason = item.get("config"), item.get("kconfig"), item.get("reason")
+        if (not isinstance(config, str) or not re.fullmatch(r"CONFIG_[A-Z0-9_]+", config) or
+                config in seen or not isinstance(kconfig, str) or
+                not isinstance(reason, str) or not reason.strip()):
+            raise Failure(f"invalid config intervention declaration: {config}")
+        seen.add(config)
+        kpath = sub / kconfig
+        if not kpath.is_file() or not re.search(
+                rf"^config {re.escape(config[len('CONFIG_'):])}$", kpath.read_text(), re.M):
+            raise Failure(f"{config}: not defined by {kconfig}")
+        if not re.search(rf"^#define {re.escape(config)} 1$", autoconf, re.M):
+            raise Failure(f"{config}: declared but not set in {AUTOCONF.relative_to(ROOT)}")
+    return len(seen)
+
+
 def main():
     try:
         manifest = json.loads(MANIFEST.read_text())
@@ -233,13 +259,14 @@ def main():
         patched = check_working_tree(sub, declared)
         copies = check_copies(sub, manifest["verified_copies"])
         interventions = check_interventions(manifest["compile_interventions"])
+        configs = check_config_interventions(sub, manifest.get("config_interventions", []))
     except (Failure, KeyError, OSError, ValueError) as error:
         print(f"upstream verification failed: {error}", file=sys.stderr)
         return 1
     print(f"Verified Linux {linux['pin']}: {len(present)} files checked out, "
           f"{sources} built sources present, {len(declared)} patch(es) on "
           f"{patched} file(s) and nothing else changed, {copies} verbatim copies, "
-          f"{interventions} compile interventions")
+          f"{interventions} compile interventions, {configs} config interventions")
     return 0
 
 

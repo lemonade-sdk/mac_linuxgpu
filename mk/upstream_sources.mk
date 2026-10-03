@@ -5,12 +5,22 @@
 # submodule holds many files the build does not use. The list covers the
 # amdgpu, amdkfd, amdxcp, pm and ras trees, TTM, the scheduler and the DRM
 # core files amdgpu needs, minus the CONFIG-disabled or deferred files named
-# by EXCLUDED_FILES in mk/kernel_config.mk. Object files keep the driver/
-# layout under build/:
+# by EXCLUDED_FILES in mk/kernel_config.mk.
+#
+# The amd/display entries are exactly AMD_DISPLAY_FILES of
+# drivers/gpu/drm/amd/display/Makefile and the Makefiles it includes,
+# evaluated with CONFIG_DRM_AMD_DC=y, CONFIG_DRM_AMD_DC_FP=y and
+# CONFIG_DEBUG_FS=y (CONFIG_DRM_AMD_DC_SI and CONFIG_DRM_AMD_SECURE_DISPLAY
+# off). drivers/gpu/drm/display/ is the drm_display_helper module for the
+# DRM_DISPLAY_* helpers amdgpu selects, and the drm_*_helper.c files are the
+# whole drm_kms_helper module (drm_fb_helper.c needs DRM_FBDEV_EMULATION).
+#
+# Object files keep the driver/ layout under build/:
 #   drivers/gpu/drm/amd/<dir>/  -> build/driver/<dir>/
 #   drivers/gpu/drm/ttm/        -> build/driver/ttm/
 #   drivers/gpu/drm/scheduler/  -> build/driver/scheduler/
 #   drivers/gpu/drm/*.c         -> build/driver/drm-core/
+#   drivers/gpu/drm/display/    -> build/driver/drm-core/display/
 
 LINUX := third_party/linux
 
@@ -334,6 +344,504 @@ UPSTREAM_DRIVER_SRCS := \
 	$(LINUX)/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c \
 	$(LINUX)/drivers/gpu/drm/amd/amdkfd/kfd_topology.c \
 	$(LINUX)/drivers/gpu/drm/amd/amdxcp/amdgpu_xcp_drv.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_color.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_colorop.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_crtc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_debugfs.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_hdcp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_helpers.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_irq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_ism.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_plane.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_pp_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_psr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_quirks.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_replay.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_services.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_wb.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/amdgpu_dm/dc_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/bw_fixed.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/conversion.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/custom_float.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/dc_common.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/dce_calcs.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/fixpt31_32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/basics/vector.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/bios_parser.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/bios_parser2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/bios_parser_common.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/bios_parser_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/bios_parser_interface.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/command_table.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/command_table2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/command_table_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/command_table_helper2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/dce110/command_table_helper_dce110.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/dce112/command_table_helper2_dce112.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/dce112/command_table_helper_dce112.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/bios/dce80/command_table_helper_dce80.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dce100/dce_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dce110/dce110_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dce112/dce112_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dce120/dce120_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv1_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv1_clk_mgr_vbios_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn10/rv2_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn20/dcn20_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn201/dcn201_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn21/rn_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn21/rn_clk_mgr_vbios_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30_clk_mgr_smu_msg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30m_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn30/dcn30m_clk_mgr_smu_msg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/dcn301_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn301/vg_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn31/dcn31_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn31/dcn31_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn314/dcn314_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn315/dcn315_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn316/dcn316_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn316/dcn316_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn32/dcn32_clk_mgr_smu_msg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn351_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn35/dcn35_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn401/dcn401_clk_mgr_smu_msg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn42/dcn42_clk_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/clk_mgr/dcn42/dcn42_smu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_debug.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_hw_sequencer.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_link_enc_cfg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_link_exports.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_sink.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_stat.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_state.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_stream.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_surface.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/core/dc_vm_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dc_dmub_srv.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dc_edid_parser.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dc_fused_io.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dc_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dc_spl_translate.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn20/dcn20_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn201/dcn201_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn21/dcn21_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn30/dcn30_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn301/dcn301_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn31/dcn31_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn314/dcn314_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn32/dcn32_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn35/dcn35_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn401/dcn401_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dccg/dcn42/dcn42_dccg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_abm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_audio.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_aux.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_clock_source.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_dmcu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_i2c.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_i2c_hw.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_i2c_sw.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_ipp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_mem_input.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_opp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_panel_cntl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_scl_filters.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dce_transform.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_abm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_abm_lcd.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_hw_lock_mgr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_outbox.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_psr.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce/dmub_replay.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_compressor.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_mem_input_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_csc_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_regamma_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_opp_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_timing_generator_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce110/dce110_transform_v.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce112/dce112_compressor.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce120/dce120_timing_generator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dce80/dce80_timing_generator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_cm_common.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer_debug.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_ipp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_dwb.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_dwb_scl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn20/dcn20_vmid.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn201/dcn201_opp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn21/dcn21_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_afmt.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_cm_common.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_mmhubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn30/dcn30_vpg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn301/dcn301_panel_cntl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_afmt.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_apg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_panel_cntl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dcn31/dcn31_vpg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_dio.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn10/dcn10_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn20/dcn20_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn30/dcn30_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn301/dcn301_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn31/dcn31_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn314/dcn314_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn32/dcn32_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn32/dcn32_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn321/dcn321_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn35/dcn35_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn401/dcn401_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn401/dcn401_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/dcn42/dcn42_dio_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/virtual/virtual_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dio/virtual/virtual_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calc_auto.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calc_math.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/calcs/dcn_calcs.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn10/dcn10_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn20/dcn20_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn20/display_mode_vba_20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn20/display_mode_vba_20v2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn20/display_rq_dlg_calc_20v2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn21/display_mode_vba_21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn21/display_rq_dlg_calc_21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn30/dcn30_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_mode_vba_30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn30/display_rq_dlg_calc_30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn301/dcn301_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn302/dcn302_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn303/dcn303_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn31/dcn31_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn31/display_mode_vba_31.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn31/display_rq_dlg_calc_31.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn314/dcn314_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn314/display_mode_vba_314.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn314/display_rq_dlg_calc_314.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn32/dcn32_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_mode_vba_util_32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn32/display_rq_dlg_calc_32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn321/dcn321_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn35/dcn35_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dcn351/dcn351_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/display_mode_lib.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/display_mode_vba.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/display_rq_dlg_helpers.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dml1_display_rq_dlg_calc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml/dsc/rc_calc_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/display_mode_core.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/display_mode_util.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/dml21_translation_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/dml21_utils.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/dml21_wrapper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/dml21_wrapper_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn4.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_core/dml2_core_dcn4_calcs.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_core/dml2_core_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_core/dml2_core_utils.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_dpmm/dml2_dpmm_dcn4.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_dpmm/dml2_dpmm_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_mcg/dml2_mcg_dcn4.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_mcg/dml2_mcg_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_mcg/dml2_mcg_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_pmo/dml2_pmo_dcn3.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_pmo/dml2_pmo_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_pmo/dml2_pmo_dcn4_fams2.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_pmo/dml2_pmo_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_standalone_libraries/lib_float_math.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_top/dml2_top_interfaces.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml21/src/dml2_top/dml2_top_soc15.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_dc_resource_mgmt.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_mall_phantom.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_policy.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_translation_helper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_utils.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_wrapper.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml2_wrapper_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dml2_0/dml_display_rq_dlg_calc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp_cm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn10/dcn10_dpp_dscl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn20/dcn20_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn20/dcn20_dpp_cm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn201/dcn201_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn30/dcn30_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn30/dcn30_dpp_cm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn32/dcn32_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn35/dcn35_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp_cm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn401/dcn401_dpp_dscl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dpp/dcn42/dcn42_dpp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/dc_dsc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/dcn20/dcn20_dsc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/dcn35/dcn35_dsc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/dcn401/dcn401_dsc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/rc_calc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dsc/rc_calc_dpi.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dwb/dcn30/dcn30_dwb.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dwb/dcn30/dcn30_dwb_cm.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/dwb/dcn35/dcn35_dwb.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce110/hw_factory_dce110.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce110/hw_translate_dce110.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce120/hw_factory_dce120.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce120/hw_translate_dce120.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce80/hw_factory_dce80.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dce80/hw_translate_dce80.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn10/hw_factory_dcn10.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn10/hw_translate_dcn10.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn20/hw_factory_dcn20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn20/hw_translate_dcn20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn21/hw_factory_dcn21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn21/hw_translate_dcn21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn30/hw_factory_dcn30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn30/hw_translate_dcn30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn315/hw_factory_dcn315.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn315/hw_translate_dcn315.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn32/hw_factory_dcn32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn32/hw_translate_dcn32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn401/hw_factory_dcn401.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn401/hw_translate_dcn401.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn42/hw_factory_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/dcn42/hw_translate_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/gpio_base.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/gpio_service.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_ddc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_generic.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_gpio.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_hpd.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/gpio/hw_translate.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hdcp/hdcp_msg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hpo/dcn31/dcn31_hpo_dp_stream_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hpo/dcn32/dcn32_hpo_dp_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hpo/dcn42/dcn42_hpo_dp_link_encoder.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn10/dcn10_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn20/dcn20_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn201/dcn201_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn21/dcn21_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn30/dcn30_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn301/dcn301_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn31/dcn31_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn32/dcn32_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn35/dcn35_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn401/dcn401_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubbub/dcn42/dcn42_hubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn10/dcn10_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn20/dcn20_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn201/dcn201_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn21/dcn21_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn30/dcn30_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn31/dcn31_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn32/dcn32_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn35/dcn35_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn401/dcn401_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hubp/dcn42/dcn42_hubp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce/dce_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce100/dce100_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce110/dce110_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce112/dce112_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce120/dce120_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dce80/dce80_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn10/dcn10_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn20/dcn20_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn201/dcn201_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn201/dcn201_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn21/dcn21_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn21/dcn21_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn30/dcn30_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn30/dcn30_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn301/dcn301_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn301/dcn301_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn302/dcn302_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn302/dcn302_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn303/dcn303_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn303/dcn303_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn31/dcn31_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn31/dcn31_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn314/dcn314_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn314/dcn314_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn32/dcn32_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn35/dcn35_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn35/dcn35_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn351/dcn351_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn351/dcn351_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn401/dcn401_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn42/dcn42_hwseq.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/hwss/dcn42/dcn42_init.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dce110/irq_service_dce110.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dce120/irq_service_dce120.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dce80/irq_service_dce80.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn10/irq_service_dcn10.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn20/irq_service_dcn20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn201/irq_service_dcn201.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn21/irq_service_dcn21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn30/irq_service_dcn30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn302/irq_service_dcn302.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn303/irq_service_dcn303.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn31/irq_service_dcn31.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn314/irq_service_dcn314.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn315/irq_service_dcn315.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn32/irq_service_dcn32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn35/irq_service_dcn35.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn351/irq_service_dcn351.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn36/irq_service_dcn36.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn401/irq_service_dcn401.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/dcn42/irq_service_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/irq/irq_service.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_cts.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/accessories/link_dp_trace.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dio_fixed_vs_pe_retimer.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_dpia.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_hpo_dp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_hpo_fixed_vs_pe_retimer_dp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/hwss/link_hwss_virtual.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/link_detection.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/link_dpms.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/link_factory.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/link_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/link_validation.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_ddc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_capability.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_dpia_bw.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_irq_handler.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_panel_replay.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_phy.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_128b_132b.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_8b_10b.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_auxless.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_dpia.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dp_training_fixed_vs_pe_retimer.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_dpcd.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_edp_panel_control.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/link/protocols/link_hpd.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mmhubbub/dcn20/dcn20_mmhubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mmhubbub/dcn32/dcn32_mmhubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mmhubbub/dcn35/dcn35_mmhubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mmhubbub/dcn42/dcn42_mmhubbub.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn10/dcn10_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn20/dcn20_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn30/dcn30_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn32/dcn32_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn401/dcn401_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/mpc/dcn42/dcn42_mpc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/opp/dcn10/dcn10_opp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/opp/dcn20/dcn20_opp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/opp/dcn35/dcn35_opp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn10/dcn10_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn20/dcn20_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn201/dcn201_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn30/dcn30_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn301/dcn301_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn31/dcn31_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn314/dcn314_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn32/dcn32_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn35/dcn35_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn401/dcn401_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/optc/dcn42/dcn42_optc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/pg/dcn35/dcn35_pg_cntl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/pg/dcn42/dcn42_pg_cntl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dce100/dce100_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dce110/dce110_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dce112/dce112_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dce120/dce120_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dce80/dce80_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn10/dcn10_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn20/dcn20_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn201/dcn201_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn21/dcn21_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn30/dcn30_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn301/dcn301_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn302/dcn302_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn303/dcn303_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn31/dcn31_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn314/dcn314_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn315/dcn315_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn316/dcn316_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn32/dcn32_resource_helpers.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn321/dcn321_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn35/dcn35_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn351/dcn351_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn36/dcn36_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn401/dcn401_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/resource/dcn42/dcn42_resource_fpu.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/soc_and_ip_translator/dcn401/dcn401_soc_and_ip_translator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/soc_and_ip_translator/dcn42/dcn42_soc_and_ip_translator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/soc_and_ip_translator/soc_and_ip_translator.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/dc_spl.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/dc_spl_filters.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/dc_spl_isharp_filters.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/dc_spl_scl_easf_filters.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/dc_spl_scl_filters.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/spl_custom_float.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dc/sspl/spl_fixpt31_32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn20.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn21.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn30.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn301.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn302.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn303.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn31.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn314.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn315.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn316.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn32.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn35.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn351.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn36.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn401.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_dcn42.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_reg.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/dmub/src/dmub_srv_stat.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/color/color_gamma.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/color/color_table.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/freesync/freesync.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp1_execution.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp1_transition.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_execution.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp2_transition.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp_ddc.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp_log.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/hdcp/hdcp_psp.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/info_packet/info_packet.c \
+	$(LINUX)/drivers/gpu/drm/amd/display/modules/power/power_helpers.c \
 	$(LINUX)/drivers/gpu/drm/amd/pm/amdgpu_dpm.c \
 	$(LINUX)/drivers/gpu/drm/amd/pm/amdgpu_dpm_internal.c \
 	$(LINUX)/drivers/gpu/drm/amd/pm/amdgpu_pm.c \
@@ -419,11 +927,22 @@ UPSTREAM_DRIVER_SRCS := \
 	$(LINUX)/drivers/gpu/drm/amd/pm/swsmu/smu15/smu_v15_0_0_ppt.c \
 	$(LINUX)/drivers/gpu/drm/amd/pm/swsmu/smu15/smu_v15_0_8_ppt.c \
 	$(LINUX)/drivers/gpu/drm/amd/pm/swsmu/smu_cmn.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_display_helper_mod.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_dp_dual_mode_helper.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_dp_helper.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_dp_mst_topology.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_dsc_helper.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_hdcp_helper.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_hdmi_helper.c \
+	$(LINUX)/drivers/gpu/drm/display/drm_scdc_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_atomic.c \
+	$(LINUX)/drivers/gpu/drm/drm_atomic_helper.c \
+	$(LINUX)/drivers/gpu/drm/drm_atomic_state_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_atomic_uapi.c \
 	$(LINUX)/drivers/gpu/drm/drm_auth.c \
 	$(LINUX)/drivers/gpu/drm/drm_blend.c \
 	$(LINUX)/drivers/gpu/drm/drm_bridge.c \
+	$(LINUX)/drivers/gpu/drm/drm_bridge_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_cache.c \
 	$(LINUX)/drivers/gpu/drm/drm_client.c \
 	$(LINUX)/drivers/gpu/drm/drm_client_event.c \
@@ -433,6 +952,8 @@ UPSTREAM_DRIVER_SRCS := \
 	$(LINUX)/drivers/gpu/drm/drm_colorop.c \
 	$(LINUX)/drivers/gpu/drm/drm_connector.c \
 	$(LINUX)/drivers/gpu/drm/drm_crtc.c \
+	$(LINUX)/drivers/gpu/drm/drm_crtc_helper.c \
+	$(LINUX)/drivers/gpu/drm/drm_damage_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_debugfs.c \
 	$(LINUX)/drivers/gpu/drm/drm_debugfs_crc.c \
 	$(LINUX)/drivers/gpu/drm/drm_displayid.c \
@@ -442,29 +963,42 @@ UPSTREAM_DRIVER_SRCS := \
 	$(LINUX)/drivers/gpu/drm/drm_eld.c \
 	$(LINUX)/drivers/gpu/drm/drm_encoder.c \
 	$(LINUX)/drivers/gpu/drm/drm_file.c \
+	$(LINUX)/drivers/gpu/drm/drm_flip_work.c \
+	$(LINUX)/drivers/gpu/drm/drm_format_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_fourcc.c \
 	$(LINUX)/drivers/gpu/drm/drm_framebuffer.c \
 	$(LINUX)/drivers/gpu/drm/drm_gem.c \
+	$(LINUX)/drivers/gpu/drm/drm_gem_atomic_helper.c \
+	$(LINUX)/drivers/gpu/drm/drm_gem_framebuffer_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_gem_ttm_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_ioctl.c \
+	$(LINUX)/drivers/gpu/drm/drm_kms_helper_common.c \
 	$(LINUX)/drivers/gpu/drm/drm_lease.c \
 	$(LINUX)/drivers/gpu/drm/drm_managed.c \
 	$(LINUX)/drivers/gpu/drm/drm_mm.c \
 	$(LINUX)/drivers/gpu/drm/drm_mode_config.c \
 	$(LINUX)/drivers/gpu/drm/drm_mode_object.c \
 	$(LINUX)/drivers/gpu/drm/drm_modes.c \
+	$(LINUX)/drivers/gpu/drm/drm_modeset_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_modeset_lock.c \
+	$(LINUX)/drivers/gpu/drm/drm_panel_backlight_quirks.c \
+	$(LINUX)/drivers/gpu/drm/drm_panel_orientation_quirks.c \
 	$(LINUX)/drivers/gpu/drm/drm_pci.c \
 	$(LINUX)/drivers/gpu/drm/drm_plane.c \
+	$(LINUX)/drivers/gpu/drm/drm_plane_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_prime.c \
 	$(LINUX)/drivers/gpu/drm/drm_print.c \
+	$(LINUX)/drivers/gpu/drm/drm_probe_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_property.c \
 	$(LINUX)/drivers/gpu/drm/drm_rect.c \
+	$(LINUX)/drivers/gpu/drm/drm_self_refresh_helper.c \
+	$(LINUX)/drivers/gpu/drm/drm_simple_kms_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_suballoc.c \
 	$(LINUX)/drivers/gpu/drm/drm_syncobj.c \
 	$(LINUX)/drivers/gpu/drm/drm_sysfs.c \
 	$(LINUX)/drivers/gpu/drm/drm_trace_points.c \
 	$(LINUX)/drivers/gpu/drm/drm_vblank.c \
+	$(LINUX)/drivers/gpu/drm/drm_vblank_helper.c \
 	$(LINUX)/drivers/gpu/drm/drm_vblank_work.c \
 	$(LINUX)/drivers/gpu/drm/drm_vma_manager.c \
 	$(LINUX)/drivers/gpu/drm/drm_writeback.c \
