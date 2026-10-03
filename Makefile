@@ -1039,3 +1039,12 @@ test-mlg-drm: lib
 test: libmlg_drm test-mlg-drm
 CRASH_PATH_TESTS += test-mlg-drm
 .PHONY: libmlg_drm test-mlg-drm
+
+# The hardware CS self-test runner (scripts/drm-selftest.py) against a fake
+# DrmSelfTest selector.
+test-drm-selftest:
+	bash scripts/test-drm-selftest.sh
+
+test: test-drm-selftest
+CRASH_PATH_TESTS += test-drm-selftest
+.PHONY: test-drm-selftest

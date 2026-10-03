@@ -91,9 +91,11 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 
 /* Observer user clients (type MLG_USER_CLIENT_OBSERVER) never join or close
  * a session. They may call selectors that read cached state, the
- * entitlement-checked release selector, and the two Linux read paths below,
+ * entitlement-checked release selector, the two Linux read paths below,
  * which run upstream callbacks while the driver runs and never claim PCI,
- * join the session or touch queues. */
+ * join the session or touch queues, and the self-contained submission
+ * self-test (DrmSelfTest). Linux-file clients are type 2
+ * (MLG_USER_CLIENT_LINUX_FILE, linuxu/headers/rt/lx_abi.h). */
 #define MLG_USER_CLIENT_SESSION  0u
 #define MLG_USER_CLIENT_OBSERVER 1u
 
@@ -104,6 +106,7 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 /* Outside the MacAMDGPU selector range (0-73): MacLinuxGPU's Linux paths. */
 #define MLG_SELECTOR_SYSFS_READ          80u
 #define MLG_SELECTOR_DRM_INFO            81u
+#define MLG_SELECTOR_DRM_SELFTEST        82u
 
 /* SysfsRead: the amdgpu device's sysfs directory, read as Linux sysfs reads
  * it (the attribute's show(), or a bin_attribute's read()), or listed.
@@ -134,6 +137,25 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  *   struct out: return_size bytes of the result
  *   scalar out: [0] 0 or the ioctl's negative Linux errno, sign-extended
  * IOReturn as SysfsRead; NotPermitted for any other query. */
+/* DrmSelfTest: the kernel-queue command submission self-test
+ * (linuxu/headers/rt/cs_selftest.h) on the GPU, in a Linux process of its
+ * own: render node, AMDGPU_INFO, a context, GEM buffers mapped in its own
+ * GPUVM, AMDGPU_CS on the compute ring and on SDMA, AMDGPU_WAIT_CS and
+ * syncobj waits, then everything undone. It touches nothing of any other
+ * client and creates no queue; each wait is bounded.
+ *   scalar in:  [0] MLG_DRM_SELFTEST_CONFIRM
+ *   struct out: struct rt_cs_selftest_result (MLG_DRM_SELFTEST_RESULT_MAX
+ *               bytes at most; its version and steps fields describe it)
+ *   scalar out: [0] 0 or the first failing step's status, sign-extended
+ *               (a negative Linux errno, RT_CS_MISMATCH, RT_CS_PARKED)
+ *               [1] earlier tests still waiting for their GPU work
+ * A test whose work never completed keeps its process until the work
+ * does (RT_CS_PARKED); the session then cannot close cleanly until it
+ * has. IOReturn as DrmInfo; Busy while another test runs. */
+#define MLG_DRM_SELFTEST_CONFIRM    0x43535354ULL /* "CSST" */
+#define MLG_DRM_SELFTEST_WORDS      2u
+#define MLG_DRM_SELFTEST_RESULT_MAX 512u
+
 #define MLG_SYSFS_OP_READ      0u
 #define MLG_SYSFS_OP_LIST      1u
 #define MLG_SYSFS_PATH_MAX     256u
@@ -202,6 +224,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_DRM_INFO:
 		return input && input_count == 2 && input[1] &&
 		       input[1] <= MLG_SYSFS_CHUNK_MAX;
+	case MLG_SELECTOR_DRM_SELFTEST:
+		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
 	default:
 		return false;
 	}

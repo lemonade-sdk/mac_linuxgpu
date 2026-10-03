@@ -52,6 +52,7 @@ clang++ -std=c++20 -fblocks -Wall -Wextra -Werror -Wno-unused-variable \
 for scenario in log-format success hold-failure compute-failure irq-failure irq-failure-late \
   reset-failure dma-fini-failure pre-quarantined isolation-failure raw-mapped shutdown-selector probe-retained \
   client-exit-reopen queue-exhaustion-exit observer-quarantined release-after-isolation-failure \
-  release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads; do
+  release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads \
+  selftest-parked; do
   "$test_dir/test_session_shutdown" "$scenario"
 done

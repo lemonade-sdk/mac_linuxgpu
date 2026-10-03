@@ -89,6 +89,13 @@ struct rt_cs_selftest_result {
 	uint32_t fill_value, user_fence;
 };
 
+/* scripts/drm-selftest.py reads this layout. */
+#ifdef __cplusplus
+static_assert(sizeof(struct rt_cs_selftest_result) == 200, "rt_cs_selftest_result layout");
+#else
+_Static_assert(sizeof(struct rt_cs_selftest_result) == 200, "rt_cs_selftest_result layout");
+#endif
+
 /* Run the test on the GPU bound to @pdev. Returns 0 when every step that
  * applies passed, else the first failing step's status (negative errno,
  * RT_CS_MISMATCH or RT_CS_PARKED); @out holds the details either way.
