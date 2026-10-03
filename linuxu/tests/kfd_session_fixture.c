@@ -70,6 +70,13 @@ unsigned int cp_dispatches;
 static void cp_add(uint32_t doorbell, uint64_t wptr, uint32_t pasid)
 {
 	pthread_mutex_lock(&cp_lock);
+	/* A queue MES never removed (a failed removal) is mapped once. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
+		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell) {
+			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
+			pthread_mutex_unlock(&cp_lock);
+			return;
+		}
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (!cp_queues[i].live) {
 			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
@@ -88,9 +95,11 @@ static void cp_remove(uint32_t doorbell)
 
 /* ---- MES ---- */
 unsigned int mes_adds, mes_removes;
-uint32_t mes_doorbells[8];
-uint64_t mes_wptr[8], mes_page_table[8];
-uint32_t mes_pasid[8];
+uint32_t mes_doorbells[FIXTURE_MES_SLOTS];
+uint64_t mes_wptr[FIXTURE_MES_SLOTS], mes_page_table[FIXTURE_MES_SLOTS];
+uint32_t mes_pasid[FIXTURE_MES_SLOTS];
+/* REMOVE_QUEUEs to fail (MES timing out): the queue stays on the CP. */
+unsigned int mes_fail_removes, mes_failed_removes;
 static int fake_add_hw_queue(struct amdgpu_mes *mes, struct mes_add_queue_input *in)
 {
 	(void)mes;
@@ -112,6 +121,11 @@ static int fake_remove_hw_queue(struct amdgpu_mes *mes, struct mes_remove_queue_
 	for (unsigned int i = 0; i < mes_adds; ++i)
 		known |= mes_doorbells[i] == in->doorbell_offset;
 	assert(known);
+	if (mes_fail_removes) {
+		mes_fail_removes--;
+		mes_failed_removes++;
+		return -ETIMEDOUT;
+	}
 	mes_removes++;
 	cp_remove(in->doorbell_offset);
 	return 0;
@@ -518,8 +532,26 @@ int amdgpu_amdkfd_map_gtt_bo_to_gart(struct amdgpu_bo *bo, struct amdgpu_bo **bo
 	gart_maps++;
 	return 0;
 }
+/* A process restore after a KFD suspend (kfd_resume_all_processes): the
+ * buffers stay where they are; like upstream, a new eviction fence replaces
+ * the one the suspend signaled. Any other restore is a tripwire. */
+bool fixture_restores_allowed;
+unsigned int bo_restores;
 int amdgpu_amdkfd_gpuvm_restore_process_bos(void *process_info, struct dma_fence __rcu **ef)
-{ (void)process_info; (void)ef; TRIPWIRE("restore_process_bos (no eviction in this test)"); }
+{
+	struct dma_fence *fence, *old;
+
+	(void)process_info;
+	if (!fixture_restores_allowed)
+		TRIPWIRE("restore_process_bos (no eviction in this test)");
+	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
+	assert(fence);
+	dma_fence_init(fence, &eviction_fence_ops, &eviction_lock, 1, 2 + bo_restores);
+	old = rcu_replace_pointer(*ef, fence, true);
+	dma_fence_put(old);
+	bo_restores++;
+	return 0;
+}
 void amdgpu_amdkfd_gpuvm_destroy_process_info_fixture(void);
 
 /* KFD's kernel-owned GTT (amdgpu_amdkfd_alloc_kernel_mem): MES process and
@@ -591,7 +623,9 @@ int kfd_gtt_sa_free(struct kfd_node *n, struct kfd_mem_obj *mem_obj)
 
 /* ---- topology: one GPU node ---- */
 uint32_t kfd_gpu_node_num(void) { return 1; }
+#ifndef FIXTURE_UPSTREAM_KFD_DEVICE
 bool kfd_is_locked(struct kfd_dev *k) { (void)k; return false; }
+#endif
 uint32_t kfd_topology_get_num_devices(void) { return 1; }
 int kfd_topology_enum_kfd_devices(uint8_t idx, struct kfd_node **kdev)
 {
@@ -772,8 +806,16 @@ int amdgpu_amdkfd_remove_gws_from_process(void *info, void *mem)
 { (void)info; (void)mem; TRIPWIRE("remove_gws_from_process"); }
 void amdgpu_amdkfd_block_mmu_notifications(void *p) { (void)p; TRIPWIRE("criu block_mmu_notifications"); }
 int amdgpu_amdkfd_criu_resume(void *p) { (void)p; TRIPWIRE("criu_resume"); }
+/* kfd_hws_hang()'s reset request: expected only after an injected MES
+ * failure (amdgpu_gpu_recovery is 0 in the driver, so it resets nothing). */
+unsigned int gpu_reset_requests;
 void amdgpu_amdkfd_gpu_reset(struct amdgpu_device *a)
-{ (void)a; TRIPWIRE("gpu_reset"); }
+{
+	(void)a;
+	if (!mes_failed_removes)
+		TRIPWIRE("gpu_reset");
+	gpu_reset_requests++;
+}
 int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *a, uint32_t *payload)
 { (void)a; (void)payload; TRIPWIRE("send_close_event_drain_irq"); }
 int amdgpu_amdkfd_submit_ib(struct amdgpu_device *a, enum kgd_engine_type engine,
@@ -922,6 +964,9 @@ void fixture_device_init(void)
 	node.vm_info.vmid_num_kfd = 8;
 	node.compute_vmid_bitmap = 0xff00;
 	node.max_proc_per_quantum = 8;
+	/* kfd_init_node's SMI event list (queue eviction/restore events). */
+	INIT_LIST_HEAD(&node.smi_clients);
+	spin_lock_init(&node.smi_lock);
 	node.dqm = device_queue_manager_init(&node);
 	assert(node.dqm && node.dqm->sched_policy != KFD_SCHED_POLICY_NO_HWS);
 	assert(!node.dqm->ops.start(node.dqm));
