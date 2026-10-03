@@ -21,6 +21,7 @@ extern int amdgpu_num_kcq;
 extern int amdgpu_rebar;
 extern unsigned int amdgpu_pp_feature_mask;
 extern int amdgpu_gpu_recovery;
+extern int amdgpu_dc;
 
 /* include/amd_shared.h: PP_GFXOFF_MASK in enum PP_FEATURE_MASK. */
 #define LINUXU_PP_GFXOFF_MASK 0x8000u
@@ -33,6 +34,23 @@ extern int amdgpu_gpu_recovery;
 
 /* 0 = stopped, 1 = initializing or stopping, 2 = running. */
 static int linuxu_bootstrap_state;
+/* Display opt-in; read once per bootstrap. */
+static int linuxu_display_requested;
+
+int linuxu_driver_set_display(int enable)
+{
+	int state = __atomic_load_n(&linuxu_bootstrap_state, __ATOMIC_ACQUIRE);
+
+	if (state != 0)
+		return -EBUSY;
+	__atomic_store_n(&linuxu_display_requested, enable != 0, __ATOMIC_RELEASE);
+	return 0;
+}
+
+int linuxu_driver_display_enabled(void)
+{
+	return __atomic_load_n(&linuxu_display_requested, __ATOMIC_ACQUIRE);
+}
 
 int linuxu_driver_bootstrap(void)
 {
@@ -99,6 +117,12 @@ int linuxu_driver_bootstrap(void)
 	/* Keep one upstream kernel compute ring; the runtime selects a free
 	 * MEC slot after probe instead of colliding with kernel/KIQ queues. */
 	amdgpu_num_kcq = 1;
+	/* Display is opt-in. amdgpu.dc=0 makes amdgpu_device_has_dc_support()
+	 * false, so discovery adds no DM block and no display interrupt,
+	 * BIOS-connector or modeset state is created: the same probe as a
+	 * build without CONFIG_DRM_AMD_DC. When requested, upstream's default
+	 * (-1: DC on every ASIC that has DCN/DCE) applies. */
+	amdgpu_dc = linuxu_driver_display_enabled() ? -1 : 0;
 	ret = linuxu_module_init_amdgpu_init();
 	if (ret)
 		goto stop_sched;

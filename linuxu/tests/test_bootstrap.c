@@ -24,6 +24,8 @@ int amdgpu_num_kcq;
 int amdgpu_rebar = -1;
 unsigned int amdgpu_pp_feature_mask = 0xfff7bfff; /* upstream default */
 int amdgpu_gpu_recovery = -1;
+int amdgpu_dc = -1; /* upstream default */
+static int expect_dc;
 int linuxu_timer_service_init(void) { return fail_stage == 5 ? -EAGAIN : 0; }
 static unsigned int workqueue_init_calls;
 int linuxu_workqueue_init(void)
@@ -70,6 +72,7 @@ static int amdgpu_init(void)
 	/* GFXOFF (PP_GFXOFF_MASK) is cleared; other PP features are kept. */
 	assert(amdgpu_pp_feature_mask == (0xfff7bfffu & ~0x8000u));
 	assert(amdgpu_gpu_recovery == 0);
+	assert(amdgpu_dc == expect_dc);
 	return fail_stage == 3 ? -ENODEV : 0;
 }
 static void amdgpu_exit(void) { event('a'); }
@@ -133,8 +136,21 @@ int main(void)
 	assert(linuxu_driver_bootstrap() == -ENODEV);
 	assert(strcmp(trace, "BDSAsdb") == 0);
 
+	/* Display is off unless requested; the request restores upstream's
+	 * amdgpu.dc default and cannot change while the modules run. */
+	assert(!linuxu_driver_display_enabled());
+	reset(3);
+	assert(linuxu_driver_set_display(1) == 0);
+	assert(linuxu_driver_display_enabled());
+	expect_dc = -1;
+	assert(linuxu_driver_bootstrap() == -ENODEV);
+	assert(linuxu_driver_set_display(0) == 0);
+	expect_dc = 0;
+
 	reset(4);
 	assert(linuxu_driver_bootstrap() == 0);
+	assert(linuxu_driver_set_display(1) == -EBUSY);
+	assert(!linuxu_driver_display_enabled());
 	assert(recursive_result == -EBUSY);
 	assert(strcmp(trace, "BDSA") == 0);
 	assert(linuxu_driver_bootstrap() == -EALREADY);

@@ -63,6 +63,10 @@
 	      - IOProbeScore: no other driver on Apple Silicon matches these
 	        functions; the score only keeps this personality ahead of generic
 	        PCI matching and does not depend on the device.
+	      - Optional MacLinuxGPUDisplay (boolean, absent = false): true lets
+	        upstream amdgpu bring up Display Core (amdgpu.dc=-1) on the GPU's
+	        own outputs. Absent or false keeps amdgpu.dc=0, the compute-only
+	        probe.
 	-->
 	<key>IOKitPersonalities</key>
 	<dict>
