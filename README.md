@@ -12,6 +12,8 @@ AMD Radeon GPUs over Thunderbolt on Apple Silicon Macs, driven by the same
 ![Tested GPU: Radeon AI PRO R9700](https://img.shields.io/badge/tested-Radeon%20AI%20PRO%20R9700%20(gfx1201)-ED1C24.svg)
 ![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)
 
+**mac_linuxgpu** · [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg) · [LemonSeed Engine](https://github.com/Geramy/LSE)
+
 </div>
 
 ---
@@ -68,11 +70,24 @@ the next steps.
   upstream removal, interrupt drain and endpoint isolation, and the driver
   stays reusable.
 - **Observability.** A read-only observer reads the driver's retained log and
-  session state at any time (`scripts/read-driver-log.py`).
+  session state at any time (`scripts/read-driver-log.py`). While compute runs,
+  it also reads upstream's own telemetry: sysfs attributes such as
+  `gpu_busy_percent`, `mem_busy_percent`, `gpu_metrics` and hwmon, and
+  `AMDGPU_INFO`. That's the same data `amdgpu_top` reads on Linux, and what
+  [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg) displays.
 - **Nothing hard-coded to one GPU.** The driver matches by AMD vendor ID and
   display/compute PCI class, and upstream's PCI ID table and IP discovery
   decide what is supported. Queue layout, MQDs, firmware names, ISA and limits
   all come from the device.
+
+## See it running
+
+[amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg) monitoring the
+R9700 through this driver while LemonSeed Engine generates text: GPU load from
+`GRBM_STATUS` samples, SMU clocks and power, hwmon temperatures and fan, and
+VRAM in use by the model.
+
+![amdgpu_mtopg monitoring an R9700 through mac_linuxgpu](assets/amdgpu_mtopg.png)
 
 ## How it works
 
@@ -270,6 +285,15 @@ third_party/linux  pinned upstream Linux (submodule)
 - **One GPU per driver instance.**
 - **No PCIe atomics over Thunderbolt.** Linux has the same limit with this card
   over Thunderbolt, and upstream's non-atomic firmware path is used.
+
+## Related projects
+
+- **[amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg):** a live
+  GPU monitor for macOS that reads this driver's telemetry. A signed and
+  notarized download is on its releases page.
+- **[LemonSeed Engine](https://github.com/Geramy/LSE):** LLM inference on AMD
+  GPUs through HRX/Loom. On macOS it runs on this driver and uses the HSA
+  runtime the driver installs.
 
 ## License
 
