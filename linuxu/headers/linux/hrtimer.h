@@ -13,6 +13,7 @@
 #include <linux/rbtree.h>
 #include <linux/types.h>
 #include <linux/err.h>
+#include <time.h>
 
 /* Mode arguments of hrtimer_start etc. (upstream hrtimer.h) */
 enum hrtimer_mode {
@@ -67,6 +68,9 @@ struct hrtimer {
 	bool				is_lazy;
 	ktime_t				_softexpires;
 	enum hrtimer_restart		(*function)(struct hrtimer *);
+	/* linuxu/src/timer.c: queue linkage and the clock the expiry uses. */
+	struct hlist_node		linuxu_entry;
+	clockid_t			linuxu_clock;
 };
 
 struct hrtimer_sleeper {
