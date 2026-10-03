@@ -879,6 +879,303 @@ final class MacLinuxGPUHost {
     var log: [String] { return logLines }
 }
 
+// ----------------------------------------------------------------
+// MARK: - The display test (selector 84, dext/sources/session_state.h)
+//
+// The driver's in-kernel DRM client (linuxu/headers/rt/display.h) probes
+// every connector Display Core found and shows a static pattern on the
+// connected outputs through upstream KMS. Observer client only; the GPU
+// must be running (display-test --init brings it up with a session client
+// held for the run).
+// ----------------------------------------------------------------
+private let kSelSysfsRead: UInt32 = 80
+private let kSelDisplay: UInt32 = 84
+private let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
+private let kDisplayReportMax = 1024
+private let kDisplayReportBytes = 72 + 8 * 80     // struct rt_display_report, version 1
+
+enum DisplayOp: UInt64 { case probe = 0, show = 1, off = 2 }
+let displayPatterns: [String: UInt64] = ["bars": 0, "white": 1, "gradient": 2]
+
+struct DisplayConnector {
+    let name: String
+    let id, status, modes, edidBytes: UInt32
+    let preferredWidth, preferredHeight, preferredRefresh: UInt32
+    let lit: Bool
+    let litWidth, litHeight, litRefresh, crtc: UInt32
+}
+
+struct DisplayReport {
+    let showing: Bool
+    let pattern, fbWidth, fbHeight, fbPitch, crtcs: UInt32
+    let fbGPUAddress, fillNs, commitNs: UInt64
+    let probeStatus, commitStatus, restoreStatus: Int32
+    let connectors: [DisplayConnector]
+
+    init?(_ data: Data) {
+        guard data.count >= kDisplayReportBytes else { return nil }
+        let bytes = [UInt8](data)
+        func u32(_ at: Int) -> UInt32 {
+            UInt32(bytes[at]) | UInt32(bytes[at + 1]) << 8 | UInt32(bytes[at + 2]) << 16 | UInt32(bytes[at + 3]) << 24
+        }
+        func u64(_ at: Int) -> UInt64 { UInt64(u32(at)) | UInt64(u32(at + 4)) << 32 }
+        guard u32(0) == 1, u32(4) <= 8 else { return nil }
+        showing = u32(8) != 0
+        pattern = u32(12); fbWidth = u32(16); fbHeight = u32(20); fbPitch = u32(24); crtcs = u32(28)
+        fbGPUAddress = u64(32); fillNs = u64(40); commitNs = u64(48)
+        probeStatus = Int32(bitPattern: u32(56)); commitStatus = Int32(bitPattern: u32(60))
+        restoreStatus = Int32(bitPattern: u32(64))
+        var list: [DisplayConnector] = []
+        for index in 0..<Int(u32(4)) {
+            let at = 72 + index * 80
+            let raw = bytes[at..<at + 32].prefix { $0 != 0 }
+            let f = (0..<12).map { u32(at + 32 + $0 * 4) }
+            list.append(DisplayConnector(name: String(decoding: raw, as: UTF8.self), id: f[0], status: f[1],
+                                         modes: f[2], edidBytes: f[3], preferredWidth: f[4],
+                                         preferredHeight: f[5], preferredRefresh: f[6], lit: f[7] != 0,
+                                         litWidth: f[8], litHeight: f[9], litRefresh: f[10], crtc: f[11]))
+        }
+        connectors = list
+    }
+
+    var lines: [String] {
+        var out: [String] = []
+        for c in connectors {
+            let state = c.status == 1 ? "connected" : c.status == 2 ? "disconnected" : "unknown"
+            var line = "  \(c.name.padding(toLength: 10, withPad: " ", startingAt: 0)) \(state)"
+            if c.status == 1 {
+                line += ", \(c.modes) mode(s), preferred \(c.preferredWidth)x\(c.preferredHeight)@\(c.preferredRefresh), EDID \(c.edidBytes) bytes"
+            }
+            if c.lit { line += "; showing \(c.litWidth)x\(c.litHeight)@\(c.litRefresh) on CRTC \(c.crtc)" }
+            out.append(line)
+        }
+        out.append("  \(crtcs) CRTC(s)")
+        if showing {
+            let name = displayPatterns.first { $0.value == UInt64(pattern) }?.key ?? "\(pattern)"
+            out.append(String(format: "  pattern %@: framebuffer %ux%u (pitch %u) at VRAM 0x%llx, written in %.1f ms, committed in %.1f ms",
+                              name, fbWidth, fbHeight, fbPitch, fbGPUAddress,
+                              Double(fillNs) / 1e6, Double(commitNs) / 1e6))
+        }
+        return out
+    }
+}
+
+/// A Linux errno as the display test reports it.
+func displayErrno(_ status: Int64) -> String {
+    if status == 0 { return "ok" }
+    let code = Int32(truncatingIfNeeded: -status)
+    let meaning: String
+    switch code {
+    case ENODEV: meaning = ": no display (the driver runs without Display Core; install with activate.sh --display)"
+    case ENOENT: meaning = ": no connected output (or no connector by that name)"
+    case E2BIG: meaning = ": the outputs' modes need a framebuffer larger than 8192 pixels"
+    default: meaning = ""
+    }
+    return "Linux errno \(code) (\(String(cString: strerror(code)))\(meaning))"
+}
+
+/// The identity, size and preferred timing of an EDID base block.
+struct EDIDSummary {
+    let vendor: String
+    let product: UInt16
+    let serial: UInt32
+    let name: String?
+    let serialText: String?
+    let year: Int
+    let widthCm, heightCm: Int
+    let preferred: (width: Int, height: Int, refresh: Double, clockHz: Int, widthMm: Int, heightMm: Int)?
+
+    init?(_ data: Data) {
+        let b = [UInt8](data)
+        guard b.count >= 128, b[0..<8] == [0, 255, 255, 255, 255, 255, 255, 0][...],
+              b[0..<128].reduce(UInt8(0), &+) == 0 else { return nil }
+        let word = Int(b[8]) << 8 | Int(b[9])
+        vendor = String([10, 5, 0].map { Character(UnicodeScalar(UInt8(((word >> $0) & 31) + 64))) })
+        product = UInt16(b[10]) | UInt16(b[11]) << 8
+        serial = UInt32(b[12]) | UInt32(b[13]) << 8 | UInt32(b[14]) << 16 | UInt32(b[15]) << 24
+        year = Int(b[17]) + 1990
+        widthCm = Int(b[21]); heightCm = Int(b[22])
+        var name: String?, serialText: String?
+        var preferred: (Int, Int, Double, Int, Int, Int)?
+        for at in stride(from: 54, to: 126, by: 18) {
+            let d = Array(b[at..<at + 18])
+            if d[0] != 0 || d[1] != 0 {
+                if preferred == nil {
+                    let clock = (Int(d[0]) | Int(d[1]) << 8) * 10_000
+                    let h = Int(d[2]) | Int(d[4] & 0xf0) << 4, hb = Int(d[3]) | Int(d[4] & 0x0f) << 8
+                    let v = Int(d[5]) | Int(d[7] & 0xf0) << 4, vb = Int(d[6]) | Int(d[7] & 0x0f) << 8
+                    let total = (h + hb) * (v + vb)
+                    preferred = (h, v, total > 0 ? Double(clock) / Double(total) : 0, clock,
+                                 Int(d[12]) | Int(d[14] & 0xf0) << 4, Int(d[13]) | Int(d[14] & 0x0f) << 8)
+                }
+                continue
+            }
+            let text = String(decoding: d[5..<18].prefix { $0 != 0x0a }, as: UTF8.self)
+                .trimmingCharacters(in: .whitespaces)
+            if d[3] == 0xfc { name = text } else if d[3] == 0xff { serialText = text }
+        }
+        self.name = name
+        self.serialText = serialText
+        self.preferred = preferred.map { (width: $0.0, height: $0.1, refresh: $0.2, clockHz: $0.3,
+                                          widthMm: $0.4, heightMm: $0.5) }
+    }
+
+    var summary: String {
+        var parts = [String(format: "%@ product 0x%04x", vendor, product),
+                     name.map { "name '\($0)'" } ?? "no name",
+                     "serial \(serialText ?? String(serial))", "made \(year)", "\(widthCm)x\(heightCm) cm"]
+        if let p = preferred {
+            parts.append(String(format: "preferred %dx%d@%.2f (%.2f MHz, %dx%d mm)", p.width, p.height,
+                                p.refresh, Double(p.clockHz) / 1e6, p.widthMm, p.heightMm))
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+extension MacLinuxGPUHost {
+    /// IOConnectCallMethod with scalars and structures both ways.
+    func callMethod(_ selector: UInt32, inScalars: [UInt64], inData: Data,
+                    outScalars: Int, outSize: Int) -> (kern_return_t, [UInt64], Data) {
+        guard isOpen else { return (kIOReturnError, [], Data()) }
+        var outBuf = [UInt64](repeating: 0, count: max(1, outScalars))
+        var outN = UInt32(outBuf.count)
+        var outData = Data(count: max(1, outSize))
+        var outCnt = size_t(outSize)
+        let kr: kern_return_t = inScalars.withUnsafeBufferPointer { ibuf in
+            outBuf.withUnsafeMutableBufferPointer { obuf in
+                outData.withUnsafeMutableBytes { optr in
+                    inData.withUnsafeBytes { iptr in
+                        IOConnectCallMethod(ucConn, selector, ibuf.baseAddress, UInt32(inScalars.count),
+                                            inData.isEmpty ? nil : iptr.baseAddress, inData.count,
+                                            obuf.baseAddress, &outN, optr.baseAddress, &outCnt)
+                    }
+                }
+            }
+        }
+        return (kr, Array(outBuf.prefix(Int(outN))), outData.prefix(Int(min(outCnt, size_t(outSize)))))
+    }
+
+    /// One display op: (IOReturn, Linux status, report).
+    func display(_ op: DisplayOp, pattern: UInt64 = 0, connector: String? = nil)
+        -> (kern_return_t, Int64, DisplayReport?) {
+        let name = Data((connector ?? "").utf8)
+        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [op.rawValue, pattern, kDisplayConfirm],
+                                            inData: name, outScalars: 1, outSize: kDisplayReportMax)
+        guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
+        return (kr, Int64(bitPattern: status), DisplayReport(data))
+    }
+
+    /// A sysfs file under the device directory (selector 80), read whole.
+    func sysfsRead(_ path: String, list: Bool = false) -> (Int64, Data)? {
+        var data = Data()
+        while true {
+            let (kr, values, chunk) = callMethod(kSelSysfsRead, inScalars: [list ? 1 : 0, UInt64(data.count)],
+                                                 inData: Data(path.utf8), outScalars: 3, outSize: 4096)
+            guard kr == kIOReturnSuccess, values.count == 3 else { return nil }
+            let status = Int64(bitPattern: values[0])
+            if status != 0 { return (status, Data()) }
+            data.append(chunk.prefix(Int(values[1])))
+            let length = values[2]
+            if values[1] == 0 || (length > 0 && UInt64(data.count) >= length) || (length == 0 && values[1] < 4096) {
+                return (0, data)
+            }
+        }
+    }
+
+    /// The connector's EDID, as Linux shows /sys/class/drm/card0-<name>/edid.
+    func connectorEDID(_ name: String) -> Data? {
+        guard let (status, listing) = sysfsRead("drm", list: true), status == 0 else { return nil }
+        let cards = String(decoding: listing, as: UTF8.self).split(separator: "\n")
+            .filter { $0.hasPrefix("d card") && !$0.contains("-") }.map { String($0.dropFirst(2)) }
+        for card in cards.sorted() {
+            if let (status, edid) = sysfsRead("drm/\(card)/\(card)-\(name)/edid"), status == 0 { return edid }
+        }
+        return nil
+    }
+}
+
+/// display-probe / display-test / display-off. Returns the exit status.
+func runDisplayCommand(_ command: String, _ options: [String]) -> Int32 {
+    func value(_ flag: String) -> String? {
+        guard let at = options.firstIndex(of: flag), at + 1 < options.count else { return nil }
+        return options[at + 1]
+    }
+    let initGPU = options.contains("--init")
+    let connector = value("--connector")
+    let patternName = value("--pattern") ?? "bars"
+    guard let pattern = displayPatterns[patternName] else {
+        print("unknown pattern \(patternName) (bars, white, gradient)")
+        return 2
+    }
+    var seconds = Double(value("--seconds") ?? "") ?? 0
+    if command == "display-test" && initGPU && seconds == 0 { seconds = 30 }
+
+    // --init: a session client brings the GPU up (InitDevice with the
+    // firmware servicer) and stays open for the run.
+    var session: MacLinuxGPUHost?
+    if initGPU {
+        let host = MacLinuxGPUHost()
+        guard host.openUserClient(), host.initDevice() else {
+            print("ERROR: GPU initialization failed (scripts/read-driver-log.py shows why)")
+            return 1
+        }
+        session = host
+    }
+    defer { session?.closeUserClient() }
+    let observer = MacLinuxGPUHost()
+    guard observer.openUserClient(observer: true) else {
+        print("ERROR: failed to open an observer client")
+        return 1
+    }
+    defer { observer.closeUserClient() }
+
+    func perform(_ op: DisplayOp, _ label: String, pattern: UInt64 = 0, connector: String? = nil) -> DisplayReport? {
+        let (kr, status, report) = observer.display(op, pattern: pattern, connector: connector)
+        if kr != kIOReturnSuccess {
+            let reason = kr == kern_return_t(bitPattern: 0xe00002d8) ? "not ready: the GPU is not running in an open session (use --init)"
+                : kr == kern_return_t(bitPattern: 0xe00002e2) ? "not permitted: this driver predates the display test"
+                : kr == kern_return_t(bitPattern: 0xe00002d5) ? "busy: another display operation is running"
+                : String(format: "call failed (kr=%#x)", kr)
+            print("\(label): \(reason)")
+            return nil
+        }
+        print("\(label): \(displayErrno(status))")
+        guard let report else { print("  (malformed report)"); return nil }
+        if status != 0 && op == .show {
+            print("  probe \(displayErrno(Int64(report.probeStatus))), commit \(displayErrno(Int64(report.commitStatus))), restore \(displayErrno(Int64(report.restoreStatus)))")
+        }
+        report.lines.forEach { print($0) }
+        return status == 0 ? report : nil
+    }
+
+    switch command {
+    case "display-probe":
+        guard let report = perform(.probe, "probe") else { return 1 }
+        var failed = false
+        if options.contains("--edid") {
+            for c in report.connectors where c.status == 1 {
+                guard let edid = observer.connectorEDID(c.name) else {
+                    print("  \(c.name) EDID: unreadable"); failed = true; continue
+                }
+                print("  \(c.name) EDID (\(edid.count) bytes): \(EDIDSummary(edid)?.summary ?? "not a valid EDID base block")")
+                for at in stride(from: 0, to: edid.count, by: 16) {
+                    let row = edid[at..<min(at + 16, edid.count)].map { String(format: "%02x", $0) }
+                    print(String(format: "    %04x  ", at) + row.joined(separator: " "))
+                }
+            }
+        }
+        return failed ? 1 : 0
+    case "display-off":
+        return perform(.off, "off") == nil ? 1 : 0
+    default:
+        guard perform(.show, "show \(patternName) on \(connector ?? "every connected output")",
+                      pattern: pattern, connector: connector) != nil else { return 1 }
+        guard seconds > 0 else { return 0 }
+        Thread.sleep(forTimeInterval: seconds)
+        return perform(.off, "off after \(seconds) s") == nil ? 1 : 0
+    }
+}
+
 // The normal app launch follows the mac_amdgpu self-installing host flow. The
 // CLI commands remain available to activate.sh and diagnostics tools.
 @MainActor
@@ -1227,6 +1524,10 @@ struct AppMain {
             activator.activate()
             RunLoop.main.run()
             return
+        }
+
+        if ["display-probe", "display-test", "display-off"].contains(args[1]) {
+            exit(runDisplayCommand(args[1], Array(args.dropFirst(2))))
         }
 
         let host = MacLinuxGPUHost()
