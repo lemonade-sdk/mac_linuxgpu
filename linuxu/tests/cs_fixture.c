@@ -539,11 +539,18 @@ static uint64_t sdma_packet(struct engine *e, const uint32_t *dw, uint64_t avail
 		break;
 	}
 	case FX_SDMA_FILL: {
+		/* As SDMA 5.2-7's CONSTANT_FILL with FILLSIZE 0 (what their
+		 * emit_fill_buffer emits): the value's low byte, per byte. */
 		uint64_t dst = ((uint64_t)dw[2] << 32) | dw[1];
+		uint8_t pattern[256];
 
 		STAT(fills);
-		for (uint32_t off = 0; off < dw[4]; off += 4)
-			gpu_access(e, vmid, dst + off, (void *)(uintptr_t)&dw[3], 4, true);
+		memset(pattern, dw[3] & 0xff, sizeof(pattern));
+		for (uint32_t off = 0; off < dw[4]; off += sizeof(pattern)) {
+			uint32_t n = dw[4] - off < sizeof(pattern) ? dw[4] - off : sizeof(pattern);
+
+			gpu_access(e, vmid, dst + off, pattern, n, true);
+		}
 		break;
 	}
 	case FX_SDMA_VM_FLUSH:
