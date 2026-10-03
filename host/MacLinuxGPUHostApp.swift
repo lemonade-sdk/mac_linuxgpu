@@ -429,6 +429,7 @@ private let kSelLiveStatus:       UInt32 = 30
 private let kSelDisableSmuFeatures: UInt32 = 33
 private let kSelBOMap:            UInt32 = 36
 private let kSelReleaseQuarantine: UInt32 = 61 // entitled; see session_state.h
+private let kSelPower:            UInt32 = 83 // device power; see power_state.h
 
 // Observer clients (dext/sources/session_state.h) read cached state only and
 // may attach while a session closes or stays quarantined.
@@ -437,6 +438,42 @@ private let kUserClientObserver: UInt32 = 1
 private let kQuerySessionState:  UInt64 = 0x4c534553
 private let kSessionStateWords = 9
 private let kIOReturnUnsupportedValue = kern_return_t(bitPattern: 0xe00002c7)
+private let kQueryPowerState:    UInt64 = 0x4c505752
+private let kPowerStateWords = 12
+private let kPowerOpQuery:   UInt64 = 0
+private let kPowerOpPrepare: UInt64 = 1
+private let kPowerOpResume:  UInt64 = 2
+
+/// The cached device power snapshot (QueryInfo "LPWR"); names match
+/// dext/sources/power_state.h and scripts/read-driver-log.py.
+struct PowerState {
+    let state: UInt64
+    let generation: UInt64
+    let flags: UInt64
+    let cause: UInt64
+    let error: Int64
+    let holds: UInt64
+
+    static let states = ["active", "suspending", "suspended", "resuming", "lost"]
+    static let causes = ["none", "client prepare", "client resume", "holding client closed", "system sleep",
+                         "system wake", "device low power", "device on", "KFD suspend failed",
+                         "KFD resume failed", "device gone after wake", "re-probed", "session closed"]
+
+    init?(_ values: [UInt64]) {
+        guard values.count == kPowerStateWords, values[0] == 1 else { return nil }
+        state = values[1]; generation = values[2]; flags = values[3]
+        cause = values[4]; error = Int64(bitPattern: values[5]); holds = values[6]
+    }
+
+    var vramPreserved: Bool { flags & 1 != 0 }
+    var summary: String {
+        let name = SessionState.name(PowerState.states, state)
+        let why = SessionState.name(PowerState.causes, cause)
+        let memory = vramPreserved ? "VRAM preserved" : "VRAM lost"
+        return "Power: \(name) (\(why)\(error != 0 ? ", error \(error)" : ""); \(memory); " +
+            "\(holds) low-power hold(s); generation \(generation))"
+    }
+}
 
 /// The cached session snapshot (QueryInfo "LSES"); names match
 /// dext/sources/session_state.h and scripts/read-driver-log.py.
@@ -851,6 +888,21 @@ final class MacLinuxGPUHost {
         return state
     }
 
+    /// Device power (cached); a PREPARE or RESUME request needs the
+    /// session-release entitlement on an observer client and lasts as long
+    /// as this client stays open.
+    func power(_ op: UInt64 = kPowerOpQuery) -> PowerState? {
+        let (kr, values) = op == kPowerOpQuery
+            ? callScalar(kSelQueryInfo, inScalars: [kQueryPowerState], outScalars: kPowerStateWords)
+            : callScalar(kSelPower, inScalars: [op], outScalars: kPowerStateWords)
+        guard kr == kIOReturnSuccess, let state = PowerState(values) else {
+            append(String(format: "power: unavailable (kr=%#x)", kr))
+            return nil
+        }
+        append(state.summary)
+        return state
+    }
+
     /// Release a quarantined session once the driver's cached state proves it
     /// quiescent. Requires the session-release entitlement.
     func releaseQuarantine() -> Bool {
@@ -1232,7 +1284,8 @@ struct AppMain {
         let host = MacLinuxGPUHost()
         // Cached-state commands use an observer client, which works while a
         // session closes or stays quarantined and never joins a session.
-        let observerCommands: Set<String> = ["status", "session", "release"]
+        let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch",
+                                             "power-hold"]
 
         if !host.openUserClient(observer: observerCommands.contains(args[1])) {
             print("ERROR: failed to open the UserClient (is the dext activated, "
@@ -1279,6 +1332,43 @@ case "session":
 case "release":
     commandStatus = host.releaseQuarantine() ? 0 : 1
     if let state = host.sessionState() { print(state.summary) }
+case "power":
+    if let state = host.power() {
+        print(state.summary)
+        commandStatus = 0
+    } else {
+        commandStatus = 1
+    }
+case "power-hold":
+    // Holds a low-power request for N seconds (default 10), then drops it:
+    // the quiesce and resume a backgrounded app gets, while clients run.
+    let seconds = args.count >= 3 ? max(1, Int(args[2]) ?? 10) : 10
+    if let state = host.power(kPowerOpPrepare) {
+        print("held: " + state.summary)
+        Thread.sleep(forTimeInterval: TimeInterval(seconds))
+        if let resumed = host.power(kPowerOpResume) { print("released: " + resumed.summary) }
+        commandStatus = 0
+    } else {
+        commandStatus = 1
+    }
+case "power-watch":
+    // Stays running: asks the driver for low power when the Mac is about
+    // to sleep and drops the request on wake, so clients quiesce cleanly
+    // before the driver closes the session for the sleep. The request is
+    // this client's: it ends with the process.
+    let center = NSWorkspace.shared.notificationCenter
+    let sleep = center.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+        if let state = host.power(kPowerOpPrepare) { print("will sleep: " + state.summary) }
+    }
+    let wake = center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+        if let state = host.power(kPowerOpResume) { print("did wake: " + state.summary) }
+    }
+    if let state = host.power() { print(state.summary) }
+    print("watching sleep and wake; Ctrl-C to stop")
+    RunLoop.main.run()
+    center.removeObserver(sleep)
+    center.removeObserver(wake)
+    commandStatus = 0
 case "close":
     commandStatus = 0
 default:

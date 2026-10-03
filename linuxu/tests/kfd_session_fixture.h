@@ -23,6 +23,7 @@
 #define FIXTURE_AQL_COMPLETION		56	/* packet completion_signal */
 #define FIXTURE_AQL_PACKET_INVALID	1
 #define FIXTURE_AQL_PACKET_DISPATCH	2
+#define FIXTURE_MES_SLOTS		32	/* ADD_QUEUEs recorded */
 
 #ifdef __cplusplus
 extern "C" {
@@ -68,9 +69,12 @@ extern struct kfd_node node;
 extern struct kfd_topology_device topo;
 extern uint64_t doorbell_bar[TEST_DOORBELL_BYTES / 8];
 extern unsigned int mes_adds, mes_removes;
-extern uint32_t mes_doorbells[8];
-extern uint64_t mes_wptr[8], mes_page_table[8];
-extern uint32_t mes_pasid[8];
+extern uint32_t mes_doorbells[FIXTURE_MES_SLOTS];
+extern uint64_t mes_wptr[FIXTURE_MES_SLOTS], mes_page_table[FIXTURE_MES_SLOTS];
+extern uint32_t mes_pasid[FIXTURE_MES_SLOTS];
+extern unsigned int mes_fail_removes, mes_failed_removes, gpu_reset_requests;
+extern bool fixture_restores_allowed;
+extern unsigned int bo_restores;
 extern unsigned int live_bos, gart_maps, render_opens, render_releases, vm_acquires;
 extern unsigned int kgd_allocs, kgd_frees, kgd_maps, kgd_unmaps, kernel_allocs;
 extern unsigned int sdma_copies, mes_shader_debugger_sets, mes_shader_debugger_flushes;

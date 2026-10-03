@@ -281,7 +281,17 @@ third_party/linux  pinned upstream Linux (submodule)
   machine (`IOPCIFamily`). If `scripts/read-driver-log.py` reports a
   quarantined session, restart the Mac instead.
 - **Compute only.** The display stack is not built.
-- **No GPU reset recovery and no suspend/resume** over Thunderbolt yet.
+- **No GPU reset recovery.**
+- **Sleep loses device memory.** When the host sleeps, the Thunderbolt link
+  goes down and the GPU is reset, so the driver closes the compute session
+  through its normal close path before the sleep, and clients reload after
+  wake (the HSA runtime reports `MAC_HSA_STATUS_DEVICE_LOST`). Upstream's
+  only suspend path for a discrete GPU evicts all of VRAM to system memory,
+  which doesn't fit a large model on the iPad. A low-power period without
+  host sleep keeps VRAM: compute is quiesced through upstream KFD suspend
+  and resumes where it left off (`mac_hsa_agent_prepare_low_power` /
+  `mac_hsa_agent_resume`, or `MacLinuxGPUHostApp power-watch` on a Mac).
+  See `dext/sources/power_state.h`.
 - **One GPU per driver instance.**
 - **No PCIe atomics over Thunderbolt.** Linux has the same limit with this card
   over Thunderbolt, and upstream's non-atomic firmware path is used.

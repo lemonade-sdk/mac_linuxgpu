@@ -33,6 +33,8 @@ public:
     void FinishStop(IOService *provider) LOCALONLY;
     virtual kern_return_t NewUserClient(uint32_t type,
                                         IOUserClient **userClient) override;
+    virtual kern_return_t SetPowerState(uint32_t powerFlags) override;
+    void AckPowerState(uint32_t powerFlags) LOCALONLY;
     virtual void InterruptOccurred(OSAction *action,
                                    uint64_t count,
                                    uint64_t time)
