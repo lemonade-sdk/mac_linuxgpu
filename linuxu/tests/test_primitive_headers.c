@@ -146,10 +146,11 @@ int main(void)
 	peripheral_contracts();
 	ioctl_contracts();
 	unaligned_contracts();
-	for (unsigned shift = 0; shift < 64; ++shift) {
-		u64 mask = 1ULL << shift;
-		assert(FIELD_GET(mask, ~0ULL) == 1);
-	}
+	/* Upstream FIELD_GET() takes compile-time constant masks only. */
+#define FIELD_GET_BIT(shift) assert(FIELD_GET(1ULL << (shift), ~0ULL) == 1)
+	FIELD_GET_BIT(0); FIELD_GET_BIT(1); FIELD_GET_BIT(7); FIELD_GET_BIT(15);
+	FIELD_GET_BIT(31); FIELD_GET_BIT(32); FIELD_GET_BIT(47); FIELD_GET_BIT(63);
+#undef FIELD_GET_BIT
 	assert(FIELD_GET(GENMASK(15, 8), 0x12345678ULL) == 0x56);
 	assert(FIELD_GET(GENMASK_ULL(63, 32), 0x123456789abcdef0ULL) == 0x12345678);
 	puts("Primitive header ABI: ioctl field decoding/directions and typed endian access passed");
