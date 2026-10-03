@@ -981,3 +981,16 @@ test-read-sysfs:
 
 test: test-sysfs-read test-upstream-pm-sysfs test-drm-info test-read-sysfs
 .PHONY: test-sysfs-read test-upstream-pm-sysfs test-drm-info test-read-sysfs
+
+# The Linux-file RPC (rt/lx_abi.h): request framing under fuzz, and the
+# per-client process, descriptor table, async waits and mmaps of
+# linuxu/src/amdgpu-rt/lx_files.c against fixture character devices.
+test-lx-frame-fuzz:
+	bash scripts/test-lx-frame-fuzz.sh
+
+test-lx-files:
+	bash scripts/test-lx-files.sh
+
+test: test-lx-frame-fuzz test-lx-files
+CRASH_PATH_TESTS += test-lx-frame-fuzz test-lx-files
+.PHONY: test-lx-frame-fuzz test-lx-files
