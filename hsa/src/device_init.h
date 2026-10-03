@@ -5,10 +5,19 @@
 
 namespace mac_hsa {
 enum class DriverProtocol { Unknown, Converted, LinuxShim };
+// The Linux-shim driver is recognized by its user class, whatever bundle
+// carries it: the same dext ships under several identifiers (the macOS host
+// app's, and one per app that embeds it, which DriverKit requires to be
+// prefixed by that app's identifier). Its identity is then proven by the
+// RuntimeBuild handshake (selector 43: magic and ABI) before the session is
+// claimed, so a foreign service with the same class name is skipped there.
+// The converted protocol predates that handshake and only ever shipped
+// under the macOS host app's identifier.
+constexpr std::string_view kConvertedDriverBundle = "com.geramyloveless.MacAMDGPUHost.MacAMDGPU";
 constexpr DriverProtocol driverProtocol(std::string_view bundle, std::string_view userClass) {
-    if (bundle != "com.geramyloveless.MacAMDGPUHost.MacAMDGPU") return DriverProtocol::Unknown;
+    if (bundle.empty()) return DriverProtocol::Unknown;
     if (userClass == "MacLinuxGPU") return DriverProtocol::LinuxShim;
-    if (userClass == "MacAMDGPU") return DriverProtocol::Converted;
+    if (userClass == "MacAMDGPU" && bundle == kConvertedDriverBundle) return DriverProtocol::Converted;
     return DriverProtocol::Unknown;
 }
 struct FirmwareFile { uint64_t type; std::string name; };

@@ -43,13 +43,24 @@ set(FW_SERVICER_SOURCES
   ${FW_SERVICER_DIR}/fw_mailbox_service.c
   ${FW_SERVICER_DIR}/fw_mailbox_iokit.c)
 
-add_library(hsa-runtime64 SHARED ${HSA_RUNTIME_SOURCES} ${FW_SERVICER_SOURCES})
+# iOS/iPadOS: an app may not dlopen a runtime from outside its bundle, so the
+# runtime is a static library linked into the app (the IOKit transport and
+# the firmware servicer are the same). Host unit tests run on macOS only.
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(HSA_RUNTIME_LIBRARY_TYPE STATIC)
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+else()
+  set(HSA_RUNTIME_LIBRARY_TYPE SHARED)
+endif()
+add_library(hsa-runtime64 ${HSA_RUNTIME_LIBRARY_TYPE} ${HSA_RUNTIME_SOURCES} ${FW_SERVICER_SOURCES})
 target_compile_definitions(hsa-runtime64 PRIVATE HSA_EXPORT)
 target_include_directories(hsa-runtime64 PUBLIC include third_party/hsa/include)
 target_include_directories(hsa-runtime64 PRIVATE ${FW_SERVICER_DIR})
 target_compile_options(hsa-runtime64 PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(hsa-runtime64 PRIVATE "-framework IOKit" "-framework CoreFoundation")
-set_target_properties(hsa-runtime64 PROPERTIES VERSION 0.1.0 SOVERSION 1)
+if(HSA_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
+  set_target_properties(hsa-runtime64 PROPERTIES VERSION 0.1.0 SOVERSION 1)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)
