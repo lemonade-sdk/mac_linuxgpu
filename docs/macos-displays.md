@@ -201,10 +201,20 @@ Apple GPU. The AMD GPU only scans out.
   fences signal. `test-surface-import` runs this on the CS fixture, whose
   software SDMA engine reads system memory through the GART and faults on
   anything the DART does not map.
-- **Not wired yet:** the IMPORT and PRESENT ops on selector 84, and which
-  client type owns the imports. Observer clients hold no handles today,
-  and session clients run on the owner's queue. This is decided with
-  hardware results.
+- **Wired (build 232):** selector 84 ops IMPORT, VERIFY, RELEASE, OUTPUT
+  and PRESENT, for observer clients. A client's imports and the output it
+  started end with its Stop; a session close releases them all.
+  `MacLinuxGPUHost display-pin-test` answers the pinning question on
+  hardware: it imports an IOSurface once, rewrites it from the CPU every
+  second, and has the driver read it back with SDMA and through its own
+  CPU view. `display-agent --create` mirrors one monitor: it creates a
+  CGVirtualDisplay from the plan, lights the connector at the mode macOS
+  picks (OUTPUT), captures the virtual display with ScreenCaptureKit, and
+  sends each frame's damage with PRESENT, which does an SDMA copy and a
+  flip on vblank. When macOS switches modes it relights. On exit it stops
+  capture, releases the imports, restores the monitor and removes the
+  display. It needs Screen Recording permission for the process that runs
+  it.
 
 ## 4. Increments
 

@@ -2,20 +2,24 @@
 //  DisplayAgent.swift — the display agent's model: what the driver reports
 //  about the GPU's outputs (selector 84, dext/sources/session_state.h), each
 //  connected monitor's EDID, and the macOS virtual display that would stand
-//  for it (docs/macos-displays.md). Foundation only: no IOKit and no
-//  CoreGraphics, so it builds and is tested on its own
-//  (scripts/test-display-agent.sh); the host app's display-agent command
-//  drives it over the observer client.
+//  for it (docs/macos-displays.md). No IOKit, no ScreenCaptureKit and only
+//  CoreGraphics geometry types, so it builds and is tested on its own
+//  (scripts/test-display-agent.sh); DisplayAgentRuntime.swift drives it
+//  over the observer client.
 //
 
 import Foundation
+import CoreGraphics
 
 // struct rt_display_report / rt_display_modes (linuxu/headers/rt/display.h),
 // version 1.
 let kDisplayReportBytes = 72 + 8 * 80
 let kDisplayModesBytes = 24 + 56 * 16
 
-enum DisplayOp: UInt64 { case probe = 0, show = 1, off = 2, status = 3, modes = 4 }
+enum DisplayOp: UInt64 {
+    case probe = 0, show = 1, off = 2, status = 3, modes = 4
+    case importSurface = 5, verify = 6, release = 7, output = 8, present = 9
+}
 let displayPatterns: [String: UInt64] = ["bars": 0, "white": 1, "gradient": 2]
 
 private func le32(_ bytes: [UInt8], _ at: Int) -> UInt32 {
@@ -345,4 +349,73 @@ struct DisplayAgentState {
         displays = incoming
         return changes
     }
+}
+
+// ----------------------------------------------------------------
+// MARK: - Frames: the pinning check and PRESENT replies
+// ----------------------------------------------------------------
+
+/// rt_surface_pattern (linuxu/headers/rt/surface.h): the value of dword
+/// @index of a surface filled for @seed.
+func surfacePattern(seed: UInt32, dword index: UInt64) -> UInt32 {
+    UInt32(truncatingIfNeeded: index &* 2654435761) ^ (seed &* 0x85ebca77) ^ 0x5a5a0000
+}
+
+/// struct rt_surface_verify_result, version 1.
+struct SurfaceVerifyResult {
+    static let bytes = 64
+    let samples, sampleBytes, gpuMismatches, cpuMismatches: UInt32
+    let cpuChecked: Bool
+    let firstGPUMismatch, firstCPUMismatch, gpuNs, gpuAddress: UInt64
+    let gpuValue, expectedValue: UInt32
+
+    var dwords: UInt32 { samples * sampleBytes / 4 }
+
+    init?(_ data: Data) {
+        guard data.count >= SurfaceVerifyResult.bytes else { return nil }
+        let b = [UInt8](data)
+        func u64(_ at: Int) -> UInt64 { UInt64(le32(b, at)) | UInt64(le32(b, at + 4)) << 32 }
+        guard le32(b, 0) == 1 else { return nil }
+        samples = le32(b, 4); sampleBytes = le32(b, 8)
+        gpuMismatches = le32(b, 12); cpuMismatches = le32(b, 16); cpuChecked = le32(b, 20) != 0
+        firstGPUMismatch = u64(24); firstCPUMismatch = u64(32); gpuNs = u64(40); gpuAddress = u64(48)
+        gpuValue = le32(b, 56); expectedValue = le32(b, 60)
+    }
+}
+
+/// struct rt_display_present_stats, version 1.
+struct PresentStats {
+    static let bytes = 56
+    let rects, jobs: UInt32
+    let full: Bool
+    let bytesCopied, copyNs, flipNs: UInt64
+    let copyStatus, flipStatus: Int32
+    let frames: UInt64
+
+    init?(_ data: Data) {
+        guard data.count >= PresentStats.bytes else { return nil }
+        let b = [UInt8](data)
+        func u64(_ at: Int) -> UInt64 { UInt64(le32(b, at)) | UInt64(le32(b, at + 4)) << 32 }
+        guard le32(b, 0) == 1 else { return nil }
+        rects = le32(b, 4); jobs = le32(b, 8); full = le32(b, 12) != 0
+        bytesCopied = u64(16); copyNs = u64(24); flipNs = u64(32)
+        copyStatus = Int32(bitPattern: le32(b, 40)); flipStatus = Int32(bitPattern: le32(b, 44))
+        frames = u64(48)
+    }
+}
+
+/// A frame's damage as PRESENT takes it: whole pixels inside the surface,
+/// at most 255 rectangles (more become the whole frame).
+func presentRects(_ dirty: [CGRect], width: Int, height: Int) -> [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)] {
+    let bounds = CGRect(x: 0, y: 0, width: width, height: height)
+    var out: [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)] = []
+    for rect in dirty {
+        let r = rect.standardized.intersection(bounds)
+        if r.isNull || r.isEmpty { continue }
+        let x0 = Int(r.minX.rounded(.down)), y0 = Int(r.minY.rounded(.down))
+        let x1 = Int(r.maxX.rounded(.up)), y1 = Int(r.maxY.rounded(.up))
+        out.append((UInt32(x0), UInt32(y0), UInt32(x1 - x0), UInt32(y1 - y0)))
+    }
+    if out.count > 255 { return [(0, 0, UInt32(width), UInt32(height))] }
+    return out
 }

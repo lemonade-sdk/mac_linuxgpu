@@ -129,4 +129,27 @@ check(state.apply([other]) == [.remove("DP-1"), .unchanged("DP-2")])
 check(state.apply([]) == [.remove("DP-2")] && state.displays.isEmpty)
 check(String(describing: DisplayAgentState.Change.add(plan)) == "add DP-1 (\"TEST PANEL\")")
 
-print("PASS display agent: report/modes decoding, EDID identity and primaries, virtual-display plans, refusals, add/update/remove")
+// ---- frames ----
+// rt_surface_pattern, as the driver computes it (C: (uint32_t)(dword * 2654435761u) ^ seed * 0x85ebca77u ^ 0x5a5a0000u).
+check(surfacePattern(seed: 0, dword: 0) == 0x5a5a0000)
+check(surfacePattern(seed: 1, dword: 1) == (2654435761 ^ 0x85ebca77 ^ 0x5a5a0000))
+check(surfacePattern(seed: 3, dword: 0x1_0000_0001) == UInt32(truncatingIfNeeded: UInt64(0x1_0000_0001) &* 2654435761) ^ (3 &* 0x85ebca77) ^ 0x5a5a0000)
+var verify = [UInt8](repeating: 0, count: SurfaceVerifyResult.bytes)
+put32(&verify, 0, 1); put32(&verify, 4, 64); put32(&verify, 8, 256); put32(&verify, 12, 3); put32(&verify, 20, 1)
+put32(&verify, 24, 4096); put32(&verify, 56, 0xdead); put32(&verify, 60, 0xbeef)
+guard let v = SurfaceVerifyResult(Data(verify)) else { check(false); exit(1) }
+check(v.dwords == 4096 && v.gpuMismatches == 3 && v.cpuChecked && v.firstGPUMismatch == 4096 &&
+      v.gpuValue == 0xdead && v.expectedValue == 0xbeef)
+var present = [UInt8](repeating: 0, count: PresentStats.bytes)
+put32(&present, 0, 1); put32(&present, 4, 2); put32(&present, 8, 1); put32(&present, 12, 1)
+put32(&present, 16, 7680); put32(&present, 40, UInt32(bitPattern: -62)); put32(&present, 48, 9)
+guard let ps = PresentStats(Data(present)) else { check(false); exit(1) }
+check(ps.rects == 2 && ps.jobs == 1 && ps.full && ps.bytesCopied == 7680 && ps.copyStatus == -62 && ps.frames == 9)
+// Damage: whole pixels, clipped, empty dropped, too many become the frame.
+let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
+                      CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)
+check(r.count == 2 && r[0] == (10, 20, 6, 6) && r[1] == (0, 0, 10, 10), "\(r)")
+check(presentRects((0..<300).map { CGRect(x: $0, y: 0, width: 1, height: 1) }, width: 640, height: 480)
+      .elementsEqual([(0, 0, 640, 480)], by: ==))
+
+print("PASS display agent: report/modes decoding, EDID identity and primaries, virtual-display plans, refusals, add/update/remove, frame replies and damage")

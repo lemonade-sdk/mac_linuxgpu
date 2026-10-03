@@ -37,6 +37,10 @@ _Static_assert(sizeof(struct rt_display_report) == 72 + 8 * 80, "rt_display_repo
 _Static_assert(sizeof(struct rt_display_mode) == 16 && sizeof(struct rt_display_modes) == 24 + 56 * 16,
 	       "rt_display_modes layout");
 
+/* host/DisplayAgent.swift decodes these. */
+_Static_assert(sizeof(struct rt_display_present_stats) == 56, "rt_display_present_stats layout");
+_Static_assert(sizeof(struct rt_surface_verify_result) == 64, "rt_surface_verify_result layout");
+
 static DEFINE_MUTEX(rt_display_lock);
 
 /* The display configuration before the pattern: per CRTC its mode and

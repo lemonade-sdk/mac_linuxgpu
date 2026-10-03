@@ -22,6 +22,7 @@
 		A00000000000000000000009 /* PCIDriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B00000000000000000000009 /* PCIDriverKit.framework */; };
 		A0000000000000000000000A /* MacLinuxGPUHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000A /* MacLinuxGPUHostApp.swift */; };
 		A00000000000000000000040 /* DisplayAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000040 /* DisplayAgent.swift */; };
+		A00000000000000000000041 /* DisplayAgentRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000041 /* DisplayAgentRuntime.swift */; };
 		A00000000000000000000020 /* fw_mailbox_service.c in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000020 /* fw_mailbox_service.c */; };
 		A00000000000000000000021 /* fw_mailbox_iokit.c in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000021 /* fw_mailbox_iokit.c */; };
 		A0000000000000000000000C /* com.geramyloveless.MacAMDGPUHost.MacAMDGPU.dext in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000C /* com.geramyloveless.MacAMDGPUHost.MacAMDGPU.dext */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -67,6 +68,8 @@
 		B00000000000000000000009 /* PCIDriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = PCIDriverKit.framework; path = System/Library/Frameworks/PCIDriverKit.framework; sourceTree = SDKROOT; };
 		B0000000000000000000000A /* MacLinuxGPUHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacLinuxGPUHostApp.swift; sourceTree = "<group>"; };
 		B00000000000000000000040 /* DisplayAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayAgent.swift; sourceTree = "<group>"; };
+		B00000000000000000000041 /* DisplayAgentRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayAgentRuntime.swift; sourceTree = "<group>"; };
+		B00000000000000000000042 /* CGVirtualDisplayPrivate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CGVirtualDisplayPrivate.h; sourceTree = "<group>"; };
 		B00000000000000000000020 /* fw_mailbox_service.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fw_mailbox_service.c; sourceTree = "<group>"; };
 		B00000000000000000000021 /* fw_mailbox_iokit.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fw_mailbox_iokit.c; sourceTree = "<group>"; };
 		B00000000000000000000022 /* fw_mailbox_service.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = fw_mailbox_service.h; sourceTree = "<group>"; };
@@ -119,6 +122,8 @@
 			children = (
 				B0000000000000000000000A /* MacLinuxGPUHostApp.swift */,
 				B00000000000000000000040 /* DisplayAgent.swift */,
+				B00000000000000000000041 /* DisplayAgentRuntime.swift */,
+				B00000000000000000000042 /* CGVirtualDisplayPrivate.h */,
 				B00000000000000000000020 /* fw_mailbox_service.c */,
 				B00000000000000000000021 /* fw_mailbox_iokit.c */,
 				B00000000000000000000022 /* fw_mailbox_service.h */,
@@ -305,6 +310,7 @@
 			files = (
 				A0000000000000000000000A /* MacLinuxGPUHostApp.swift in Sources */,
 				A00000000000000000000040 /* DisplayAgent.swift in Sources */,
+				A00000000000000000000041 /* DisplayAgentRuntime.swift in Sources */,
 				A00000000000000000000020 /* fw_mailbox_service.c in Sources */,
 				A00000000000000000000021 /* fw_mailbox_iokit.c in Sources */,
 			);

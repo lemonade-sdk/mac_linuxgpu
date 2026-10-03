@@ -968,10 +968,10 @@ final class MacLinuxGPUHost {
 // must be running (display-test --init brings it up with a session client
 // held for the run).
 // ----------------------------------------------------------------
-private let kSelSysfsRead: UInt32 = 80
-private let kSelDisplay: UInt32 = 84
-private let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
-private let kDisplayReportMax = 1024
+let kSelSysfsRead: UInt32 = 80
+let kSelDisplay: UInt32 = 84
+let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
+let kDisplayReportMax = 1024
 
 extension MacLinuxGPUHost {
     /// IOConnectCallMethod with scalars and structures both ways.
@@ -1054,8 +1054,9 @@ func runDisplayAgent(_ options: [String]) -> Int32 {
         guard let at = options.firstIndex(of: flag), at + 1 < options.count else { return nil }
         return options[at + 1]
     }
+    if options.contains("--create") { return runDisplayAgentCreate(options) }
     guard options.contains("--dry-run") else {
-        print("display-agent: creating virtual displays is not enabled yet; run with --dry-run to see what it would create")
+        print("display-agent: say --dry-run (print what it would create) or --create (make a virtual display)")
         return 2
     }
     let once = options.contains("--once")
@@ -1574,6 +1575,9 @@ struct AppMain {
             return
         }
 
+        if args[1] == "display-pin-test" {
+            exit(runDisplayPinTest(Array(args.dropFirst(2))))
+        }
         if args[1] == "display-agent" {
             exit(runDisplayAgent(Array(args.dropFirst(2))))
         }
