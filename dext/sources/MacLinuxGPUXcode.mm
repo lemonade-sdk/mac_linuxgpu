@@ -2468,18 +2468,16 @@ static uint32_t s_displayRunning;
 // return negative Linux errnos).
 static constexpr int kLinuxENOENT = 2, kLinuxEIO = 5, kLinuxENOMEM = 12, kLinuxENOSPC = 28;
 
-// A client memory import: the DMA mapping of the client's descriptor and a
-// read-only CPU view of it, released once the GPU can no longer reach it
+// A client memory import: the DMA mapping of the client's descriptor,
+// released once the GPU can no longer reach it
 // (rt_surface's provider release, after the BO is destroyed).
 struct DisplayImport {
     uint64_t importID;
-    IOMemoryMap *view;
     uint64_t length;
 };
 static void display_import_release(void *context)
 {
     auto *import = static_cast<DisplayImport *>(context);
-    if (import->view) import->view->release();
     if (dext_dma_release_import(import->importID) != 0)
         MACLINUXGPU_LOG("display: import %llu release retained by the DMA seam",
                         (unsigned long long)import->importID);
@@ -2533,14 +2531,15 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
             out[0] = (uint64_t)(int64_t)-kLinuxEIO;
             return kIOReturnSuccess;
         }
-        if (memory->CreateMapping(kIOMemoryMapReadOnly, 0, 0, 0, 0, &import->view) != kIOReturnSuccess)
-            import->view = nullptr;
+        // No CPU view: a mapping of the client's descriptor here is a
+        // snapshot taken at this call, not its live pages (hardware run,
+        // build 233); the GPU's DMA mapping is what follows the client.
         struct rt_surface_segment segments[DEXT_DMA_IMPORT_SEGMENTS_MAX];
         for (uint32_t i = 0; i < count; ++i) segments[i] = {addresses[i], lengths[i]};
         const struct rt_surface_provider provider = {display_import_release, import};
         struct rt_surface *surface = nullptr;
-        int r = import->view ? rt_surface_import(pdev, segments, count, length, width, height,
-                                                 pitch, &provider, &surface) : -kLinuxENOMEM;
+        int r = rt_surface_import(pdev, segments, count, length, width, height, pitch, &provider,
+                                  &surface);
         if (r) {
             display_import_release(import); // the provider was not taken
         } else {
@@ -2566,10 +2565,7 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
         struct rt_surface_verify_result result{};
         int r = -kLinuxENOENT;
         if (surface) {
-            auto *import = static_cast<DisplayImport *>(rt_surface_provider_context(surface));
-            const void *view = import && import->view ?
-                reinterpret_cast<const void *>(import->view->GetAddress()) : nullptr;
-            r = rt_surface_verify(surface, (uint32_t)in[1], view, 2000, &result);
+            r = rt_surface_verify(surface, (uint32_t)in[1], nullptr, 2000, &result);
             MACLINUXGPU_LOG("display: VERIFY seed %u -> %d (GPU %u, CPU %u mismatching dwords, %llu us)",
                             (uint32_t)in[1], r, result.gpu_mismatches, result.cpu_mismatches,
                             (unsigned long long)(result.gpu_ns / 1000));

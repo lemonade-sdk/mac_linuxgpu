@@ -182,9 +182,11 @@ func runDisplayPinTest(_ options: [String]) -> Int32 {
             failures += 1
             return
         }
-        let ok = expectMatch ? result.gpuMismatches == 0 && result.cpuMismatches == 0 && result.cpuChecked :
-                               result.gpuMismatches == result.dwords
-        print(String(format: "pin-test: %@ seed %u: GPU %u, CPU %u of %u dwords differ (%.0f us, GART 0x%llx)%@",
+        // The GPU's reads decide. The driver's CPU view of the descriptor is
+        // reported only: on macOS 26 it is a snapshot taken at the import
+        // call, not the client's live pages (hardware run, build 233).
+        let ok = expectMatch ? result.gpuMismatches == 0 : result.gpuMismatches == result.dwords
+        print(String(format: "pin-test: %@ seed %u: GPU %u (CPU view %u) of %u dwords differ (%.0f us, GART 0x%llx)%@",
                      label, seed, result.gpuMismatches, result.cpuMismatches, result.dwords,
                      Double(result.gpuNs) / 1000, result.gpuAddress,
                      ok ? "" : String(format: " — FAIL (first GPU mismatch at %llu: 0x%08x, want 0x%08x)",
