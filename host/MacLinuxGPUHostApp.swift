@@ -32,6 +32,7 @@
 
 import Foundation
 import IOKit
+import Security
 import SystemExtensions
 import AppKit
 import SwiftUI
@@ -338,8 +339,12 @@ final class ExtensionActivator: NSObject, OSSystemExtensionRequestDelegate {
             $0.bundleVersion == version.build
         }) {
             print("Extension \(version.short) (\(version.build)) is already enabled.")
-            exit(0)
+            // An earlier upgrade may have left the previous driver attached.
+            exit(DriverUpgrade.retirePrevious(force: false, timeout: 90, report: { print($0) }) ? 0 : 3)
         }
+        // macOS replaces a running driver only once its instances are gone:
+        // the previous driver closes its session first (Retire QUIESCE).
+        DriverUpgrade.quiescePrevious(force: false) { print($0) }
         let activation = OSSystemExtensionRequest.activationRequest(
             forExtensionWithIdentifier: dextBundleIdentifier, queue: .main)
         self.request = activation
@@ -374,13 +379,21 @@ final class ExtensionActivator: NSObject, OSSystemExtensionRequestDelegate {
         let exitStatus: Int32
         switch result {
         case .completed:
-            print("System extension registered. Check attachment with systemextensionsctl list.")
-            exitStatus = 0
+            print("System extension registered.")
+            // The new driver attaches once the previous one is gone.
+            if DriverUpgrade.retirePrevious(force: false, timeout: 90, report: { print($0) }) {
+                print("Check attachment with `MacLinuxGPUHost ping-bundled`.")
+                exitStatus = 0
+            } else {
+                exitStatus = 3
+            }
         case .willCompleteAfterReboot:
             print("System extension activation is pending; attachment has not been verified.")
+            DriverUpgrade.resumePrevious { print($0) }
             exitStatus = 2
         @unknown default:
             print("System extension request finished with result: \(result)")
+            DriverUpgrade.resumePrevious { print($0) }
             exitStatus = 1
         }
         exit(exitStatus)
@@ -389,6 +402,7 @@ final class ExtensionActivator: NSObject, OSSystemExtensionRequestDelegate {
     func request(_ request: OSSystemExtensionRequest, didFailWithError error: Error) {
         self.request = nil
         fputs("System extension activation failed: \(error)\n", stderr)
+        DriverUpgrade.resumePrevious { print($0) }
         exit(1)
     }
 }
@@ -431,6 +445,12 @@ private let kSelDisableSmuFeatures: UInt32 = 33
 private let kSelBOMap:            UInt32 = 36
 private let kSelReleaseQuarantine: UInt32 = 61 // entitled; see session_state.h
 private let kSelPower:            UInt32 = 83 // device power; see power_state.h
+private let kSelRetire:           UInt32 = 85 // entitled: hand the GPU to a new driver; see session_state.h
+private let kRetireOpQuiesce:   UInt64 = 0
+private let kRetireOpTerminate: UInt64 = 1
+private let kRetireOpResume:    UInt64 = 2
+private let kRetireForce:       UInt64 = 1
+private let kRetireConfirm:     UInt64 = 0x52455452 // "RETR"
 
 // Observer clients (dext/sources/session_state.h) read cached state only and
 // may attach while a session closes or stays quarantined.
@@ -439,6 +459,8 @@ private let kUserClientObserver: UInt32 = 1
 private let kQuerySessionState:  UInt64 = 0x4c534553
 private let kSessionStateWords = 9
 private let kIOReturnUnsupportedValue = kern_return_t(bitPattern: 0xe00002c7)
+private let kIOReturnNotAttachedValue = kern_return_t(bitPattern: 0xe00002d9)
+private let kIOReturnNotFoundValue = kern_return_t(bitPattern: 0xe00002f0)
 private let kQueryPowerState:    UInt64 = 0x4c505752
 private let kPowerStateWords = 12
 private let kPowerOpQuery:   UInt64 = 0
@@ -490,6 +512,7 @@ struct SessionState {
     var quarantined: Bool { flags & (1 << 1) != 0 }
     var releasable: Bool { flags & (1 << 6) != 0 }
     var restartRequired: Bool { flags & (1 << 7) != 0 }
+    var retiring: Bool { flags & (1 << 12) != 0 }
 
     static let causes = ["none", "raw BAR mapping lifetime uncertain", "DMA shutdown reservation failed",
                          "GPU completion uncertain (compute stop)", "interrupt cancellation failed",
@@ -516,7 +539,269 @@ struct SessionState {
         if quarantined {
             return "Quarantined, release pending: \(SessionState.name(SessionState.blockers, releaseBlocker)); do not kill the driver"
         }
+        if retiring {
+            return closing ? "Retiring for a driver upgrade: session closing"
+                           : "Retiring for a driver upgrade: no session, new sessions refused"
+        }
         return closing ? "Session closing" : "No quarantine (session generation \(generation), \(participants) client(s))"
+    }
+}
+
+/// The answer to Retire (selector 85; dext/sources/session_state.h).
+struct RetireResult {
+    let status: kern_return_t
+    let state: UInt64
+    let detail: UInt64
+
+    static let idle: UInt64 = 0, terminating: UInt64 = 1, closing: UInt64 = 2, clients: UInt64 = 3
+    static let rawBAR: UInt64 = 4, quarantined: UInt64 = 5, stopping: UInt64 = 6, resumed: UInt64 = 7
+
+    init?(_ values: [UInt64]) {
+        guard values.count == 3 else { return nil }
+        status = kern_return_t(bitPattern: UInt32(truncatingIfNeeded: values[0]))
+        state = values[1]
+        detail = values[2]
+    }
+
+    /// The instance stops and its process exits (or already does).
+    var leaving: Bool { state == RetireResult.terminating || state == RetireResult.stopping }
+    /// Nothing later in this process can change the answer: restart the Mac.
+    var restartRequired: Bool { state == RetireResult.quarantined && status == kIOReturnError }
+
+    var summary: String {
+        switch state {
+        case RetireResult.idle: return "idle: no session, new sessions refused"
+        case RetireResult.terminating: return "terminating: its clients and the driver stop, then its process exits"
+        case RetireResult.closing: return "closing its session through the normal close"
+        case RetireResult.clients: return "\(detail) session client(s) still attached"
+        case RetireResult.rawBAR: return "a client still maps a GPU BAR; closing now would quarantine the session"
+        case RetireResult.quarantined:
+            let blocker = SessionState.name(SessionState.blockers, detail)
+            return restartRequired
+                ? "quarantined (\(blocker)): restart the Mac, do not kill the driver"
+                : "quarantined, release pending (\(blocker))"
+        case RetireResult.stopping: return "already stopping"
+        case RetireResult.resumed: return "resumed: sessions admitted again"
+        default: return "unknown state \(state)"
+        }
+    }
+}
+
+// ----------------------------------------------------------------
+// MARK: - Driver instances and upgrades
+//
+// macOS does not stop a running driver extension when an activation request
+// replaces it. kernelmanagerd declines to terminate the old version ("being
+// replaced"), sysextd leaves it "terminating for upgrade via delegate", and
+// the kernel attaches the new version only once every instance of the old
+// one is gone: until then a GPU that appears matches the old version. An
+// instance goes when its GPU leaves the bus or when it terminates itself,
+// which Retire (selector 85) asks it to do. Killing it is never the way: a
+// driver that dies while it holds the PCI device can panic the Mac.
+// ----------------------------------------------------------------
+
+/// One MacLinuxGPU driver instance (an IOUserService of this dext).
+struct DriverInstance {
+    let registryID: UInt64
+    /// IOUserServerCDHash: the code directory hash of the running binary.
+    let cdhash: String
+    /// IOUserClientCreator ("pid N, name") of each attached user client.
+    let clients: [String]
+
+    var label: String { String(format: "instance %#llx (cdhash %@)", registryID, String(cdhash.prefix(12))) }
+}
+
+enum DriverInstances {
+    static func list() -> [DriverInstance] {
+        guard let matching = IOServiceMatching("IOUserService") else { return [] }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+            return []
+        }
+        defer { IOObjectRelease(iterator) }
+        var instances: [DriverInstance] = []
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            defer { IOObjectRelease(service) }
+            guard property(service, "CFBundleIdentifier") as? String == dextBundleIdentifier else { continue }
+            var registryID: UInt64 = 0
+            guard IORegistryEntryGetRegistryEntryID(service, &registryID) == KERN_SUCCESS else { continue }
+            let cdhash = (property(service, "IOUserServerCDHash") as? String ?? "").lowercased()
+            instances.append(DriverInstance(registryID: registryID, cdhash: cdhash, clients: clients(of: service)))
+        }
+        return instances
+    }
+
+    private static func property(_ entry: io_registry_entry_t, _ key: String) -> Any? {
+        IORegistryEntryCreateCFProperty(entry, key as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue()
+    }
+
+    private static func clients(of service: io_service_t) -> [String] {
+        var iterator: io_iterator_t = 0
+        guard IORegistryEntryGetChildIterator(service, kIOServicePlane, &iterator) == KERN_SUCCESS else {
+            return []
+        }
+        defer { IOObjectRelease(iterator) }
+        var creators: [String] = []
+        while true {
+            let child = IOIteratorNext(iterator)
+            if child == 0 { break }
+            if let creator = property(child, "IOUserClientCreator") as? String { creators.append(creator) }
+            IOObjectRelease(child)
+        }
+        return creators
+    }
+
+    /// The code directory hash IOKit records as IOUserServerCDHash.
+    static func cdhash(ofCodeAt url: URL) -> String? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &code) == errSecSuccess,
+              let code else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let unique = info[kSecCodeInfoUnique as String] as? Data else { return nil }
+        return unique.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// The driver this app bundles (and installs).
+    static func bundledCDHash() -> String? {
+        cdhash(ofCodeAt: Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Library/SystemExtensions")
+            .appendingPathComponent(dextBundleIdentifier + ".dext"))
+    }
+
+    /// Instances running another build than the bundled driver.
+    static func previous() -> [DriverInstance] {
+        guard let bundled = bundledCDHash() else { return [] }
+        return list().filter { $0.cdhash != bundled }
+    }
+}
+
+enum DriverUpgrade {
+    /// One Retire call on one instance, over an observer client.
+    static func call(_ instance: DriverInstance, _ op: UInt64, force: Bool)
+        -> (result: RetireResult?, status: kern_return_t, session: SessionState?) {
+        let host = MacLinuxGPUHost()
+        host.quiet = true
+        guard host.openUserClient(observer: true, registryID: instance.registryID) else {
+            return (nil, kIOReturnNotFoundValue, nil)
+        }
+        let result = host.retire(op, force: force)
+        let status = host.lastStatus
+        let session = host.sessionState()
+        _ = host.closeUserClient()
+        return (result, status, session)
+    }
+
+    private static func describe(_ instance: DriverInstance) -> String {
+        instance.clients.isEmpty ? instance.label
+            : instance.label + "; clients: " + instance.clients.joined(separator: "; ")
+    }
+
+    static let legacyAdvice = "it predates Retire and stays until its GPU leaves the bus or the Mac restarts. " +
+        "Do not kill it. Builds 0.1.128 (232) to 0.1.129 (233) leave cleanly when the GPU enclosure is switched off; " +
+        "switch it off, wait for the driver to go, then switch it on."
+
+    /// Before the activation request: the previous driver closes its session
+    /// the normal way and admits no new one, so nothing runs on the GPU when
+    /// the replacement is accepted. Without `force` a session other clients
+    /// still use stays open (they are listed); Retire after the activation
+    /// then waits for them.
+    static func quiescePrevious(force: Bool, report: (String) -> Void) {
+        for instance in DriverInstances.previous() {
+            let (result, status, session) = call(instance, kRetireOpQuiesce, force: force)
+            guard let result else {
+                if status == kIOReturnUnsupportedValue {
+                    report("Previous driver \(instance.label): " + legacyAdvice)
+                } else {
+                    report(String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status))
+                }
+                continue
+            }
+            var line = "Previous driver \(describe(instance)): \(result.summary)."
+            if result.state == RetireResult.clients {
+                line += " Quit those apps, or run `MacLinuxGPUHost retire-previous --force` to close their sessions."
+            }
+            if let session, result.state == RetireResult.quarantined { line += " " + session.summary + "." }
+            report(line)
+        }
+    }
+
+    /// After macOS accepted the replacement: every previous instance closes
+    /// its session and terminates; wait until each is gone. Returns true
+    /// when none is left; otherwise reports why and how to recover.
+    @discardableResult
+    static func retirePrevious(force: Bool, timeout: TimeInterval, report: (String) -> Void) -> Bool {
+        if DriverInstances.bundledCDHash() == nil {
+            report("Cannot read the bundled driver's code signature, so a previous driver instance cannot be " +
+                   "told apart; `MacLinuxGPUHost instances` lists what is attached.")
+            return true
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastLine: [UInt64: String] = [:]
+        var stuck: [UInt64: String] = [:] // nothing later in this boot can make it go
+        var announced = false
+        while true {
+            let previous = DriverInstances.previous()
+            if previous.isEmpty {
+                if announced { report("The previous driver is gone; the new driver attaches to the GPU.") }
+                return true
+            }
+            if !announced {
+                report("Handing the GPU to the new driver: asking \(previous.count) previous driver instance(s) to close and terminate.")
+                announced = true
+            }
+            for instance in previous where stuck[instance.registryID] == nil {
+                let (result, status, session) = call(instance, kRetireOpTerminate, force: force)
+                var line: String
+                if let result {
+                    line = "Previous driver \(describe(instance)): \(result.summary)."
+                    if result.restartRequired {
+                        if let session { line += " " + session.summary + "." }
+                        stuck[instance.registryID] = line
+                    }
+                } else if status == kIOReturnUnsupportedValue {
+                    line = "Previous driver \(instance.label): " + legacyAdvice
+                    stuck[instance.registryID] = line
+                } else if status == kIOReturnNotFoundValue || status == kIOReturnNotAttachedValue {
+                    line = "Previous driver \(instance.label) is leaving."
+                } else {
+                    line = String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status)
+                }
+                if lastLine[instance.registryID] != line {
+                    report(line)
+                    lastLine[instance.registryID] = line
+                }
+            }
+            if previous.allSatisfy({ stuck[$0.registryID] != nil }) || Date() >= deadline { break }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        let remaining = DriverInstances.previous()
+        if remaining.isEmpty { return true }
+        report("The previous driver is still attached after \(Int(timeout)) s, so the new driver cannot attach yet. Do not kill it:")
+        for instance in remaining {
+            report("  " + (stuck[instance.registryID] ?? lastLine[instance.registryID] ?? describe(instance)))
+        }
+        report("  Quit the apps listed above and run `MacLinuxGPUHost retire-previous` (add --force to close their " +
+               "sessions). If it reports a quarantine that needs a restart, or predates Retire, restart the Mac (or " +
+               "switch the GPU enclosure off and on for builds 0.1.128 (232) and later); the new driver attaches then.")
+        let extensions = InstallPackage.run("/usr/bin/systemextensionsctl", ["list"]).output
+            .split(separator: "\n").filter { $0.contains(dextBundleIdentifier) }
+        for line in extensions { report("  " + line.trimmingCharacters(in: .whitespaces)) }
+        return false
+    }
+
+    /// The replacement failed or was deferred: previous instances admit
+    /// sessions again.
+    static func resumePrevious(report: (String) -> Void) {
+        for instance in DriverInstances.previous() {
+            if let result = call(instance, kRetireOpResume, force: false).result,
+               result.state == RetireResult.resumed {
+                report("Previous driver \(instance.label) admits sessions again.")
+            }
+        }
     }
 }
 
@@ -542,68 +827,63 @@ final class MacLinuxGPUHost {
     // MARK: Lifecycle
 
     /// Open the UserClient (IOServiceGetMatchingService + IOServiceOpen).
-    /// The single-tenant client (type 0).  Returns true on success.
+    /// The single-tenant client (type 0), or an observer.  Returns true on
+    /// success.
+    ///
+    /// The dext's Info.plist IOKitPersonalities (the IOPCIDevice provider)
+    /// make IOKit instantiate MacLinuxGPU on PCI match; the UserClient is
+    /// spawned per IOServiceOpen.  The service is found by the dext's bundle
+    /// identifier, never by a PCI device ID: the dext attaches to whichever
+    /// AMD GPU matched.  During an upgrade the previous driver version can
+    /// still be attached, so the instance running the driver this app
+    /// bundles is preferred; `bundledOnly` refuses any other, and
+    /// `registryID` names one instance.
     @discardableResult
-    func openUserClient(allowUnverified: Bool = false, observer: Bool = false) -> Bool {
+    func openUserClient(allowUnverified: Bool = false, observer: Bool = false,
+                        registryID: UInt64? = nil, bundledOnly: Bool = false) -> Bool {
         if isOpen { return true }
-
-        // Match the dext's IOUserService.  The dext's Info.plist
-        // IOKitPersonalities (the IOPCIDevice provider) makes IOKit
-        // instantiate MacLinuxGPU on PCI match; the UserClient is spawned
-        // per IOServiceOpen (the NewUserClient, type 0).
-        //
-        // The match is on the "IOUserService" class (the generic UserClient
-        // class) filtered by the dext's product.  The mac_amdgpu reference
-        // uses IOServiceGetMatchingServices on "IOUserService".
-        guard let matching = IOServiceMatching("IOUserService") else {
-            append("openUserClient: IOServiceMatching(IOUserService) failed")
+        var candidates = DriverInstances.list()
+        if let registryID {
+            candidates = candidates.filter { $0.registryID == registryID }
+        } else if let bundled = DriverInstances.bundledCDHash() {
+            candidates = candidates.filter { $0.cdhash == bundled } +
+                (bundledOnly ? [] : candidates.filter { $0.cdhash != bundled })
+        } else if bundledOnly {
+            append("openUserClient: the bundled driver's code signature could not be read")
             return false
         }
-
-        var iter: io_iterator_t = 0
-        let matched = IOServiceGetMatchingServices(kIOMainPortDefault,
-                                                   matching as CFDictionary,
-                                                   &iter)
-        guard matched == kIOReturnSuccess else {
-            append(String(format: "openUserClient: service matching failed (kr=%#x)", matched))
+        guard let instance = candidates.first else {
+            append("openUserClient: no MacLinuxGPU service found for \(dextBundleIdentifier)"
+                   + (bundledOnly ? " running the bundled driver" : ""))
             return false
         }
-        defer { IOObjectRelease(iter) }
-
-        // Find the dext's service by the dext's bundle identifier, never by
-        // a PCI device ID: the dext attaches to whichever AMD GPU matched.
-        var svc = IOIteratorNext(iter)
-        while svc != 0 {
-            var props: Unmanaged<CFMutableDictionary>?
-            let kr = IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0)
-            let dict = props?.takeRetainedValue() as? [String: Any]
-            if kr == kIOReturnSuccess,
-               dict?["CFBundleIdentifier"] as? String == dextBundleIdentifier {
-                var connection: io_connect_t = 0
-                var opened = IOServiceOpen(svc, mach_task_self_,
-                                           observer ? kUserClientObserver : kUserClientSession,
-                                           &connection)
-                if observer && opened == kIOReturnUnsupportedValue {
-                    // Drivers without observer clients accept only a session client.
-                    opened = IOServiceOpen(svc, mach_task_self_, kUserClientSession, &connection)
-                }
-                IOObjectRelease(svc)
-                if opened != kIOReturnSuccess {
-                    append(String(format: "openUserClient: IOServiceOpen failed (kr=%#x)", opened))
-                    if connection != 0 { IOServiceClose(connection) }
-                    return false
-                }
-                ucConn = connection
-                isOpen = true
-                append("openUserClient: UserClient opened (conn=%d)", ucConn)
-                return true
-            }
-            IOObjectRelease(svc)
-            svc = IOIteratorNext(iter)
+        guard let matching = IORegistryEntryIDMatching(instance.registryID) else {
+            append("openUserClient: IORegistryEntryIDMatching failed")
+            return false
         }
-
-        append("openUserClient: no MacLinuxGPU service found for \(dextBundleIdentifier)")
-        return false
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, matching)
+        guard svc != 0 else {
+            append("openUserClient: the MacLinuxGPU service left the registry")
+            return false
+        }
+        defer { IOObjectRelease(svc) }
+        var connection: io_connect_t = 0
+        var opened = IOServiceOpen(svc, mach_task_self_,
+                                   observer ? kUserClientObserver : kUserClientSession,
+                                   &connection)
+        if observer && opened == kIOReturnUnsupportedValue {
+            // Drivers without observer clients accept only a session client.
+            opened = IOServiceOpen(svc, mach_task_self_, kUserClientSession, &connection)
+        }
+        if opened != kIOReturnSuccess {
+            append(String(format: "openUserClient: IOServiceOpen failed (kr=%#x)", opened))
+            if connection != 0 { IOServiceClose(connection) }
+            return false
+        }
+        ucConn = connection
+        isOpen = true
+        append("openUserClient: UserClient opened (conn=%d)", ucConn)
+        return true
     }
 
     /// Close the UserClient (IOServiceClose).  The lifecycle teardown.
@@ -948,12 +1228,33 @@ final class MacLinuxGPUHost {
         return false
     }
 
+    /// Retire (selector 85): hand the GPU to a replacement driver. QUIESCE
+    /// closes the session the normal way and refuses new ones; TERMINATE
+    /// also has the instance terminated once idle; RESUME undoes QUIESCE.
+    /// Requires the session-release entitlement. Nil with `lastStatus` set
+    /// when the call failed (Unsupported: a driver older than Retire).
+    func retire(_ op: UInt64, force: Bool = false) -> RetireResult? {
+        let (kr, values) = callScalar(kSelRetire, inScalars: [op, force ? kRetireForce : 0, kRetireConfirm],
+                                      outScalars: 3)
+        lastStatus = kr
+        guard kr == kIOReturnSuccess, let result = RetireResult(values) else {
+            append(String(format: "retire: refused (kr=%#x)", kr))
+            return nil
+        }
+        append("retire: " + result.summary)
+        return result
+    }
+    private(set) var lastStatus: kern_return_t = kIOReturnSuccess
+
     // MARK: Logging
+
+    /// No console output (polling loops report their own summaries).
+    var quiet = false
 
     private func append(_ fmt: String, _ args: CVarArg...) {
         let line = String(format: fmt, arguments: args)
         logLines.append(line)
-        print("[mac.linuxgpu.host] " + line)
+        if !quiet { print("[mac.linuxgpu.host] " + line) }
     }
 
     var log: [String] { return logLines }
@@ -1329,7 +1630,8 @@ private final class InstallerController: NSObject, ObservableObject,
             append("Bundled extension is registered and enabled; checking the actual UserClient.")
             self.request = nil
             checkingProperties = false
-            verifyAttachedDriver()
+            // An earlier upgrade may have left the previous driver attached.
+            retireThenVerify()
             return
         }
         if let bundled = InstallPackage.version(at: Bundle.main.bundleURL),
@@ -1343,6 +1645,22 @@ private final class InstallerController: NSObject, ObservableObject,
             return
         }
         checkingProperties = false
+        // macOS replaces a running driver only once its instances are gone.
+        // The previous driver closes its session first (Retire QUIESCE);
+        // after the replacement is accepted it terminates (retireThenVerify).
+        self.request = nil
+        status = "Preparing the running driver…"
+        Task { [weak self] in
+            await Task.detached(priority: .userInitiated) { [weak self] in
+                DriverUpgrade.quiescePrevious(force: false) { line in
+                    Task { @MainActor [weak self] in self?.append(line) }
+                }
+            }.value
+            self?.requestActivation()
+        }
+    }
+
+    private func requestActivation() {
         status = "Requesting activation…"
         append("Requesting activation of \(dextBundleIdentifier) \(bundledVersion).")
         let activation = OSSystemExtensionRequest.activationRequest(
@@ -1350,6 +1668,37 @@ private final class InstallerController: NSObject, ObservableObject,
         self.request = activation
         activation.delegate = self
         OSSystemExtensionManager.shared.submitRequest(activation)
+    }
+
+    /// The new driver attaches only once every previous instance is gone:
+    /// Retire TERMINATE each one, wait, then verify the bundled driver.
+    private func retireThenVerify() {
+        isWorking = true
+        status = "Handing the GPU to the new driver…"
+        runningStatus = "waiting for the previous driver"
+        Task { [weak self] in
+            let retired = await Task.detached(priority: .userInitiated) { [weak self] () -> Bool in
+                DriverUpgrade.retirePrevious(force: false, timeout: 90) { line in
+                    Task { @MainActor [weak self] in self?.append(line) }
+                }
+            }.value
+            guard let self else { return }
+            if retired {
+                self.verifyAttachedDriver()
+            } else {
+                self.status = "Previous driver still attached"
+                self.runningStatus = "previous driver attached; see the log"
+                self.isWorking = false
+            }
+        }
+    }
+
+    private func resumePrevious() {
+        Task.detached(priority: .utility) { [weak self] in
+            DriverUpgrade.resumePrevious { line in
+                Task { @MainActor [weak self] in self?.append(line) }
+            }
+        }
     }
 
     func request(_ request: OSSystemExtensionRequest,
@@ -1385,15 +1734,17 @@ private final class InstallerController: NSObject, ObservableObject,
         case .completed:
             append("macOS completed extension registration; checking attachment.")
             registeredVersion = bundledVersion
-            verifyAttachedDriver()
+            retireThenVerify()
         case .willCompleteAfterReboot:
             status = "Activation pending"
             runningStatus = "replacement staged"
             append("macOS deferred activation of this extension; attachment has not been verified.")
+            resumePrevious()
             isWorking = false
         @unknown default:
             status = "Unknown activation result"
             append("macOS returned an unknown extension result: \(result.rawValue)")
+            resumePrevious()
             isWorking = false
         }
     }
@@ -1405,6 +1756,7 @@ private final class InstallerController: NSObject, ObservableObject,
         isWorking = false
         status = "Activation failed"
         append(error.localizedDescription)
+        resumePrevious()
     }
 
     func verifyAttachedDriver() {
@@ -1417,16 +1769,18 @@ private final class InstallerController: NSObject, ObservableObject,
                 for attempt in 0..<45 {
                     let driver = MacLinuxGPUHost()
                     // A quarantined driver refuses session clients; an observer
-                    // reports why and whether killing it would be unsafe.
+                    // reports why and whether killing it would be unsafe. Only
+                    // the bundled driver counts: a previous one still attached
+                    // would answer as well.
                     let observer = MacLinuxGPUHost()
-                    if observer.openUserClient(observer: true) {
+                    if observer.openUserClient(observer: true, bundledOnly: true) {
                         let state = observer.sessionState()
                         _ = observer.closeUserClient()
                         if let state, state.quarantined {
                             return (false, state.summary)
                         }
                     }
-                    if driver.openUserClient() {
+                    if driver.openUserClient(bundledOnly: true) {
                         let first = driver.ping() && driver.getIdentity()
                         if first {
                             let device = driver.deviceDescription()
@@ -1575,6 +1929,43 @@ struct AppMain {
             return
         }
 
+        // Driver upgrades (DriverUpgrade): the instances attached, and the
+        // safe way to make a previous driver let go of the GPU (never kill).
+        if args[1] == "instances" {
+            let bundled = DriverInstances.bundledCDHash()
+            let instances = DriverInstances.list()
+            if instances.isEmpty { print("No MacLinuxGPU driver instance is attached.") }
+            for instance in instances {
+                let role = bundled == nil ? "" : (instance.cdhash == bundled ? " [bundled]" : " [previous]")
+                print(instance.label + role)
+                for client in instance.clients { print("  client: " + client) }
+                let observer = MacLinuxGPUHost()
+                observer.quiet = true
+                if observer.openUserClient(observer: true, registryID: instance.registryID) {
+                    if let state = observer.sessionState() { print("  " + state.summary) }
+                    _ = observer.closeUserClient()
+                }
+            }
+            exit(0)
+        }
+        if args[1] == "retire-previous" || args[1] == "resume-previous" {
+            let options = Array(args.dropFirst(2))
+            if args[1] == "resume-previous" {
+                DriverUpgrade.resumePrevious { print($0) }
+                exit(0)
+            }
+            var wait: TimeInterval = 90
+            if let index = options.firstIndex(of: "--wait"), index + 1 < options.count,
+               let seconds = TimeInterval(options[index + 1]), seconds >= 0 {
+                wait = seconds
+            }
+            if DriverInstances.previous().isEmpty {
+                print("No previous driver instance is attached.")
+                exit(0)
+            }
+            let retired = DriverUpgrade.retirePrevious(force: options.contains("--force"), timeout: wait) { print($0) }
+            exit(retired ? 0 : 3)
+        }
         if args[1] == "display-pin-test" {
             exit(runDisplayPinTest(Array(args.dropFirst(2))))
         }
@@ -1591,7 +1982,8 @@ struct AppMain {
         let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch",
                                              "power-hold"]
 
-        if !host.openUserClient(observer: observerCommands.contains(args[1])) {
+        if !host.openUserClient(observer: observerCommands.contains(args[1]),
+                                bundledOnly: args[1] == "ping-bundled") {
             print("ERROR: failed to open the UserClient (is the dext activated, "
                   + "signed, and an AMD GPU attached over Thunderbolt?)")
             exit(1)
@@ -1599,7 +1991,7 @@ struct AppMain {
 
         let commandStatus: Int32
         switch args[1] {
-case "ping":
+case "ping", "ping-bundled":
     commandStatus = host.ping() ? 0 : 1
 case "identity":
     commandStatus = host.getIdentity() ? 0 : 1

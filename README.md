@@ -297,6 +297,19 @@ third_party/llama.cpp  pinned llama.cpp (optional submodule)
   owns a PCI device, macOS runs PCI crash recovery, and that can panic the
   machine (`IOPCIFamily`). If `scripts/read-driver-log.py` reports a
   quarantined session, restart the Mac instead.
+- **Upgrades hand the GPU over explicitly.** macOS does not stop a running
+  driver extension when a new version is activated: the old one stays
+  attached (`systemextensionsctl list` shows it `terminating for upgrade via
+  delegate`) and the new one attaches only once every old instance is gone.
+  The installer therefore asks the running driver to close its session the
+  normal way before it requests the replacement, and to terminate itself once
+  macOS has accepted it (the Retire selector, `dext/sources/session_state.h`).
+  It reports apps that still hold a session and a quarantine that needs a
+  restart. To finish a stuck upgrade, quit the apps it lists and run
+  `MacLinuxGPUHost retire-previous` (`--force` closes their sessions);
+  `MacLinuxGPUHost instances` shows what is attached. Drivers up to 0.1.129
+  (build 233) have no Retire: from 0.1.128 (232) they leave cleanly when the
+  GPU enclosure is switched off; older ones need a restart.
 - **Compute only.** The display stack is not built. Vulkan has no
   presentation yet (headless WSI only).
 - **No GPU reset recovery.**
