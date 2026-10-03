@@ -33,6 +33,9 @@
  * Every wait on the way is bounded: MES completions by MES's own timeout,
  * the session close by the interrupt drain, and the acknowledgement of a
  * power change by a deadline after which the driver acknowledges anyway.
+ * The work runs on the driver's default queue after SetPowerState has
+ * returned; the change is acknowledged (passed to the superclass) when it
+ * is done.
  * A step that cannot prove the GPU idle leaves the session to the existing
  * quarantine (the GPU may still be using the memory), never to a guess.
  *
@@ -86,9 +89,10 @@
 #define MLG_POWER_STATE_WORDS   12u
 #define MLG_QUERY_POWER_STATE   0x4c505752ULL /* "LPWR" */
 #define MLG_SELECTOR_POWER      83u
-/* How long a power-change acknowledgement may wait for the session close
- * (the kernel allows a dext a bounded time to acknowledge). */
-#define MLG_POWER_ACK_DEADLINE_MS 8000u
+/* How long a power-change acknowledgement may wait for the work it needs
+ * (a session close, a quiesce). The kernel gives a dext a bounded time to
+ * acknowledge (xnu's IOUserServer allows 20 s); this stays under it. */
+#define MLG_POWER_ACK_DEADLINE_MS 15000u
 
 enum mlg_power_state {
 	MLG_POWER_ACTIVE     = 0,

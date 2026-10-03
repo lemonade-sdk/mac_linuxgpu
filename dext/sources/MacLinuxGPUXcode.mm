@@ -789,6 +789,7 @@ static IODispatchQueue *s_powerQueue;        // the acknowledgement deadline's w
 static uint64_t s_powerAckPending;           // serial of the change awaiting its ack, 0 if none
 static uint64_t s_powerAckSerial;
 static uint32_t s_powerAckFlags;
+static bool s_powerAckOnClose;               // the pending ack waits for a session close
 static uint32_t s_powerCheckQueued;
 struct PowerWaiter {
     MacLinuxGPUUserClient *client;
@@ -1099,7 +1100,7 @@ static void power_ack(MacLinuxGPU *driver, uint64_t serial, const char *how)
 static void power_check_close(MacLinuxGPU *driver)
 {
     const uint64_t serial = __atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE);
-    if (!serial) return;
+    if (!serial || !s_powerAckOnClose) return;
     const bool closed = !s_sessionClosing && !s_pciOpen;
     const bool quarantined = s_dmaQuarantined && (s_finalCleanup || s_irqDrainFailed);
     if (!closed && !quarantined) return;
@@ -1135,51 +1136,92 @@ static void power_watch(MacLinuxGPU *driver, uint64_t serial)
     });
 }
 
+// A power change is acknowledged once the driver is safe for it, from the
+// default queue after SetPowerState returned (the kernel's call is not
+// held while upstream works), or at the deadline. Returns the serial the
+// acknowledgement goes by; 0 without a watcher queue (acknowledge at once).
+static uint64_t power_defer(MacLinuxGPU *driver, uint32_t powerFlags, bool onClose)
+{
+    if (!s_powerQueue) return 0;
+    s_powerAckFlags = powerFlags;
+    s_powerAckOnClose = onClose;
+    const uint64_t serial = ++s_powerAckSerial;
+    __atomic_store_n(&s_powerAckPending, serial, __ATOMIC_RELEASE);
+    power_watch(driver, serial);
+    return serial;
+}
+
 // SetPowerState(Off): the host is going to sleep. Returns true when the
-// acknowledgement waits for a session close.
+// acknowledgement waits for a session close (this one, or one already
+// running for another reason).
 static bool power_sleep(MacLinuxGPU *driver, uint32_t powerFlags)
 {
     s_power.flags |= MLG_POWER_FLAG_SYSTEM_SLEEP;
-    const bool session = power_session_open();
     const enum mlg_power_action action =
-        mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_OFF, session);
+        mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_OFF, power_session_open());
     if (action != MLG_POWER_DO_CLOSE_SESSION) {
         power_run(driver, action, MLG_POWER_CAUSE_SYSTEM_SLEEP);
-        return false;
+        if (!s_sessionClosing || s_dmaQuarantined) return false;
+        MACLINUXGPU_LOG("power: host sleep: waiting for the session close in progress");
+        return power_defer(driver, powerFlags, true) != 0;
     }
-    // A quiesced session closes as it is: its queues are already off MES
-    // and power_before_removal hands the suspend back.
+    // No new GPU work from here; the close runs after this call returns. A
+    // quiesced session closes as it is: its queues are already off MES and
+    // power_before_removal hands the suspend back.
     power_set(MLG_POWER_SUSPENDING, MLG_POWER_CAUSE_SYSTEM_SLEEP, 0);
     s_power.flags |= MLG_POWER_FLAG_SESSION_CLOSED;
     s_power.flags &= ~MLG_POWER_FLAG_VRAM_PRESERVED;
     MACLINUXGPU_LOG("power: host sleep: closing the compute session before acknowledging "
                     "(VRAM does not survive the link going down)");
-    if (!s_powerQueue) {
+    if (!power_defer(driver, powerFlags, true)) {
         close_session(driver);
         return false;
     }
-    s_powerAckFlags = powerFlags;
-    const uint64_t serial = ++s_powerAckSerial;
-    __atomic_store_n(&s_powerAckPending, serial, __ATOMIC_RELEASE);
-    close_session(driver);
-    power_check_close(driver);
-    if (__atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE) == serial) power_watch(driver, serial);
+    driver->retain();
+    s_bringupQueue->DispatchAsync(^{
+        if (s_pciOpen && !s_sessionClosing) close_session(driver);
+        power_check_close(driver);
+        driver->release();
+    });
     return true;
 }
 
-// SetPowerState(On): awake (the provider's state is restored).
-static void power_wake(MacLinuxGPU *driver)
+// SetPowerState(On) or (Low) with upstream work to do: done after the call
+// returns, then acknowledged. Returns true when the acknowledgement waits.
+static bool power_device_change(MacLinuxGPU *driver, uint32_t powerFlags, uint32_t capability)
 {
-    s_power.flags &= ~(MLG_POWER_FLAG_SYSTEM_SLEEP | MLG_POWER_FLAG_DEVICE_LOW);
+    if (capability == MLG_POWER_CAPABILITY_ON)
+        s_power.flags &= ~(MLG_POWER_FLAG_SYSTEM_SLEEP | MLG_POWER_FLAG_DEVICE_LOW);
+    else
+        s_power.flags |= MLG_POWER_FLAG_DEVICE_LOW;
     const enum mlg_power_action action =
-        mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_ON, power_session_open());
+        mlg_power_plan_capability(&s_power, capability, power_session_open());
     if (action == MLG_POWER_DO_WAKE_LOST) {
+        // The session was closed for the sleep: device memory is gone.
         s_power.flags &= ~MLG_POWER_FLAG_SESSION_CLOSED;
         if (!power_device_present()) s_power.flags |= MLG_POWER_FLAG_LINK_DOWN;
         power_set(MLG_POWER_LOST, MLG_POWER_CAUSE_SYSTEM_WAKE, 0);
-        return;
+        return false;
     }
-    power_run(driver, action, MLG_POWER_CAUSE_DEVICE_ON);
+    const uint32_t cause = capability == MLG_POWER_CAPABILITY_ON ? MLG_POWER_CAUSE_DEVICE_ON
+                                                                 : MLG_POWER_CAUSE_DEVICE_LOW;
+    if (action != MLG_POWER_DO_QUIESCE && action != MLG_POWER_DO_RESUME) {
+        power_run(driver, action, cause); // no upstream call
+        return false;
+    }
+    const uint64_t serial = power_defer(driver, powerFlags, false);
+    if (!serial) {
+        power_run(driver, action, cause);
+        return false;
+    }
+    driver->retain();
+    s_bringupQueue->DispatchAsync(^{
+        power_run(driver, mlg_power_plan_capability(&s_power, capability, power_session_open()), cause);
+        power_ack(driver, serial, capability == MLG_POWER_CAPABILITY_ON ? "after the resume"
+                                                                       : "after the quiesce");
+        driver->release();
+    });
+    return true;
 }
 
 kern_return_t
@@ -1371,14 +1413,13 @@ IMPL(MacLinuxGPU, SetPowerState)
     if (s_driver != this) return SetPowerState(powerFlags, SUPERDISPATCH);
     MACLINUXGPU_LOG("power: SetPowerState(%#x) in state %s, session %s", powerFlags,
                     power_state_name(s_power.state), power_session_open() ? "open" : "none");
+    // A change that needs work is acknowledged later (AckPowerState).
     if (powerFlags == kIOServicePowerCapabilityOff) {
-        if (power_sleep(this, powerFlags)) return kIOReturnSuccess; // acknowledged later
+        if (power_sleep(this, powerFlags)) return kIOReturnSuccess;
     } else if (powerFlags & kIOServicePowerCapabilityOn) {
-        power_wake(this);
+        if (power_device_change(this, powerFlags, MLG_POWER_CAPABILITY_ON)) return kIOReturnSuccess;
     } else if (powerFlags & kIOServicePowerCapabilityLow) {
-        s_power.flags |= MLG_POWER_FLAG_DEVICE_LOW;
-        power_run(this, mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_LOW, power_session_open()),
-                  MLG_POWER_CAUSE_DEVICE_LOW);
+        if (power_device_change(this, powerFlags, MLG_POWER_CAPABILITY_LOW)) return kIOReturnSuccess;
     }
     return SetPowerState(powerFlags, SUPERDISPATCH);
 }
