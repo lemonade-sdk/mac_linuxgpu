@@ -1087,10 +1087,14 @@ CRASH_PATH_TESTS += test-drm-selftest
 .PHONY: test-drm-selftest
 
 # Device power: upstream amdkfd's suspend/resume (kgd2kfd_suspend/resume)
-# driving a KFD process over the KFD session fixture.
+# driving a KFD process over the KFD session fixture, and the driver's
+# power state machine with the runtime's copy of its protocol.
 test-kfd-power:
 	bash scripts/test-kfd-power.sh
 
-test: test-kfd-power
-CRASH_PATH_TESTS += test-kfd-power
-.PHONY: test-kfd-power
+test-power-state:
+	bash scripts/test-power-state.sh
+
+test: test-kfd-power test-power-state
+CRASH_PATH_TESTS += test-kfd-power test-power-state
+.PHONY: test-kfd-power test-power-state

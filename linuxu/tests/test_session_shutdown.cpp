@@ -152,6 +152,10 @@ static bool lx_teardown_all() {
 }
 static unsigned rt_cs_selftest_parked() { return lxParked; }
 static void lx_client_stop(MacLinuxGPUUserClient *, IOService *) { assert(false); }
+// No KFD suspend is held in these scenarios (power_state.h): the hook that
+// hands one back before upstream removal has nothing to do.
+static unsigned powerRemovalHooks;
+static void power_before_removal() { ++powerRemovalHooks; }
 
 #include "session_shutdown_production.inc"
 
@@ -407,6 +411,18 @@ static void checkObserverPolicy() {
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, probe, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, topology, 1));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, nullptr, 0));
+    // The power state, and the power selector's ops (PREPARE and RESUME
+    // check the release entitlement in the handler).
+    const uint64_t power[] = {MLG_QUERY_POWER_STATE};
+    const uint64_t query[] = {MLG_POWER_OP_QUERY}, wait[] = {MLG_POWER_OP_WAIT, 3};
+    const uint64_t prepare[] = {MLG_POWER_OP_PREPARE}, badOp[] = {MLG_POWER_OP_WAIT + 1};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, power, 1));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, power, 2));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_POWER, query, 1));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_POWER, wait, 2));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_POWER, prepare, 1));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_POWER, badOp, 1));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_POWER, nullptr, 0));
     const uint64_t read[] = {MLG_SYSFS_OP_READ, 0}, list[] = {MLG_SYSFS_OP_LIST, 4096};
     const uint64_t write[] = {2, 0}, info[] = {0x1d, 4}, huge[] = {0x1d, MLG_SYSFS_CHUNK_MAX + 1};
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_READ, read, 2));
@@ -474,6 +490,8 @@ static void clientExitReopen(bool queueExhausted) {
         "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset",
         "super_client_stop"};
     assert(events == expected);
+    // The power hook ran once, ahead of upstream removal.
+    assert(powerRemovalHooks == 1);
     assert(!s_dmaQuarantined && !s_sessionClosing && !s_quarantineRetained);
     assert(s_sessionGeneration == 2 && clientStops == 1 && client.superStops == 1);
     assert(driver.references == 1 && provider.references == 1);

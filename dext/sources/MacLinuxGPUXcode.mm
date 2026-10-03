@@ -34,6 +34,7 @@
 
 #include <os/log.h>
 #include <string.h>
+#include <time.h>
 
 #include <DriverKit/OSMetaClass.h>
 #include <DriverKit/IOLib.h>
@@ -65,6 +66,7 @@
 // gpu-op hook (dext_compute_dk.mm, dext-only).
 #include "dext_compute.h"
 #include "observer_gate.h"
+#include "power_state.h"
 #include "raw_bar_lease.h"
 #include "session_state.h"
 #include <rt/bootstrap.h>
@@ -78,6 +80,7 @@
 #include <rt/gart.h>
 #include <rt/klog.h>
 #include <rt/fw_mailbox.h>
+#include <rt/power.h>
 
 extern "C" uint64_t linuxu_dart_budget(void);
 
@@ -462,6 +465,9 @@ static bool lx_teardown_all()
     return rt_cs_selftest_reap() != 0;
 }
 
+// Device power (power_state.h); defined after the session paths.
+static void power_before_removal();
+
 // All session transitions run on the shared default queue. Cancellation
 // completion may run elsewhere, so always enqueue final cleanup here.
 static void session_irq_drained(void *context)
@@ -676,6 +682,9 @@ static void close_session(MacLinuxGPU *driver)
         }
     }
     if (s_modulesRunning && !s_dmaQuarantined) {
+        // A KFD suspend this driver holds goes back before upstream removal
+        // takes its own (power_before_removal).
+        power_before_removal();
         // The observers' render file closes like any client's, first.
         if (auto *drm = __atomic_exchange_n(&s_observerDrm, nullptr, __ATOMIC_ACQ_REL))
             rt_drm_info_close(drm);
@@ -766,6 +775,413 @@ static kern_return_t prepare_interrupts(MacLinuxGPU *driver)
     return s_irqReady ? kIOReturnSuccess : kIOReturnError;
 }
 
+// ----------------------------------------------------------------
+// Device power (power_state.h has the transitions, the upstream paths and
+// the client protocol). Every transition runs on the shared default queue,
+// serialized with the session transitions and session-client selectors;
+// only the acknowledgement deadline's watcher and a client's waits touch
+// state from elsewhere, each under its own atomic or lock.
+// ----------------------------------------------------------------
+static struct mlg_power s_power;
+static uint64_t s_powerStartNs;
+static uint64_t s_powerHolders[16];          // clients holding a PREPARE
+static IODispatchQueue *s_powerQueue;        // the acknowledgement deadline's watcher
+static uint64_t s_powerAckPending;           // serial of the change awaiting its ack, 0 if none
+static uint64_t s_powerAckSerial;
+static uint32_t s_powerAckFlags;
+static uint32_t s_powerCheckQueued;
+struct PowerWaiter {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+    uint64_t generation;
+};
+static PowerWaiter s_powerWaiters[16];
+static uint32_t s_powerWaitLock;
+
+static const char *power_state_name(uint32_t state)
+{
+    static const char *const names[] = {"active", "suspending", "suspended", "resuming", "lost"};
+    return state < 5 ? names[state] : "unknown";
+}
+
+static uint64_t power_now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+// A compute session with the upstream driver running, that a transition
+// may act on.
+static bool power_session_open()
+{
+    return s_modulesRunning && s_pciOpen && s_rtDevice && !s_sessionClosing && !s_dmaQuarantined;
+}
+
+static struct pci_dev *power_pdev()
+{
+    return s_rtDevice ? static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)) : nullptr;
+}
+
+static void power_wait_acquire()
+{
+    while (__atomic_exchange_n(&s_powerWaitLock, 1u, __ATOMIC_ACQUIRE)) {}
+}
+
+static void power_wait_release()
+{
+    __atomic_store_n(&s_powerWaitLock, 0u, __ATOMIC_RELEASE);
+}
+
+static void power_snapshot(uint64_t out[MLG_POWER_STATE_WORDS])
+{
+    mlg_power_snapshot(&s_power, out);
+    if (__atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE)) out[3] |= MLG_POWER_FLAG_ACK_PENDING;
+}
+
+static void power_complete_wait(const PowerWaiter &waiter, kern_return_t status)
+{
+    IOUserClientAsyncArgumentsArray data = {};
+    data[0] = s_power.state;
+    data[1] = s_power.generation;
+    data[2] = s_power.flags;
+    waiter.client->AsyncCompletion(waiter.action, status, data, 3);
+    waiter.action->release();
+    waiter.client->release();
+}
+
+// Complete every wait whose generation is no longer current.
+static void power_notify()
+{
+    PowerWaiter ready[16];
+    unsigned count = 0;
+    power_wait_acquire();
+    for (auto &waiter : s_powerWaiters) {
+        if (!waiter.client || waiter.generation == s_power.generation) continue;
+        ready[count++] = waiter;
+        waiter = {};
+    }
+    power_wait_release();
+    for (unsigned i = 0; i < count; ++i) power_complete_wait(ready[i], kIOReturnSuccess);
+}
+
+static kern_return_t power_wait(MacLinuxGPUUserClient *client, OSAction *action, uint64_t known)
+{
+    PowerWaiter waiter = {client, action, known};
+    client->retain();
+    action->retain();
+    if (known != s_power.generation) {
+        power_complete_wait(waiter, kIOReturnSuccess);
+        return kIOReturnSuccess;
+    }
+    power_wait_acquire();
+    for (auto &slot : s_powerWaiters) {
+        if (slot.client) continue;
+        slot = waiter;
+        power_wait_release();
+        return kIOReturnSuccess;
+    }
+    power_wait_release();
+    action->release();
+    client->release();
+    return kIOReturnNoResources;
+}
+
+// A closing client's waits end now (any queue).
+static void power_cancel_waits(MacLinuxGPUUserClient *client)
+{
+    PowerWaiter cancelled[16];
+    unsigned count = 0;
+    power_wait_acquire();
+    for (auto &waiter : s_powerWaiters) {
+        if (waiter.client != client) continue;
+        cancelled[count++] = waiter;
+        waiter = {};
+    }
+    power_wait_release();
+    for (unsigned i = 0; i < count; ++i) power_complete_wait(cancelled[i], kIOReturnAborted);
+}
+
+static void power_set(uint32_t state, uint32_t cause, int error)
+{
+    const uint32_t from = s_power.state;
+    if (state == MLG_POWER_SUSPENDING || state == MLG_POWER_RESUMING) {
+        if (!s_powerStartNs) s_powerStartNs = power_now_ns();
+    } else if (s_powerStartNs) {
+        s_power.last_us = (power_now_ns() - s_powerStartNs) / 1000;
+        s_powerStartNs = 0;
+    }
+    s_power.session = s_sessionGeneration;
+    if (!mlg_power_set(&s_power, state, cause, error)) {
+        MACLINUXGPU_LOG("power: no transition %s -> %s (cause %u)", power_state_name(from),
+                        power_state_name(state), cause);
+        return;
+    }
+    MACLINUXGPU_LOG("power: %s -> %s (cause %u, error %d, flags %#x, holds %u, generation %llu%s)",
+                    power_state_name(from), power_state_name(state), cause, error, s_power.flags,
+                    s_power.holds, s_power.generation,
+                    (s_power.flags & MLG_POWER_FLAG_VRAM_PRESERVED) ? ", VRAM preserved" : ", VRAM lost");
+    power_notify();
+}
+
+static bool power_device_present()
+{
+    uint16_t vendor = UINT16_MAX;
+    if (!s_retainedPCI) return false;
+    s_retainedPCI->ConfigurationRead16(kIOPCIConfigurationOffsetVendorID, &vendor);
+    return vendor == 0x1002;
+}
+
+// A transition that failed: the session goes, so the next client starts a
+// new one. A failed quiesce first gives its suspend back to upstream, which
+// maps the queues again, so the close removes them through MES rather than
+// freeing memory MES may still be using; if the GPU cannot prove that, the
+// close keeps the session quarantined as it would for any client.
+static void power_fail(MacLinuxGPU *driver, uint32_t cause, int error)
+{
+    if (s_power.flags & MLG_POWER_FLAG_KFD_QUIESCED) {
+        s_power.flags &= ~MLG_POWER_FLAG_KFD_QUIESCED;
+        const int resumed = rt_power_resume(power_pdev(), nullptr);
+        MACLINUXGPU_LOG("power: KFD suspend handed back before the close (%d)", resumed);
+    }
+    power_set(MLG_POWER_LOST, cause, error);
+    MACLINUXGPU_LOG("power: closing the compute session (cause %u, error %d); the next client re-probes",
+                    cause, error);
+    close_session(driver);
+}
+
+// No session to act on: stop admitting GPU work, or admit it again.
+static void power_idle(uint32_t cause)
+{
+    power_set(MLG_POWER_SUSPENDING, cause, 0);
+    power_set(MLG_POWER_SUSPENDED, cause, 0);
+}
+
+static void power_wake_idle(uint32_t cause)
+{
+    power_set(MLG_POWER_RESUMING, cause, 0);
+    power_set(MLG_POWER_ACTIVE, cause, 0);
+}
+
+// Upstream KFD suspend (rt_power_quiesce -> kgd2kfd_suspend): VRAM kept.
+static void power_quiesce(MacLinuxGPU *driver, uint32_t cause)
+{
+    power_set(MLG_POWER_SUSPENDING, cause, 0);
+    struct rt_power_report report = {};
+    const int r = rt_power_quiesce(power_pdev(), &report);
+    if (r == -19 /* ENODEV: no KFD bound, legacy queues only */) {
+        MACLINUXGPU_LOG("power: no KFD device to quiesce; admission closed only");
+        power_set(MLG_POWER_SUSPENDED, cause, 0);
+        return;
+    }
+    // From here this driver holds upstream's suspend (it counts suspends),
+    // whether or not every queue came off MES.
+    s_power.flags |= MLG_POWER_FLAG_KFD_QUIESCED;
+    if (r && r != -37 /* EALREADY: already held */) {
+        MACLINUXGPU_LOG("power: upstream KFD suspend failed (%d): %u of %u queues mapped, "
+                        "%u processes marked for reset", r, report.active, report.queues,
+                        report.reset_marked);
+        power_fail(driver, MLG_POWER_CAUSE_QUIESCE_FAILED, r);
+        return;
+    }
+    ++s_power.quiesces;
+    MACLINUXGPU_LOG("power: compute quiesced through upstream KFD suspend: %u processes, %u queues unmapped",
+                    report.processes, report.queues);
+    power_set(MLG_POWER_SUSPENDED, cause, 0);
+}
+
+// Upstream KFD resume (rt_power_resume -> kgd2kfd_resume).
+static void power_resume(MacLinuxGPU *driver, uint32_t cause)
+{
+    power_set(MLG_POWER_RESUMING, cause, 0);
+    if ((s_power.flags & MLG_POWER_FLAG_KFD_QUIESCED) && !power_session_open()) {
+        // The session was quarantined while quiesced: there is nothing to
+        // resume into, and an uncertain GPU gets no further work.
+        MACLINUXGPU_LOG("power: no session to resume (closing or quarantined)");
+        power_set(MLG_POWER_LOST, MLG_POWER_CAUSE_SESSION_CLOSED, 0);
+        return;
+    }
+    if (s_power.flags & MLG_POWER_FLAG_KFD_QUIESCED) {
+        if (!power_device_present()) {
+            // Gone from the bus while quiesced: never touch its MMIO.
+            s_power.flags |= MLG_POWER_FLAG_LINK_DOWN;
+            power_fail(driver, MLG_POWER_CAUSE_LINK_DOWN, -19);
+            return;
+        }
+        s_power.flags &= ~MLG_POWER_FLAG_KFD_QUIESCED;
+        struct rt_power_report report = {};
+        const int r = rt_power_resume(power_pdev(), &report);
+        if (r) {
+            power_fail(driver, MLG_POWER_CAUSE_RESUME_FAILED, r);
+            return;
+        }
+        MACLINUXGPU_LOG("power: compute resumed through upstream KFD resume: %u queues mapped again",
+                        report.active);
+    }
+    power_set(MLG_POWER_ACTIVE, cause, 0);
+}
+
+static void power_run(MacLinuxGPU *driver, enum mlg_power_action action, uint32_t cause)
+{
+    switch (action) {
+    case MLG_POWER_DO_QUIESCE: power_quiesce(driver, cause); break;
+    case MLG_POWER_DO_RESUME: power_resume(driver, cause); break;
+    case MLG_POWER_DO_IDLE: power_idle(cause); break;
+    case MLG_POWER_DO_WAKE_IDLE: power_wake_idle(cause); break;
+    default: break;
+    }
+}
+
+// Upstream removal suspends KFD itself (amdgpu_device_ip_fini_early) and
+// kgd2kfd_device_exit gives that suspend back; a suspend this driver still
+// holds goes back first, so upstream's count is balanced for the next
+// session. Every KFD process has exited by now (dext_compute_stop tore them
+// down while their queues were off MES), so nothing is restored.
+static void power_before_removal()
+{
+    if (!(s_power.flags & MLG_POWER_FLAG_KFD_QUIESCED)) return;
+    s_power.flags &= ~MLG_POWER_FLAG_KFD_QUIESCED;
+    const int r = rt_power_resume(power_pdev(), nullptr);
+    MACLINUXGPU_LOG("power: KFD suspend handed back before upstream removal (%d)", r);
+}
+
+static bool power_hold(uint64_t client, bool take)
+{
+    for (auto &holder : s_powerHolders) {
+        if (holder != client) continue;
+        if (!take) {
+            holder = 0;
+            --s_power.holds;
+        }
+        return !take;
+    }
+    if (!take) return false;
+    for (auto &holder : s_powerHolders) {
+        if (holder) continue;
+        holder = client;
+        ++s_power.holds;
+        return true;
+    }
+    return false;
+}
+
+static void power_client_prepare(MacLinuxGPU *driver, uint64_t client)
+{
+    if (!power_hold(client, true)) return;
+    MACLINUXGPU_LOG("power: client %llu asks for low power (%u holding)", client, s_power.holds);
+    power_run(driver, mlg_power_plan_hold(&s_power, power_session_open()), MLG_POWER_CAUSE_CLIENT_PREPARE);
+}
+
+static void power_client_release(MacLinuxGPU *driver, uint64_t client, uint32_t cause)
+{
+    if (!power_hold(client, false)) return;
+    MACLINUXGPU_LOG("power: client %llu %s its low-power hold (%u holding)", client,
+                    cause == MLG_POWER_CAUSE_CLIENT_EXIT ? "closed with" : "drops", s_power.holds);
+    power_run(driver, mlg_power_plan_release(&s_power), cause);
+}
+
+// A new session after LOST: the state is active again.
+static void power_session_started()
+{
+    if (s_power.state != MLG_POWER_LOST) return;
+    s_power.flags |= MLG_POWER_FLAG_VRAM_PRESERVED;
+    s_power.flags &= ~MLG_POWER_FLAG_LINK_DOWN;
+    power_set(MLG_POWER_ACTIVE, MLG_POWER_CAUSE_REPROBED, 0);
+}
+
+// The acknowledgement of a deferred power change, exactly once.
+static void power_ack(MacLinuxGPU *driver, uint64_t serial, const char *how)
+{
+    uint64_t expected = serial;
+    if (!__atomic_compare_exchange_n(&s_powerAckPending, &expected, 0, false,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+    MACLINUXGPU_LOG("power: SetPowerState(%#x) acknowledged %s", s_powerAckFlags, how);
+    driver->AckPowerState(s_powerAckFlags);
+}
+
+// On the default queue: whether the session close a sleep waits for ended.
+static void power_check_close(MacLinuxGPU *driver)
+{
+    const uint64_t serial = __atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE);
+    if (!serial) return;
+    const bool closed = !s_sessionClosing && !s_pciOpen;
+    const bool quarantined = s_dmaQuarantined && (s_finalCleanup || s_irqDrainFailed);
+    if (!closed && !quarantined) return;
+    if (s_power.state == MLG_POWER_SUSPENDING)
+        power_set(MLG_POWER_SUSPENDED, MLG_POWER_CAUSE_SYSTEM_SLEEP, quarantined ? -16 : 0);
+    power_ack(driver, serial, quarantined ? "with the session quarantined"
+                                          : "after the session closed");
+}
+
+// The deadline: the change is acknowledged whatever the close is doing,
+// so a stuck close never stalls the host's sleep.
+static void power_watch(MacLinuxGPU *driver, uint64_t serial)
+{
+    driver->retain();
+    s_powerQueue->DispatchAsync(^{
+        const uint64_t deadline = power_now_ns() + uint64_t(MLG_POWER_ACK_DEADLINE_MS) * 1000000;
+        while (__atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE) == serial) {
+            if (power_now_ns() >= deadline) {
+                power_ack(driver, serial, "at its deadline, with the session close still running");
+                break;
+            }
+            if (!__atomic_exchange_n(&s_powerCheckQueued, 1u, __ATOMIC_ACQ_REL)) {
+                driver->retain();
+                s_bringupQueue->DispatchAsync(^{
+                    __atomic_store_n(&s_powerCheckQueued, 0u, __ATOMIC_RELEASE);
+                    power_check_close(driver);
+                    driver->release();
+                });
+            }
+            IOSleep(10);
+        }
+        driver->release();
+    });
+}
+
+// SetPowerState(Off): the host is going to sleep. Returns true when the
+// acknowledgement waits for a session close.
+static bool power_sleep(MacLinuxGPU *driver, uint32_t powerFlags)
+{
+    s_power.flags |= MLG_POWER_FLAG_SYSTEM_SLEEP;
+    const bool session = power_session_open();
+    const enum mlg_power_action action =
+        mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_OFF, session);
+    if (action != MLG_POWER_DO_CLOSE_SESSION) {
+        power_run(driver, action, MLG_POWER_CAUSE_SYSTEM_SLEEP);
+        return false;
+    }
+    // A quiesced session closes as it is: its queues are already off MES
+    // and power_before_removal hands the suspend back.
+    power_set(MLG_POWER_SUSPENDING, MLG_POWER_CAUSE_SYSTEM_SLEEP, 0);
+    s_power.flags |= MLG_POWER_FLAG_SESSION_CLOSED;
+    s_power.flags &= ~MLG_POWER_FLAG_VRAM_PRESERVED;
+    MACLINUXGPU_LOG("power: host sleep: closing the compute session before acknowledging "
+                    "(VRAM does not survive the link going down)");
+    if (!s_powerQueue) {
+        close_session(driver);
+        return false;
+    }
+    s_powerAckFlags = powerFlags;
+    const uint64_t serial = ++s_powerAckSerial;
+    __atomic_store_n(&s_powerAckPending, serial, __ATOMIC_RELEASE);
+    close_session(driver);
+    power_check_close(driver);
+    if (__atomic_load_n(&s_powerAckPending, __ATOMIC_ACQUIRE) == serial) power_watch(driver, serial);
+    return true;
+}
+
+// SetPowerState(On): awake (the provider's state is restored).
+static void power_wake(MacLinuxGPU *driver)
+{
+    s_power.flags &= ~(MLG_POWER_FLAG_SYSTEM_SLEEP | MLG_POWER_FLAG_DEVICE_LOW);
+    const enum mlg_power_action action =
+        mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_ON, power_session_open());
+    if (action == MLG_POWER_DO_WAKE_LOST) {
+        s_power.flags &= ~MLG_POWER_FLAG_SESSION_CLOSED;
+        if (!power_device_present()) s_power.flags |= MLG_POWER_FLAG_LINK_DOWN;
+        power_set(MLG_POWER_LOST, MLG_POWER_CAUSE_SYSTEM_WAKE, 0);
+        return;
+    }
+    power_run(driver, action, MLG_POWER_CAUSE_DEVICE_ON);
+}
+
 kern_return_t
 IMPL(MacLinuxGPU, Start)
 {
@@ -800,6 +1216,16 @@ IMPL(MacLinuxGPU, Start)
         bqueue->release();
         s_bringupQueue = nullptr;
         return qret;
+    }
+    // Device power starts active; a sleep's acknowledgement deadline runs
+    // on a queue of its own.
+    mlg_power_init(&s_power);
+    memset(s_powerHolders, 0, sizeof(s_powerHolders));
+    s_powerStartNs = 0;
+    __atomic_store_n(&s_powerAckPending, 0, __ATOMIC_RELEASE);
+    if (!s_powerQueue && IODispatchQueue::Create("MacLinuxGPUPower", 0, 0, &s_powerQueue) != kIOReturnSuccess) {
+        s_powerQueue = nullptr;
+        MACLINUXGPU_LOG("power: no queue for sleep acknowledgements; a sleep will not wait for the session close");
     }
 
     // Compute sessions become KFD processes when the device supports them;
@@ -934,6 +1360,35 @@ IMPL(MacLinuxGPU, InterruptOccurred)
         dext_irq_dispatch((int)*vector);
 }
 
+// DriverKit delivers the provider's power changes here (IOService.iig):
+// kIOServicePowerCapabilityOff before system sleep, On when the device and
+// system are fully powered again, Low for a reduced device power state
+// while the system runs. The change is acknowledged by passing it to the
+// superclass, after the driver made itself safe for it (power_state.h).
+kern_return_t
+IMPL(MacLinuxGPU, SetPowerState)
+{
+    if (s_driver != this) return SetPowerState(powerFlags, SUPERDISPATCH);
+    MACLINUXGPU_LOG("power: SetPowerState(%#x) in state %s, session %s", powerFlags,
+                    power_state_name(s_power.state), power_session_open() ? "open" : "none");
+    if (powerFlags == kIOServicePowerCapabilityOff) {
+        if (power_sleep(this, powerFlags)) return kIOReturnSuccess; // acknowledged later
+    } else if (powerFlags & kIOServicePowerCapabilityOn) {
+        power_wake(this);
+    } else if (powerFlags & kIOServicePowerCapabilityLow) {
+        s_power.flags |= MLG_POWER_FLAG_DEVICE_LOW;
+        power_run(this, mlg_power_plan_capability(&s_power, MLG_POWER_CAPABILITY_LOW, power_session_open()),
+                  MLG_POWER_CAUSE_DEVICE_LOW);
+    }
+    return SetPowerState(powerFlags, SUPERDISPATCH);
+}
+
+void
+MacLinuxGPU::AckPowerState(uint32_t powerFlags)
+{
+    (void)SetPowerState(powerFlags, SUPERDISPATCH);
+}
+
 kern_return_t
 IMPL(MacLinuxGPU, NewUserClient)
 {
@@ -1025,6 +1480,10 @@ MacLinuxGPU::free()
     if (s_bringupQueue != nullptr) {
         s_bringupQueue->release();
         s_bringupQueue = nullptr;
+    }
+    if (s_powerQueue != nullptr) {
+        s_powerQueue->release();
+        s_powerQueue = nullptr;
     }
     if (s_retainedPCI != nullptr && !s_dmaQuarantined) {
         s_retainedPCI->release();
@@ -1179,6 +1638,17 @@ void
 MacLinuxGPUUserClient::FinishStop(IOService *provider)
 {
     MacLinuxGPU *driver = ivars->ownerDriver;
+    // Its power waits end now; a low-power hold it kept goes on the
+    // default queue, where every power transition runs.
+    power_cancel_waits(this);
+    if (s_bringupQueue) {
+        const uint64_t client = ivars->clientID;
+        driver->retain();
+        s_bringupQueue->DispatchAsync(^{
+            power_client_release(driver, client, MLG_POWER_CAUSE_CLIENT_EXIT);
+            driver->release();
+        });
+    }
     // An observer never holds a lease, and stops on its own queue.
     if (!ivars->observer) s_rawBARLease.release(ivars->clientID);
     if (ivars->ownerQueue) ivars->ownerQueue->release();
@@ -1836,7 +2306,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     } else if (s_sessionClosing && selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodQueryInfo &&
         selector != kMacAMDGPUMethodRuntimeBuild && selector != kMacAMDGPUMethodPing &&
-        selector != kMacAMDGPUMethodReleaseQuarantine)
+        selector != kMacAMDGPUMethodReleaseQuarantine && selector != MLG_SELECTOR_POWER)
         return kIOReturnBusy;
     if (!ivars->observer && selector >= kMacAMDGPUMethodBOAlloc &&
         selector != kMacAMDGPUMethodQueryInfo &&
@@ -1844,8 +2314,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         selector != kMacAMDGPUMethodHostWindow &&
         selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodReleaseQuarantine &&
+        selector != MLG_SELECTOR_POWER &&
         ivars->sessionGeneration != s_sessionGeneration)
         return kIOReturnNotOpen;
+    // Suspending, suspended or resuming: no new work for the GPU. Nothing
+    // was submitted; the client retries after resume (power_state.h).
+    if (!ivars->observer && !mlg_power_admits(s_power.state, selector))
+        return kIOReturnOffline;
 
     // Read the in scalars (the IOUserClientMethodArguments layout: scalarInput
     // is the in scalars, scalarOutput is the out scalars).  The mac_amdgpu
@@ -2053,6 +2528,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         }
         s_observerReads.open();
         s_lxCalls.open();
+        power_session_started();
         return kIOReturnSuccess;
     }
 
@@ -2138,6 +2614,14 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             out[0] = end; out[1] = cursor; out[2] = copied;
             memcpy(out + 3, text, copied);
             arguments->scalarOutputCount = 3 + (uint32_t)((copied + 7) / 8);
+            return kIOReturnSuccess;
+        }
+        // Device power state: cached, as the session state.
+        if (in && arguments->scalarInputCount == 1 && in[0] == MLG_QUERY_POWER_STATE) {
+            if (!out || arguments->scalarOutputCount < MLG_POWER_STATE_WORDS)
+                return kIOReturnBadArgument;
+            power_snapshot(out);
+            arguments->scalarOutputCount = MLG_POWER_STATE_WORDS;
             return kIOReturnSuccess;
         }
         // Session lifecycle and quarantine cause: lifecycle variables only.
@@ -2554,6 +3038,39 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                                           arguments->scalarOutput) != 0)
             return kIOReturnBadArgument;
         arguments->scalarOutputCount = DEXT_COMPUTE_ATOMIC_REQUESTER_WORDS;
+        return kIOReturnSuccess;
+    }
+
+    case MLG_SELECTOR_POWER: {
+        // in[0]=op (power_state.h); WAIT: in[1]=known generation, async.
+        // Others: out = the power snapshot.
+        if (!in || arguments->scalarInputCount < 1) return kIOReturnBadArgument;
+        if (in[0] == MLG_POWER_OP_WAIT) {
+            if (arguments->scalarInputCount != 2 || !arguments->completion) return kIOReturnBadArgument;
+            return power_wait(this, arguments->completion, in[1]);
+        }
+        if (arguments->scalarInputCount != 1 || !out ||
+            arguments->scalarOutputCount < MLG_POWER_STATE_WORDS)
+            return kIOReturnBadArgument;
+        if (in[0] == MLG_POWER_OP_PREPARE || in[0] == MLG_POWER_OP_RESUME) {
+            if (ivars->observer) {
+                OSDictionary *entitlements = nullptr;
+                bool entitled = false;
+                if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
+                    entitled = entitlements->getObject(MLG_SESSION_RELEASE_ENTITLEMENT) == kOSBooleanTrue;
+                    entitlements->release();
+                }
+                if (!entitled) return kIOReturnNotPrivileged;
+            }
+            if (in[0] == MLG_POWER_OP_PREPARE)
+                power_client_prepare(ivars->ownerDriver, ivars->clientID);
+            else
+                power_client_release(ivars->ownerDriver, ivars->clientID, MLG_POWER_CAUSE_CLIENT_RESUME);
+        } else if (in[0] != MLG_POWER_OP_QUERY) {
+            return kIOReturnBadArgument;
+        }
+        power_snapshot(out);
+        arguments->scalarOutputCount = MLG_POWER_STATE_WORDS;
         return kIOReturnSuccess;
     }
 
