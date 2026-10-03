@@ -213,7 +213,8 @@ DK_FW_OBJ  := $(DK_BUILD)/gen/fw_rodata_generated.o
 DK_LIB     := $(DK_BUILD)/libmacamgdu-dk.a
 # driverKit platform flags for the KMD objects (parallel to HOSTCFLAGS but
 # -target driverKit + C headers from the MacOSX SDK).
-DK_HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -w -MMD -MP -Wno-incompatible-function-pointer-types
+# -ftrivial-auto-var-init=zero: CONFIG_INIT_STACK_ALL_ZERO, as HOSTCFLAGS.
+DK_HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
 DK_CFLAGS     := -target arm64-apple-driverkit -isystem $(MSDK)/usr/include $(DK_HOSTCFLAGS)
 DK_CFLAGS += -include rt/device_string.h -mstrict-align \
 	-fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
