@@ -4,6 +4,7 @@
 #include "host_window.h"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <limits>
 #include <system_error>
 
@@ -71,6 +72,24 @@ hsa_status_t poolCapacity(const Pool &pool, void *value) {
     }
     return writeValue(value, size_t(capacity));
 }
+// A tracked allocation overlapping [address, address + size), if any. Caller
+// holds runtimeMutex.
+std::shared_ptr<Allocation> collision(uintptr_t address, size_t size) {
+    if (auto inside = findAllocation(reinterpret_cast<void *>(address))) return inside;
+    const auto next = allocations.lower_bound(address);
+    if (next != allocations.end() && next->first - address < size) return next->second;
+    return nullptr;
+}
+const char *allocationKind(const Allocation &a) {
+    return !a.connection ? "host" : a.shared.host ? "shared" : "device";
+}
+// A refused allocation whose address range is already taken by another
+// tracked allocation: a device VA reused while still tracked, or a device VA
+// that equals a host address. Rare enough to always report.
+void reportCollision(const Allocation &fresh, const Allocation &held) {
+    std::fprintf(stderr, "mac_hsa: %s allocation %p+%#zx overlaps tracked %s allocation %p+%#zx; refused\n",
+        allocationKind(fresh), fresh.base, fresh.size, allocationKind(held), held.base, held.size);
+}
 hsa_status_t allocate(uint64_t poolHandle, size_t size, uint32_t flags, void **out,
                       hsa_status_t invalidPool) {
     Pool pool{};
@@ -122,10 +141,10 @@ hsa_status_t allocate(uint64_t poolHandle, size_t size, uint32_t flags, void **o
             const auto address = reinterpret_cast<uintptr_t>(allocation->base);
             // Distinct GPUs can expose identical MC addresses. Until per-process
             // GPU VAs are implemented, reject collisions instead of aliasing them.
-            if (findAllocation(allocation->base)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-            const auto next = allocations.lower_bound(address);
-            if (next != allocations.end() && next->first - address < allocation->size)
+            if (const auto clash = collision(address, allocation->size)) {
+                reportCollision(*allocation, *clash);
                 return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            }
             allocations.emplace(address, allocation);
         }
         *out = allocation->base;
@@ -245,10 +264,10 @@ hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void
         {
             std::lock_guard lock(runtimeMutex);
             if (!references || !findAgent(agent)) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-            if (findAllocation(allocation->base)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-            const auto next = allocations.lower_bound(address);
-            if (next != allocations.end() && next->first - address < allocation->size)
+            if (const auto clash = collision(address, allocation->size)) {
+                reportCollision(*allocation, *clash);
                 return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            }
             allocations.emplace(address, allocation);
         }
         *out = allocation->base;

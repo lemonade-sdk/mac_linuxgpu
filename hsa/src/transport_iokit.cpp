@@ -234,7 +234,10 @@ public:
         if (status != HSA_STATUS_SUCCESS) return status;
         if (!bytes || bytes > capacity || bytes > UINT64_MAX - 16383)
             return HSA_STATUS_ERROR_INVALID_ALLOCATION;
-        return allocateRaw((bytes + 16383) & ~uint64_t(16383), 3, buffer);
+        const auto allocated = allocateRaw((bytes + 16383) & ~uint64_t(16383), 3, buffer);
+        if (allocated == HSA_STATUS_SUCCESS) { vramBytes += buffer.size; ++vramCount; }
+        else reportAllocationFailureLocked("VRAM", bytes, allocated);
+        return allocated;
     }
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override {
         std::lock_guard lock(sessionMutex);
@@ -242,6 +245,7 @@ public:
         if (sharedBuffers.contains(buffer.handle)) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         const auto status = scalar(17, {&buffer.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
+        else { vramBytes -= std::min(vramBytes, buffer.size); vramCount -= vramCount != 0; }
         return status;
     }
     hsa_status_t readBuffer(const DeviceBuffer &buffer, uint64_t offset, void *out, size_t bytes) override {
@@ -625,6 +629,60 @@ private:
     // bytes of shared buffers currently mapped in it.
     HostWindowReservation hostReservation;
     uint64_t sharedBytes = 0;
+    // Device-local buffers this connection holds, and the IOReturn of the
+    // last RPC: what an allocation failure report states.
+    uint64_t vramBytes = 0, vramCount = 0;
+    uint32_t lastIOReturn = 0;
+    std::chrono::steady_clock::time_point lastFailureReport{};
+    // An allocation the driver refused: what was asked, what the driver
+    // answered, what the device's memory manager holds, what this process
+    // holds, and the end of the driver's log, which names the refusal. At
+    // most one report every few seconds; a refusal is often retried.
+    void reportAllocationFailureLocked(const char *kind, uint64_t bytes, hsa_status_t status) {
+        const auto raw = lastIOReturn;
+        const auto now = std::chrono::steady_clock::now();
+        if (lastFailureReport.time_since_epoch().count() && now - lastFailureReport < std::chrono::seconds(5)) return;
+        lastFailureReport = now;
+        std::fprintf(stderr, "mac_linuxgpu: %s allocation of %llu bytes refused: IOReturn %#x (HSA status %#x); "
+            "this process holds %llu VRAM buffers (%llu bytes) and %zu shared buffers (%llu bytes)\n",
+            kind, (unsigned long long)bytes, raw, unsigned(status), (unsigned long long)vramCount,
+            (unsigned long long)vramBytes, sharedBuffers.size(), (unsigned long long)sharedBytes);
+        if (state != State::Ready || !linuxShim) return;
+        std::array<uint64_t, 6> usage{};
+        const uint64_t tag = 9;
+        if (call(ownerPort, 21, &tag, 1, usage.data(), uint32_t(usage.size())) == HSA_STATUS_SUCCESS)
+            std::fprintf(stderr, "mac_linuxgpu: device VRAM total %llu usable %llu used %llu free %llu; "
+                "CPU-visible %llu used %llu\n", (unsigned long long)usage[0], (unsigned long long)usage[1],
+                (unsigned long long)usage[2], (unsigned long long)usage[3], (unsigned long long)usage[4],
+                (unsigned long long)usage[5]);
+        dumpKernelLogTailLocked(4096);
+    }
+    // The last `bytes` of the driver's cached kernel log.
+    void dumpKernelLogTailLocked(uint64_t bytes) {
+        uint64_t cursor = 0, end = 0;
+        bool header = false;
+        for (unsigned chunk = 0; chunk < 64; ++chunk) {
+            const uint64_t input[] = {kCachedKernelLog, cursor};
+            std::array<uint64_t, 16> output{};
+            uint32_t count = output.size();
+            if (IOConnectCallScalarMethod(ownerPort, 21, input, 2, output.data(), &count) != KERN_SUCCESS ||
+                count < 3 || output[2] > (count - 3) * sizeof(uint64_t))
+                return;
+            if (chunk == 0) {
+                end = output[0];
+                const uint64_t from = end > bytes ? end - bytes : 0;
+                if (from > cursor) { cursor = from; continue; }
+            }
+            const uint64_t next = output[1], length = output[2];
+            char data[104];
+            for (uint64_t i = 0; i < length; ++i) data[i] = char(output[3 + i / 8] >> ((i % 8) * 8));
+            if (!header) { std::fputs("mac_linuxgpu: driver log tail:\n", stderr); header = true; }
+            std::fwrite(data, 1, size_t(length), stderr);
+            if (!length || next >= end) break;
+            cursor = next;
+        }
+        std::fputc('\n', stderr);
+    }
     void reserveHostWindowLocked() {
         const auto reserved = hostReservation.reserve(hostWindowBase, hostWindowSize);
         if (const char *trace = std::getenv("MAC_HSA_SESSION_TRACE"); trace && trace[0] == '1')
@@ -686,6 +744,7 @@ private:
         uint32_t raw = 0, count = 0;
         const auto status = call(ownerPort, selector, input.data(), uint32_t(input.size()),
                     output.data(), uint32_t(output.size()), &raw, &count);
+        lastIOReturn = raw;
         if (linuxShim && state == State::Initializing && status != HSA_STATUS_SUCCESS &&
             !initializationTransportFailure.present)
             initializationTransportFailure = {true, selector, raw, count, uint32_t(output.size())};
@@ -907,7 +966,7 @@ private:
         }
         SharedBuffer buffer;
         status = allocateRaw(rounded, 2, buffer.device);
-        if (status != HSA_STATUS_SUCCESS) return status;
+        if (status != HSA_STATUS_SUCCESS) { reportAllocationFailureLocked("shared (GTT)", rounded, status); return status; }
         std::array<uint64_t, 2> mapping{};
         status = scalar(36, {&buffer.device.handle, 1}, mapping);
         mach_vm_address_t address = buffer.device.address;
