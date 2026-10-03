@@ -10,9 +10,11 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "mlg_drm.h"
 #include "mlg_transport.h"
+#include "mlg_uapi.h"
 #include <rt/lx_abi.h>
 
 /* What each descriptor is: indexed by descriptor, MLG_LX_DEV_* or 0. */
@@ -26,7 +28,8 @@ static unsigned int fds_open;
 struct mapping {
 	struct mapping *next;
 	void *addr;
-	uint64_t length;
+	uint64_t length;	/* as the caller asked */
+	uint64_t span;		/* as mapped: whole pages */
 	uint64_t handle;
 };
 static struct mapping *mappings;
@@ -283,13 +286,33 @@ static uint64_t monotonic_ns(void)
 	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* The DRM core finds a driver request by its number and copies only the
+ * directions both the caller's encoding and its own table declare, so a
+ * caller may encode a request with more directions than the table (Mesa
+ * issues DRM_AMDGPU_GEM_VA as read-write; the table declares write). The
+ * transport knows requests by their exact encoding: send the table's. */
+static uint32_t table_cmd(uint32_t dev, uint32_t cmd)
+{
+	/* The render node's requests are known by exact encoding, so the
+	 * one that matches is the table's; KFD's are known by range. */
+	if (dev != MLG_LX_DEV_RENDER || mlg_lx_cmd_known(dev, cmd))
+		return cmd;
+	for (uint32_t dir = 0; dir < 4; ++dir) {
+		const uint32_t c = (cmd & ~(3u << 30)) | dir << 30;
+
+		if (mlg_lx_cmd_known(dev, c))
+			return c;
+	}
+	return cmd;
+}
+
 int mlg_ioctl(int fd, unsigned long request, void *arg)
 {
 	struct mlg_lx_span local[32], *spans = local;
 	uint8_t frame_local[2048], reply_local[2048];
 	void *frame = frame_local, *reply = reply_local;
-	const uint32_t cmd = (uint32_t)request;
 	const uint32_t dev = device_of(fd);
+	const uint32_t cmd = table_cmd(dev, (uint32_t)request);
 	uint64_t timeout_va = 0, out_bytes = 0;
 	struct mlg_transport t;
 	size_t reply_bytes = 0;
@@ -396,7 +419,12 @@ void *mlg_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t off
 		fail(MLG_LX_ENOMEM);
 		return MAP_FAILED;
 	}
-	r = t.mmap(t.ctx, fd, (uint64_t)offset, length, lprot, MLG_LX_MAP_SHARED, &at, &handle);
+	/* As mmap(2) does, map whole pages (the driver process's page size
+	 * is this platform's); munmap takes the caller's length. */
+	const uint64_t page = (uint64_t)getpagesize();
+	const uint64_t span = ((uint64_t)length + page - 1) & ~(page - 1);
+
+	r = t.mmap(t.ctx, fd, (uint64_t)offset, span, lprot, MLG_LX_MAP_SHARED, &at, &handle);
 	if (r) {
 		free(m);
 		fail(-r);
@@ -404,12 +432,24 @@ void *mlg_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t off
 	}
 	m->addr = at;
 	m->length = length;
+	m->span = span;
 	m->handle = handle;
 	pthread_mutex_lock(&lock);
 	m->next = mappings;
 	mappings = m;
 	pthread_mutex_unlock(&lock);
 	return at;
+}
+
+int mlg_is_mapping(const void *addr, size_t length)
+{
+	int found = 0;
+
+	pthread_mutex_lock(&lock);
+	for (struct mapping *m = mappings; m && !found; m = m->next)
+		found = m->addr == addr && m->length == length;
+	pthread_mutex_unlock(&lock);
+	return found;
 }
 
 int mlg_munmap(void *addr, size_t length)
@@ -434,7 +474,52 @@ int mlg_munmap(void *addr, size_t length)
 		free(m);
 		return fail(MLG_LX_ENODEV);
 	}
-	r = t.munmap(t.ctx, m->handle, m->addr, m->length);
+	r = t.munmap(t.ctx, m->handle, m->addr, m->span);
 	free(m);
 	return r ? fail(-r) : 0;
+}
+
+/* ---- the GPU's PCI identity ---- */
+
+int mlg_pci_identity(struct mlg_pci_identity *out)
+{
+	struct drm_amdgpu_info_device info = { 0 };
+	struct drm_amdgpu_info request = {
+		.return_pointer = (uint64_t)(uintptr_t)&info,
+		.return_size = sizeof(info),
+		.query = AMDGPU_INFO_DEV_INFO,
+	};
+	struct mlg_transport t;
+	int fd, r;
+
+	if (!out)
+		return fail(MLG_LX_EFAULT);
+	if (!get_transport(&t))
+		return fail(MLG_LX_ENODEV);
+	memset(out, 0, sizeof(*out));
+	if (t.identity) {
+		r = t.identity(t.ctx, out);
+		if (r)
+			return fail(-r);
+		last_linux_errno = 0;
+		return 0;
+	}
+	/* What the driver itself reports; AMD is the only vendor amdgpu
+	 * drives. */
+	fd = mlg_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	r = mlg_ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &request);
+	if (r) {
+		int e = last_linux_errno;
+
+		(void)mlg_close(fd);
+		return fail(e);
+	}
+	(void)mlg_close(fd);
+	out->vendor_id = 0x1002;
+	out->device_id = (uint16_t)info.device_id;
+	out->revision_id = (uint8_t)info.pci_rev;
+	last_linux_errno = 0;
+	return 0;
 }

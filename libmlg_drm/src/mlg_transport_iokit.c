@@ -344,11 +344,92 @@ static int t_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 	return r ? r : (int)(int64_t)out[0];
 }
 
+/* ---- identity: the IOPCIDevice the driver matched ---- */
+
+static bool data_property(io_registry_entry_t entry, CFStringRef key, uint32_t *value)
+{
+	CFTypeRef p = IORegistryEntryCreateCFProperty(entry, key, kCFAllocatorDefault, 0);
+	bool ok = false;
+
+	if (p && CFGetTypeID(p) == CFDataGetTypeID() && CFDataGetLength(p) >= 4) {
+		const uint8_t *b = CFDataGetBytePtr(p);
+
+		*value = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 |
+			 (uint32_t)b[3] << 24;
+		ok = true;
+	}
+	if (p)
+		CFRelease(p);
+	return ok;
+}
+
+static int t_identity(void *ctx, struct mlg_pci_identity *out)
+{
+	const char *want = getenv("MLG_DRM_REGISTRY_ID");
+	uint64_t wanted = want ? strtoull(want, NULL, 0) : 0;
+	io_iterator_t it = IO_OBJECT_NULL;
+	io_service_t service;
+	int r = -MLG_LX_ENODEV;
+
+	(void)ctx;
+	if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUserService"),
+					 &it) != KERN_SUCCESS)
+		return -MLG_LX_ENODEV;
+	while (r && (service = IOIteratorNext(it))) {
+		io_registry_entry_t entry = service, parent;
+		uint64_t id = 0;
+		uint32_t v;
+
+		if (!is_driver(service) || (wanted &&
+		    (IORegistryEntryGetRegistryEntryID(service, &id) != KERN_SUCCESS ||
+		     id != wanted))) {
+			IOObjectRelease(service);
+			continue;
+		}
+		IOObjectRetain(entry);
+		/* The provider chain up to the PCI function. */
+		while (!data_property(entry, CFSTR("vendor-id"), &v)) {
+			kern_return_t kr = IORegistryEntryGetParentEntry(entry, kIOServicePlane,
+									 &parent);
+
+			IOObjectRelease(entry);
+			if (kr != KERN_SUCCESS) {
+				entry = IO_OBJECT_NULL;
+				break;
+			}
+			entry = parent;
+		}
+		if (entry) {
+			out->vendor_id = (uint16_t)v;
+			if (data_property(entry, CFSTR("device-id"), &v))
+				out->device_id = (uint16_t)v;
+			if (data_property(entry, CFSTR("subsystem-vendor-id"), &v))
+				out->subvendor_id = (uint16_t)v;
+			if (data_property(entry, CFSTR("subsystem-id"), &v))
+				out->subdevice_id = (uint16_t)v;
+			if (data_property(entry, CFSTR("revision-id"), &v))
+				out->revision_id = (uint8_t)v;
+			/* Open Firmware "reg": the config address, bus 23:16,
+			 * device 15:11, function 10:8. */
+			if (data_property(entry, CFSTR("reg"), &v)) {
+				out->bus = (uint8_t)(v >> 16);
+				out->dev = (uint8_t)((v >> 11) & 0x1f);
+				out->func = (uint8_t)((v >> 8) & 0x7);
+			}
+			IOObjectRelease(entry);
+			r = 0;
+		}
+		IOObjectRelease(service);
+	}
+	IOObjectRelease(it);
+	return r;
+}
+
 int mlg_default_transport(struct mlg_transport *out)
 {
 	*out = (struct mlg_transport){
 		.open = t_open, .close = t_close, .ioctl = t_ioctl,
-		.mmap = t_mmap, .munmap = t_munmap,
+		.mmap = t_mmap, .munmap = t_munmap, .identity = t_identity,
 	};
 	return 0;
 }
