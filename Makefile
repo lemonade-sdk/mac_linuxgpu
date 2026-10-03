@@ -995,3 +995,13 @@ test-lx-files:
 test: test-lx-frame-fuzz test-lx-files
 CRASH_PATH_TESTS += test-lx-frame-fuzz test-lx-files
 .PHONY: test-lx-frame-fuzz test-lx-files
+
+# Kernel-queue command submission offline: the CS self-test (render node,
+# GEM, VM, AMDGPU_CS on compute and SDMA, WAIT_CS, syncobjs) through the
+# Linux-file transport against upstream DRM/amdgpu on a software GPU.
+test-cs-selftest: lib
+	bash scripts/test-cs-selftest.sh
+
+test: test-cs-selftest
+CRASH_PATH_TESTS += test-cs-selftest
+.PHONY: test-cs-selftest
