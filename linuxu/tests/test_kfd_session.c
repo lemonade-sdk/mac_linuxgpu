@@ -22,6 +22,7 @@
 #include <linux/mm.h>
 #include <drm/drm_ioctl.h>
 #include <rt/kfd_session.h>
+#include <rt/lx_files.h>
 #include "amdgpu.h"
 #include "kfd_priv.h"
 #include "kfd_device_queue_manager.h"
@@ -77,6 +78,80 @@ static void check_ctx_header(const struct queue_set *set,
 	assert(header);
 	assert(header[4] == limits->xcc_count * limits->ctx_save_bytes);	/* DebugOffset */
 	assert(header[5] == limits->debug_bytes * limits->xcc_count);	/* DebugSize */
+}
+
+/* ---- the Linux-file transport (lx_files) as libhsakmt uses /dev/kfd ---- */
+
+/* The fixture maps no GEM objects through a render file. */
+int rt_lx_gem_map(struct drm_device *ddev, struct pci_dev *pdev, struct vm_area_struct *vma,
+		  uint64_t length, void **pinned, uint32_t *backing, uint32_t *cache,
+		  int (*add)(void *, uint32_t, uint64_t, uint64_t), void *arg)
+{
+	(void)ddev; (void)pdev; (void)vma; (void)length; (void)pinned; (void)backing;
+	(void)cache; (void)add; (void)arg;
+	return -ENODEV;
+}
+void rt_lx_gem_unpin(void *pinned) { (void)pinned; }
+
+/* ioctl(2) as libmlg_drm frames it: this test's memory is the client's. */
+static long lx_ioctl(struct rt_lx_client *c, uint32_t dev, int fd, uint32_t cmd, void *arg)
+{
+	static struct mlg_lx_span spans[MLG_LX_DESCRIBE_MAX];
+	static uint8_t frame[16384], rep[16384];
+	uint64_t timeout_va = 0, out = 0;
+	size_t rep_bytes = 0;
+	int64_t result = 0;
+	uint32_t n = 0;
+	long len;
+
+	if (mlg_lx_describe(dev, cmd, (uint64_t)(uintptr_t)arg, spans, MLG_LX_DESCRIBE_MAX, &n,
+			    &timeout_va))
+		return -ENOTTY;
+	len = mlg_lx_encode(cmd, (uint64_t)(uintptr_t)arg, spans, n, timeout_va, 0, frame,
+			    sizeof(frame), &out);
+	assert(len > 0);
+	assert(!rt_lx_ioctl(c, fd, cmd, frame, (size_t)len, rep, sizeof(rep), &rep_bytes, &result));
+	assert(!mlg_lx_apply_reply(frame, (size_t)len, rep, rep_bytes, NULL));
+	return (long)result;
+}
+
+/* hsaKmtOpenKFD and hsakmt_fmm_init_process_apertures through the
+ * transport: a client process opening /dev/kfd and the render node itself,
+ * the apertures array written through its pointer, ACQUIRE_VM finding the
+ * render descriptor in the same process's table. */
+static void lx_kfd_client(void)
+{
+	static struct pci_dev pdev;
+	struct rt_lx_client *c = NULL;
+	struct kfd_ioctl_get_version_args version = {0};
+	struct kfd_ioctl_get_process_apertures_new_args apn = {0};
+	struct kfd_process_device_apertures nodes[4];
+	struct kfd_ioctl_acquire_vm_args acquire = {0};
+	const unsigned int opens = render_opens, acquires = vm_acquires;
+	int kfd_fd, drm_fd;
+
+	pci_set_drvdata(&pdev, &adev->ddev);
+	assert(!rt_lx_client_create(&pdev, 5150, "lx-hsakmt", &c) && rt_lx_client_pid(c) == 5150);
+	kfd_fd = rt_lx_open(c, MLG_LX_DEV_KFD, MLG_LX_O_RDWR | MLG_LX_O_CLOEXEC);
+	drm_fd = rt_lx_open(c, MLG_LX_DEV_RENDER, MLG_LX_O_RDWR | MLG_LX_O_CLOEXEC);
+	assert(kfd_fd >= 0 && drm_fd >= 0 && render_opens == opens + 1);
+	assert(!lx_ioctl(c, MLG_LX_DEV_KFD, kfd_fd, AMDKFD_IOC_GET_VERSION, &version));
+	assert(version.major_version == KFD_IOCTL_MAJOR_VERSION);
+	/* The count, then the array. */
+	assert(!lx_ioctl(c, MLG_LX_DEV_KFD, kfd_fd, AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &apn));
+	assert(apn.num_of_nodes == 1);
+	memset(nodes, 0, sizeof(nodes));
+	apn.kfd_process_device_apertures_ptr = (uint64_t)(uintptr_t)nodes;
+	assert(!lx_ioctl(c, MLG_LX_DEV_KFD, kfd_fd, AMDKFD_IOC_GET_PROCESS_APERTURES_NEW, &apn));
+	assert(nodes[0].gpu_id == TEST_GPU_ID && nodes[0].gpuvm_limit == (1ULL << 47) - 1);
+	acquire.gpu_id = TEST_GPU_ID;
+	acquire.drm_fd = drm_fd;
+	assert(!lx_ioctl(c, MLG_LX_DEV_KFD, kfd_fd, AMDKFD_IOC_ACQUIRE_VM, &acquire));
+	assert(vm_acquires == acquires + 1);
+	/* Not a KFD request: refused before the device. */
+	assert(lx_ioctl(c, MLG_LX_DEV_KFD, kfd_fd, AMDKFD_IOC_SVM, &apn) == -ENOTTY);
+	/* Exit: KFD's notifier release, then both files close. */
+	rt_lx_client_destroy(c);
 }
 
 int main(void)
@@ -206,6 +281,8 @@ int main(void)
 	/* Session close destroys the queue and frees the memory it left. */
 	assert(!rt_kfd_session_close(second));
 	assert(mes_removes == 1);
+
+	lx_kfd_client();
 
 	/* ---- DESTROY_QUEUE ---- */
 	assert(!rt_kfd_queue_destroy(s, q0.q));

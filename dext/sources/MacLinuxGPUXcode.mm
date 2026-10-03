@@ -68,7 +68,10 @@
 #include "raw_bar_lease.h"
 #include "session_state.h"
 #include <rt/bootstrap.h>
+#include <rt/cs_selftest.h>
 #include <rt/drm_info.h>
+#include <rt/lx_abi.h>
+#include <rt/lx_files.h>
 #include <rt/sysfs.h>
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
@@ -258,22 +261,24 @@ static bool             s_finalCleanup = false;
 static bool             s_irqDrainFailed = false;
 static bool             s_releaseFailed = false;
 static bool             s_creatingObserver = false;
+static bool             s_creatingLinuxFile = false;
 // DriverKit runs a new user client's Start after NewUserClient returns, not
 // inside Create, so the requested role is recorded against the created
 // object and claimed by its Start. Both run on the driver's default queue.
 static const void      *s_pendingObservers[16];
+static const void      *s_pendingLinuxFiles[16];
 
-__attribute__((unused)) static bool pending_observer_add(const void *client)
+__attribute__((unused)) static bool pending_role_add(const void **slots, const void *client)
 {
-    for (auto &slot : s_pendingObservers)
-        if (!slot) { slot = client; return true; }
+    for (unsigned i = 0; i < 16; ++i)
+        if (!slots[i]) { slots[i] = client; return true; }
     return false;
 }
 
-__attribute__((unused)) static bool pending_observer_take(const void *client)
+__attribute__((unused)) static bool pending_role_take(const void **slots, const void *client)
 {
-    for (auto &slot : s_pendingObservers)
-        if (slot == client) { slot = nullptr; return true; }
+    for (unsigned i = 0; i < 16; ++i)
+        if (slots[i] == client) { slots[i] = nullptr; return true; }
     return false;
 }
 // Observer reads (SysfsRead, DrmInfo) run upstream callbacks on observer
@@ -286,6 +291,9 @@ static void observer_reads_close()
     s_observerReads.close();
     while (!s_observerReads.drained()) IOSleep(1);
 }
+// Linux-file calls (lx_files) run on their clients' own queues under this
+// admission, opened and closed with the observer reads.
+static mlg_observer_gate s_lxCalls;
 struct MacLinuxGPUUserClient_IVars {
     MacLinuxGPU *ownerDriver;
     IOService *stopProvider;
@@ -295,10 +303,13 @@ struct MacLinuxGPUUserClient_IVars {
     bool stopping;
     bool observer; // read-only: never joins, opens or closes a session
     bool identityRecorded; // pid/name handed to the compute backend
-    // Observers run on their own queue and hop to the owner's queue for
-    // everything but the Linux reads.
+    // Observers and Linux-file clients run on their own queue and hop to
+    // the owner's queue for everything but their own calls.
     IODispatchQueue *ownerQueue;
     bool onOwnerQueue;
+    bool linuxFile; // type 2: a Linux process of its own (lx_files)
+    struct rt_lx_client *lx; // created on the first Linux-file call
+    MacLinuxGPUUserClient *nextLinuxFile; // s_linuxFiles registry
 };
 
 class ComputeClientScope {
@@ -315,13 +326,11 @@ public:
 // kernel records them on the user client as IOUserClientCreator
 // ("pid N, name") once IOServiceOpen returns; without it the KFD process
 // gets a counter pid.
-static void record_client_identity(MacLinuxGPUUserClient *client)
+static void client_creator(MacLinuxGPUUserClient *client, int *pidOut, char *name, size_t size)
 {
-    if (!client->ivars || client->ivars->identityRecorded) return;
-    client->ivars->identityRecorded = true;
     int pid = 0;
-    char name[32] = {};
     OSDictionary *properties = nullptr;
+    memset(name, 0, size);
     if (client->CopyProperties(&properties) == kIOReturnSuccess && properties) {
         OSString *creator = OSDynamicCast(OSString, properties->getObject("IOUserClientCreator"));
         const char *text = creator ? creator->getCStringNoCopy() : nullptr;
@@ -332,13 +341,23 @@ static void record_client_identity(MacLinuxGPUUserClient *client)
                 ++p;
                 while (*p == ' ') ++p;
                 size_t n = 0;
-                while (p[n] && n + 1 < sizeof(name)) { name[n] = p[n]; ++n; }
+                while (p[n] && n + 1 < size) { name[n] = p[n]; ++n; }
             } else {
                 pid = 0;
             }
         }
         properties->release();
     }
+    *pidOut = pid;
+}
+
+static void record_client_identity(MacLinuxGPUUserClient *client)
+{
+    if (!client->ivars || client->ivars->identityRecorded) return;
+    client->ivars->identityRecorded = true;
+    int pid = 0;
+    char name[32] = {};
+    client_creator(client, &pid, name, sizeof(name));
     (void)dext_compute_client_identity(client->ivars->clientID, pid, name[0] ? name : nullptr);
     MACLINUXGPU_LOG("client %llu identity: pid %d name %s", client->ivars->clientID, pid,
                     name[0] ? name : "(unknown)");
@@ -372,6 +391,75 @@ static IOMemoryDescriptor *copy_bo_ranges_descriptor(uint32_t memoryType, uint64
     if (ranges.addresses) IOFree(ranges.addresses, ranges.capacity * sizeof(uint64_t));
     if (ranges.lengths) IOFree(ranges.lengths, ranges.capacity * sizeof(uint64_t));
     return descriptor;
+}
+
+// ----------------------------------------------------------------
+// Linux-file clients (type 2): one Linux process each (rt/lx_files.h),
+// created on the client's first Linux-file call. The registry lets a
+// session close tear down every process that still exists; a client's
+// own Stop takes its process out of it first. Both run upstream file
+// release callbacks, so both run while the driver does: a Stop inside
+// the call admission, a session close before it removes the driver.
+// ----------------------------------------------------------------
+static uint32_t s_lxRegistryLock;
+static MacLinuxGPUUserClient *s_linuxFiles;
+
+static void lx_registry_acquire()
+{
+    while (__atomic_exchange_n(&s_lxRegistryLock, 1u, __ATOMIC_ACQUIRE)) {}
+}
+
+static void lx_registry_release()
+{
+    __atomic_store_n(&s_lxRegistryLock, 0u, __ATOMIC_RELEASE);
+}
+
+// Unregister @client and hand over its process, if it has one.
+static struct rt_lx_client *lx_take(MacLinuxGPUUserClient *client)
+{
+    struct rt_lx_client *lx;
+    lx_registry_acquire();
+    lx = client->ivars->lx;
+    client->ivars->lx = nullptr;
+    for (MacLinuxGPUUserClient **link = &s_linuxFiles; *link; link = &(*link)->ivars->nextLinuxFile) {
+        if (*link == client) {
+            *link = client->ivars->nextLinuxFile;
+            break;
+        }
+    }
+    client->ivars->nextLinuxFile = nullptr;
+    lx_registry_release();
+    return lx;
+}
+
+static void lx_gate_close()
+{
+    s_lxCalls.close();
+    while (!s_lxCalls.drained()) IOSleep(1);
+}
+
+// Session close: no Linux-file call may start; every client process exits
+// (waits return, files close through upstream postclose); CS self-tests
+// whose GPU work completed are torn down. Returns whether GPU work of a
+// self-test is still outstanding.
+static bool lx_teardown_all()
+{
+    lx_gate_close();
+    for (;;) {
+        struct rt_lx_client *lx = nullptr;
+        lx_registry_acquire();
+        MacLinuxGPUUserClient *client = s_linuxFiles;
+        if (client) {
+            s_linuxFiles = client->ivars->nextLinuxFile;
+            client->ivars->nextLinuxFile = nullptr;
+            lx = client->ivars->lx;
+            client->ivars->lx = nullptr;
+        }
+        lx_registry_release();
+        if (!client) break;
+        if (lx) rt_lx_client_destroy(lx);
+    }
+    return rt_cs_selftest_reap() != 0;
 }
 
 // All session transitions run on the shared default queue. Cancellation
@@ -409,6 +497,7 @@ static void note_quarantine(uint32_t cause, int code)
 static void quarantine_session(MacLinuxGPU *driver)
 {
     observer_reads_close();
+    lx_gate_close();
     note_quarantine(MLG_QUARANTINE_NONE, 0);
     s_dmaQuarantined = true;
     s_sessionClosing = true;
@@ -441,7 +530,7 @@ static uint32_t release_blocker()
     if (s_irqDrainFailed) return MLG_RELEASE_IRQ_FAILED;
     if (!s_finalCleanup) return MLG_RELEASE_IRQ_PENDING;
     if (s_modulesRunning || s_rtDevice) return MLG_RELEASE_UPSTREAM_RETAINED;
-    if (!dext_compute_quiescent()) return MLG_RELEASE_COMPUTE_RETAINED;
+    if (!dext_compute_quiescent() || rt_cs_selftest_parked()) return MLG_RELEASE_COMPUTE_RETAINED;
     if (s_rawBARLease.hasMappings()) return MLG_RELEASE_RAW_BAR_MAPPED;
     if (s_participants) return MLG_RELEASE_PARTICIPANTS;
     if (!dext_dma_quarantine_releasable()) return MLG_RELEASE_DMA_OWNED;
@@ -550,6 +639,12 @@ static void close_session(MacLinuxGPU *driver)
     s_finalCleanup = false;
     // No observer read may run an upstream callback past this point.
     observer_reads_close();
+    // Linux-file processes exit while the driver runs; a self-test whose
+    // GPU work never completed leaves that work uncertain.
+    if (lx_teardown_all()) {
+        s_dmaQuarantined = true;
+        note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, -16);
+    }
     MACLINUXGPU_LOG("session close begin: probe=%d result=%d modules=%d pci=%d quarantine=%d participants=%u",
         s_probeAttempted, s_probeResult, s_modulesRunning, s_pciOpen,
         s_dmaQuarantined, s_participants);
@@ -845,9 +940,10 @@ IMPL(MacLinuxGPU, NewUserClient)
     // Observers read cached state only, so they may attach while a session
     // closes or stays quarantined; session clients still may not.
     const bool observer = type == MLG_USER_CLIENT_OBSERVER;
+    const bool linuxFile = type == MLG_USER_CLIENT_LINUX_FILE;
     if (s_stopping || s_driver != this || (s_sessionClosing && !observer))
         return kIOReturnNotAttached;
-    if (type != MLG_USER_CLIENT_SESSION && !observer) {
+    if (type != MLG_USER_CLIENT_SESSION && !observer && !linuxFile) {
         MACLINUXGPU_LOG("unsupported user-client type %u", (unsigned)type);
         return kIOReturnUnsupported;
     }
@@ -857,9 +953,11 @@ IMPL(MacLinuxGPU, NewUserClient)
     // (it returns kIOReturnUnsupported).
     IOService *clientService = nullptr;
     s_creatingObserver = observer;
+    s_creatingLinuxFile = linuxFile;
     kern_return_t ret = Create(this, "MacLinuxGPUUserClientProperties",
                                &clientService);
     s_creatingObserver = false;
+    s_creatingLinuxFile = false;
     if (ret != kIOReturnSuccess) {
         MACLINUXGPU_LOG("Create UserClient failed: %#x", ret);
         return ret;
@@ -875,14 +973,16 @@ IMPL(MacLinuxGPU, NewUserClient)
     auto *created = OSDynamicCast(MacLinuxGPUUserClient, clientService);
     if (created && created->ivars) {
         created->ivars->observer = observer;
-    } else if (observer && !pending_observer_add(clientService)) {
+        created->ivars->linuxFile = linuxFile;
+    } else if ((observer && !pending_role_add(s_pendingObservers, clientService)) ||
+               (linuxFile && !pending_role_add(s_pendingLinuxFiles, clientService))) {
         clientService->release();
-        MACLINUXGPU_LOG("too many observer clients starting at once");
+        MACLINUXGPU_LOG("too many clients starting at once");
         return kIOReturnNoResources;
     }
     *userClient = typed;
     MACLINUXGPU_LOG("NewUserClient: MacLinuxGPUUserClient created%s",
-                    observer ? " (observer)" : "");
+                    observer ? " (observer)" : linuxFile ? " (Linux file)" : "");
     return kIOReturnSuccess;
 }
 
@@ -955,7 +1055,9 @@ IMPL(MacLinuxGPUUserClient, Start)
     if (ret != kIOReturnSuccess) return ret;
     MacLinuxGPU *driver = OSDynamicCast(MacLinuxGPU, provider);
     if (driver == nullptr) return kIOReturnUnsupported;
-    const bool observer = s_creatingObserver || pending_observer_take(this);
+    const bool observer = s_creatingObserver || pending_role_take(s_pendingObservers, this);
+    const bool linuxFile = !observer &&
+        (s_creatingLinuxFile || pending_role_take(s_pendingLinuxFiles, this));
     if (s_driver != driver || s_stopping || (s_sessionClosing && !observer))
         return kIOReturnNotAttached;
     IODispatchQueue *ownerQueue = nullptr;
@@ -967,10 +1069,14 @@ IMPL(MacLinuxGPUUserClient, Start)
     // DrmInfo run upstream callbacks that take upstream locks and may sleep
     // on an SMU round trip, so they must neither wait behind an in-flight
     // ioctl nor stall one. Its other selectors hop to the owner's queue.
+    // A Linux-file client gets its own for the same reason: its process's
+    // system calls (lx_files) may sleep in upstream locks, and none of them
+    // may wait behind another client's.
     IODispatchQueue *clientQueue = ownerQueue;
-    if (observer) {
+    if (observer || linuxFile) {
         clientQueue = nullptr;
-        ret = IODispatchQueue::Create("MacLinuxGPUObserver", 0, 0, &clientQueue);
+        ret = IODispatchQueue::Create(observer ? "MacLinuxGPUObserver" : "MacLinuxGPULinuxFile",
+                                      0, 0, &clientQueue);
         if (ret != kIOReturnSuccess || clientQueue == nullptr) {
             ownerQueue->release();
             return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
@@ -989,9 +1095,42 @@ IMPL(MacLinuxGPUUserClient, Start)
     ivars->ownerDriver = driver;
     ivars->clientID = ++s_nextClientID;
     ivars->observer = observer;
+    ivars->linuxFile = linuxFile;
     MACLINUXGPU_LOG("UserClient Start (client %llu, type %u)", ivars->clientID,
-                    observer ? MLG_USER_CLIENT_OBSERVER : MLG_USER_CLIENT_SESSION);
+                    observer ? MLG_USER_CLIENT_OBSERVER :
+                    linuxFile ? MLG_USER_CLIENT_LINUX_FILE : MLG_USER_CLIENT_SESSION);
     return kIOReturnSuccess;
+}
+
+// A Linux-file client's session membership ends on the owner's queue, as a
+// session client's does (it holds no compute handles to release).
+static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
+{
+    auto *iv = client->ivars;
+    const bool participant = iv->sessionGeneration == s_sessionGeneration;
+    if (participant) {
+        iv->sessionGeneration = 0;
+        if (s_participants) --s_participants;
+    }
+    if (s_sessionClosing || (participant && (!s_participants || s_dmaQuarantined))) {
+        iv->nextStopping = s_stoppingClients;
+        s_stoppingClients = client;
+        close_session(iv->ownerDriver);
+    } else {
+        client->FinishStop(provider);
+    }
+}
+
+// On the client's own queue, so no call of its own is in flight: its process
+// exits first (async waits return, files close) while the driver runs.
+static void lx_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
+{
+    if (s_lxCalls.enter()) {
+        if (struct rt_lx_client *lx = lx_take(client)) rt_lx_client_destroy(lx);
+        s_lxCalls.leave();
+    }
+    // Otherwise a session close owns the teardown (lx_teardown_all).
+    client->ivars->ownerQueue->DispatchAsync(^{ lx_finish_stop(client, provider); });
 }
 
 kern_return_t
@@ -1006,6 +1145,10 @@ IMPL(MacLinuxGPUUserClient, Stop)
     if (ivars->observer) {
         // No session membership, handles or mappings: nothing to drain.
         FinishStop(provider);
+        return kIOReturnSuccess;
+    }
+    if (ivars->linuxFile) {
+        lx_client_stop(this, provider);
         return kIOReturnSuccess;
     }
     const bool participant = ivars->sessionGeneration == s_sessionGeneration;
@@ -1075,6 +1218,373 @@ IMPL(MacLinuxGPUUserClient, InterruptOccurred)
     // return); no SetResult/Perform (those don't exist on OSAction).
 }
 
+// ----------------------------------------------------------------
+// Linux-file calls (rt/lx_abi.h selectors), on the client's own queue.
+// ----------------------------------------------------------------
+
+// The client's process, created on its first call: the client joins the
+// session as a session client does (on the owner's queue, outside the
+// call admission, which a closing session drains while holding that
+// queue), then gets a Linux process with its creator's pid and name.
+static kern_return_t lx_state(MacLinuxGPUUserClient *client, struct rt_lx_client **out)
+{
+    auto *iv = client->ivars;
+    if (iv->lx && iv->sessionGeneration == __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE)) {
+        *out = iv->lx;
+        return kIOReturnSuccess;
+    }
+    if (iv->lx) {
+        // From a session that has closed: never used since its admission
+        // closed, so it holds no files of the driver that is gone.
+        if (struct rt_lx_client *stale = lx_take(client)) rt_lx_client_destroy(stale);
+    }
+    __block kern_return_t ret = kIOReturnNotReady;
+    __block void *pdev = nullptr;
+    iv->ownerQueue->DispatchSync(^{
+        if (s_stopping || s_sessionClosing || s_dmaQuarantined || !s_modulesRunning || !s_rtDevice)
+            return;
+        ret = ensure_open(client);
+        if (ret == kIOReturnSuccess) pdev = rt_device_get_pdev(s_rtDevice);
+    });
+    if (ret != kIOReturnSuccess) return ret;
+    int pid = 0;
+    char name[32];
+    client_creator(client, &pid, name, sizeof(name));
+    struct rt_lx_client *lx = nullptr;
+    if (rt_lx_client_create(static_cast<struct pci_dev *>(pdev), pid, name[0] ? name : nullptr, &lx))
+        return kIOReturnNoMemory;
+    lx_registry_acquire();
+    iv->lx = lx;
+    iv->nextLinuxFile = s_linuxFiles;
+    s_linuxFiles = client;
+    lx_registry_release();
+    MACLINUXGPU_LOG("client %llu: Linux process pid %d (%s)", iv->clientID,
+                    rt_lx_client_pid(lx), name[0] ? name : "unnamed");
+    *out = lx;
+    return kIOReturnSuccess;
+}
+
+// A call that did not reach the process.
+static kern_return_t lx_transport_error(int r)
+{
+    switch (r) {
+    case -MLG_LX_ENOMEM: return kIOReturnNoMemory;
+    case -MLG_LX_ENOSPC: return kIOReturnNoSpace;
+    case -MLG_LX_ESRCH: return kIOReturnNotAttached;
+    case -MLG_LX_EAGAIN: return kIOReturnBusy;
+    case -MLG_LX_EINVAL:
+    case -MLG_LX_E2BIG:
+    case -MLG_LX_EFAULT: return kIOReturnBadArgument;
+    default: return kIOReturnError;
+    }
+}
+
+// The request frame: inline structure input, or a descriptor above 4096 bytes.
+struct LxInput {
+    const void *bytes = nullptr;
+    size_t length = 0;
+    IOMemoryMap *map = nullptr;
+    ~LxInput() { if (map) map->release(); }
+};
+static bool lx_input(IOUserClientMethodArguments *a, LxInput &in)
+{
+    if (a->structureInput) {
+        in.bytes = a->structureInput->getBytesNoCopy();
+        in.length = a->structureInput->getLength();
+    } else if (a->structureInputDescriptor) {
+        if (a->structureInputDescriptor->CreateMapping(kIOMemoryMapReadOnly, 0, 0, 0, 0,
+                                                       &in.map) != kIOReturnSuccess || !in.map)
+            return false;
+        in.bytes = reinterpret_cast<const void *>(in.map->GetAddress());
+        in.length = (size_t)in.map->GetLength();
+    }
+    return in.bytes && in.length;
+}
+
+// Where the reply frame goes: the caller's output descriptor when it gave
+// one (above 4096 bytes), else structure output.
+struct LxOutput {
+    void *bytes = nullptr;
+    size_t capacity = 0;
+    IOMemoryMap *map = nullptr;
+    bool heap = false;
+    ~LxOutput() {
+        if (map) map->release();
+        if (heap) IOFree(bytes, capacity);
+    }
+};
+static bool lx_output(IOUserClientMethodArguments *a, LxOutput &out)
+{
+    if (a->structureOutputDescriptor) {
+        if (a->structureOutputDescriptor->CreateMapping(0, 0, 0, 0, 0, &out.map) != kIOReturnSuccess ||
+            !out.map)
+            return false;
+        out.bytes = reinterpret_cast<void *>(out.map->GetAddress());
+        out.capacity = (size_t)out.map->GetLength();
+        return out.bytes != nullptr;
+    }
+    out.capacity = a->structureOutputMaximumSize < MLG_LX_INLINE_STRUCT_BYTES ?
+        (size_t)a->structureOutputMaximumSize : MLG_LX_INLINE_STRUCT_BYTES;
+    if (!out.capacity) return false;
+    out.bytes = IOMalloc(out.capacity);
+    out.heap = out.bytes != nullptr;
+    return out.heap;
+}
+static kern_return_t lx_output_done(IOUserClientMethodArguments *a, LxOutput &out, size_t length)
+{
+    if (out.map) return kIOReturnSuccess;
+    a->structureOutput = OSData::withBytes(out.bytes, length);
+    return a->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
+// An async call's completion: async data [0] token, [1] result, [2] reply
+// bytes, then the reply when it fits.
+struct LxAsync {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+};
+static int lx_async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
+                         size_t reply_bytes)
+{
+    auto *a = static_cast<LxAsync *>(ctx);
+    IOUserClientAsyncArgumentsArray data = {};
+    uint32_t count = 3;
+    const bool inline_reply = reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES;
+    data[0] = token;
+    data[1] = (uint64_t)result;
+    data[2] = reply_bytes;
+    if (inline_reply) {
+        memcpy(&data[3], rbuf, reply_bytes);
+        count += (uint32_t)((reply_bytes + 7) / 8);
+    }
+    a->client->AsyncCompletion(a->action, kIOReturnSuccess, data, count);
+    a->action->release();
+    a->client->release();
+    IOFree(a, sizeof(*a));
+    return inline_reply;
+}
+
+static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client *lx,
+                             uint64_t selector, IOUserClientMethodArguments *a)
+{
+    const uint64_t *in = a->scalarInput;
+    uint64_t *out = a->scalarOutput;
+    const uint32_t nin = a->scalarInputCount;
+    if (!in || !out) return kIOReturnBadArgument;
+    switch (selector) {
+    case MLG_SELECTOR_LX_OPEN:
+        if (nin != 2 || a->scalarOutputCount < 1 || in[0] > UINT32_MAX || in[1] > UINT32_MAX)
+            return kIOReturnBadArgument;
+        out[0] = (uint64_t)(int64_t)rt_lx_open(lx, (uint32_t)in[0], (uint32_t)in[1]);
+        a->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    case MLG_SELECTOR_LX_CLOSE:
+        if (nin != 1 || a->scalarOutputCount < 1 || in[0] > INT32_MAX)
+            return kIOReturnBadArgument;
+        out[0] = (uint64_t)(int64_t)rt_lx_close(lx, (int)in[0]);
+        a->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    case MLG_SELECTOR_LX_IOCTL:
+    case MLG_SELECTOR_LX_IOCTL_ASYNC: {
+        if (nin != 2 || a->scalarOutputCount < 2 || in[0] > INT32_MAX || in[1] > UINT32_MAX)
+            return kIOReturnBadArgument;
+        LxInput frame;
+        if (!lx_input(a, frame)) return kIOReturnBadArgument;
+        if (selector == MLG_SELECTOR_LX_IOCTL_ASYNC) {
+            if (!a->completion) return kIOReturnBadArgument;
+            auto *ctx = static_cast<LxAsync *>(IOMallocZero(sizeof(LxAsync)));
+            if (!ctx) return kIOReturnNoMemory;
+            ctx->client = client;
+            ctx->action = a->completion;
+            client->retain();
+            ctx->action->retain();
+            uint64_t token = 0;
+            const int r = rt_lx_ioctl_async(lx, (int)in[0], (uint32_t)in[1], frame.bytes,
+                                            frame.length, lx_async_done, ctx, &token);
+            if (r) {
+                ctx->action->release();
+                client->release();
+                IOFree(ctx, sizeof(*ctx));
+            }
+            out[0] = (uint64_t)(int64_t)r;  // not started: nothing will complete
+            out[1] = token;
+            a->scalarOutputCount = 2;
+            return kIOReturnSuccess;
+        }
+        LxOutput reply;
+        if (!lx_output(a, reply)) return kIOReturnBadArgument;
+        size_t bytes = 0;
+        int64_t result = 0;
+        const int r = rt_lx_ioctl(lx, (int)in[0], (uint32_t)in[1], frame.bytes, frame.length,
+                                  reply.bytes, reply.capacity, &bytes, &result);
+        if (r) return lx_transport_error(r);
+        out[0] = (uint64_t)result;
+        out[1] = bytes;
+        a->scalarOutputCount = 2;
+        return lx_output_done(a, reply, bytes);
+    }
+    case MLG_SELECTOR_LX_RESULT: {
+        if (nin != 1 || a->scalarOutputCount < 2) return kIOReturnBadArgument;
+        LxOutput reply;
+        if (!lx_output(a, reply)) return kIOReturnBadArgument;
+        size_t bytes = 0;
+        int64_t result = 0;
+        const int r = rt_lx_result(lx, in[0], reply.bytes, reply.capacity, &bytes, &result);
+        if (r == -MLG_LX_ENOENT) return kIOReturnBadArgument;
+        if (r == -MLG_LX_EBUSY) return kIOReturnBusy;
+        if (r) return lx_transport_error(r);
+        out[0] = (uint64_t)result;
+        out[1] = bytes;
+        a->scalarOutputCount = 2;
+        return lx_output_done(a, reply, bytes);
+    }
+    case MLG_SELECTOR_LX_MMAP: {
+        if (nin != 5 || a->scalarOutputCount < 4 || in[0] > INT32_MAX || in[3] > UINT32_MAX ||
+            in[4] > UINT32_MAX)
+            return kIOReturnBadArgument;
+        struct rt_lx_map_info info = {};
+        const int r = rt_lx_mmap(lx, (int)in[0], in[1], in[2], (uint32_t)in[3], (uint32_t)in[4],
+                                 &info);
+        out[0] = (uint64_t)(int64_t)r;
+        out[1] = r ? 0 : info.type;
+        out[2] = r ? 0 : info.length;
+        out[3] = r ? 0 : info.cache;
+        a->scalarOutputCount = 4;
+        return kIOReturnSuccess;
+    }
+    case MLG_SELECTOR_LX_MMAP_COMMIT:
+        if (nin != 2 || a->scalarOutputCount < 1) return kIOReturnBadArgument;
+        out[0] = (uint64_t)(int64_t)rt_lx_mmap_commit(lx, in[0], in[1]);
+        a->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    case MLG_SELECTOR_LX_MUNMAP:
+        if (nin != 1 || a->scalarOutputCount < 1) return kIOReturnBadArgument;
+        out[0] = (uint64_t)(int64_t)rt_lx_munmap(lx, in[0]);
+        a->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    default:
+        return kIOReturnUnsupported;
+    }
+}
+
+static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t selector,
+                                        IOUserClientMethodArguments *arguments)
+{
+    struct rt_lx_client *lx = nullptr;
+    kern_return_t ret = lx_state(client, &lx);
+    if (ret != kIOReturnSuccess) return ret;
+    if (!s_lxCalls.enter()) return kIOReturnNotReady;
+    ret = lx_call(client, lx, selector, arguments);
+    s_lxCalls.leave();
+    return ret;
+}
+
+// A Linux-file mapping as client memory: its page runs, or its BAR ranges.
+struct LxRanges {
+    uint64_t *addresses, *lengths;
+    uint32_t *bars;
+    size_t count, capacity;
+};
+static int lx_collect_range(void *arg, uint32_t backing, uint32_t bar, uint64_t addr, uint64_t bytes)
+{
+    (void)backing;
+    auto *r = static_cast<LxRanges *>(arg);
+    if (r->count == r->capacity) return -1;
+    r->addresses[r->count] = addr;
+    r->lengths[r->count] = bytes;
+    r->bars[r->count] = bar;
+    ++r->count;
+    return 0;
+}
+
+// Concatenate @count descriptors (consumed), 32 per level.
+static IOMemoryDescriptor *lx_concat(IOMemoryDescriptor **descs, size_t count)
+{
+    while (count > 1) {
+        size_t next = 0;
+        for (size_t i = 0; i < count; i += 32) {
+            const uint32_t n = (uint32_t)(count - i > 32 ? 32 : count - i);
+            IOMemoryDescriptor *parent = nullptr;
+            if (IOMemoryDescriptor::CreateWithMemoryDescriptors(kIOMemoryDirectionOutIn, n,
+                                                                &descs[i], &parent) != kIOReturnSuccess ||
+                !parent) {
+                for (size_t j = 0; j < next; ++j) descs[j]->release();
+                for (size_t j = i; j < count; ++j) descs[j]->release();
+                return nullptr;
+            }
+            for (size_t j = i; j < i + n; ++j) descs[j]->release();
+            descs[next++] = parent;
+        }
+        count = next;
+    }
+    return count ? descs[0] : nullptr;
+}
+
+static kern_return_t lx_copy_memory(MacLinuxGPUUserClient *client, uint64_t type,
+                                    uint64_t *options, IOMemoryDescriptor **memory)
+{
+    if (type < MLG_LX_MMAP_TYPE_BASE || type > MLG_LX_MMAP_TYPE_LIMIT || !options || !memory)
+        return kIOReturnBadArgument;
+    if (!s_lxCalls.enter()) return kIOReturnNotReady;
+    struct rt_lx_client *lx = client->ivars->lx;
+    struct rt_lx_map_info info = {};
+    kern_return_t ret = lx && !rt_lx_map_info(lx, type, &info) && info.ranges ?
+        kIOReturnSuccess : kIOReturnBadArgument;
+    LxRanges ranges = {};
+    if (ret == kIOReturnSuccess) {
+        ranges.capacity = info.ranges;
+        ranges.addresses = static_cast<uint64_t *>(IOMallocZero(ranges.capacity * sizeof(uint64_t)));
+        ranges.lengths = static_cast<uint64_t *>(IOMallocZero(ranges.capacity * sizeof(uint64_t)));
+        ranges.bars = static_cast<uint32_t *>(IOMallocZero(ranges.capacity * sizeof(uint32_t)));
+        if (!ranges.addresses || !ranges.lengths || !ranges.bars ||
+            rt_lx_map_ranges(lx, type, lx_collect_range, &ranges) || ranges.count != info.ranges)
+            ret = kIOReturnNoMemory;
+    }
+    IOMemoryDescriptor *descriptor = nullptr;
+    if (ret == kIOReturnSuccess && info.backing == RT_LX_RANGE_CPU) {
+        // GTT pages and kernel pages: the dext's own buffers.
+        descriptor = static_cast<IOMemoryDescriptor *>(
+            dext_dma_copy_ranges_descriptor(ranges.addresses, ranges.lengths, ranges.count));
+    } else if (ret == kIOReturnSuccess && info.backing == RT_LX_RANGE_BAR && s_retainedPCI) {
+        // CPU-visible VRAM and doorbells: ranges of the BARs.
+        auto **descs = static_cast<IOMemoryDescriptor **>(
+            IOMallocZero(ranges.count * sizeof(IOMemoryDescriptor *)));
+        size_t built = 0;
+        for (; descs && built < ranges.count; ++built) {
+            uint8_t memoryIndex = 0, barType = 0;
+            uint64_t barSize = 0;
+            IOMemoryDescriptor *bar = nullptr;
+            if (ranges.bars[built] > 5 ||
+                s_retainedPCI->GetBARInfo((uint8_t)ranges.bars[built], &memoryIndex, &barSize,
+                                          &barType) != kIOReturnSuccess ||
+                s_retainedPCI->_CopyDeviceMemoryWithIndex(memoryIndex, &bar,
+                                                          client->GetProvider()) != kIOReturnSuccess ||
+                !bar)
+                break;
+            const kern_return_t sub = IOMemoryDescriptor::CreateSubMemoryDescriptor(
+                kIOMemoryDirectionOutIn, ranges.addresses[built], ranges.lengths[built], bar,
+                &descs[built]);
+            bar->release();
+            if (sub != kIOReturnSuccess || !descs[built]) break;
+        }
+        if (descs && built == ranges.count) {
+            descriptor = lx_concat(descs, built);
+        } else if (descs) {
+            for (size_t i = 0; i < built; ++i) descs[i]->release();
+        }
+        if (descs) IOFree(descs, ranges.count * sizeof(IOMemoryDescriptor *));
+    }
+    if (ranges.addresses) IOFree(ranges.addresses, ranges.capacity * sizeof(uint64_t));
+    if (ranges.lengths) IOFree(ranges.lengths, ranges.capacity * sizeof(uint64_t));
+    if (ranges.bars) IOFree(ranges.bars, ranges.capacity * sizeof(uint32_t));
+    s_lxCalls.leave();
+    if (ret != kIOReturnSuccess) return ret;
+    if (!descriptor) return kIOReturnNotReady;
+    *options = 0;
+    *memory = descriptor;
+    return kIOReturnSuccess;
+}
+
 // CopyClientMemoryForType — the BAR0..5 memory regions (T-dma-dart-dext).
 // type is the BAR index (0..5); the dext returns the IOMemoryDescriptor
 // for that BAR (the IOPCIDevice's memory mapping).
@@ -1083,6 +1593,7 @@ IMPL(MacLinuxGPUUserClient, CopyClientMemoryForType)
 {
     if (!ivars || ivars->stopping) return kIOReturnNotAttached;
     if (ivars->observer) return kIOReturnNotPermitted;
+    if (ivars->linuxFile) return lx_copy_memory(this, type, options, memory);
     ComputeClientScope clientScope(ivars->clientID);
     if (memory == nullptr || options == nullptr) {
         return kIOReturnBadArgument;
@@ -1222,6 +1733,42 @@ static kern_return_t observer_drm_info(IOUserClientMethodArguments *arguments)
     return kIOReturnSuccess;
 }
 
+// DrmSelfTest: the kernel-queue CS self-test in a Linux process of its own,
+// one at a time, admitted like the other observer reads (the upstream
+// driver runs in an open session for the whole test).
+static uint32_t s_selfTestRunning;
+static_assert(sizeof(struct rt_cs_selftest_result) <= MLG_DRM_SELFTEST_RESULT_MAX,
+              "DrmSelfTest result size");
+static kern_return_t observer_drm_selftest(IOUserClientMethodArguments *arguments)
+{
+    uint64_t *out = arguments->scalarOutput;
+    if (!out || arguments->scalarOutputCount < MLG_DRM_SELFTEST_WORDS ||
+        arguments->structureInput || arguments->structureInputDescriptor ||
+        arguments->structureOutputDescriptor ||
+        arguments->structureOutputMaximumSize < sizeof(struct rt_cs_selftest_result))
+        return kIOReturnBadArgument;
+    if (__atomic_exchange_n(&s_selfTestRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
+    if (!s_observerReads.enter()) {
+        __atomic_store_n(&s_selfTestRunning, 0u, __ATOMIC_RELEASE);
+        return kIOReturnNotReady;
+    }
+    struct rt_cs_selftest_result result;
+    const int r = rt_cs_selftest_run(
+        static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)), &result);
+    const unsigned parked = rt_cs_selftest_parked();
+    s_observerReads.leave();
+    __atomic_store_n(&s_selfTestRunning, 0u, __ATOMIC_RELEASE);
+    MACLINUXGPU_LOG("CS self-test: %d (failed step %u, passed %#x, compute %llu ns, sdma %llu ns, parked %u)",
+                    r, result.failed_step, result.passed,
+                    (unsigned long long)result.compute_ns, (unsigned long long)result.sdma_ns, parked);
+    arguments->structureOutput = OSData::withBytes(&result, sizeof(result));
+    if (!arguments->structureOutput) return kIOReturnNoMemory;
+    out[0] = (uint64_t)(int64_t)r;
+    out[1] = parked;
+    arguments->scalarOutputCount = MLG_DRM_SELFTEST_WORDS;
+    return kIOReturnSuccess;
+}
+
 // ----------------------------------------------------------------
 // ExternalMethod — the selector-RPC dispatch.
 //
@@ -1250,6 +1797,24 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnNotPermitted;
         if (selector == MLG_SELECTOR_SYSFS_READ) return observer_sysfs_read(arguments);
         if (selector == MLG_SELECTOR_DRM_INFO) return observer_drm_info(arguments);
+        if (selector == MLG_SELECTOR_DRM_SELFTEST) return observer_drm_selftest(arguments);
+        __block kern_return_t result = kIOReturnNotAttached;
+        ivars->onOwnerQueue = true;
+        ivars->ownerQueue->DispatchSync(^{
+            result = ExternalMethod(selector, arguments, dispatch, target, reference);
+        });
+        ivars->onOwnerQueue = false;
+        return result;
+    }
+    if (ivars && ivars->linuxFile && !ivars->onOwnerQueue) {
+        // On the client's own queue: its process's system calls run here;
+        // device initialization and cached queries on the owner's queue.
+        if (ivars->stopping) return kIOReturnNotAttached;
+        if (selector >= MLG_SELECTOR_LX_OPEN && selector <= MLG_SELECTOR_LX_MUNMAP)
+            return lx_external_method(this, selector, arguments);
+        if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
+            selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice)
+            return kIOReturnUnsupported;
         __block kern_return_t result = kIOReturnNotAttached;
         ivars->onOwnerQueue = true;
         ivars->ownerQueue->DispatchSync(^{
@@ -1262,7 +1827,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         (s_stopping && !ivars->observer))
         return kIOReturnNotAttached;
     ComputeClientScope clientScope(ivars->clientID);
-    if (!ivars->observer) record_client_identity(this);
+    if (!ivars->observer && !ivars->linuxFile) record_client_identity(this);
     if (ivars->observer) {
         // Cached state and the entitled release only; never PCI or the GPU.
         if (!mlg_observer_selector_allowed(selector, arguments->scalarInput,
@@ -1487,6 +2052,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnError;
         }
         s_observerReads.open();
+        s_lxCalls.open();
         return kIOReturnSuccess;
     }
 

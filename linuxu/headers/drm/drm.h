@@ -14,12 +14,10 @@
 #include <uapi/drm/drm_mode.h>
 
 /*
- * The ioctl command band.  amdgpu_drv.c's amdgpu_ioctls[] table is indexed
- * by (DRM_IOCTL_NR(cmd) - DRM_COMMAND_BASE); the KMD's DRM_IOCTL_DEF_DRV()
- * macro uses these three macros.
+ * The ioctl command band is the uapi's: DRM_COMMAND_BASE 0x40 to
+ * DRM_COMMAND_END 0xA0. Driver ioctl numbers (DRM_IOCTL_AMDGPU_*) are
+ * DRM_COMMAND_BASE + their index, as on Linux, and drm_ioctl() routes
+ * numbers below the band to the core table (DRM_IOCTL_VERSION is 0x00).
  */
-#define DRM_COMMAND_BASE		(0x0)
-#define DRM_COMMAND_START			(0x40)
-#define DRM_COMMAND_END			(0x0f)
 
 #endif

@@ -20,7 +20,12 @@ CC := clang
 # (ssize_t == long on arm64; ABI is identical, so this is a pure
 # misdiagnosis, not a real mismatch). Downgrading at the build level keeps
 # the upstream sources byte-identical — the shim/build fix is the only option.
-HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_RT_HOST_SHADOW=1 -include linux/autoconf.h -w -MMD -MP -Wno-incompatible-function-pointer-types
+# -ftrivial-auto-var-init=zero: Linux's CONFIG_INIT_STACK_ALL_ZERO (the
+# default with any compiler that has it), so local variables start zeroed as
+# in a Linux build. Upstream relies on it: amdgpu_vm_bo_update() returns its
+# uninitialized r for a mapping-less PRT update (the first AMDGPU_CS of every
+# render client).
+HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_RT_HOST_SHADOW=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
 
 # Include order matters: linuxu/headers first (shadow headers override),
 # then the driver-local include roots inside the submodule. Never add

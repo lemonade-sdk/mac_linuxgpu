@@ -139,6 +139,19 @@ static int dext_compute_release_client(uint64_t);
 struct rt_drm_info { int closes; };
 static void IOSleep(uint64_t);
 static void rt_drm_info_close(rt_drm_info *);
+// Linux-file processes and CS self-tests (lx_files, cs_selftest): a session
+// close tears them down first; a self-test whose GPU work never completed
+// leaves the session quarantined, compute uncertain.
+struct MacLinuxGPUUserClient;
+static unsigned lxTeardowns, lxParked;
+static void lx_gate_close() {}
+static bool lx_teardown_all() {
+    ++lxTeardowns;
+    if (lxParked) events.push_back("lx_teardown_parked");
+    return lxParked != 0;
+}
+static unsigned rt_cs_selftest_parked() { return lxParked; }
+static void lx_client_stop(MacLinuxGPUUserClient *, IOService *) { assert(false); }
 
 #include "session_shutdown_production.inc"
 
@@ -438,7 +451,8 @@ static void clientExitReopen(bool queueExhausted) {
     s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
     bar0Aliases = 1;
     client.ivars = &clientIvars;
-    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false};
+    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
+                   false, nullptr, nullptr};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held. The runtime refused it before
     // any allocation (or the driver did, with -ENOSPC before reserving), so
@@ -470,7 +484,8 @@ static void clientExitReopen(bool queueExhausted) {
     expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
     // The dext is reusable: a new client opens a new PCI session.
     next.ivars = &nextIvars;
-    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false};
+    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
+                 false, nullptr, nullptr};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 1 && saw("pci_open"));
@@ -522,6 +537,7 @@ int main(int argc, char **argv) {
     else if (scenario == "release-reset-failed") resetError = -110;
     else if (scenario == "stop-release") { resetError = -5; resetFailures = 1; s_stopping = true; }
     else if (scenario == "pci-fault-cause") { transportFault = DEXT_PCI_FAULT_CONFIG; holdError = -1; }
+    else if (scenario == "selftest-parked") lxParked = 1;
     else if (scenario == "observer-reads") {
         // A running session admits observer reads; one is in flight and the
         // observers' render file is open.
@@ -565,6 +581,7 @@ int main(int argc, char **argv) {
             "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset",
             "super_client_stop", "super_client_stop", "super_driver_stop"};
         assert(events == expected);
+        assert(lxTeardowns == 1);
         fixture.assertReleased();
         expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
     } else if (scenario == "stop-release") {
@@ -579,9 +596,15 @@ int main(int argc, char **argv) {
         assert(!saw("pci_close") && !saw("gart_reset"));
         if (holdError || computeError || scenario == "pre-quarantined" ||
             scenario == "raw-mapped" || scenario == "isolation-failure" ||
-            scenario == "probe-retained") {
+            scenario == "probe-retained" || lxParked) {
             assert(s_rtDevice && s_modulesRunning);
             assert(!saw("device_free") && !saw("endpoint_reset") && !saw("dma_fini"));
+        }
+        if (lxParked) {
+            // The self-test's work is still on the GPU: nothing upstream is
+            // stopped or removed under it.
+            assert(events.front() == "lx_teardown_parked");
+            assert(!saw("hold_dma") && !saw("compute_stop") && !saw("upstream_shutdown"));
         }
         if (scenario == "raw-mapped") {
             assert(!saw("hold_dma") && !saw("compute_stop") && !saw("upstream_shutdown"));
@@ -630,7 +653,9 @@ int main(int argc, char **argv) {
         else if (scenario == "raw-mapped") cause = MLG_QUARANTINE_RAW_BAR_MAPPING;
         else if (scenario == "probe-retained") cause = MLG_QUARANTINE_PROBE_RETAINED;
         else if (scenario == "pci-fault-cause") cause = MLG_QUARANTINE_PCI_FAULT;
+        else if (lxParked) cause = MLG_QUARANTINE_COMPUTE_UNCERTAIN;
         assert(snapshot[2] == cause);
+        if (lxParked) assert(snapshot[6] == MLG_RELEASE_UPSTREAM_RETAINED);
         if (scenario == "pci-fault-cause") {
             assert(snapshot[3] == DEXT_PCI_FAULT_CONFIG);
             assert(snapshot[4] == MLG_QUARANTINE_SHUTDOWN_HOLD);
@@ -639,7 +664,7 @@ int main(int argc, char **argv) {
         if (resetError || dmaFiniError) assert(snapshot[3] == (uint64_t)(int64_t)(resetError ? resetError : dmaFiniError));
         if (computeError || holdError || scenario == "pre-quarantined" ||
             scenario == "isolation-failure" || scenario == "raw-mapped" ||
-            scenario == "probe-retained" || irqError) {
+            scenario == "probe-retained" || irqError || lxParked) {
             // Owners that were never removed (or live callbacks) cannot be
             // released in this process: the readers say restart, never kill.
             assert(snapshot[1] & MLG_SESSION_FLAG_RESTART_REQUIRED);

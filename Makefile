@@ -213,7 +213,8 @@ DK_FW_OBJ  := $(DK_BUILD)/gen/fw_rodata_generated.o
 DK_LIB     := $(DK_BUILD)/libmacamgdu-dk.a
 # driverKit platform flags for the KMD objects (parallel to HOSTCFLAGS but
 # -target driverKit + C headers from the MacOSX SDK).
-DK_HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -w -MMD -MP -Wno-incompatible-function-pointer-types
+# -ftrivial-auto-var-init=zero: CONFIG_INIT_STACK_ALL_ZERO, as HOSTCFLAGS.
+DK_HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
 DK_CFLAGS     := -target arm64-apple-driverkit -isystem $(MSDK)/usr/include $(DK_HOSTCFLAGS)
 DK_CFLAGS += -include rt/device_string.h -mstrict-align \
 	-fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
@@ -1001,3 +1002,69 @@ test-read-sysfs:
 
 test: test-sysfs-read test-upstream-pm-sysfs test-drm-info test-read-sysfs
 .PHONY: test-sysfs-read test-upstream-pm-sysfs test-drm-info test-read-sysfs
+
+# The Linux-file RPC (rt/lx_abi.h): request framing under fuzz, and the
+# per-client process, descriptor table, async waits and mmaps of
+# linuxu/src/amdgpu-rt/lx_files.c against fixture character devices.
+test-lx-frame-fuzz:
+	bash scripts/test-lx-frame-fuzz.sh
+
+test-lx-files:
+	bash scripts/test-lx-files.sh
+
+test: test-lx-frame-fuzz test-lx-files
+CRASH_PATH_TESTS += test-lx-frame-fuzz test-lx-files
+.PHONY: test-lx-frame-fuzz test-lx-files
+
+# Kernel-queue command submission offline: the CS self-test (render node,
+# GEM, VM, AMDGPU_CS on compute and SDMA, WAIT_CS, syncobjs) through the
+# Linux-file transport against upstream DRM/amdgpu on a software GPU.
+test-cs-selftest: lib
+	bash scripts/test-cs-selftest.sh
+
+test: test-cs-selftest
+CRASH_PATH_TESTS += test-cs-selftest
+.PHONY: test-cs-selftest
+
+# libmlg_drm: the Linux-file RPC client library (open/ioctl/mmap/close on
+# the GPU's render node and /dev/kfd from a macOS process), static and
+# shared, for a Mesa winsys or libdrm shim. Shares the frame code and ioctl
+# tables with the dext (linuxu/src/amdgpu-rt/lx_frame.c, lx_describe.c).
+MLG_DRM_BUILD := $(BUILD)/libmlg_drm
+MLG_DRM_SRCS := libmlg_drm/src/mlg_drm.c libmlg_drm/src/mlg_transport_iokit.c \
+	linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c
+MLG_DRM_OBJS := $(addprefix $(MLG_DRM_BUILD)/,$(notdir $(MLG_DRM_SRCS:.c=.o)))
+MLG_DRM_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -MMD -MP -DMLG_LX_CLIENT_BUILD \
+	-Ilibmlg_drm/include -Ilibmlg_drm/compat -Ilibmlg_drm/src \
+	-I$(LINUX)/include/uapi -idirafter linuxu/headers
+
+$(MLG_DRM_BUILD)/%.o: libmlg_drm/src/%.c
+	@mkdir -p $(dir $@)
+	clang $(MLG_DRM_CFLAGS) -c $< -o $@
+
+$(MLG_DRM_BUILD)/%.o: linuxu/src/amdgpu-rt/%.c
+	@mkdir -p $(dir $@)
+	clang $(MLG_DRM_CFLAGS) -c $< -o $@
+
+libmlg_drm: $(MLG_DRM_OBJS)
+	@rm -f $(MLG_DRM_BUILD)/libmlg_drm.a
+	ar rcs $(MLG_DRM_BUILD)/libmlg_drm.a $(MLG_DRM_OBJS)
+	clang -dynamiclib -install_name @rpath/libmlg_drm.dylib $(MLG_DRM_OBJS) \
+		-framework IOKit -framework CoreFoundation -o $(MLG_DRM_BUILD)/libmlg_drm.dylib
+	@echo "libmlg_drm: OK ($(MLG_DRM_BUILD)/libmlg_drm.a, libmlg_drm.dylib)"
+
+test-mlg-drm: lib
+	bash scripts/test-mlg-drm.sh
+
+test: libmlg_drm test-mlg-drm
+CRASH_PATH_TESTS += test-mlg-drm
+.PHONY: libmlg_drm test-mlg-drm
+
+# The hardware CS self-test runner (scripts/drm-selftest.py) against a fake
+# DrmSelfTest selector.
+test-drm-selftest:
+	bash scripts/test-drm-selftest.sh
+
+test: test-drm-selftest
+CRASH_PATH_TESTS += test-drm-selftest
+.PHONY: test-drm-selftest
