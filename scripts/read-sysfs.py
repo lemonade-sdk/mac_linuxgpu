@@ -8,6 +8,8 @@ Paths are relative to the device directory a Linux tool reads under
   read-sysfs.py --list hwmon/hwmon0
   read-sysfs.py --hex gpu_metrics
   read-sysfs.py --sensor gpu_load --grbm 100
+  read-sysfs.py --list drm/card0                  # DRM connectors (display on)
+  read-sysfs.py drm/card0/card0-DP-1/status; read-sysfs.py --hex drm/card0/card0-DP-1/edid
 
 Each file read runs the attribute's show() (or a bin attribute's read())
 in the driver, exactly as a Linux sysfs read does. The observer client never
@@ -71,7 +73,9 @@ def read_file(call, path, op=OP_READ):
         if count != len(payload) or count > CHUNK:
             raise DriverError(f"{path}: inconsistent reply")
         data.extend(payload)
-        if not count or len(data) >= length:
+        # A bin file of unknown size (length 0, such as a connector's edid)
+        # ends at a short read.
+        if not count or (length and len(data) >= length) or (not length and count < CHUNK):
             return bytes(data[:length]) if length else bytes(data)
 
 

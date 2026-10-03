@@ -89,9 +89,26 @@ def describe_session(values, count):
     return fields, advice
 
 
+# Lines that belong to display bring-up and the display test: the display
+# opt-in, DMCUB load and DMUB, Display Core and its clock manager, the
+# connectors, HPD, EDID, link training, commits and their waits.
+DISPLAY_MARKERS = ("display", "dmub", "dmcub", "dc_", "dcn", "dce", "clk_mgr", "smu", "hpd",
+                   "edid", "link training", "link_training", "flip_done", "vblank", "hw_done",
+                   "dp-", "hdmi", "dvi", "connector", "crtc", "psr", "dsc", "atomic", "otg",
+                   "hubp", "reg_wait", "i2c", "aux")
+
+
+def display_lines(text):
+    """The display-related lines of the retained log, in order."""
+    return [line for line in text.splitlines()
+            if any(marker in line.lower() for marker in DISPLAY_MARKERS)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cursor", type=int, default=0, help="resume at this log byte offset")
+    parser.add_argument("--display", action="store_true",
+                        help="print only display bring-up and display-test lines")
     args = parser.parse_args()
     if not 0 <= args.cursor <= (1 << 64) - 1:
         parser.error("cursor must be an unsigned 64-bit integer")
@@ -159,6 +176,9 @@ def main():
         collected, cursor = read_snapshot(query, args.cursor,
             lambda message: print(message, file=sys.stderr))
         print(f"next cursor: {cursor}", file=sys.stderr)
+        if args.display:
+            collected = "".join(line + "\n" for line in
+                                display_lines(collected.decode(errors="replace"))).encode()
         sys.stdout.buffer.write(collected)
         sys.stdout.buffer.flush()
     finally:

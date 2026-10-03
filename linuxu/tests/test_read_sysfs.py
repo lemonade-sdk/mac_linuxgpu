@@ -48,7 +48,8 @@ class Driver:
                 return failure(errno.ENOENT), b""
             content = self.files[name]
         chunk = content[offset:offset + min(capacity, reader.CHUNK)]
-        return [0, len(chunk), len(content)], chunk
+        # A bin attribute of size 0 (drm_sysfs's edid) reports no length.
+        return [0, len(chunk), 0 if name.endswith("/edid") else len(content)], chunk
 
 
 def expect_errno(code, function, *args):
@@ -64,11 +65,17 @@ metrics = struct.pack("<HBB", 120, 1, 3) + bytes(116)
 long_listing = [("f", f"attribute_{i:04d}") for i in range(400)]
 driver = Driver({"gpu_busy_percent": b"37\n", "gpu_metrics": metrics,
                  "pp_dpm_sclk": b"0: 500Mhz \n1: 2450Mhz *\n", "big": bytes(range(256)) * 40,
-                 "ip_discovery/die/0/GC/0/base_addr": b"0x00001260\n0x0000A000\n"},
+                 "ip_discovery/die/0/GC/0/base_addr": b"0x00001260\n0x0000A000\n",
+                 "drm/card0/card0-DP-1/edid": bytes(range(256)),
+                 "drm/card0/card0-DP-2/edid": bytes(range(256)) * 32},
                 {"hwmon": [("d", "hwmon3")], "many": long_listing,
                  "": [("f", "gpu_busy_percent"), ("d", "hwmon")]})
 assert reader.read_file(driver.call, "gpu_busy_percent") == b"37\n"
 assert reader.read_file(driver.call, "big") == bytes(range(256)) * 40     # three chunks
+# Unknown-length bin files end at a short read: one EDID, and one of two
+# full chunks.
+assert reader.read_file(driver.call, "drm/card0/card0-DP-1/edid") == bytes(range(256))
+assert reader.read_file(driver.call, "drm/card0/card0-DP-2/edid") == bytes(range(256)) * 32
 assert reader.metrics_header(reader.read_file(driver.call, "gpu_metrics")) == (120, 1, 3)
 assert reader.list_dir(driver.call, "hwmon") == [("d", "hwmon3")]
 assert reader.list_dir(driver.call, "many") == long_listing                 # paged listing

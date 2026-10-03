@@ -104,4 +104,19 @@ for values, count in (([1] * 9, 8), ([2] + [0] * 8, 9), ([1, -1] + [0] * 7, 9)):
     raise AssertionError("malformed session snapshot accepted")
 
 print("cached session snapshot: flags, cause, blocker and advice decoding passed")
+
+# --display keeps display bring-up and display-test lines only.
+sample = "\n".join([
+    "KFD compute sessions enabled when supported",
+    "display requested (amdgpu.dc=-1)",
+    "<6> 0000:c3:00.0: [drm] Loading DMUB firmware via PSP: version=0x0A000C00",
+    "<6> 0000:c3:00.0: [drm] DMUB hardware initialized: version=0x0A000C00",
+    "<6> 0000:c3:00.0: amdgpu: SMU is initialized successfully!",
+    "upstream AMDGPU PCI probe completed",
+    "<3> 0000:c3:00.0: [drm] *ERROR* flip_done timed out",
+    "display test: op 1 -> 0 (probe 0, commit 0, restore 0; 4 connector(s), 1 connected, 1 lit)",
+    "client 3 identity: pid 42 name lse",
+])
+kept = reader.display_lines(sample)
+assert kept == [sample.split("\n")[i] for i in (1, 2, 3, 4, 6, 7)], kept
 print("cached log reader: append/resume, ring wrap, overwrite, empty/future cursors and malformed ABI passed")
