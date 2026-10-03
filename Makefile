@@ -765,6 +765,17 @@ test-waitqueue-tasks:
 test-timer-service:
 	bash scripts/test-timer-service.sh
 
+# hrtimer on the timer service; per-task per-CPU copies and kernel FPU
+# sections (Display Core's DC_FP_START/END depth).
+test-hrtimer:
+	bash scripts/test-hrtimer.sh
+
+test-percpu-fpu:
+	bash scripts/test-percpu-fpu.sh
+
+test: test-hrtimer test-percpu-fpu
+.PHONY: test-hrtimer test-percpu-fpu
+
 test-devres-concurrency:
 	bash scripts/test-devres-concurrency.sh
 
@@ -855,6 +866,7 @@ CRASH_PATH_TESTS += test-device-string
 CRASH_PATH_TESTS += test-pci-fault-containment
 CRASH_PATH_TESTS += test-sysfs-read test-drm-info test-read-sysfs
 CRASH_PATH_TESTS += test-platform-policy
+CRASH_PATH_TESTS += test-hrtimer test-percpu-fpu
 CRASH_PATH_TESTS += test-queue-partition
 
 test-queue-partition:
