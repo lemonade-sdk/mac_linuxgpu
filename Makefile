@@ -1215,3 +1215,11 @@ test-surface-import:
 
 test: test-surface-import
 .PHONY: test-surface-import
+
+# The display agent's model (host/DisplayAgent.swift): decoding, the
+# virtual-display plan for a monitor, and the changes a probe makes.
+test-display-agent:
+	bash scripts/test-display-agent.sh
+
+test: test-display-agent
+.PHONY: test-display-agent

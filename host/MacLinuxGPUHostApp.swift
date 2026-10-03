@@ -944,145 +944,6 @@ private let kSelSysfsRead: UInt32 = 80
 private let kSelDisplay: UInt32 = 84
 private let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
 private let kDisplayReportMax = 1024
-private let kDisplayReportBytes = 72 + 8 * 80     // struct rt_display_report, version 1
-
-enum DisplayOp: UInt64 { case probe = 0, show = 1, off = 2 }
-let displayPatterns: [String: UInt64] = ["bars": 0, "white": 1, "gradient": 2]
-
-struct DisplayConnector {
-    let name: String
-    let id, status, modes, edidBytes: UInt32
-    let preferredWidth, preferredHeight, preferredRefresh: UInt32
-    let lit: Bool
-    let litWidth, litHeight, litRefresh, crtc: UInt32
-}
-
-struct DisplayReport {
-    let showing: Bool
-    let pattern, fbWidth, fbHeight, fbPitch, crtcs: UInt32
-    let fbGPUAddress, fillNs, commitNs: UInt64
-    let probeStatus, commitStatus, restoreStatus: Int32
-    let connectors: [DisplayConnector]
-
-    init?(_ data: Data) {
-        guard data.count >= kDisplayReportBytes else { return nil }
-        let bytes = [UInt8](data)
-        func u32(_ at: Int) -> UInt32 {
-            UInt32(bytes[at]) | UInt32(bytes[at + 1]) << 8 | UInt32(bytes[at + 2]) << 16 | UInt32(bytes[at + 3]) << 24
-        }
-        func u64(_ at: Int) -> UInt64 { UInt64(u32(at)) | UInt64(u32(at + 4)) << 32 }
-        guard u32(0) == 1, u32(4) <= 8 else { return nil }
-        showing = u32(8) != 0
-        pattern = u32(12); fbWidth = u32(16); fbHeight = u32(20); fbPitch = u32(24); crtcs = u32(28)
-        fbGPUAddress = u64(32); fillNs = u64(40); commitNs = u64(48)
-        probeStatus = Int32(bitPattern: u32(56)); commitStatus = Int32(bitPattern: u32(60))
-        restoreStatus = Int32(bitPattern: u32(64))
-        var list: [DisplayConnector] = []
-        for index in 0..<Int(u32(4)) {
-            let at = 72 + index * 80
-            let raw = bytes[at..<at + 32].prefix { $0 != 0 }
-            let f = (0..<12).map { u32(at + 32 + $0 * 4) }
-            list.append(DisplayConnector(name: String(decoding: raw, as: UTF8.self), id: f[0], status: f[1],
-                                         modes: f[2], edidBytes: f[3], preferredWidth: f[4],
-                                         preferredHeight: f[5], preferredRefresh: f[6], lit: f[7] != 0,
-                                         litWidth: f[8], litHeight: f[9], litRefresh: f[10], crtc: f[11]))
-        }
-        connectors = list
-    }
-
-    var lines: [String] {
-        var out: [String] = []
-        for c in connectors {
-            let state = c.status == 1 ? "connected" : c.status == 2 ? "disconnected" : "unknown"
-            var line = "  \(c.name.padding(toLength: 10, withPad: " ", startingAt: 0)) \(state)"
-            if c.status == 1 {
-                line += ", \(c.modes) mode(s), preferred \(c.preferredWidth)x\(c.preferredHeight)@\(c.preferredRefresh), EDID \(c.edidBytes) bytes"
-            }
-            if c.lit { line += "; showing \(c.litWidth)x\(c.litHeight)@\(c.litRefresh) on CRTC \(c.crtc)" }
-            out.append(line)
-        }
-        out.append("  \(crtcs) CRTC(s)")
-        if showing {
-            let name = displayPatterns.first { $0.value == UInt64(pattern) }?.key ?? "\(pattern)"
-            out.append(String(format: "  pattern %@: framebuffer %ux%u (pitch %u) at VRAM 0x%llx, written in %.1f ms, committed in %.1f ms",
-                              name, fbWidth, fbHeight, fbPitch, fbGPUAddress,
-                              Double(fillNs) / 1e6, Double(commitNs) / 1e6))
-        }
-        return out
-    }
-}
-
-/// A Linux errno as the display test reports it.
-func displayErrno(_ status: Int64) -> String {
-    if status == 0 { return "ok" }
-    let code = Int32(truncatingIfNeeded: -status)
-    let meaning: String
-    switch code {
-    case ENODEV: meaning = ": no display (the driver runs without Display Core; install with activate.sh --display)"
-    case ENOENT: meaning = ": no connected output (or no connector by that name)"
-    case E2BIG: meaning = ": the outputs' modes need a framebuffer larger than 8192 pixels"
-    default: meaning = ""
-    }
-    return "Linux errno \(code) (\(String(cString: strerror(code)))\(meaning))"
-}
-
-/// The identity, size and preferred timing of an EDID base block.
-struct EDIDSummary {
-    let vendor: String
-    let product: UInt16
-    let serial: UInt32
-    let name: String?
-    let serialText: String?
-    let year: Int
-    let widthCm, heightCm: Int
-    let preferred: (width: Int, height: Int, refresh: Double, clockHz: Int, widthMm: Int, heightMm: Int)?
-
-    init?(_ data: Data) {
-        let b = [UInt8](data)
-        guard b.count >= 128, b[0..<8] == [0, 255, 255, 255, 255, 255, 255, 0][...],
-              b[0..<128].reduce(UInt8(0), &+) == 0 else { return nil }
-        let word = Int(b[8]) << 8 | Int(b[9])
-        vendor = String([10, 5, 0].map { Character(UnicodeScalar(UInt8(((word >> $0) & 31) + 64))) })
-        product = UInt16(b[10]) | UInt16(b[11]) << 8
-        serial = UInt32(b[12]) | UInt32(b[13]) << 8 | UInt32(b[14]) << 16 | UInt32(b[15]) << 24
-        year = Int(b[17]) + 1990
-        widthCm = Int(b[21]); heightCm = Int(b[22])
-        var name: String?, serialText: String?
-        var preferred: (Int, Int, Double, Int, Int, Int)?
-        for at in stride(from: 54, to: 126, by: 18) {
-            let d = Array(b[at..<at + 18])
-            if d[0] != 0 || d[1] != 0 {
-                if preferred == nil {
-                    let clock = (Int(d[0]) | Int(d[1]) << 8) * 10_000
-                    let h = Int(d[2]) | Int(d[4] & 0xf0) << 4, hb = Int(d[3]) | Int(d[4] & 0x0f) << 8
-                    let v = Int(d[5]) | Int(d[7] & 0xf0) << 4, vb = Int(d[6]) | Int(d[7] & 0x0f) << 8
-                    let total = (h + hb) * (v + vb)
-                    preferred = (h, v, total > 0 ? Double(clock) / Double(total) : 0, clock,
-                                 Int(d[12]) | Int(d[14] & 0xf0) << 4, Int(d[13]) | Int(d[14] & 0x0f) << 8)
-                }
-                continue
-            }
-            let text = String(decoding: d[5..<18].prefix { $0 != 0x0a }, as: UTF8.self)
-                .trimmingCharacters(in: .whitespaces)
-            if d[3] == 0xfc { name = text } else if d[3] == 0xff { serialText = text }
-        }
-        self.name = name
-        self.serialText = serialText
-        self.preferred = preferred.map { (width: $0.0, height: $0.1, refresh: $0.2, clockHz: $0.3,
-                                          widthMm: $0.4, heightMm: $0.5) }
-    }
-
-    var summary: String {
-        var parts = [String(format: "%@ product 0x%04x", vendor, product),
-                     name.map { "name '\($0)'" } ?? "no name",
-                     "serial \(serialText ?? String(serial))", "made \(year)", "\(widthCm)x\(heightCm) cm"]
-        if let p = preferred {
-            parts.append(String(format: "preferred %dx%d@%.2f (%.2f MHz, %dx%d mm)", p.width, p.height,
-                                p.refresh, Double(p.clockHz) / 1e6, p.widthMm, p.heightMm))
-        }
-        return parts.joined(separator: ", ")
-    }
-}
 
 extension MacLinuxGPUHost {
     /// IOConnectCallMethod with scalars and structures both ways.
@@ -1117,6 +978,14 @@ extension MacLinuxGPUHost {
         return (kr, Int64(bitPattern: status), DisplayReport(data))
     }
 
+    /// One connector's probed modes (op MODES).
+    func displayModes(_ connector: String) -> (kern_return_t, Int64, DisplayModes?) {
+        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [DisplayOp.modes.rawValue, 0, kDisplayConfirm],
+                                            inData: Data(connector.utf8), outScalars: 1, outSize: kDisplayReportMax)
+        guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
+        return (kr, Int64(bitPattern: status), DisplayModes(data))
+    }
+
     /// A sysfs file under the device directory (selector 80), read whole.
     func sysfsRead(_ path: String, list: Bool = false) -> (Int64, Data)? {
         var data = Data()
@@ -1143,6 +1012,89 @@ extension MacLinuxGPUHost {
             if let (status, edid) = sysfsRead("drm/\(card)/\(card)-\(name)/edid"), status == 0 { return edid }
         }
         return nil
+    }
+}
+
+/// display-agent: follow the GPU's connected monitors and maintain a macOS
+/// virtual display for each (docs/macos-displays.md). Polls the driver's
+/// cached connector state (STATUS) and, when the hotplug epoch moves,
+/// probes, reads each connected monitor's modes and EDID and plans its
+/// CGVirtualDisplay. Only --dry-run exists so far: it prints the plans and
+/// the changes and creates nothing.
+func runDisplayAgent(_ options: [String]) -> Int32 {
+    func value(_ flag: String) -> String? {
+        guard let at = options.firstIndex(of: flag), at + 1 < options.count else { return nil }
+        return options[at + 1]
+    }
+    guard options.contains("--dry-run") else {
+        print("display-agent: creating virtual displays is not enabled yet; run with --dry-run to see what it would create")
+        return 2
+    }
+    let once = options.contains("--once")
+    let interval = max(50, Int(value("--interval") ?? "") ?? 500)
+    var session: MacLinuxGPUHost?
+    if options.contains("--init") {
+        let host = MacLinuxGPUHost()
+        guard host.openUserClient(), host.initDevice() else {
+            print("ERROR: GPU initialization failed (scripts/read-driver-log.py shows why)")
+            return 1
+        }
+        session = host
+    }
+    defer { session?.closeUserClient() }
+    let observer = MacLinuxGPUHost()
+    guard observer.openUserClient(observer: true) else {
+        print("ERROR: failed to open an observer client")
+        return 1
+    }
+    defer { observer.closeUserClient() }
+
+    var state = DisplayAgentState()
+    var failures = 0
+    while true {
+        let (kr, status, report) = observer.display(.status)
+        guard kr == kIOReturnSuccess, status == 0, let report else {
+            print(kr == kern_return_t(bitPattern: 0xe00002d8) ?
+                  "display-agent: the GPU is not running in an open session (use --init)" :
+                  String(format: "display-agent: status failed (kr=%#x, %@)", kr, displayErrno(status)))
+            return 1
+        }
+        if state.needsProbe(epoch: report.hotplugEpoch) {
+            print("display-agent: hotplug epoch \(report.hotplugEpoch): probing")
+            let (pkr, pstatus, probed) = observer.display(.probe)
+            guard pkr == kIOReturnSuccess, let probed else {
+                print(String(format: "display-agent: probe failed (kr=%#x)", pkr))
+                return 1
+            }
+            if pstatus != 0 { print("display-agent: probe: \(displayErrno(pstatus))") }
+            var plans: [VirtualDisplayPlan] = []
+            for connector in probed.connectors where connector.connected {
+                let (mkr, mstatus, modes) = observer.displayModes(connector.name)
+                guard mkr == kIOReturnSuccess, mstatus == 0, let modes else {
+                    print("  \(connector.name): modes unavailable (\(displayErrno(mstatus)))")
+                    failures += 1
+                    continue
+                }
+                switch planVirtualDisplay(connector: connector.name, modes: modes,
+                                          edid: observer.connectorEDID(connector.name)) {
+                case .success(let plan):
+                    plans.append(plan)
+                case .failure(let error):
+                    print("  \(connector.name): no virtual display: \(error)")
+                    failures += 1
+                }
+            }
+            for change in state.apply(plans) {
+                print("display-agent: would \(change)")
+                switch change {
+                case .add(let plan), .update(let plan): plan.lines.forEach { print($0) }
+                default: break
+                }
+            }
+            if plans.isEmpty { print("display-agent: no connected monitor to mirror") }
+        }
+        if once { return failures == 0 ? 0 : 1 }
+        Thread.sleep(forTimeInterval: Double(interval) / 1000)
     }
 }
 
@@ -1578,6 +1530,9 @@ struct AppMain {
             return
         }
 
+        if args[1] == "display-agent" {
+            exit(runDisplayAgent(Array(args.dropFirst(2))))
+        }
         if ["display-probe", "display-test", "display-off"].contains(args[1]) {
             exit(runDisplayCommand(args[1], Array(args.dropFirst(2))))
         }

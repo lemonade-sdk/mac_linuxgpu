@@ -178,6 +178,34 @@ Apple GPU. The AMD GPU only scans out.
   log.
 - `amdgpu_mtopg` for AMD SDMA load.
 
+### 1d. What exists for the frame path (offline-tested)
+
+- **The DMA mapping of a client's memory.** `dext_dma_import`
+  (`iokit_bridge.mm`, `rt/dext_dma.h`) retains the memory descriptor the
+  agent passed and prepares it with an IODMACommand on the GPU. It refuses
+  segments that are not whole 16 KiB pages or that lie beyond the
+  device's DMA width. It records the mapping in the same table as the
+  driver's own coherent mappings, so the shutdown hold, the quarantine and
+  fini rules all apply. Tested with the DriverKit mocks
+  (`test-iokit-dma import`).
+- **The GPU side.** `rt_surface_import` / `rt_surface_copy`
+  (`rt/surface.h`) wrap those segments in a dma-buf exporter, import it
+  through `amdgpu_gem_prime_import` (an SG BO pinned in GTT and bound in
+  the GART) and copy dirty rectangles into a VRAM buffer with SDMA:
+  - up to 1024 copy packets per job;
+  - whole rows with equal pitches become one range;
+  - the fence goes on both buffers.
+
+  The provider's release, which calls `dext_dma_release_import`, runs only
+  after the BO is destroyed, and TTM delays that until the copies'
+  fences signal. `test-surface-import` runs this on the CS fixture, whose
+  software SDMA engine reads system memory through the GART and faults on
+  anything the DART does not map.
+- **Not wired yet:** the IMPORT and PRESENT ops on selector 84, and which
+  client type owns the imports. Observer clients hold no handles today,
+  and session clients run on the owner's queue. This is decided with
+  hardware results.
+
 ## 4. Increments
 
 1. **Done on feature/display-c:** STATUS (cached state, hotplug epoch via
@@ -185,24 +213,36 @@ Apple GPU. The AMD GPU only scans out.
    offline tests on the fixture DCN 4.0.1 device. The tests cover epoch
    1 at registration, epoch +1 on a hotplug event, the mode list of a
    connected output, and an empty list for an empty one.
-2. Agent skeleton: STATUS polling, EDID and MODES to a descriptor, a
-   `--dry-run` that prints the CGVirtualDisplay it would create.
+2. **Done:** `MacLinuxGPUHost display-agent --dry-run [--once]
+   [--interval ms] [--init]`. It polls STATUS and probes on an epoch
+   change. For each connected monitor it reads MODES and the EDID and
+   prints the CGVirtualDisplay it would create (name, vendor, product,
+   serial, size, primaries, max pixels, modes with the preferred one
+   first, hiDPI 0), then the add/update/remove changes. The model
+   (`host/DisplayAgent.swift`) is tested by `test-display-agent`.
    Creating real displays needs the user's go-ahead, since they appear on
-   the Mac's desktop.
+   the Mac's desktop. Without `--dry-run` the command refuses.
 3. Scanout contexts and MODESET/flip, tested offline on the fixture
    device (register checks as in test-dm-offline).
-4. IMPORT/PRESENT. This needs hardware to validate the DART mapping of
-   another process's IOSurface pages and SDMA reads over Thunderbolt.
+4. IMPORT/PRESENT ops over the pieces in 1d. Hardware has to validate
+   the DART mapping of another process's IOSurface pages (see the open
+   questions) and SDMA reads over Thunderbolt.
 5. Mode-change sync, measurements, then the async hotplug notification.
 
 ## 5. Open questions
 
 - Can a DriverKit user client keep a structure-input memory descriptor
-  past the call that passed it, and prepare it for DMA? If not, the agent
-  can map dext-allocated GTT buffers instead (CopyClientMemoryForType)
-  and have the Apple GPU blit the IOSurface into them with Metal (one
-  small GPU copy). That would be a design change to decide on hardware
-  results, not a silent fallback.
+  past the call that passed it, and prepare it for DMA?
+  `dext_dma_import` assumes it can: it retains the descriptor and
+  PrepareForDMA wires it. Only a run on hardware can confirm this.
+  - IOSurfaces that WindowServer allocates may be GPU-compressed or
+    purgeable. The agent must pass surfaces it can lock for CPU access
+    (SCK's BGRA output); if their pages cannot be prepared, the import
+    fails with its error.
+  - If it cannot be done, the agent maps dext-allocated GTT buffers
+    instead (CopyClientMemoryForType) and has the Apple GPU blit the
+    IOSurface into them with Metal (one small GPU copy). That would be a
+    design change, decided on hardware results, never a silent fallback.
 - What does the DART budget allow for N surfaces at 4K?
 - SCK latency and frame pacing against AMD vblank. Do we need
   `refreshDeadline` on CGVirtualDisplaySettings?
