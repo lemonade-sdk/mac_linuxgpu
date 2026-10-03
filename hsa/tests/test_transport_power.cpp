@@ -127,6 +127,23 @@ struct IdleDiagnosticAccess {
         gpu_result = kIOReturnNotOpen;
         assert(connection.kickQueue(9, 6) == HSA_STATUS_ERROR && !ready());
         assert(connection.powerState(snapshot) == HSA_STATUS_SUCCESS && snapshot.lost());
+        /* The GPU left the bus: the driver's session (or the driver) is
+         * gone, so calls fail with kIOReturnNotAttached or a dead port. The
+         * device is lost, and the power state says so with the removal as
+         * its cause, a new generation each time the driver went away. */
+        gpu_result = kIOReturnNotAttached;
+        connection.state = IOKitConnection::State::Ready;
+        /* The call faults the session (queue errors then ask the power
+         * state, which reports the loss: deviceStatus). */
+        assert(connection.kickQueue(9, 7) == HSA_STATUS_ERROR && !ready());
+        power_result = kIOReturnNotAttached;
+        power_generation = 6;
+        assert(connection.powerState(snapshot) == HSA_STATUS_SUCCESS && snapshot.valid() && snapshot.lost());
+        assert(snapshot.words[amdgpu::power::Cause] == amdgpu::power::kCauseDeviceRemoved);
+        assert(snapshot.flags() & amdgpu::power::LinkDown);
+        assert(snapshot.generation() == 5);	/* after the last one the driver reported (4) */
+        power_result = MACH_SEND_INVALID_DEST;
+        assert(connection.powerState(snapshot) == HSA_STATUS_SUCCESS && snapshot.lost());
         connection.ownerPort = IO_OBJECT_NULL;
         assert(connection.powerState(snapshot) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
     }
@@ -135,6 +152,6 @@ struct IdleDiagnosticAccess {
 
 int main() {
     mac_hsa::IdleDiagnosticAccess::run();
-    std::puts("IOKit transport device power: offline refusals keep the session, snapshot and requests, old-driver decline");
+    std::puts("IOKit transport device power: offline refusals keep the session, snapshot and requests, old-driver decline, device removed reported lost");
     return 0;
 }

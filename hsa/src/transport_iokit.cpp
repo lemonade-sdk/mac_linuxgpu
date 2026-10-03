@@ -186,8 +186,10 @@ public:
         if (selector == 60 && (result != KERN_SUCCESS || count != outputs))
             std::fprintf(stderr, "AtomicOp requester RPC: IOReturn=%#x output-count=%u expected=%u\n",
                          unsigned(result), count, outputs);
+        // The driver's session or the driver itself is gone (the GPU left
+        // the bus, or the driver stopped): the device is lost, not busy.
         if (result == kIOReturnNoDevice || result == kIOReturnNotAttached ||
-            result == MACH_SEND_INVALID_DEST) return HSA_STATUS_ERROR_INVALID_AGENT;
+            result == MACH_SEND_INVALID_DEST) return kDeviceLostStatus;
         // The device is suspending, suspended or resuming (power.h): the
         // driver submitted nothing; the call is retried after resume.
         if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
@@ -653,11 +655,28 @@ private:
         if (raw == uint32_t(kIOReturnUnsupported) || raw == uint32_t(kIOReturnBadArgument) ||
             raw == uint32_t(kIOReturnNotPermitted))
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (status == kDeviceLostStatus) {
+            // The driver no longer answers: the device left the bus (or the
+            // driver stopped). Report the loss the driver would have.
+            namespace power = amdgpu::power;
+            snapshot = {};
+            snapshot.words[power::Version] = power::kVersion;
+            snapshot.words[power::State] = uint64_t(power::PowerState::Lost);
+            snapshot.words[power::Generation] = lostGeneration;
+            snapshot.words[power::Flags] = power::LinkDown;
+            snapshot.words[power::Cause] = power::kCauseDeviceRemoved;
+            snapshot.words[power::Error] = uint64_t(int64_t(-19)); // ENODEV
+            out = snapshot;
+            return HSA_STATUS_SUCCESS;
+        }
         if (status != HSA_STATUS_SUCCESS) return status;
         if (!snapshot.valid()) return HSA_STATUS_ERROR;
+        // A later loss the runtime reports itself is a new generation.
+        lostGeneration = snapshot.generation() + 1;
         out = snapshot;
         return HSA_STATUS_SUCCESS;
     }
+    std::atomic<uint64_t> lostGeneration{1};
     const bool linuxShim;
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     std::mutex sessionMutex;
