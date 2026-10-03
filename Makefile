@@ -1085,3 +1085,22 @@ test-drm-selftest:
 test: test-drm-selftest
 CRASH_PATH_TESTS += test-drm-selftest
 .PHONY: test-drm-selftest
+
+# Device power: upstream amdkfd's suspend/resume (kgd2kfd_suspend/resume)
+# driving a KFD process over the KFD session fixture, and the driver's
+# power state machine with the runtime's copy of its protocol.
+test-kfd-power:
+	bash scripts/test-kfd-power.sh
+
+test-power-state:
+	bash scripts/test-power-state.sh
+
+# The runtime's IOKit transport under device power (offline refusals, the
+# power snapshot and requests). The runtime's behaviour itself is
+# hsa/tests/test_power.cpp in make hsa-test.
+test-hsa-power-transport:
+	bash scripts/test-hsa-power-transport.sh
+
+test: test-kfd-power test-power-state test-hsa-power-transport
+CRASH_PATH_TESTS += test-kfd-power test-power-state test-hsa-power-transport
+.PHONY: test-kfd-power test-power-state test-hsa-power-transport

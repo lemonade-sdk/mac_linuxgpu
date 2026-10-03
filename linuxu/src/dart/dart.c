@@ -78,6 +78,47 @@ static void dart_refund(uint64_t bytes)
 		dart_used -= bytes;
 }
 
+/* ---- holding mappings an engine may still use ----
+ * A DMA mapping the driver releases while a GPU engine still has work
+ * queued against it becomes a stray device access once that work runs: a
+ * DART fault (which can take a Thunderbolt device off the bus) or, if the
+ * IOVA was handed out again, a write into someone else's memory. Upstream
+ * releases such memory itself when a timed-out move gives up (TTM's
+ * ttm_bo_wait_free_node after 15 s), counting on a GPU reset to cancel the
+ * work, and with recovery off nothing cancels it. While the registered
+ * predicate reports a stalled engine, releases are held: the mapping (and
+ * its backing) stays live and is released once no engine is stalled, or
+ * when the predicate is removed. */
+static pthread_mutex_t dart_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool (*dart_hold_fn)(void *);
+static void *dart_hold_arg;
+static unsigned int dart_held_count;	/* dart_lock */
+
+static bool dart_hold_active(void)
+{
+	bool active = false;
+
+	pthread_mutex_lock(&dart_hold_lock);
+	if (dart_hold_fn)
+		active = dart_hold_fn(dart_hold_arg);
+	pthread_mutex_unlock(&dart_hold_lock);
+	return active;
+}
+
+static void dart_release_held_now(void);
+
+/* Release what was held once no engine is stalled any more. */
+static void dart_release_held_if_idle(void)
+{
+	unsigned int held;
+
+	pthread_mutex_lock(&dart_lock);
+	held = dart_held_count;
+	pthread_mutex_unlock(&dart_lock);
+	if (held && !dart_hold_active())
+		dart_release_held_now();
+}
+
 /* ---- token table (hash of live mappings) ---- */
 struct dart_token {
 	struct dart_token *next;
@@ -100,6 +141,7 @@ struct dart_coherent {
 	unsigned int aliases;
 	int freeing;
 	int releasing;
+	int held;	/* freed while an engine was stalled */
 };
 static struct dart_coherent *dart_coherents;
 static unsigned int dart_allocations_inflight;
@@ -154,6 +196,23 @@ static void dart_coherent_release(struct dart_coherent *e)
 	free(e);
 }
 
+/* A free from the driver: held while an engine is stalled. The caller set
+ * releasing under dart_lock. */
+static void dart_coherent_retire(struct dart_coherent *e)
+{
+	if (dart_hold_active()) {
+		pthread_mutex_lock(&dart_lock);
+		e->releasing = 0;
+		if (!e->held) {
+			e->held = 1;
+			dart_held_count++;
+		}
+		pthread_mutex_unlock(&dart_lock);
+		return;
+	}
+	dart_coherent_release(e);
+}
+
 struct dart_alias {
 	struct dart_alias *next;
 	struct dart_coherent *owner;
@@ -174,6 +233,7 @@ struct dart_stream {
 	size_t charged;
 	enum dma_data_direction direction;
 	int releasing;
+	int held;	/* unmapped while an engine was stalled */
 };
 #define DART_STREAM_SLOTS 4096
 static struct dart_stream dart_streams[DART_STREAM_SLOTS];
@@ -291,7 +351,7 @@ void linuxu_dma_unmap_single(struct device *dev, dma_addr_t address,
 		if (coherent->freeing && !coherent->aliases) {
 			coherent->releasing = 1;
 			pthread_mutex_unlock(&dart_lock);
-			dart_coherent_release(coherent);
+			dart_coherent_retire(coherent);
 		} else {
 			pthread_mutex_unlock(&dart_lock);
 		}
@@ -306,6 +366,16 @@ void linuxu_dma_unmap_single(struct device *dev, dma_addr_t address,
 	pthread_mutex_unlock(&dart_lock);
 	if (entry.direction != DMA_TO_DEVICE)
 		memcpy(entry.source, entry.bounce, entry.length);
+	if (dart_hold_active()) {
+		/* The bounce buffer stays mapped; no sync reaches it again. */
+		pthread_mutex_lock(&dart_lock);
+		if (!found->held) {
+			found->held = 1;
+			dart_held_count++;
+		}
+		pthread_mutex_unlock(&dart_lock);
+		return;
+	}
 	int result = dext_dma_free_coherent(entry.bounce, entry.charged);
 	pthread_mutex_lock(&dart_lock);
 	if (!result) {
@@ -423,6 +493,127 @@ static uint64_t dart_table_remove(uint64_t iova, uint64_t length,
 	return 0;
 }
 
+#ifndef LINUXU_DEXT_DK
+/* Host: a held release keeps its token (the identity mapping stays live)
+ * and, for a coherent buffer, its memory. */
+struct dart_held {
+	struct dart_held *next;
+	uint64_t iova, length;
+	enum dma_data_direction dir;
+	void *coherent;		/* memory to free once released, or NULL */
+};
+static struct dart_held *dart_held_list;
+
+/* Hold a release; false (release now) if the record cannot be made. */
+static bool dart_hold_push(uint64_t iova, uint64_t length, enum dma_data_direction dir,
+			   void *coherent)
+{
+	struct dart_held *h = malloc(sizeof(*h));
+
+	if (!h)
+		return false;
+	*h = (struct dart_held){ .iova = iova, .length = length, .dir = dir,
+				 .coherent = coherent };
+	pthread_mutex_lock(&dart_lock);
+	h->next = dart_held_list;
+	dart_held_list = h;
+	dart_held_count++;
+	pthread_mutex_unlock(&dart_lock);
+	return true;
+}
+#endif
+
+static void dart_release_held_now(void)
+{
+#ifdef LINUXU_DEXT_DK
+	for (;;) {
+		struct dart_coherent *e = NULL;
+
+		pthread_mutex_lock(&dart_lock);
+		for (struct dart_coherent *it = dart_coherents; it; it = it->next) {
+			if (it->held && !it->releasing && !it->aliases) {
+				e = it;
+				e->held = 0;
+				e->releasing = 1;
+				dart_held_count--;
+				break;
+			}
+		}
+		pthread_mutex_unlock(&dart_lock);
+		if (!e)
+			break;
+		/* A failed completion keeps it, as for any free. */
+		dart_coherent_release(e);
+	}
+	for (int i = 0; i < DART_STREAM_SLOTS; ++i) {
+		struct dart_stream entry;
+
+		pthread_mutex_lock(&dart_lock);
+		if (!dart_streams[i].held) {
+			pthread_mutex_unlock(&dart_lock);
+			continue;
+		}
+		dart_streams[i].held = 0;
+		dart_held_count--;
+		entry = dart_streams[i];
+		pthread_mutex_unlock(&dart_lock);
+		int result = dext_dma_free_coherent(entry.bounce, entry.charged);
+		pthread_mutex_lock(&dart_lock);
+		if (!result) {
+			memset(&dart_streams[i], 0, sizeof(dart_streams[i]));
+			dart_refund(entry.charged);
+			dart_table_count--;
+		}
+		pthread_mutex_unlock(&dart_lock);
+	}
+#else
+	struct dart_held *list, *h;
+
+	pthread_mutex_lock(&dart_lock);
+	list = dart_held_list;
+	dart_held_list = NULL;
+	dart_held_count = 0;
+	for (h = list; h; h = h->next) {
+		uint64_t freed = dart_table_remove(h->iova, h->length, h->dir, h->coherent != NULL);
+
+		dart_refund(freed);
+		if (!freed)
+			h->coherent = NULL;	/* not ours to free */
+	}
+	pthread_mutex_unlock(&dart_lock);
+	while ((h = list)) {
+		list = h->next;
+		free(h->coherent);
+		free(h);
+	}
+#endif
+}
+
+void linuxu_dart_set_hold(bool (*stalled)(void *), void *arg)
+{
+	pthread_mutex_lock(&dart_hold_lock);
+	dart_hold_fn = stalled;
+	dart_hold_arg = arg;
+	pthread_mutex_unlock(&dart_hold_lock);
+	dart_release_held_if_idle();
+}
+
+unsigned int linuxu_dart_held(void)
+{
+	unsigned int held;
+
+	pthread_mutex_lock(&dart_lock);
+	held = dart_held_count;
+	pthread_mutex_unlock(&dart_lock);
+	return held;
+}
+
+unsigned int linuxu_dart_release_held(void)
+{
+	dart_release_held_if_idle();
+	return linuxu_dart_held();
+}
+
 /* ---- page map/unmap ---- */
 dma_addr_t linuxu_dma_map_page(struct device *dev, struct page *page,
 			       unsigned long offset, size_t size,
@@ -436,6 +627,7 @@ dma_addr_t linuxu_dma_map_page(struct device *dev, struct page *page,
 	(void)dev; (void)dir;
 	if (!page || size == 0 || !valid_dma_direction(dir))
 		return (dma_addr_t)(uintptr_t)-22; /* -EINVAL */
+	dart_release_held_if_idle();
 	host = page_address(page);
 	if (!host)
 		return (dma_addr_t)(uintptr_t)-22; /* -EINVAL */
@@ -474,6 +666,8 @@ void linuxu_dma_unmap_page(struct device *dev, dma_addr_t iova, size_t size,
 #ifdef LINUXU_DEXT_DK
 	linuxu_dma_unmap_single(dev, iova, size, dir);
 #else
+	if (dart_hold_active() && dart_hold_push((uint64_t)iova, size, dir, NULL))
+		return;
 	pthread_mutex_lock(&dart_lock);
 	size_free = dart_table_remove((uint64_t)iova, size, dir, false);
 	dart_refund(size_free);
@@ -550,6 +744,19 @@ void linuxu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
 {
 	if (!sg || nents <= 0) return;
 #ifndef LINUXU_DEXT_DK
+	if (dart_hold_active()) {
+		bool held = true;
+		struct scatterlist *entry = sg;
+
+		for (int i = 0; i < nents && entry && held; i++) {
+			held = dart_hold_push((uint64_t)entry->dma_address, entry->length, dir, NULL);
+			if (i + 1 < nents) entry = sg_next(entry);
+		}
+		if (held)
+			return;
+		/* Out of records: what was not held is released now. */
+		dart_release_held_now();
+	}
 	pthread_mutex_lock(&dart_lock);
 #endif
 	for (int i = 0; i < nents && sg; i++) {
@@ -582,6 +789,7 @@ void *linuxu_dma_alloc_coherent(struct device *dev, size_t size,
 
 	(void)dev; (void)gfp;
 	if (dma_handle) *dma_handle = DMA_MAPPING_ERROR;
+	dart_release_held_if_idle();
 	if (size == 0 || size > SIZE_MAX - (DART_COHERENT_ALIGN - 1))
 		return NULL;
 	rounded = (size + DART_COHERENT_ALIGN - 1) &
@@ -685,8 +893,13 @@ void linuxu_dma_free_coherent(struct device *dev, size_t size, void *vaddr,
 	}
 	coherent->releasing = 1;
 	pthread_mutex_unlock(&dart_lock);
-	dart_coherent_release(coherent);
+	dart_coherent_retire(coherent);
 	return;
+#endif
+#ifndef LINUXU_DEXT_DK
+	if (iova == dma_handle && dart_hold_active() &&
+	    dart_hold_push(iova, size, DMA_BIDIRECTIONAL, vaddr))
+		return;
 #endif
 	pthread_mutex_lock(&dart_lock);
 	size_free = iova == dma_handle ? dart_table_remove(iova, size, DMA_BIDIRECTIONAL, true) : 0;
@@ -697,6 +910,49 @@ void linuxu_dma_free_coherent(struct device *dev, size_t size, void *vaddr,
 #else
 	if (size_free) free(vaddr);
 #endif
+}
+
+/* ---- containment: what a device access may touch ---- */
+
+#ifdef LINUXU_DEXT_DK
+/* caller holds dart_lock */
+static int dart_live_locked(uint64_t iova, uint64_t bytes)
+{
+	for (struct dart_coherent *e = dart_coherents; e; e = e->next)
+		if (!e->releasing && iova >= e->iova && iova - e->iova < e->size &&
+		    bytes <= e->size - (iova - e->iova))
+			return 1;
+	for (int i = 0; i < DART_STREAM_SLOTS; ++i) {
+		const struct dart_stream *st = &dart_streams[i];
+		if (st->iova && (!st->releasing || st->held) && iova >= st->iova &&
+		    iova - st->iova < st->charged && bytes <= st->charged - (iova - st->iova))
+			return 1;
+	}
+	return 0;
+}
+#else
+/* caller holds dart_lock */
+static int dart_live_locked(uint64_t iova, uint64_t bytes)
+{
+	for (int b = 0; b < DART_TABLE_BUCKETS; ++b)
+		for (const struct dart_token *t = dart_table[b]; t; t = t->next)
+			if (iova >= t->iova && iova - t->iova < t->size &&
+			    bytes <= t->size - (iova - t->iova))
+				return 1;
+	return 0;
+}
+#endif
+
+int linuxu_dart_contains(uint64_t iova, uint64_t bytes)
+{
+	int live;
+
+	if (!bytes || bytes - 1 > UINT64_MAX - iova)
+		return 0;
+	pthread_mutex_lock(&dart_lock);
+	live = dart_live_locked(iova, bytes);
+	pthread_mutex_unlock(&dart_lock);
+	return live;
 }
 
 /* ---- getters / test hooks ---- */

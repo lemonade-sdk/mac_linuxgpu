@@ -8,6 +8,7 @@
 #include <string>
 #include "atomic_path.h"
 #include "isa_target.h"
+#include "power.h"
 #include "../abi/amdgpu_dispatch_abi.h"
 #include "../abi/amdgpu_aql_abi.h"
 #include "../abi/amdgpu_atomic_diagnostics.h"
@@ -247,6 +248,12 @@ public:
     virtual hsa_status_t copyBuffers(const DeviceBuffer &, uint64_t, const DeviceBuffer &, uint64_t, size_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t exportBuffer(const DeviceBuffer &, BufferToken &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t importBuffer(const BufferToken &, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    // Device power (power.h): the driver's power snapshot, and a request
+    // (amdgpu::power::Prepare or Resume) answered with the snapshot after
+    // it. Callable whatever state the session is in; drivers that predate
+    // the protocol decline with HSA_STATUS_ERROR_INVALID_ARGUMENT.
+    virtual hsa_status_t powerState(PowerSnapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    virtual hsa_status_t requestPower(uint64_t, PowerSnapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
 };
 
 // Discover the installed DriverKit service and initialize the Linux shim

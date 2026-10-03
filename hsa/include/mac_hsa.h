@@ -1,5 +1,6 @@
 #pragma once
 #include <hsa/hsa.h>
+#include "mac_hsa_power.h" // device power: suspend, resume, lost device memory
 
 #ifdef __cplusplus
 extern "C" {

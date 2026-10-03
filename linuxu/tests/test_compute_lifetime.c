@@ -15,6 +15,11 @@ static struct amdgpu_ring ring;
 static struct amdgpu_buffer_funcs buffer_funcs;
 
 void msleep(unsigned int ms) { usleep(ms * 1000); }
+ktime_t ktime_get(void) { return 0; }
+/* The session's DMA hold: attached by open, detached by close. */
+static bool (*hold_fn)(void *);
+static void *hold_arg;
+void linuxu_dart_set_hold(bool (*stalled)(void *), void *arg) { hold_fn = stalled; hold_arg = arg; }
 int rt_pci_probe_result(struct pci_dev *pdev) { return pdev == &pci ? 0 : -ENODEV; }
 int dma_resv_lock(struct dma_resv *r, struct ww_acquire_ctx *c)
 { (void)r; (void)c; return fail_cleanup && copies == 2 ? -EINTR : 0; }
@@ -115,9 +120,12 @@ int main(void)
 	device.mman.buffer_funcs_ring = &ring; ring.sched.ready = true;
 	mutex_init(&device.mman.default_entity.lock);
 	assert(rt_compute_open(&pci, &ctx) == 0);
+	/* No ring has a job: no engine is stalled. */
+	assert(hold_fn && hold_arg == &device && !hold_fn(hold_arg));
 	assert(rt_compute_verify_host_memory(ctx) == 0);
 	assert(rt_compute_status(ctx) == 0 && live == 0 && dma_live == 0 && copies == 2);
 	assert(rt_compute_close(ctx) == 0);
+	assert(!hold_fn && !hold_arg);
 
 	copies = 0; fail_cleanup = 1;
 	assert(rt_compute_open(&pci, &ctx) == 0);

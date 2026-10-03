@@ -22,6 +22,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "power_state.h"
+
 #define MLG_SESSION_STATE_VERSION 1u
 #define MLG_SESSION_STATE_WORDS   9u
 
@@ -90,8 +92,9 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 }
 
 /* Observer user clients (type MLG_USER_CLIENT_OBSERVER) never join or close
- * a session. They may call selectors that read cached state, the
- * entitlement-checked release selector, the two Linux read paths below,
+ * a session. They may call selectors that read cached state (the power
+ * state among them, power_state.h), the entitlement-checked release and
+ * power-request selectors, the two Linux read paths below,
  * which run upstream callbacks while the driver runs and never claim PCI,
  * join the session or touch queues, and the self-contained submission
  * self-test (DrmSelfTest). Linux-file clients are type 2
@@ -141,7 +144,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * (linuxu/headers/rt/cs_selftest.h) on the GPU, in a Linux process of its
  * own: render node, AMDGPU_INFO, a context, GEM buffers mapped in its own
  * GPUVM, AMDGPU_CS on the compute ring and on SDMA, AMDGPU_WAIT_CS and
- * syncobj waits, then everything undone. It touches nothing of any other
+ * syncobj waits, its VRAM buffer moved to GTT (through a GART transfer
+ * window, as TTM evicts) and back by submissions, then everything undone. It touches nothing of any other
  * client and creates no queue; each wait is bounded.
  *   scalar in:  [0] MLG_DRM_SELFTEST_CONFIRM
  *   struct out: struct rt_cs_selftest_result (MLG_DRM_SELFTEST_RESULT_MAX
@@ -217,6 +221,7 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 			return false;
 		return (input[0] == MLG_QUERY_PROBE_STATUS && input_count == 1) ||
 		       (input[0] == MLG_QUERY_SESSION_STATE && input_count == 1) ||
+		       (input[0] == MLG_QUERY_POWER_STATE && input_count == 1) ||
 		       (input[0] == MLG_QUERY_KERNEL_LOG && input_count == 2);
 	case MLG_SELECTOR_SYSFS_READ:
 		return input && input_count == 2 &&
@@ -226,6 +231,9 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		       input[1] <= MLG_SYSFS_CHUNK_MAX;
 	case MLG_SELECTOR_DRM_SELFTEST:
 		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
+	case MLG_SELECTOR_POWER:
+		/* QUERY and WAIT; PREPARE/RESUME check the release entitlement. */
+		return input && input_count >= 1 && input_count <= 2 && input[0] <= MLG_POWER_OP_WAIT;
 	default:
 		return false;
 	}
