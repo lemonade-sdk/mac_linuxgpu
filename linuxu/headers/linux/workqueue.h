@@ -40,6 +40,7 @@ struct work_struct {
 	struct workqueue_struct *wq;
 	unsigned short color;
 	unsigned long queue_seq;
+	unsigned int disable;	/* Linux WORK_OFFQ_DISABLE count */
 };
 
 struct delayed_work {
@@ -86,6 +87,7 @@ static inline void init_work(struct work_struct *work, work_func_t func)
 	work->wq = NULL;
 	work->color = 0;
 	work->queue_seq = 0;
+	work->disable = 0;
 }
 
 static inline void init_delayed_work(struct delayed_work *dwork,
@@ -144,6 +146,16 @@ extern bool cancel_work_sync(struct work_struct *work);
 extern bool cancel_delayed_work_sync(struct delayed_work *dwork);
 extern bool cancel_delayed_work(struct delayed_work *dwork);
 extern unsigned int work_busy(struct work_struct *work);
+/* Disable/enable (Linux 6.10+): a disabled item cannot be queued until
+ * every disable is matched by an enable. */
+extern bool disable_work(struct work_struct *work);
+extern bool disable_work_sync(struct work_struct *work);
+extern bool enable_work(struct work_struct *work);
+extern bool disable_delayed_work(struct delayed_work *dwork);
+extern bool disable_delayed_work_sync(struct delayed_work *dwork);
+extern bool enable_delayed_work(struct delayed_work *dwork);
+/* The work item the calling worker is executing, or NULL. */
+extern struct work_struct *current_work(void);
 extern int  workqueue_congested(int cpu, struct workqueue_struct *wq);
 
 /* ---- workqueue creation (runtime: linuxu/src/work.c) ---- */

@@ -15,6 +15,10 @@
 
 /* 100 Hz tick (matches CONFIG_HZ=100 in the shim autoconf) */
 #define HZ			100
+/* vdso/jiffies.h: time between ticks in nsec */
+#ifndef TICK_NSEC
+#define TICK_NSEC ((NSEC_PER_SEC+HZ/2)/HZ)
+#endif
 #define USER_HZ			100
 #define CONFIG_HZ			100
 

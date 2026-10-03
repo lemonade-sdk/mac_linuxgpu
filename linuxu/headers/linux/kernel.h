@@ -32,6 +32,9 @@
 #include <linux/array_size.h>
 #include <linux/overflow.h>
 #include <linux/math64.h>
+#include <asm/byteorder.h>	/* upstream kernel.h includes it too */
+/* Upstream reaches str_*() through deep module.h/seq_file.h chains. */
+#include <linux/string_choices.h>
 
 
 #include <stdarg.h>

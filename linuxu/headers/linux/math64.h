@@ -75,4 +75,30 @@ static inline u64 add_u64_u32(u64 a, u32 b)
 	({ u64 __n = (ll); u32 __d = (d); __n / __d + !!(__n % __d); })
 #endif
 
+
+/* Upstream rounding forms. */
+#ifndef DIV64_U64_ROUND_UP
+#define DIV64_U64_ROUND_UP(ll, d)	\
+	({ u64 _tmp = (d); div64_u64((ll) + _tmp - 1, _tmp); })
+#define DIV_U64_ROUND_UP(ll, d)		\
+	({ u32 _tmp = (d); div_u64((ll) + _tmp - 1, _tmp); })
+#define DIV64_U64_ROUND_CLOSEST(dividend, divisor)	\
+	({ u64 _tmp = (divisor); div64_u64((dividend) + _tmp / 2, _tmp); })
+#define DIV_U64_ROUND_CLOSEST(dividend, divisor)	\
+	({ u32 _tmp = (divisor); div_u64((u64)(dividend) + _tmp / 2, _tmp); })
+#define DIV_S64_ROUND_CLOSEST(dividend, divisor)(	\
+{							\
+	s64 __x = (dividend);				\
+	s32 __d = (divisor);				\
+	((__x > 0) == (__d > 0)) ?			\
+		(s64)((__x + (__d / 2)) / __d) :	\
+		(s64)((__x - (__d / 2)) / __d);		\
+}							\
+)
+static inline u64 roundup_u64(u64 x, u32 y)
+{
+	return DIV_U64_ROUND_UP(x, y) * y;
+}
+#endif
+
 #endif /* _LINUX_MATH64_H */

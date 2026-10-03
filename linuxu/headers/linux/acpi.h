@@ -82,4 +82,18 @@ extern void acpi_put_table(struct acpi_table_header *table);
 extern acpi_status acpi_get_table_header(const char *signature, u32 instance,
 					   struct acpi_table_header **table);
 
+/* Upstream !CONFIG_ACPI companion helpers: no device has an ACPI node. */
+struct acpi_device;
+struct device;
+#ifndef acpi_disabled
+#define acpi_disabled 1
+#endif
+#define ACPI_COMPANION(dev)		(NULL)
+#define ACPI_COMPANION_SET(dev, adev)	do { } while (0)
+#define ACPI_HANDLE(dev)		(NULL)
+static inline bool has_acpi_companion(struct device *dev)
+{
+	return false;
+}
+
 #endif /* __LINUX_ACPI_H */

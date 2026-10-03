@@ -13,6 +13,7 @@
 #include <linux/bug.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
+#include <linux/string_helpers.h>
 #include <stdarg.h>
 
 struct seq_operations;

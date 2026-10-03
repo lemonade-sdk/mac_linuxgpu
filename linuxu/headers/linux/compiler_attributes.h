@@ -11,6 +11,16 @@
 #ifndef __noinline
 #define __noinline			__attribute__((noinline))
 #endif
+/* Upstream compiler_attributes.h / compiler_types.h spellings. */
+#ifndef noinline
+#define noinline			__attribute__((__noinline__))
+#endif
+#ifndef noinline_for_stack
+#define noinline_for_stack		noinline
+#endif
+#ifndef noinline_for_tracing
+#define noinline_for_tracing		noinline
+#endif
 #ifndef __weak
 #define __weak				__attribute__((weak))
 #endif
