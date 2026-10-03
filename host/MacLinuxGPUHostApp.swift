@@ -1079,19 +1079,31 @@ func runDisplayAgent(_ options: [String]) -> Int32 {
 
     var state = DisplayAgentState()
     var failures = 0
+    let notPermitted = kern_return_t(bitPattern: 0xe00002e2)
+    func failure(_ kr: kern_return_t, _ what: String) -> String {
+        kr == kern_return_t(bitPattern: 0xe00002d8) ?
+            "the GPU is not running in an open session (use --init)" :
+        kr == notPermitted ?
+            "\(what) is not in this driver build (selector 84 ops STATUS and MODES arrived in build 231)" :
+            String(format: "%@ failed (kr=%#x)", what, kr)
+    }
     while true {
-        let (kr, status, report) = observer.display(.status)
-        guard kr == kIOReturnSuccess, status == 0, let report else {
-            print(kr == kern_return_t(bitPattern: 0xe00002d8) ?
-                  "display-agent: the GPU is not running in an open session (use --init)" :
-                  String(format: "display-agent: status failed (kr=%#x, %@)", kr, displayErrno(status)))
-            return 1
+        // A single pass probes at once; following needs the hotplug epoch.
+        var probeNow = once
+        if !once {
+            let (kr, status, report) = observer.display(.status)
+            guard kr == kIOReturnSuccess, status == 0, let report else {
+                print("display-agent: " + (kr == kIOReturnSuccess ? "status: \(displayErrno(status))" :
+                                           failure(kr, "STATUS")))
+                return 1
+            }
+            probeNow = state.needsProbe(epoch: report.hotplugEpoch)
+            if probeNow { print("display-agent: hotplug epoch \(report.hotplugEpoch): probing") }
         }
-        if state.needsProbe(epoch: report.hotplugEpoch) {
-            print("display-agent: hotplug epoch \(report.hotplugEpoch): probing")
+        if probeNow {
             let (pkr, pstatus, probed) = observer.display(.probe)
             guard pkr == kIOReturnSuccess, let probed else {
-                print(String(format: "display-agent: probe failed (kr=%#x)", pkr))
+                print("display-agent: " + failure(pkr, "PROBE"))
                 return 1
             }
             if pstatus != 0 { print("display-agent: probe: \(displayErrno(pstatus))") }
@@ -1099,7 +1111,11 @@ func runDisplayAgent(_ options: [String]) -> Int32 {
             for connector in probed.connectors where connector.connected {
                 let (mkr, mstatus, modes) = observer.displayModes(connector.name)
                 guard mkr == kIOReturnSuccess, mstatus == 0, let modes else {
-                    print("  \(connector.name): modes unavailable (\(displayErrno(mstatus)))")
+                    print("  \(connector.name): no plan: " + (mkr == kIOReturnSuccess ?
+                          "modes: \(displayErrno(mstatus))" : failure(mkr, "MODES")))
+                    if let edid = observer.connectorEDID(connector.name), let info = EDIDSummary(edid) {
+                        print("  \(connector.name) EDID (\(edid.count) bytes): \(info.summary)")
+                    }
                     failures += 1
                     continue
                 }
