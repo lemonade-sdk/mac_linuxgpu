@@ -72,6 +72,7 @@
 #include <rt/bootstrap.h>
 #include <rt/cs_selftest.h>
 #include <rt/display.h>
+#include <rt/surface.h>
 #include <rt/drm_info.h>
 #include <rt/lx_abi.h>
 #include <rt/lx_files.h>
@@ -170,7 +171,12 @@ static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               MLG_DISPLAY_PATTERN_GRADIENT == RT_DISPLAY_PATTERN_GRADIENT &&
               MLG_DISPLAY_NAME_MAX < RT_DISPLAY_NAME_BYTES &&
               sizeof(struct rt_display_report) <= MLG_DISPLAY_REPORT_MAX &&
-              sizeof(struct rt_display_modes) <= MLG_DISPLAY_REPORT_MAX, "display ABI");
+              sizeof(struct rt_display_modes) <= MLG_DISPLAY_REPORT_MAX &&
+              sizeof(struct rt_surface_verify_result) <= MLG_DISPLAY_REPORT_MAX &&
+              sizeof(struct rt_display_present_stats) <= MLG_DISPLAY_REPORT_MAX &&
+              sizeof(struct mlg_display_rect) == sizeof(struct rt_surface_rect) &&
+              sizeof(struct mlg_display_present) + MLG_DISPLAY_PRESENT_RECTS_MAX *
+                  sizeof(struct mlg_display_rect) <= 4096, "display ABI");
 static_assert(DEXT_COMPUTE_QUERY_SESSION_STATE == MLG_QUERY_SESSION_STATE &&
               DEXT_COMPUTE_QUERY_PROBE_STATUS == MLG_QUERY_PROBE_STATUS &&
               DEXT_COMPUTE_QUERY_KERNEL_LOG == MLG_QUERY_KERNEL_LOG, "observer query tags");
@@ -307,6 +313,7 @@ static void observer_reads_close()
 // Linux-file calls (lx_files) run on their clients' own queues under this
 // admission, opened and closed with the observer reads.
 static mlg_observer_gate s_lxCalls;
+static void observer_display_client_stop(uint64_t clientID);
 struct MacLinuxGPUUserClient_IVars {
     MacLinuxGPU *ownerDriver;
     IOService *stopProvider;
@@ -661,6 +668,13 @@ static void close_session(MacLinuxGPU *driver)
     if (s_modulesRunning && !s_dmaQuarantined && rt_display_showing()) {
         MACLINUXGPU_LOG("session close: turning the display test pattern off");
         rt_display_stop();
+    }
+    // A display agent's imported surfaces: their buffers go now; the
+    // client mappings follow once the GPU is done with them (retired by
+    // the DMA hold until the endpoint reset when that is later).
+    if (s_modulesRunning && !s_dmaQuarantined && rt_surface_count()) {
+        const unsigned released = rt_surface_remove_all();
+        MACLINUXGPU_LOG("session close: released %u imported surface(s)", released);
     }
     // Linux-file processes exit while the driver runs; a self-test whose
     // GPU work never completed leaves that work uncertain.
@@ -1660,7 +1674,10 @@ IMPL(MacLinuxGPUUserClient, Stop)
     provider->retain();
     ivars->stopProvider = provider;
     if (ivars->observer) {
-        // No session membership, handles or mappings: nothing to drain.
+        // No session membership or mappings. A display agent's imports and
+        // the output it started end with it (on its own queue, so none of
+        // its calls is in flight); a closing session has released them.
+        observer_display_client_stop(ivars->clientID);
         FinishStop(provider);
         return kIOReturnSuccess;
     }
@@ -2305,6 +2322,192 @@ static kern_return_t observer_drm_selftest(IOUserClientMethodArguments *argument
 // open session for the whole op). Every wait inside is upstream's own
 // bounded wait.
 static uint32_t s_displayRunning;
+static uint64_t s_displayOwner; // the client whose OUTPUT is on screen, 0 for none
+// Linux errno values the display ops report (rt/display.h and rt/surface.h
+// return negative Linux errnos).
+static constexpr int kLinuxENOENT = 2, kLinuxEIO = 5, kLinuxENOMEM = 12, kLinuxENOSPC = 28;
+
+// A client memory import: the DMA mapping of the client's descriptor and a
+// read-only CPU view of it, released once the GPU can no longer reach it
+// (rt_surface's provider release, after the BO is destroyed).
+struct DisplayImport {
+    uint64_t importID;
+    IOMemoryMap *view;
+    uint64_t length;
+};
+static void display_import_release(void *context)
+{
+    auto *import = static_cast<DisplayImport *>(context);
+    if (import->view) import->view->release();
+    if (dext_dma_release_import(import->importID) != 0)
+        MACLINUXGPU_LOG("display: import %llu release retained by the DMA seam",
+                        (unsigned long long)import->importID);
+    IOFree(import, sizeof(*import));
+}
+
+static void observer_display_client_stop(uint64_t clientID)
+{
+    if (!s_observerReads.enter()) return; // a session close released everything
+    const unsigned released = rt_surface_remove_owner(clientID);
+    bool output = false;
+    if (__atomic_load_n(&s_displayOwner, __ATOMIC_ACQUIRE) == clientID) {
+        rt_display_stop();
+        __atomic_store_n(&s_displayOwner, 0, __ATOMIC_RELEASE);
+        output = true;
+    }
+    s_observerReads.leave();
+    if (released || output)
+        MACLINUXGPU_LOG("display: client %llu stopped: %u surface(s) released%s",
+                        (unsigned long long)clientID, released, output ? ", output off" : "");
+}
+
+// IMPORT, VERIFY, RELEASE, OUTPUT and PRESENT (session_state.h). Admitted
+// and serialized like the other display ops. Statuses are Linux errnos in
+// out[0]; nothing here falls back to another mechanism.
+static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArguments *a,
+                                    struct pci_dev *pdev)
+{
+    const uint64_t *in = a->scalarInput;
+    uint64_t *out = a->scalarOutput;
+    out[0] = 0;
+    out[1] = 0;
+    a->scalarOutputCount = MLG_DISPLAY_WORDS;
+    switch (in[0]) {
+    case MLG_DISPLAY_OP_IMPORT: {
+        IOMemoryDescriptor *memory = a->structureInputDescriptor;
+        uint64_t length = 0;
+        if (!memory || a->structureInput || memory->GetLength(&length) != kIOReturnSuccess || !length)
+            return kIOReturnBadArgument;
+        const uint32_t width = (uint32_t)(in[1] >> 48), height = (uint32_t)(in[1] >> 32) & 0xffff;
+        const uint32_t pitch = (uint32_t)in[1];
+        uint64_t addresses[DEXT_DMA_IMPORT_SEGMENTS_MAX], lengths[DEXT_DMA_IMPORT_SEGMENTS_MAX];
+        uint32_t count = DEXT_DMA_IMPORT_SEGMENTS_MAX;
+        auto *import = static_cast<DisplayImport *>(IOMallocZero(sizeof(DisplayImport)));
+        if (!import) { out[0] = (uint64_t)(int64_t)-kLinuxENOMEM; return kIOReturnSuccess; }
+        import->length = length;
+        if (dext_dma_import(memory, length, addresses, lengths, &count, &import->importID) != 0) {
+            IOFree(import, sizeof(*import));
+            MACLINUXGPU_LOG("display: IMPORT of %llu bytes: the platform DMA mapping was refused",
+                            (unsigned long long)length);
+            out[0] = (uint64_t)(int64_t)-kLinuxEIO;
+            return kIOReturnSuccess;
+        }
+        if (memory->CreateMapping(kIOMemoryMapReadOnly, 0, 0, 0, 0, &import->view) != kIOReturnSuccess)
+            import->view = nullptr;
+        struct rt_surface_segment segments[DEXT_DMA_IMPORT_SEGMENTS_MAX];
+        for (uint32_t i = 0; i < count; ++i) segments[i] = {addresses[i], lengths[i]};
+        const struct rt_surface_provider provider = {display_import_release, import};
+        struct rt_surface *surface = nullptr;
+        int r = import->view ? rt_surface_import(pdev, segments, count, length, width, height,
+                                                 pitch, &provider, &surface) : -kLinuxENOMEM;
+        if (r) {
+            display_import_release(import); // the provider was not taken
+        } else {
+            const uint32_t handle = rt_surface_add(clientID, surface);
+            if (!handle) {
+                rt_surface_release(surface); // the provider follows the BO
+                r = -kLinuxENOSPC;
+            } else {
+                out[1] = handle;
+            }
+        }
+        MACLINUXGPU_LOG("display: IMPORT %ux%u pitch %u, %llu bytes in %u segment(s) -> %d (handle %llu)",
+                        width, height, pitch, (unsigned long long)length, count, r,
+                        (unsigned long long)out[1]);
+        out[0] = (uint64_t)(int64_t)r;
+        return kIOReturnSuccess;
+    }
+    case MLG_DISPLAY_OP_VERIFY: {
+        if (a->structureInput || a->structureInputDescriptor ||
+            a->structureOutputMaximumSize < sizeof(struct rt_surface_verify_result))
+            return kIOReturnBadArgument;
+        struct rt_surface *surface = rt_surface_get(clientID, (uint32_t)(in[1] >> 32));
+        struct rt_surface_verify_result result{};
+        int r = -kLinuxENOENT;
+        if (surface) {
+            auto *import = static_cast<DisplayImport *>(rt_surface_provider_context(surface));
+            const void *view = import && import->view ?
+                reinterpret_cast<const void *>(import->view->GetAddress()) : nullptr;
+            r = rt_surface_verify(surface, (uint32_t)in[1], view, 2000, &result);
+            MACLINUXGPU_LOG("display: VERIFY seed %u -> %d (GPU %u, CPU %u mismatching dwords, %llu us)",
+                            (uint32_t)in[1], r, result.gpu_mismatches, result.cpu_mismatches,
+                            (unsigned long long)(result.gpu_ns / 1000));
+        }
+        a->structureOutput = OSData::withBytes(&result, sizeof(result));
+        if (!a->structureOutput) return kIOReturnNoMemory;
+        out[0] = (uint64_t)(int64_t)r;
+        return kIOReturnSuccess;
+    }
+    case MLG_DISPLAY_OP_RELEASE:
+        if (a->structureInput || a->structureInputDescriptor) return kIOReturnBadArgument;
+        out[0] = (uint64_t)(int64_t)rt_surface_remove(clientID, (uint32_t)in[1]);
+        return kIOReturnSuccess;
+    case MLG_DISPLAY_OP_OUTPUT: {
+        const OSData *data = a->structureInput;
+        struct mlg_display_output request{};
+        if (!data || data->getLength() != sizeof(request) ||
+            a->structureOutputMaximumSize < sizeof(struct rt_display_report))
+            return kIOReturnBadArgument;
+        memcpy(&request, data->getBytesNoCopy(), sizeof(request));
+        request.connector[sizeof(request.connector) - 1] = 0;
+        struct rt_display_report report;
+        const int r = rt_display_output(pdev, request.connector, request.width, request.height,
+                                        (uint32_t)in[1], &report);
+        if (!r) __atomic_store_n(&s_displayOwner, clientID, __ATOMIC_RELEASE);
+        MACLINUXGPU_LOG("display: OUTPUT %s at %ux%u %llu mHz -> %d (commit %d)", request.connector,
+                        request.width, request.height, (unsigned long long)in[1], r, report.commit_status);
+        a->structureOutput = OSData::withBytes(&report, sizeof(report));
+        if (!a->structureOutput) return kIOReturnNoMemory;
+        out[0] = (uint64_t)(int64_t)r;
+        return kIOReturnSuccess;
+    }
+    case MLG_DISPLAY_OP_PRESENT: {
+        const OSData *data = a->structureInput;
+        if (!data || data->getLength() < sizeof(struct mlg_display_present) ||
+            a->structureOutputMaximumSize < sizeof(struct rt_display_present_stats))
+            return kIOReturnBadArgument;
+        const auto *request = static_cast<const struct mlg_display_present *>(data->getBytesNoCopy());
+        if (request->count > MLG_DISPLAY_PRESENT_RECTS_MAX ||
+            data->getLength() != sizeof(*request) + request->count * sizeof(struct mlg_display_rect))
+            return kIOReturnBadArgument;
+        struct rt_surface *surface = rt_surface_get(clientID, (uint32_t)in[1]);
+        struct rt_display_present_stats stats{};
+        int r = -kLinuxENOENT;
+        if (surface && __atomic_load_n(&s_displayOwner, __ATOMIC_ACQUIRE) == clientID)
+            r = rt_display_present(pdev, surface,
+                                   reinterpret_cast<const struct rt_surface_rect *>(request->rect),
+                                   request->count, &stats);
+        if (r && r != -kLinuxENOENT)
+            MACLINUXGPU_LOG("display: PRESENT failed %d (copy %d, flip %d)", r, stats.copy_status,
+                            stats.flip_status);
+        a->structureOutput = OSData::withBytes(&stats, sizeof(stats));
+        if (!a->structureOutput) return kIOReturnNoMemory;
+        out[0] = (uint64_t)(int64_t)r;
+        return kIOReturnSuccess;
+    }
+    default:
+        return kIOReturnBadArgument;
+    }
+}
+
+static kern_return_t observer_display_frames(uint64_t clientID, IOUserClientMethodArguments *arguments)
+{
+    if (!arguments->scalarInput || arguments->scalarInputCount != 3 || !arguments->scalarOutput ||
+        arguments->scalarOutputCount < MLG_DISPLAY_WORDS || arguments->structureOutputDescriptor ||
+        !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, arguments->scalarInput, 3))
+        return kIOReturnBadArgument;
+    if (__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
+    if (!s_observerReads.enter()) {
+        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+        return kIOReturnNotReady;
+    }
+    const kern_return_t ret = display_frames(clientID, arguments,
+        static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
+    s_observerReads.leave();
+    __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+    return ret;
+}
+
 static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
 {
     const uint64_t *in = arguments->scalarInput;
@@ -2368,6 +2571,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         r = rt_display_show(pdev, name[0] ? name : nullptr, (uint32_t)in[1], &report);
     } else {
         r = rt_display_off(pdev, &report);
+        __atomic_store_n(&s_displayOwner, 0, __ATOMIC_RELEASE);
     }
     s_observerReads.leave();
     __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
@@ -2418,6 +2622,9 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (selector == MLG_SELECTOR_SYSFS_READ) return observer_sysfs_read(arguments);
         if (selector == MLG_SELECTOR_DRM_INFO) return observer_drm_info(arguments);
         if (selector == MLG_SELECTOR_DRM_SELFTEST) return observer_drm_selftest(arguments);
+        if (selector == MLG_SELECTOR_DISPLAY && arguments->scalarInput &&
+            arguments->scalarInputCount == 3 && arguments->scalarInput[0] >= MLG_DISPLAY_OP_IMPORT)
+            return observer_display_frames(ivars->clientID, arguments);
         if (selector == MLG_SELECTOR_DISPLAY) return observer_display(arguments);
         __block kern_return_t result = kIOReturnNotAttached;
         ivars->onOwnerQueue = true;

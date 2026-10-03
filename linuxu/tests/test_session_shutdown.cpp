@@ -157,6 +157,13 @@ static void lx_client_stop(MacLinuxGPUUserClient *, IOService *) { assert(false)
 static bool displayShowing;
 static int rt_display_showing() { return displayShowing; }
 static void rt_display_stop();
+// A display agent's imported surfaces are released with the display.
+static unsigned surfacesImported;
+static unsigned rt_surface_count() { return surfacesImported; }
+static unsigned rt_surface_remove_all();
+// An observer's Stop releases what its display agent imported.
+static unsigned observerDisplayStops;
+static void observer_display_client_stop(uint64_t) { ++observerDisplayStops; }
 
 // No KFD suspend is held in these scenarios (power_state.h): the hook that
 // hands one back before upstream removal has nothing to do.
@@ -186,6 +193,15 @@ static void rt_display_stop() {
     assert(s_modulesRunning && !s_dmaQuarantined && lxTeardowns == 0);
     events.push_back("display_off");
     displayShowing = false;
+}
+
+static unsigned rt_surface_remove_all() {
+    assert(surfacesImported && !s_observerReads.admitting() && s_observerReads.drained());
+    assert(s_modulesRunning && !s_dmaQuarantined && !displayShowing && lxTeardowns == 0);
+    events.push_back("surfaces_release");
+    const unsigned n = surfacesImported;
+    surfacesImported = 0;
+    return n;
 }
 
 static void *rt_device_get_pdev(void *device) {
@@ -456,7 +472,24 @@ static void checkObserverPolicy() {
     const uint64_t displayStatus[] = {MLG_DISPLAY_OP_STATUS, 0, MLG_DISPLAY_CONFIRM};
     const uint64_t displayModes[] = {MLG_DISPLAY_OP_MODES, 0, MLG_DISPLAY_CONFIRM};
     const uint64_t displayModesPattern[] = {MLG_DISPLAY_OP_MODES, 1, MLG_DISPLAY_CONFIRM};
-    const uint64_t displayBadOp[] = {5, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayBadOp[] = {10, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayImport[] = {MLG_DISPLAY_OP_IMPORT, (2560ULL << 48) | (1440ULL << 32) | 10240,
+                                      MLG_DISPLAY_CONFIRM};
+    const uint64_t displayImportBad[] = {MLG_DISPLAY_OP_IMPORT, (1440ULL << 32) | 10240, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayVerify[] = {MLG_DISPLAY_OP_VERIFY, (3ULL << 32) | 7, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayVerifyBad[] = {MLG_DISPLAY_OP_VERIFY, 7, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayPresent[] = {MLG_DISPLAY_OP_PRESENT, 3, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayPresentBad[] = {MLG_DISPLAY_OP_PRESENT, 1ULL << 32, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayOutput[] = {MLG_DISPLAY_OP_OUTPUT, 59951, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayOutputBad[] = {MLG_DISPLAY_OP_OUTPUT, 0, MLG_DISPLAY_CONFIRM};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayImport, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayImportBad, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayVerify, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayVerifyBad, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayPresent, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayPresentBad, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOutput, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOutputBad, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayStatus, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayModes, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayModesPattern, 3));
@@ -593,8 +626,10 @@ int main(int argc, char **argv) {
     else if (scenario == "stop-release") { resetError = -5; resetFailures = 1; s_stopping = true; }
     else if (scenario == "pci-fault-cause") { transportFault = DEXT_PCI_FAULT_CONFIG; holdError = -1; }
     else if (scenario == "selftest-parked") lxParked = 1;
-    else if (scenario == "display-showing") displayShowing = true;
-    else if (scenario == "display-quarantined") { displayShowing = true; s_dmaQuarantined = true; }
+    else if (scenario == "display-showing") { displayShowing = true; surfacesImported = 2; }
+    else if (scenario == "display-quarantined") {
+        displayShowing = true; surfacesImported = 1; s_dmaQuarantined = true;
+    }
     else if (scenario == "observer-reads") {
         // A running session admits observer reads; one is in flight and the
         // observers' render file is open.
@@ -634,13 +669,14 @@ int main(int argc, char **argv) {
     } else if (scenario == "display-showing") {
         // The pattern goes first, before Linux-file teardown and removal.
         const std::vector<std::string> expected{
-            "display_off", "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
+            "display_off", "surfaces_release", "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
             "irq_drained", "enqueue_finish", "device_free", "release_bar0",
             "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset",
             "super_client_stop", "super_client_stop", "super_driver_stop"};
         assert(events == expected && !displayShowing);
         fixture.assertReleased();
         expectLog("session close: turning the display test pattern off");
+        expectLog("session close: released 2 imported surface(s)");
     } else if (scenario == "success") {
         const std::vector<std::string> expected{
             "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",

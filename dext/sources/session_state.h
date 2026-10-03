@@ -188,13 +188,52 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_DISPLAY_OP_OFF      2u
 #define MLG_DISPLAY_OP_STATUS   3u
 #define MLG_DISPLAY_OP_MODES    4u
+/* A display agent's frames (docs/macos-displays.md). Imports belong to the
+ * client that made them: its Stop releases them, as a session close
+ * releases all; an output the client started is turned off with it.
+ *   IMPORT  [1] width << 48 | height << 32 | pitch (bytes per row)
+ *           struct in: the surface's memory (above 4096 bytes, so a memory
+ *           descriptor), whole 16 KiB pages; it is mapped for the GPU
+ *           (dext_dma_import) and imported (rt_surface_import)
+ *           scalar out [1] the handle; no struct out
+ *   VERIFY  [1] handle << 32 | seed: the GPU (SDMA) and a CPU view check
+ *           the surface against rt_surface_pattern(seed)
+ *           struct out: struct rt_surface_verify_result
+ *   RELEASE [1] handle
+ *   OUTPUT  [1] refresh in mHz; struct in: struct mlg_display_output; the
+ *           connector at that mode with two framebuffers (rt_display_output)
+ *           struct out: struct rt_display_report
+ *   PRESENT [1] handle; struct in: struct mlg_display_present; the dirty
+ *           rectangles copied and flipped (rt_display_present)
+ *           struct out: struct rt_display_present_stats */
+#define MLG_DISPLAY_OP_IMPORT   5u
+#define MLG_DISPLAY_OP_VERIFY   6u
+#define MLG_DISPLAY_OP_RELEASE  7u
+#define MLG_DISPLAY_OP_OUTPUT   8u
+#define MLG_DISPLAY_OP_PRESENT  9u
+#define MLG_DISPLAY_PRESENT_RECTS_MAX 255u
+
+struct mlg_display_output {
+	char connector[32];
+	uint32_t width, height;
+};
+
+struct mlg_display_rect {
+	uint32_t x, y, width, height;
+};
+
+struct mlg_display_present {
+	uint32_t count;
+	uint32_t reserved;
+	struct mlg_display_rect rect[]; /* count, at most MLG_DISPLAY_PRESENT_RECTS_MAX */
+};
 #define MLG_DISPLAY_PATTERN_BARS     0u
 #define MLG_DISPLAY_PATTERN_WHITE    1u
 #define MLG_DISPLAY_PATTERN_GRADIENT 2u
 #define MLG_DISPLAY_PATTERNS    3u
 #define MLG_DISPLAY_CONFIRM     0x44495350ULL /* "DISP" */
 #define MLG_DISPLAY_NAME_MAX    31u
-#define MLG_DISPLAY_WORDS       1u
+#define MLG_DISPLAY_WORDS       2u /* [0] status; [1] IMPORT's handle */
 #define MLG_DISPLAY_REPORT_MAX  1024u
 
 #define MLG_DRM_SELFTEST_CONFIRM    0x43535354ULL /* "CSST" */
@@ -273,9 +312,28 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_DRM_SELFTEST:
 		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
 	case MLG_SELECTOR_DISPLAY:
-		return input && input_count == 3 && input[2] == MLG_DISPLAY_CONFIRM &&
-		       input[0] <= MLG_DISPLAY_OP_MODES &&
-		       (input[0] == MLG_DISPLAY_OP_SHOW ? input[1] < MLG_DISPLAY_PATTERNS : !input[1]);
+		if (!input || input_count != 3 || input[2] != MLG_DISPLAY_CONFIRM)
+			return false;
+		switch (input[0]) {
+		case MLG_DISPLAY_OP_SHOW:
+			return input[1] < MLG_DISPLAY_PATTERNS;
+		case MLG_DISPLAY_OP_PROBE:
+		case MLG_DISPLAY_OP_OFF:
+		case MLG_DISPLAY_OP_STATUS:
+		case MLG_DISPLAY_OP_MODES:
+			return !input[1];
+		case MLG_DISPLAY_OP_IMPORT:
+			return (input[1] >> 48) && ((input[1] >> 32) & 0xffff) && (uint32_t)input[1];
+		case MLG_DISPLAY_OP_VERIFY:
+			return (input[1] >> 32) != 0;
+		case MLG_DISPLAY_OP_RELEASE:
+		case MLG_DISPLAY_OP_PRESENT:
+			return input[1] && input[1] <= UINT32_MAX;
+		case MLG_DISPLAY_OP_OUTPUT:
+			return input[1] && input[1] <= 1000000;
+		default:
+			return false;
+		}
 	case MLG_SELECTOR_POWER:
 		/* QUERY and WAIT; PREPARE/RESUME check the release entitlement. */
 		return input && input_count >= 1 && input_count <= 2 && input[0] <= MLG_POWER_OP_WAIT;
