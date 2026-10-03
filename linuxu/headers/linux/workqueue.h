@@ -204,6 +204,7 @@ extern void workqueue_flush(int cpu);
 extern bool workqueue_is_single_threaded(struct workqueue_struct *wq);
 
 extern bool work_pending(struct work_struct *w);
+#define delayed_work_pending(w)	work_pending(&(w)->work)
 
 
 static inline void destroy_work_on_stack(struct work_struct *work)

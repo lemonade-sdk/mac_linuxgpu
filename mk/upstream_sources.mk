@@ -1029,5 +1029,6 @@ UPSTREAM_HELPERS := \
 	shims/list_sort:lib/list_sort.c \
 	shims/rbtree:lib/rbtree.c \
 	shims/sort:lib/sort.c \
+	shims/uuid:lib/uuid.c \
 	drm/drm_buddy:drivers/gpu/drm/drm_buddy.c \
 	drm/gpu_buddy:drivers/gpu/buddy.c

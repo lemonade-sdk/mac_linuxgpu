@@ -68,7 +68,7 @@
 #define stringify(a)		__stringify(a)
 
 /* ---- type helpers ---- */
-#define typecheck(type, x)	((typeof(x) *)0)
+#include <linux/typecheck.h>
 #define __typecheck(type, x)	__builtin_types_compatible_p(typeof(x), type)
 
 /* ---- alignment / rounding ---- */

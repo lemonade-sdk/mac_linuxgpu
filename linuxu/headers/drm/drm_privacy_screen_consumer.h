@@ -1,43 +1,67 @@
-/* linuxu: SHIM (third_party/linux/include/drm/drm_privacy_screen_consumer.h) */
-#ifndef __DRM_PRIVACY_SCREEN_CONSUMER_H
-#define __DRM_PRIVACY_SCREEN_CONSUMER_H
+/* linuxu: AS-IS (third_party/linux/include/drm/drm_privacy_screen_consumer.h) - vendored verbatim from
+ * the pinned tree; kernel-only includes resolve to linuxu shadows. */
+/* SPDX-License-Identifier: MIT */
+/*
+ * Copyright (C) 2020 Red Hat, Inc.
+ *
+ * Authors:
+ * Hans de Goede <hdegoede@redhat.com>
+ */
 
-#include <linux/notifier.h>
-#include <drm/drm_connector.h>   /* enum drm_privacy_screen_status */
+#ifndef __DRM_PRIVACY_SCREEN_CONSUMER_H__
+#define __DRM_PRIVACY_SCREEN_CONSUMER_H__
+
+#include <linux/device.h>
+#include <drm/drm_connector.h>
 
 struct drm_privacy_screen;
-struct drm_privacy_screen_notifier;
 
-static inline int drm_privacy_screen_register_notifier(struct drm_privacy_screen *priv,
-						       struct drm_privacy_screen_notifier *notifier)
+#if IS_ENABLED(CONFIG_DRM_PRIVACY_SCREEN)
+struct drm_privacy_screen *drm_privacy_screen_get(struct device *dev,
+						  const char *con_id);
+void drm_privacy_screen_put(struct drm_privacy_screen *priv);
+
+int drm_privacy_screen_set_sw_state(struct drm_privacy_screen *priv,
+				    enum drm_privacy_screen_status sw_state);
+void drm_privacy_screen_get_state(struct drm_privacy_screen *priv,
+				  enum drm_privacy_screen_status *sw_state_ret,
+				  enum drm_privacy_screen_status *hw_state_ret);
+
+int drm_privacy_screen_register_notifier(struct drm_privacy_screen *priv,
+					 struct notifier_block *nb);
+int drm_privacy_screen_unregister_notifier(struct drm_privacy_screen *priv,
+					   struct notifier_block *nb);
+#else
+static inline struct drm_privacy_screen *drm_privacy_screen_get(struct device *dev,
+								const char *con_id)
 {
-	(void)priv; (void)notifier;
-	return 0;
+	return ERR_PTR(-ENODEV);
 }
-
-static inline int drm_privacy_screen_unregister_notifier(struct drm_privacy_screen *priv,
-							 struct drm_privacy_screen_notifier *notifier)
+static inline void drm_privacy_screen_put(struct drm_privacy_screen *priv)
 {
-	(void)priv; (void)notifier;
-	return 0;
 }
-
-
-static inline int drm_privacy_screen_get_state(struct drm_privacy_screen *priv,
-					       enum drm_privacy_screen_status *sw,
-					       enum drm_privacy_screen_status *hw)
-{
-	(void)priv;
-	if (sw) *sw = PRIVACY_SCREEN_DISABLED;
-	if (hw) *hw = PRIVACY_SCREEN_DISABLED;
-	return 0;
-}
-
 static inline int drm_privacy_screen_set_sw_state(struct drm_privacy_screen *priv,
-						  enum drm_privacy_screen_status sw)
+						  enum drm_privacy_screen_status sw_state)
 {
-	(void)priv; (void)sw;
-	return 0;
+	return -ENODEV;
 }
+static inline void drm_privacy_screen_get_state(struct drm_privacy_screen *priv,
+						enum drm_privacy_screen_status *sw_state_ret,
+						enum drm_privacy_screen_status *hw_state_ret)
+{
+	*sw_state_ret = PRIVACY_SCREEN_DISABLED;
+	*hw_state_ret = PRIVACY_SCREEN_DISABLED;
+}
+static inline int drm_privacy_screen_register_notifier(struct drm_privacy_screen *priv,
+						       struct notifier_block *nb)
+{
+	return -ENODEV;
+}
+static inline int drm_privacy_screen_unregister_notifier(struct drm_privacy_screen *priv,
+							 struct notifier_block *nb)
+{
+	return -ENODEV;
+}
+#endif
 
 #endif

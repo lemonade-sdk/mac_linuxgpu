@@ -26,6 +26,7 @@
 #define preempt_count_inc()	do { } while (0)
 #define preempt_count_dec()	do { } while (0)
 #define might_sleep()		do { } while (0)
+#define might_sleep_if(cond)	do { if (cond) might_sleep(); } while (0)
 #define might_resched()		do { } while (0)
 #define might_resched_rcu()	do { } while (0)
 #define cond_resched()		false

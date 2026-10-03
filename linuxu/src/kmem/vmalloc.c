@@ -24,6 +24,11 @@ void *vmalloc(unsigned long size)
 	return size ? malloc(size) : NULL;
 }
 
+void *vzalloc(unsigned long size)
+{
+	return size ? calloc(1, size) : NULL;
+}
+
 void vfree(const void *addr)
 {
 	free((void *)addr);

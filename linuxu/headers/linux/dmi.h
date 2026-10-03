@@ -10,6 +10,7 @@
 
 #include <linux/types.h>
 #include <linux/errno.h>
+#include <linux/err.h>
 
 /* enum dmi_field is in mod_devicetable.h */
 enum dmi_field {

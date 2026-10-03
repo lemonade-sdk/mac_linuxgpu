@@ -22,7 +22,8 @@
       "/lib/kfifo.c",
       "/lib/list_sort.c",
       "/lib/rbtree.c",
-      "/lib/sort.c"
+      "/lib/sort.c",
+      "/lib/uuid.c"
     ]
   },
   "patches": [

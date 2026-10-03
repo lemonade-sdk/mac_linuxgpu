@@ -108,6 +108,9 @@ struct kmem_cache;
 
 #include <linux/compiler.h>
 #define ARCH_DMA_MINALIGN 64
+/* kmalloc() aligns every allocation to ARCH_DMA_MINALIGN (kmemalloc.c), the
+ * upstream rule when no DMA bounce buffering is configured. */
+#define ARCH_KMALLOC_MINALIGN ARCH_DMA_MINALIGN
 #include <stdarg.h>
 extern void *kmalloc(size_t size, gfp_t flags);
 extern void *kzalloc(size_t size, gfp_t flags);

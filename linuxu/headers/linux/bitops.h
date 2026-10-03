@@ -13,6 +13,8 @@
 /* ---- bit indices: __ffs/__fls are zero-based; ffs/fls are one-based. ---- */
 #define __ffs(x) __builtin_ctzl((unsigned long)(x))
 #define __ffs64(x) __builtin_ctzll((unsigned long long)(x))
+/* First zero bit; undefined when no zero bit exists, as upstream. */
+#define ffz(x) __ffs(~(unsigned long)(x))
 #define __fls(x) (BITS_PER_LONG - 1 - __builtin_clzl((unsigned long)(x)))
 #define __fls64(x) (63 - __builtin_clzll((unsigned long long)(x)))
 static __always_inline int generic_ffs(int x)
