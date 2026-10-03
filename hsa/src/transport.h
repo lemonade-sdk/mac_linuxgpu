@@ -216,6 +216,9 @@ public:
     virtual hsa_status_t memoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t memoryAvailable(uint64_t &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
     virtual hsa_status_t allocateBuffer(uint64_t, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    // What this connection holds from the driver and where it was asked for
+    // (allocation_census.h); empty when the transport keeps no census.
+    virtual std::string memoryReport() { return {}; }
     virtual hsa_status_t freeBuffer(const DeviceBuffer &) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t readBuffer(const DeviceBuffer &, uint64_t, void *, size_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t writeBuffer(const DeviceBuffer &, uint64_t, const void *, size_t) { return HSA_STATUS_ERROR; }

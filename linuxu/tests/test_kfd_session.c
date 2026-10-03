@@ -219,6 +219,23 @@ int main(void)
 	assert(GET_GPU_ID(host_info.handle) == TEST_GPU_ID);
 	assert(kgd_allocs == 2 && kgd_maps == 2);
 	{
+		/* A VRAM allocation the VRAM manager cannot place without eviction
+		 * is refused before KFD sees it; one that fits is not. */
+		struct ttm_resource_manager *man = &adev->mman.vram_mgr.manager;
+		struct rt_kfd_bo *tight = NULL;
+
+		spin_lock_init(&adev->mman.bdev.lru_lock);
+		man->size = TEST_VRAM_BYTES;
+		man->usage = TEST_VRAM_BYTES - (160ULL << 20);
+		assert(rt_kfd_bo_alloc(s, 64ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE, &tight) == -ENOMEM);
+		assert(!tight && kgd_allocs == 2);
+		assert(!rt_kfd_bo_alloc(s, 16ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE, &tight) && tight);
+		assert(kgd_allocs == 3);
+		assert(!rt_kfd_bo_free(s, tight));
+		man->size = 0;
+		man->usage = 0;
+	}
+	{
 		struct range_count c = {0};
 		assert(!rt_kfd_bo_cpu_ranges(s, host, count_range, &c));
 		assert(c.bytes == host_info.size && c.runs >= 1);

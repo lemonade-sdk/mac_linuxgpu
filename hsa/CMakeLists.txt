@@ -30,6 +30,7 @@ set(HSA_RUNTIME_SOURCES
   src/virtual_memory.cpp
   src/host_services.cpp
   src/host_window.cpp
+  src/allocation_census.cpp
   src/ipc_memory.cpp
   src/ipc_signal.cpp
   src/platform_extensions.cpp
@@ -138,4 +139,9 @@ if(BUILD_TESTING)
   target_compile_options(hsa-host-window-test PRIVATE -Wall -Wextra -Werror)
   target_include_directories(hsa-host-window-test PRIVATE src)
   add_test(NAME hsa-host-window COMMAND hsa-host-window-test)
+
+  add_executable(hsa-allocation-census-test tests/test_allocation_census.cpp src/allocation_census.cpp)
+  target_compile_options(hsa-allocation-census-test PRIVATE -Wall -Wextra -Werror -O1)
+  target_include_directories(hsa-allocation-census-test PRIVATE src)
+  add_test(NAME hsa-allocation-census COMMAND hsa-allocation-census-test)
 endif()

@@ -105,6 +105,17 @@ hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void
 __attribute__((visibility("default")))
 void mac_hsa_set_host_memory_budget(uint64_t bytes);
 
+// What every GPU this runtime opened holds from its driver, and where in the
+// process each buffer was asked for: buffer counts and bytes (VRAM and
+// shared), a VRAM size histogram, and the callers holding the most VRAM with
+// their return addresses. Text, one fact per line. Writes at most `capacity`
+// bytes including the terminating NUL and returns the length of the whole
+// report, so a short buffer can be retried with the size returned. 0 before
+// hsa_init. MAC_HSA_VRAM_TRACE=1 also logs every buffer as it is allocated
+// and freed.
+__attribute__((visibility("default")))
+size_t mac_hsa_memory_report(char *buffer, size_t capacity);
+
 enum {
     MAC_HSA_SYNC_CPU_LOCAL_ATOMICS = 1u << 0,
     MAC_HSA_SYNC_GPU_LOCAL_ATOMICS = 1u << 1,

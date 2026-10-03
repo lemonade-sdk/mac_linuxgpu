@@ -12,12 +12,12 @@ clang++ -std=c++20 -Wall -Wextra -Werror "${sanitize[@]}" -Ihsa/src -Ihsa/third_
 "$test_dir/test_shim_init_diagnostics"
 clang++ -std=c++20 -Wall -Wextra -Werror "${sanitize[@]}" -ffunction-sections -fdata-sections \
   -Ihsa/src -Ihsa/third_party/hsa/include -Ihost \
-  hsa/tests/test_shim_init_transport.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp \
+  hsa/tests/test_shim_init_transport.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp hsa/src/allocation_census.cpp \
   -framework IOKit -framework CoreFoundation -Wl,-dead_strip \
   -o "$test_dir/test_shim_init_transport"
 clang++ -std=c++20 -Wall -Wextra -Werror "${sanitize[@]}" -ffunction-sections -fdata-sections \
   -Ihsa/src -Ihsa/third_party/hsa/include -Ihost \
-  hsa/tests/test_transport_dispatch.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp \
+  hsa/tests/test_transport_dispatch.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp hsa/src/allocation_census.cpp \
   -framework IOKit -framework CoreFoundation -Wl,-dead_strip \
   -o "$test_dir/test_transport_dispatch"
 "$test_dir/test_transport_dispatch"
@@ -38,7 +38,7 @@ clang -std=gnu11 -Wall -Wextra -Werror "${sanitize[@]}" -Ihost \
   -c host/fw_mailbox_iokit.c -o "$test_dir/fw_mailbox_iokit.o"
 clang++ -std=c++20 -Wall -Wextra -Werror "${sanitize[@]}" -ffunction-sections -fdata-sections \
   -Ihsa/src -Ihsa/third_party/hsa/include -Ihost -Ilinuxu/src \
-  hsa/tests/test_shim_init_firmware.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp \
+  hsa/tests/test_shim_init_firmware.cpp hsa/src/device_init.cpp hsa/src/isa_target.cpp hsa/src/host_window.cpp hsa/src/allocation_census.cpp \
   "$test_dir/fw_mailbox.o" "$test_dir/printk.o" "$test_dir/fw_mailbox_service.o" \
   "$test_dir/fw_mailbox_iokit.o" -framework IOKit -framework CoreFoundation -Wl,-dead_strip \
   -o "$test_dir/test_shim_init_firmware"

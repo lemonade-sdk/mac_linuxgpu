@@ -4,6 +4,7 @@
 #include "host_window.h"
 #include <algorithm>
 #include <array>
+#include <vector>
 #include <cstdio>
 #include <limits>
 #include <system_error>
@@ -237,6 +238,23 @@ HSA_API_EXPORT hsa_status_t mac_hsa_memory_get_sync_capabilities(hsa_agent_t han
     return HSA_STATUS_SUCCESS;
 }
 void mac_hsa_set_host_memory_budget(uint64_t bytes) { mac_hsa::setHostMemoryBudget(bytes); }
+size_t mac_hsa_memory_report(char *buffer, size_t capacity) {
+    std::vector<std::shared_ptr<mac_hsa::Connection>> connections;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return 0;
+        for (const auto &agent : agents) if (agent.connection) connections.push_back(agent.connection);
+    }
+    std::string text;
+    try { for (const auto &c : connections) text += c->memoryReport(); }
+    catch (const std::bad_alloc &) { return 0; }
+    if (buffer && capacity) {
+        const size_t n = std::min(capacity - 1, text.size());
+        std::memcpy(buffer, text.data(), n);
+        buffer[n] = '\0';
+    }
+    return text.size();
+}
 hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void **out) {
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     *out = nullptr;

@@ -9,6 +9,7 @@
 #include <TargetConditionals.h>
 #include "mach_vm_compat.h"
 #include "host_window.h"
+#include "allocation_census.h"
 #include <atomic>
 #include <new>
 #include <array>
@@ -161,6 +162,10 @@ public:
         return scalar(21,input,out);
     }
     bool supportsSharedBuffers() const override { return true; }
+    std::string memoryReport() override {
+        std::lock_guard lock(sessionMutex);
+        return census.report();
+    }
     hsa_status_t sharedMemoryCapacity(uint64_t &bytes) override {
         std::lock_guard lock(sessionMutex);
         auto status = ensureReady();
@@ -235,8 +240,10 @@ public:
         if (!bytes || bytes > capacity || bytes > UINT64_MAX - 16383)
             return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         const auto allocated = allocateRaw((bytes + 16383) & ~uint64_t(16383), 3, buffer);
-        if (allocated == HSA_STATUS_SUCCESS) { vramBytes += buffer.size; ++vramCount; }
-        else reportAllocationFailureLocked("VRAM", bytes, allocated);
+        if (allocated == HSA_STATUS_SUCCESS) {
+            vramBytes += buffer.size; ++vramCount;
+            census.add(buffer.handle, AllocationCensus::Kind::VRAM, buffer.size);
+        } else reportAllocationFailureLocked("VRAM", bytes, allocated);
         return allocated;
     }
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override {
@@ -245,7 +252,10 @@ public:
         if (sharedBuffers.contains(buffer.handle)) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
         const auto status = scalar(17, {&buffer.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
-        else { vramBytes -= std::min(vramBytes, buffer.size); vramCount -= vramCount != 0; }
+        else {
+            vramBytes -= std::min(vramBytes, buffer.size); vramCount -= vramCount != 0;
+            census.remove(buffer.handle);
+        }
         return status;
     }
     hsa_status_t readBuffer(const DeviceBuffer &buffer, uint64_t offset, void *out, size_t bytes) override {
@@ -313,6 +323,7 @@ public:
         }
         hostReservation.give(buffer.device.address, buffer.device.size);
         sharedBytes -= std::min(sharedBytes, buffer.device.size);
+        census.remove(buffer.device.handle);
         sharedBuffers.erase(found);
         const auto status = scalar(17, {&buffer.device.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
@@ -632,6 +643,7 @@ private:
     // Device-local buffers this connection holds, and the IOReturn of the
     // last RPC: what an allocation failure report states.
     uint64_t vramBytes = 0, vramCount = 0;
+    AllocationCensus census;
     uint32_t lastIOReturn = 0;
     std::chrono::steady_clock::time_point lastFailureReport{};
     // An allocation the driver refused: what was asked, what the driver
@@ -647,6 +659,7 @@ private:
             "this process holds %llu VRAM buffers (%llu bytes) and %zu shared buffers (%llu bytes)\n",
             kind, (unsigned long long)bytes, raw, unsigned(status), (unsigned long long)vramCount,
             (unsigned long long)vramBytes, sharedBuffers.size(), (unsigned long long)sharedBytes);
+        std::fputs(census.report().c_str(), stderr);
         if (state != State::Ready || !linuxShim) return;
         std::array<uint64_t, 6> usage{};
         const uint64_t tag = 9;
@@ -989,6 +1002,7 @@ private:
                     try {
                         sharedBuffers.emplace(buffer.device.handle, buffer);
                         sharedBytes += buffer.device.size;
+                        census.add(buffer.device.handle, AllocationCensus::Kind::Shared, buffer.device.size);
                         std::memset(buffer.host, 0, size);
                         std::atomic_thread_fence(std::memory_order_seq_cst);
                         out = buffer; return HSA_STATUS_SUCCESS;
