@@ -1171,8 +1171,18 @@ int pci_is_root_bus(struct pci_bus *bus)
 #endif
 }
 
+void linuxu_pci_mark_removed(struct pci_dev *dev)
+{
+	if (dev)
+		__atomic_store_n(&dev->error_state, pci_channel_io_perm_failure,
+				 __ATOMIC_RELEASE);
+}
+
 int pci_device_is_present(struct pci_dev *dev)
 {
+	if (dev && __atomic_load_n(&dev->error_state, __ATOMIC_ACQUIRE) ==
+		   pci_channel_io_perm_failure)
+		return 0;
 #ifdef LINUXU_DEXT_DK
 	u32 identity = UINT32_MAX;
 	return dev && dext_pci_config_read32(0, &identity) == 0 &&
@@ -1185,6 +1195,9 @@ int pci_device_is_present(struct pci_dev *dev)
 
 int pci_dev_is_disconnected(struct pci_dev *dev)
 {
+	if (dev && __atomic_load_n(&dev->error_state, __ATOMIC_ACQUIRE) ==
+		   pci_channel_io_perm_failure)
+		return 1;
 #ifdef LINUXU_DEXT_DK
 	return !pci_device_is_present(dev);
 #else

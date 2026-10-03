@@ -104,6 +104,10 @@ int dext_compute_start(struct pci_dev *pdev);
 /* The step and error of the last failed dext_compute_start (NULL, 0 if none). */
 void dext_compute_start_failure(const char **step, int *error);
 int dext_compute_stop(void);
+/* The device left the bus (surprise removal, rt/removal.h): nothing the
+ * runtime kept for GPU work that might still run needs keeping any more,
+ * so stopping and client release no longer refuse on that account. */
+void dext_compute_device_removed(void);
 /* Serialized by the driver lifecycle queue. Handles and mapped memory types
  * belong to the selected client; client zero is reserved for internal use. */
 uint64_t dext_compute_select_client(uint64_t client);

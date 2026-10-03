@@ -83,6 +83,7 @@
 #include <rt/klog.h>
 #include <rt/fw_mailbox.h>
 #include <rt/power.h>
+#include <rt/removal.h>
 
 extern "C" uint64_t linuxu_dart_budget(void);
 
@@ -279,6 +280,8 @@ static bool             s_pciIsolationAttempted = false;
 static bool             s_finalCleanup = false;
 static bool             s_irqDrainFailed = false;
 static bool             s_releaseFailed = false;
+// Surprise removal: the GPU left the bus (a Thunderbolt unplug).
+static bool             s_deviceRemoved = false;
 static bool             s_creatingObserver = false;
 static bool             s_creatingLinuxFile = false;
 // DriverKit runs a new user client's Start after NewUserClient returns, not
@@ -577,6 +580,7 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_rawBARLease.hasMappings()) flags |= MLG_SESSION_FLAG_RAW_BAR_MAPPED;
     if (s_rtDevice) flags |= MLG_SESSION_FLAG_RUNTIME_DEVICE;
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
+    if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     out[0] = MLG_SESSION_STATE_VERSION;
     out[1] = flags;
     out[2] = s_quarantineCause;
@@ -592,7 +596,14 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
 // DMA descriptor released: close the provider normally and finish Stops.
 static void complete_session_close(MacLinuxGPU *driver)
 {
-    dext_close();
+    if (s_deviceRemoved) {
+        const int closed = dext_pci_close_removed();
+        MACLINUXGPU_LOG("removal: provider %s (%d); the next device probes afresh",
+                        closed ? "close deferred" : "closed", closed);
+        s_deviceRemoved = false;
+    } else {
+        dext_close();
+    }
     rt_gart_reset();
     s_dmaShutdownPrepared = false;
     s_pciOpen = false;
@@ -655,6 +666,42 @@ static uint32_t release_quarantine(MacLinuxGPU *driver)
     return MLG_RELEASE_READY;
 }
 
+// Device power (power_state.h): the session is lost with the device.
+static void power_device_removed();
+
+// Surprise removal, as Linux handles it (pci_dev_set_disconnected, then
+// amdgpu_pci_remove with the device gone): from the moment the device stops
+// answering, nothing touches it again (no MMIO, configuration access, reset
+// or isolation), GPU work completes with -ECANCELED (rt/removal.h), and the
+// session closes all the way: a device that is gone can reach no memory, so
+// nothing needs keeping and the provider is closed instead of held.
+static void note_device_removed(const char *where)
+{
+    if (s_deviceRemoved) return;
+    s_deviceRemoved = true;
+    MACLINUXGPU_LOG("device removed from the bus (%s): no further hardware access; "
+                    "the session closes without waiting for the GPU", where);
+    dext_pci_mark_removed();
+    if (s_rtDevice != nullptr) {
+        const int begun = rt_removal_begin(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
+        if (begun) MACLINUXGPU_LOG("removal: GPU work completion thread not started (%d)", begun);
+    }
+    dext_compute_device_removed();
+    const int kept = dext_dma_device_removed();
+    if (kept) MACLINUXGPU_LOG("removal: %d DMA descriptor(s) could not be completed; backing retained", kept);
+    power_device_removed();
+}
+
+// Whether the device is still on the bus; once it is not, removal begins.
+// Asked when a client or the driver stops: an unplug terminates the PCI
+// provider and its clients.
+static bool device_removed(const char *where)
+{
+    if (!s_deviceRemoved && s_pciOpen && !dext_pci_device_present())
+        note_device_removed(where);
+    return s_deviceRemoved;
+}
+
 static void close_session(MacLinuxGPU *driver)
 {
     if (s_sessionClosing) return;
@@ -678,7 +725,7 @@ static void close_session(MacLinuxGPU *driver)
     }
     // Linux-file processes exit while the driver runs; a self-test whose
     // GPU work never completed leaves that work uncertain.
-    if (lx_teardown_all()) {
+    if (lx_teardown_all() && !s_deviceRemoved) {
         s_dmaQuarantined = true;
         note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, -16);
     }
@@ -687,12 +734,15 @@ static void close_session(MacLinuxGPU *driver)
         s_dmaQuarantined, s_participants);
     // Stop is also reached through forced service termination. It provides
     // no proof that a client's raw BAR mappings have been revoked yet.
-    if (s_rawBARLease.hasMappings()) {
+    if (s_rawBARLease.hasMappings() && s_deviceRemoved) {
+        // The mapped BAR belongs to a device that is gone; it carries no DMA.
+        MACLINUXGPU_LOG("session close: a client still maps a BAR of the removed device");
+    } else if (s_rawBARLease.hasMappings()) {
         s_dmaQuarantined = true;
         note_quarantine(MLG_QUARANTINE_RAW_BAR_MAPPING, 0);
         MACLINUXGPU_LOG("session close: raw BAR mapping lifetime uncertain; retaining backing");
     }
-    if (s_pciOpen && !s_dmaQuarantined) {
+    if (s_pciOpen && !s_dmaQuarantined && !s_deviceRemoved) {
         const int held = dext_dma_begin_shutdown(linuxu_dart_budget());
         if (held != 0) {
             s_dmaQuarantined = true;
@@ -706,7 +756,9 @@ static void close_session(MacLinuxGPU *driver)
     // Their released DMA mappings stay pinned until the post-drain reset.
     if (!s_dmaQuarantined) {
         const int stopped = dext_compute_stop();
-        if (stopped != 0) {
+        if (stopped != 0 && s_deviceRemoved) {
+            MACLINUXGPU_LOG("session close: compute stop after removal returned %d; nothing can run", stopped);
+        } else if (stopped != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, stopped);
             MACLINUXGPU_LOG("session close: GPU completion uncertain (%d); retaining runtime", stopped);
@@ -719,6 +771,9 @@ static void close_session(MacLinuxGPU *driver)
         // The observers' render file closes like any client's, first.
         if (auto *drm = __atomic_exchange_n(&s_observerDrm, nullptr, __ATOMIC_ACQ_REL))
             rt_drm_info_close(drm);
+        // A removed device's GPU work stops being completed here; upstream
+        // removal finishes the rest itself (amdgpu_fence_driver_hw_fini).
+        if (s_deviceRemoved) rt_removal_end();
         MACLINUXGPU_LOG("session close: removing upstream driver");
         linuxu_driver_shutdown();
         s_modulesRunning = false;
@@ -740,12 +795,56 @@ static void close_session(MacLinuxGPU *driver)
     }
 }
 
+// A session already closing or quarantined when the removal was seen: the
+// device is gone, so what the quarantine kept for it is free. Finish what
+// the close left (compute, upstream removal, runtime device, DMA) and close
+// the provider. Waits for an interrupt drain still pending (FinishSession
+// calls this then); keeps the quarantine only when interrupt sources could
+// not be cancelled, as the provider cannot close under live callbacks.
+static void release_removed(MacLinuxGPU *driver)
+{
+    if (!s_deviceRemoved) return;
+    if (!s_finalCleanup) {
+        MACLINUXGPU_LOG("removal: waiting for the interrupt drain before releasing the session");
+        return;
+    }
+    if (s_irqDrainFailed) {
+        MACLINUXGPU_LOG("removal: interrupt sources still own callbacks; the session stays quarantined");
+        return;
+    }
+    s_dmaQuarantined = false;
+    if (s_modulesRunning) {
+        const int stopped = dext_compute_stop();
+        if (stopped) MACLINUXGPU_LOG("removal: compute stop returned %d; nothing can run", stopped);
+        rt_removal_end();
+        if (auto *drm = __atomic_exchange_n(&s_observerDrm, nullptr, __ATOMIC_ACQ_REL))
+            rt_drm_info_close(drm);
+        MACLINUXGPU_LOG("removal: removing upstream driver");
+        linuxu_driver_shutdown();
+        s_modulesRunning = false;
+    }
+    if (s_rtDevice != nullptr) {
+        rt_device_free(s_rtDevice);
+        s_rtDevice = nullptr;
+    }
+    (void)dext_bar0_cpu_release_orphaned();
+    (void)dext_dma_device_removed();
+    const int released = dext_dma_fini();
+    if (released)
+        MACLINUXGPU_LOG("removal: DMA backing still owned (%d) is kept; the provider closes", released);
+    dext_compute_set_pci_open(false);
+    dext_compute_set_stage(DEXT_COMPUTE_STAGE_NONE);
+    MACLINUXGPU_LOG("removal: session released after the device left the bus");
+    complete_session_close(driver);
+}
+
 static kern_return_t ensure_open(MacLinuxGPUUserClient *client)
 {
     if (!client->ivars || !client->ivars->ownerDriver || s_stopping ||
         client->ivars->stopping || !s_retainedPCI)
         return kIOReturnNotAttached;
     if (client->ivars->observer) return kIOReturnNotPermitted;
+    if (s_deviceRemoved) return kIOReturnNotAttached;
     if (s_sessionClosing || s_dmaQuarantined) return kIOReturnNotReady;
     if (!s_rawBARLease.allowsJoin(client->ivars->clientID)) return kIOReturnBusy;
     if (client->ivars->sessionGeneration == s_sessionGeneration)
@@ -1072,6 +1171,12 @@ static void power_before_removal()
     MACLINUXGPU_LOG("power: KFD suspend handed back before upstream removal (%d)", r);
 }
 
+static void power_device_removed()
+{
+    s_power.flags |= MLG_POWER_FLAG_LINK_DOWN;
+    power_set(MLG_POWER_LOST, MLG_POWER_CAUSE_DEVICE_REMOVED, -19 /* ENODEV */);
+}
+
 static bool power_hold(uint64_t client, bool take)
 {
     for (auto &holder : s_powerHolders) {
@@ -1359,6 +1464,11 @@ IMPL(MacLinuxGPU, Stop)
     retain();
     provider->retain();
     s_stopProvider = provider;
+    // An unplug terminates the provider: see whether the device is gone
+    // before anything else touches it.
+    const bool alreadyClosing = s_sessionClosing;
+    if (device_removed("provider stop") && alreadyClosing && s_dmaQuarantined)
+        release_removed(this);
     close_session(this);
     // A quarantine that is already provably quiescent must not stall system
     // extension deactivation or upgrade; otherwise FinishSession retries.
@@ -1370,15 +1480,26 @@ void
 MacLinuxGPU::FinishSession()
 {
     s_finalCleanup = true;
-    MACLINUXGPU_LOG("session close: final cleanup entered (prepared=%d quarantine=%d)",
-        s_dmaShutdownPrepared, s_dmaQuarantined);
+    MACLINUXGPU_LOG("session close: final cleanup entered (prepared=%d quarantine=%d removed=%d)",
+        s_dmaShutdownPrepared, s_dmaQuarantined, s_deviceRemoved);
+    if (s_deviceRemoved && s_dmaQuarantined) {
+        release_removed(this);
+        return;
+    }
     // Compute/upstream producers have stopped and IRQ actions are drained.
     // Release final device-managed aliases under the DMA hold before FLR.
     if (s_rtDevice != nullptr && !s_dmaQuarantined) {
         rt_device_free(s_rtDevice);
         s_rtDevice = nullptr;
     }
-    if (s_dmaShutdownPrepared && !s_dmaQuarantined) {
+    if (s_deviceRemoved && !s_dmaQuarantined) {
+        // No reset or isolation of a device that is gone: drop the BAR0
+        // aperture mapping and complete what DMA was still retired.
+        const int aliases = dext_bar0_cpu_release_orphaned();
+        if (aliases > 0)
+            MACLINUXGPU_LOG("removal: released %d BAR0 CPU mapping reference(s)", aliases);
+        (void)dext_dma_device_removed();
+    } else if (s_dmaShutdownPrepared && !s_dmaQuarantined) {
         // With every Linux owner gone, the only BAR0 CPU mapping left is the
         // aperture upstream does not unmap after drm_dev_unplug().
         const int aliases = dext_bar0_cpu_release_orphaned();
@@ -1395,7 +1516,11 @@ MacLinuxGPU::FinishSession()
     dext_compute_set_stage(DEXT_COMPUTE_STAGE_NONE);
     if (!s_dmaQuarantined) {
         const int released = dext_dma_fini();
-        if (released != 0) {
+        if (released != 0 && s_deviceRemoved) {
+            // Nothing on the bus can use what is left: keep the backing,
+            // but never the provider of a device that is gone.
+            MACLINUXGPU_LOG("removal: DMA backing still owned (%d) is kept; the provider closes", released);
+        } else if (released != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_DMA_RETAINED, released);
             MACLINUXGPU_LOG("session close: live DMA backing retained (%d)", released);
@@ -1681,6 +1806,9 @@ IMPL(MacLinuxGPUUserClient, Stop)
         FinishStop(provider);
         return kIOReturnSuccess;
     }
+    // An unplug terminates the clients before the provider: see whether the
+    // device is gone before this client's teardown waits on it.
+    (void)device_removed("client stop");
     if (ivars->linuxFile) {
         lx_client_stop(this, provider);
         return kIOReturnSuccess;
@@ -1689,7 +1817,9 @@ IMPL(MacLinuxGPUUserClient, Stop)
     if (participant && s_participants > 1 && !s_sessionClosing) {
         // IRQ delivery stays active while this client's queues are removed.
         const int released = dext_compute_release_client(ivars->clientID);
-        if (released != 0) {
+        if (released != 0 && s_deviceRemoved) {
+            MACLINUXGPU_LOG("client close after removal: cleanup returned %d; nothing can run", released);
+        } else if (released != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_CLIENT_RELEASE, released);
             MACLINUXGPU_LOG("client close: cleanup failed (%d); retaining uncertain shared-session backing", released);

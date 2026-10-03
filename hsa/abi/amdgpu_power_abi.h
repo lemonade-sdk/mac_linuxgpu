@@ -32,6 +32,10 @@ enum Flag : uint32_t {
 
 enum Op : uint64_t { Query = 0, Prepare = 1, Resume = 2, Wait = 3 };
 
+// The cause of a loss the runtime reports itself when the driver no longer
+// answers because the device left the bus (MLG_POWER_CAUSE_DEVICE_REMOVED).
+constexpr uint32_t kCauseDeviceRemoved = 13;
+
 // IOReturn the driver gives a selector that would put work on the GPU
 // while the device is suspending, suspended or resuming (kIOReturnOffline):
 // nothing was submitted; retry after resume.

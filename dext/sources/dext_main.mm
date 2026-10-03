@@ -292,6 +292,79 @@ extern "C" int dext_pci_shutdown_reset(void)
 	return result;
 }
 
+/* ---- surprise removal (the GPU left the bus) ----
+ * A device that is gone cannot reach host memory and must not be touched:
+ * admission closes for good, nothing resets or isolates it, and the
+ * provider is closed as soon as no access is in flight, so the dext never
+ * holds a vanished device. */
+static bool g_pci_removed;
+
+extern "C" int dext_pci_device_present(void)
+{
+	IOPCIDevice *pci;
+	{
+		dext_pci_control_guard control;
+		pci = g_pci;
+		if (pci) pci->retain();
+	}
+	if (!pci) return 1;
+	/* Directly on the provider: admission may already be closed by the
+	 * fault that made the caller ask. A device off the bus reads ~0. */
+	uint32_t identity = UINT32_MAX;
+	pci->ConfigurationRead32(0, &identity);
+	pci->release();
+	const uint16_t vendor = (uint16_t)identity;
+	return vendor != 0xffff && vendor != 0;
+}
+
+extern "C" void dext_pci_mark_removed(void)
+{
+	__atomic_store_n(&g_pci_removed, true, __ATOMIC_RELEASE);
+	g_pci_access.block();
+}
+
+extern "C" int dext_pci_removed(void)
+{
+	return __atomic_load_n(&g_pci_removed, __ATOMIC_ACQUIRE);
+}
+
+/* Close a removed device's provider once every admitted access left (at
+ * most a second; an access to a vanished device fails at once), then
+ * reopen admission and clear the fault records for the next device. 0, or
+ * -16 while interrupt sources or an access remain, -22 if not removed. */
+extern "C" int dext_pci_close_removed(void)
+{
+	if (!dext_pci_removed()) return -22;
+	for (unsigned waited = 0; !g_pci_access.drained(); ++waited) {
+		if (waited == 1000) return -16;
+		IOSleep(1);
+	}
+	dext_pci_control_guard control;
+	if (!g_pci_access.drained() ||
+	    __atomic_load_n(&g_irq_draining, __ATOMIC_ACQUIRE) ||
+	    g_irq_vector_count || g_irq_queue)
+		return -16;
+	if (g_reg_token) {
+		rt_mmio_free_token(g_reg_token);
+		g_reg_token = 0;
+	}
+	g_reg_bar = UINT8_MAX;
+	g_reg_window = 0;
+	if (g_pci_open && g_pci && g_pci_client)
+		g_pci->Close(g_pci_client, 0);
+	g_pci_open = false;
+	g_pci = nullptr;
+	g_pci_client = nullptr;
+	__atomic_store_n(&g_pci_resetting, false, __ATOMIC_RELEASE);
+	(void)g_pci_access.reopen();
+	__atomic_store_n(&g_transport_fault_offset, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&g_transport_fault, DEXT_PCI_FAULT_NONE, __ATOMIC_RELEASE);
+	__atomic_store_n(&g_transport_sentinel_offset, 0, __ATOMIC_RELAXED);
+	__atomic_store_n(&g_transport_sentinel, DEXT_PCI_SENTINEL_NONE, __ATOMIC_RELEASE);
+	__atomic_store_n(&g_pci_removed, false, __ATOMIC_RELEASE);
+	return 0;
+}
+
 extern "C" int dext_pci_quarantine(void)
 {
 	IOPCIDevice *pci;

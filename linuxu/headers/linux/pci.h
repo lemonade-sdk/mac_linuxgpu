@@ -165,6 +165,14 @@ struct linuxu_pci_state {
 };
 struct pci_saved_state;
 
+typedef enum {
+	pci_channel_state_normal = 0,
+	pci_channel_io_normal,
+	pci_channel_io_frozen,
+	pci_channel_io_disabled,
+	pci_channel_io_perm_failure,
+} pci_channel_state_t;
+
 struct pci_dev {
 	u16		vendor;
 	u16		device;
@@ -207,6 +215,9 @@ struct pci_dev {
 	u32		saved_config_space[64];
 	struct linuxu_pci_state saved_state;
 	bool state_saved;
+	/* pci_channel_io_perm_failure once the device was surprise-removed
+	 * (linuxu_pci_mark_removed), as the Linux PCI core sets it. */
+	pci_channel_state_t error_state;
 };
 
 /* ---- static inline helpers ---- */
@@ -334,13 +345,6 @@ extern struct pci_dev *pci_get_device(unsigned int vendor, unsigned int device,
 				      struct pci_dev *prev);
 extern void pci_dev_put(struct pci_dev *dev);
 extern struct pci_dev *pci_dev_get(struct pci_dev *dev);
-typedef enum {
-	pci_channel_state_normal = 0,
-	pci_channel_io_normal,
-	pci_channel_io_frozen,
-	pci_channel_io_disabled,
-	pci_channel_io_perm_failure,
-} pci_channel_state_t;
 
 typedef enum {
 	pci_ers_result_success = 0,
@@ -405,6 +409,15 @@ extern int pci_config_reset(struct pci_dev *dev);
 extern struct pci_dev *pci_upstream_bridge(struct pci_dev *dev);
 extern int pci_is_root_bus(struct pci_bus *bus);
 extern int pci_device_is_present(struct pci_dev *dev);
+/* The device left the bus (a Thunderbolt unplug): what the Linux PCI core
+ * records with pci_dev_set_disconnected. From then on pci_dev_is_disconnected
+ * and pci_device_is_present answer without touching configuration space. */
+extern void linuxu_pci_mark_removed(struct pci_dev *dev);
+static inline int pci_channel_offline(struct pci_dev *pdev)
+{
+	return pdev->error_state != pci_channel_state_normal &&
+	       pdev->error_state != pci_channel_io_normal;
+}
 extern int pci_dev_is_disconnected(struct pci_dev *dev);
 static inline bool pci_is_enabled(const struct pci_dev *dev)
 {

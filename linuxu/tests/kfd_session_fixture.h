@@ -49,6 +49,8 @@ struct rt_compute_ctx *fixture_compute_ctx(void);
 size_t fixture_kmalloc_live(void);
 unsigned int fixture_mes_adds(void);
 unsigned int fixture_mes_removes(void);
+/* The device leaves the bus (rt_removal_active) or comes back. */
+void fixture_remove_device(bool removed);
 /* MES queues whose waves never preempt: REMOVE_QUEUE fails until MES's
  * hung-queue reset reset them. */
 void fixture_mes_hang_all(bool hung);
@@ -94,5 +96,6 @@ void fixture_mes_hang(uint32_t doorbell, bool hung);
 /* An SDMA engine that holds its copies until released. */
 extern bool sdma_hold;
 void fixture_sdma_release(void);
+void fixture_sdma_finish(bool run);
 #endif
 #endif

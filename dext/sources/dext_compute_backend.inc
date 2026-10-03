@@ -80,6 +80,8 @@ static struct {
     /* Every cause of uncertain so far was a KFD client's: closing those
      * clients (which retries their recovery) may clear it. */
     bool uncertain_kfd_only;
+    /* The device left the bus: what it may still have used is free. */
+    bool removed;
     bool legacy_queues;	/* the queue partition left a legacy HQD */
     bool kfd_disabled;	/* policy: never open KFD sessions */
 } production;
@@ -223,6 +225,12 @@ static int kfd_release(struct production_client *rec)
     return 0;
 }
 
+void dext_compute_device_removed(void)
+{
+    production.removed = true;
+    production.ready = false;
+}
+
 /* A device frozen only by KFD clients thaws once none of them is uncertain
  * any more: their sessions retry what they could not confirm (a copy that
  * outlived its timeout, a queue MES did not remove) when settled. Every
@@ -231,14 +239,14 @@ static bool thaw_kfd(unsigned int wait_ms)
 {
     bool certain = true;
     if (!production.uncertain) return true;
-    if (!production.uncertain_kfd_only) return false;
+    if (!production.uncertain_kfd_only && !production.removed) return false;
     for (unsigned i = 0; i < DEXT_CLIENT_SLOTS; ++i) {
         struct production_client *rec = &production.clients[i];
         if (rec->kfd && dext_kfd_uncertain(rec->kfd) &&
             dext_kfd_settle(rec->kfd, wait_ms) != 0)
             certain = false;
     }
-    if (!certain) return false;
+    if (!certain && !production.removed) return false;
     production.uncertain = false;
     production.uncertain_kfd_only = false;
     return true;
@@ -326,7 +334,8 @@ int dext_compute_release_client(uint64_t client)
      * process is closed even when it is what froze the device, since the
      * close retries what was left uncertain; the device thaws if that was
      * all. Anything else uncertain refuses the release. */
-    if (production.uncertain && !production.uncertain_kfd_only) return -EBUSY_L;
+    if (production.uncertain && !production.uncertain_kfd_only && !production.removed)
+        return -EBUSY_L;
     /* A KFD client kept after its open failed is closed as well. */
     if (rec && rec->kfd && kfd_release(rec) != 0)
         return -EBUSY_L;
@@ -335,7 +344,7 @@ int dext_compute_release_client(uint64_t client)
     for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
         if (!q->object || q->owner != client) continue;
-        if (dext_aql_destroy(q->object) != 0) {
+        if (dext_aql_destroy(q->object) != 0 && !production.removed) {
             freeze(false);
             return -EBUSY_L;
         }
@@ -446,7 +455,7 @@ int dext_compute_stop(void)
         return 0;
     /* Only KFD clients may have frozen the device for closing them to be
      * worth trying: their closes retry their recovery. */
-    if (production.uncertain && !production.uncertain_kfd_only)
+    if (production.uncertain && !production.uncertain_kfd_only && !production.removed)
         return -EBUSY_L;
     production.ready = false;
     /* KFD processes first: their queues leave MES and their memory is
@@ -456,8 +465,16 @@ int dext_compute_stop(void)
         /* Every client is tried, even after one is kept. */
         for (i = 0; i < DEXT_CLIENT_SLOTS; ++i) {
             struct production_client *rec = &production.clients[i];
-            if (rec->kfd && kfd_release(rec) != 0)
-                kept = true;
+            if (rec->kfd && kfd_release(rec) != 0) {
+                /* A removed device runs nothing: the record goes even
+                 * when its close could not finish (its memory leaks). */
+                if (production.removed) {
+                    rec->kfd = NULL;
+                    rec->mode = PRODUCTION_UNDECIDED;
+                } else {
+                    kept = true;
+                }
+            }
             if (rec->mode != PRODUCTION_KFD)
                 rec->mode = PRODUCTION_UNDECIDED;
         }
@@ -470,12 +487,13 @@ int dext_compute_stop(void)
         struct production_queue *q = &production.queues[i];
         if (!q->object)
             continue;
-        if (dext_aql_destroy(q->object) != 0) {
+        if (dext_aql_destroy(q->object) != 0 && !production.removed) {
             freeze(false);
             return -EBUSY_L;
         }
         memset(q, 0, sizeof(*q));
     }
+    if (production.removed) production.uncertain = false;
     for (i = 0; i < DEXT_BO_SLOTS; ++i) {
         struct production_bo *bo = &production.bos[i];
         if (!bo->object)

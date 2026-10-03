@@ -40,6 +40,9 @@ struct amdgpu_device *cs_fixture_adev(void);
 /* TTM moves VRAM <-> GTT through the upstream code on this device
  * (ttm_evict_check.c). */
 void ttm_evict_check(void);
+/* Surprise removal with work outstanding (removal_check.c); the device
+ * stays removed. */
+void removal_check(struct pci_dev *pdev);
 /* Let IBs carry what a full driver emits around its work: chained IBs are
  * followed, packets the software GPU does not model (register state,
  * cache and event packets, register writes) are skipped and counted, and

@@ -26,6 +26,7 @@ static struct rt_compute_fence fence;
 static unsigned char cpu_memory[4096];
 static unsigned opens, closes, allocations, frees, destroys, kicks, services;
 static int open_error, startup_failure, close_error, status_error;
+static bool device_removed;
 static int create_error, destroy_error, service_error, kick_error;
 static int alloc_info_error, free_error, dispatch_error, bounded_error;
 static bool create_retained, service_retained, kick_poison, bounded_uncertain;
@@ -56,7 +57,8 @@ int rt_compute_close(struct rt_compute_ctx *ctx)
     assert(ctx == &context && ctx->live); ++closes;
     if (close_error) return close_error;
     for (unsigned i=0; i<32; ++i) assert(!bos[i].live);
-    assert(!queue.live); ctx->live = false; return 0;
+    /* A queue of a removed device is left behind with nothing to run it. */
+    assert(!queue.live || device_removed); ctx->live = false; return 0;
 }
 int rt_compute_status(struct rt_compute_ctx *ctx)
 { assert(ctx == &context && ctx->live); return status_error; }
@@ -713,6 +715,15 @@ int main(int argc, char **argv)
             destroy_error=-ETIMEDOUT;
             assert(dext_compute_stop()==-EBUSY_L);
             assert(destroys==1 && !frees && !closes); expect_frozen(payload);
+        } else if (!strcmp(argv[1],"stop-removed")) {
+            /* The queue could not be removed, then the device left the
+             * bus: nothing can run the queue, so the stop completes and
+             * every buffer goes. */
+            destroy_error=-ETIMEDOUT;
+            assert(dext_compute_stop()==-EBUSY_L && !closes);
+            dext_compute_device_removed(); device_removed=true;
+            assert(dext_compute_stop()==0 && closes==1 && frees==3);
+            assert(dext_compute_quiescent());
         } else if (!strcmp(argv[1],"ordinary-errors")) {
             kick_error=-EINVAL;
             assert(dext_compute_aql_queue_kick(q,UINT64_MAX,out)==-ENOTREADY_L);

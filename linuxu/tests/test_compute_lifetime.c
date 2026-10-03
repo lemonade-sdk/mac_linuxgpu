@@ -16,6 +16,9 @@ static struct amdgpu_buffer_funcs buffer_funcs;
 
 void msleep(unsigned int ms) { usleep(ms * 1000); }
 ktime_t ktime_get(void) { return 0; }
+/* rt/removal.h: whether the device left the bus. */
+static bool removed;
+bool rt_removal_active(struct amdgpu_device *adev) { (void)adev; return removed; }
 /* The session's DMA hold: attached by open, detached by close. */
 static bool (*hold_fn)(void *);
 static void *hold_arg;
@@ -146,10 +149,12 @@ int main(void)
 	assert(rt_compute_bo_read(ctx, a, 0, readback, sizeof(readback)) == -EBUSY);
 	assert(rt_compute_bo_free(ctx, a) == -EBUSY);
 	assert(rt_compute_close(ctx) == -EBUSY && live == 2 && dma_live == 2);
-	/* All addresses above belong to this CPU-only fixture. Release the fixture
-	 * after asserting the production path retained uncertain submissions. */
-	ctx->poisoned = 0; dma_fence_put(ctx->uncertain_fence); ctx->uncertain_fence = NULL;
+	/* The device leaves the bus: nothing can reach the memory a timed-out
+	 * copy used, so the context releases it. */
+	removed = true;
+	assert(rt_compute_bo_free(ctx, a) == 0 && live == 1 && dma_live == 1);
 	assert(rt_compute_close(ctx) == 0 && live == 0 && dma_live == 0);
+	removed = false;
 	puts("production compute verification cleanup and timeout retention passed");
 	return 0;
 }

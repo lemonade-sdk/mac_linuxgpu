@@ -6,6 +6,8 @@
 
 /* Probe/cleanup simulation has no endpoint capable of a function reset. */
 int dext_pci_function_reset(void) { return -95; }
+/* The device never leaves the bus in these scenarios. */
+int dext_pci_removed(void) { return 0; }
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>

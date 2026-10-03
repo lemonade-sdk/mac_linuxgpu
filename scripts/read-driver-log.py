@@ -45,7 +45,7 @@ UNSUPPORTED = 0xe00002c7
 # Names follow dext/sources/session_state.h.
 SESSION_FLAGS = ["closing", "quarantined", "stopping", "pci_open", "modules_running",
                  "final_cleanup", "releasable", "restart_required", "raw_bar_mapped",
-                 "runtime_device", "isolation_attempted"]
+                 "runtime_device", "isolation_attempted", "device_removed"]
 QUARANTINE_CAUSES = ["none", "raw BAR mapping lifetime uncertain", "DMA shutdown reservation failed",
                      "GPU completion uncertain (compute stop)", "interrupt cancellation failed",
                      "endpoint isolation failed", "DMA backing retained at fini", "definite PCI fault",
@@ -111,7 +111,8 @@ POWER_FLAGS = ["vram_preserved", "system_sleep", "device_low", "client_hold", "k
                "session_closed", "ack_pending", "link_down"]
 POWER_CAUSES = ["none", "client prepare", "client resume", "holding client closed", "system sleep",
                 "system wake", "device low power", "device on", "KFD suspend failed",
-                "KFD resume failed", "device gone after wake", "re-probed", "session closed"]
+                "KFD resume failed", "device gone after wake", "re-probed", "session closed",
+                "device removed (unplugged)"]
 
 
 def describe_power(values, count):

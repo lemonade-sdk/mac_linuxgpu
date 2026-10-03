@@ -722,16 +722,21 @@ static int teardown(struct st *s)
 }
 
 /* Whether every submission has completed: AMDGPU_WAIT_CS with a zero
- * deadline polls. */
+ * deadline polls. A device that left the bus (-ENODEV: the DRM device is
+ * unplugged) runs nothing any more; its work was completed with an error. */
 static bool idle(struct st *s)
 {
 	for (unsigned int i = 0; i < s->nsubs; ++i) {
+		long r;
+
 		memset(&s->arg.wait_cs, 0, sizeof(s->arg.wait_cs));
 		s->arg.wait_cs.in.handle = s->subs[i].seq;
 		s->arg.wait_cs.in.ip_type = s->subs[i].ip_type;
 		s->arg.wait_cs.in.ctx_id = s->ctx_id;
-		if (st_ioctl(s, DRM_IOCTL_AMDGPU_WAIT_CS, &s->arg.wait_cs) ||
-		    s->arg.wait_cs.out.status)
+		r = st_ioctl(s, DRM_IOCTL_AMDGPU_WAIT_CS, &s->arg.wait_cs);
+		if (r == -ENODEV)
+			return true;
+		if (r || s->arg.wait_cs.out.status)
 			return false;
 	}
 	return true;

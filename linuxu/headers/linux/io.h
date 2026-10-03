@@ -25,6 +25,10 @@
 
 #if defined(LINUXU_DEXT_DK)
 #include <rt/dext_dma.h>
+/* rt/dext_pci.h: the device left the bus. Its BAR0 aperture is then never
+ * touched again: reads see ~0, as a device gone from PCIe answers, and
+ * writes are dropped. */
+extern int dext_pci_removed(void);
 /* Each token owns a 256 GB synthetic address range.  Pointer arithmetic
  * within a BAR preserves the token and yields a BAR-relative byte offset. */
 static inline void *linuxu_dk_token(const void __iomem *addr)
@@ -47,13 +51,18 @@ extern void rt_mmio_writew(struct rt_device *, void *, uint64_t, uint16_t);
  * orders it, so it takes no extra barrier here.  No _relaxed variants
  * exist yet; they would omit both barriers. */
 #define linuxu_bar0_read(type, addr) ({				\
-	type __v = *(const volatile type *)(addr);			\
-	dma_rmb();							\
+	type __v = (type)~(type)0;					\
+	if (!dext_pci_removed()) {					\
+		__v = *(const volatile type *)(addr);			\
+		dma_rmb();						\
+	}								\
 	__v;								\
 })
 #define linuxu_bar0_write(type, v, addr) do {			\
-	dma_wmb();							\
-	*(volatile type *)(addr) = (v);					\
+	if (!dext_pci_removed()) {					\
+		dma_wmb();						\
+		*(volatile type *)(addr) = (v);				\
+	}								\
 } while (0)
 static inline u8 readb(const void __iomem *addr)
 {
@@ -239,7 +248,7 @@ static inline void memcpy_fromio(void *to, const void __iomem *from, size_t coun
 #ifdef LINUXU_DEXT_DK
 	if (dext_bar0_cpu_contains(from, count)) {
 		for (size_t i = 0; i < count; ++i)
-			((u8 *)to)[i] = ((const volatile u8 *)from)[i];
+			((u8 *)to)[i] = dext_pci_removed() ? 0xff : ((const volatile u8 *)from)[i];
 		return;
 	}
 	rt_mmio_memcpy_fromio(to, linuxu_dk_token(from), linuxu_dk_offset(from), count, NULL);
@@ -251,7 +260,7 @@ static inline void memcpy_toio(void __iomem *to, const void *from, size_t count)
 {
 #ifdef LINUXU_DEXT_DK
 	if (dext_bar0_cpu_contains(to, count)) {
-		for (size_t i = 0; i < count; ++i)
+		for (size_t i = 0; i < count && !dext_pci_removed(); ++i)
 			((volatile u8 *)to)[i] = ((const u8 *)from)[i];
 		return;
 	}
@@ -318,7 +327,7 @@ static inline void *memset_io(void __iomem *addr, int val, size_t count)
 {
 #ifdef LINUXU_DEXT_DK
 	if (dext_bar0_cpu_contains(addr, count)) {
-		for (size_t i = 0; i < count; ++i)
+		for (size_t i = 0; i < count && !dext_pci_removed(); ++i)
 			((volatile u8 *)addr)[i] = (u8)val;
 		return (void *)addr;
 	}

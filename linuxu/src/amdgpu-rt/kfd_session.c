@@ -28,6 +28,7 @@
 #include <rt/kfd_session.h>
 #include <rt/process.h>
 #include <rt/process_file.h>
+#include <rt/removal.h>
 
 #include "amdgpu.h"
 #include "amdgpu_amdkfd.h"
@@ -626,6 +627,14 @@ static void settle_copy_locked(struct rt_kfd_session *s, unsigned int wait_ms)
 
 	if (!f)
 		return;
+	if (rt_removal_active(s->adev)) {
+		/* A removed device writes no memory: the copy is over. */
+		pr_warn("kfd session %d: device removed; an SDMA copy it never finished "
+			"no longer holds anything\n", session_pid(s));
+		dma_fence_put(f);
+		s->pending_copy = NULL;
+		return;
+	}
 	if (!dma_fence_is_signaled(f) &&
 	    dma_fence_wait_timeout(f, false, msecs_to_jiffies(wait_ms)) <= 0 &&
 	    !dma_fence_is_signaled(f))
@@ -1646,7 +1655,16 @@ static int queue_release_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q
 					     "KFD still schedules it");
 		}
 	}
-	if (q->detached) {
+	if (r && rt_removal_active(s->adev)) {
+		/* The device left the bus: nothing can run the queue or reach
+		 * the memory it uses any more. */
+		pr_warn("kfd session %d: queue %u dropped: the device was removed\n",
+			session_pid(s), q->queue_id);
+		q->detached = true;
+		r = 0;
+	} else if (q->detached && rt_removal_active(s->adev)) {
+		r = 0;
+	} else if (q->detached) {
 		r = queue_recover(s, q);
 		if (r == -EAGAIN)
 			pr_warn("kfd session %d: queue %u: KFD's queue manager is stopped; its "

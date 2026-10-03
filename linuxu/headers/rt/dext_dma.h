@@ -50,6 +50,11 @@ int dext_dma_commit_probe(void);
 /* Permanent retention, even if an in-flight RPC prevented orderly shutdown.
  * Stops new mappings, keeps future frees/aliases, and preserves the provider. */
 void dext_dma_quarantine(void);
+/* The device left the bus (surprise removal): it can use no mapping any
+ * more, so the quarantine and holds lift and retired descriptors complete
+ * now; later frees complete at once. Returns how many stayed retained
+ * because their completion failed. */
+int dext_dma_device_removed(void);
 /* After software teardown and IRQ drain, reserve the endpoint for FLR.
  * All coherent mappings must be retired and all CPU aliases released. */
 int dext_dma_begin_shutdown_reset(void);

@@ -136,6 +136,21 @@ static int dext_set_pci(void *, void *);
 static int dext_open(uint32_t *);
 static int dext_compute_query_info(uint64_t, uint64_t *, int);
 static int dext_compute_release_client(uint64_t);
+// Surprise removal (rt/removal.h, dext_pci_* and dext_dma_device_removed).
+struct pci_dev;
+static bool devicePresent = true, dmaRemoved;
+static int dext_pci_device_present() { return devicePresent; }
+static void dext_pci_mark_removed() { events.push_back("pci_mark_removed"); }
+static int dext_pci_close_removed();
+static int rt_removal_begin(struct pci_dev *) { events.push_back("removal_begin"); return 0; }
+static void rt_removal_end() { events.push_back("removal_end"); }
+static void dext_compute_device_removed() { events.push_back("compute_removed"); }
+static int dext_dma_device_removed() {
+    events.push_back("dma_removed");
+    // A device off the bus uses no mapping: retired descriptors complete.
+    dmaRemoved = dmaCompleted = true;
+    return 0;
+}
 struct rt_drm_info { int closes; };
 static void IOSleep(uint64_t);
 static void rt_drm_info_close(rt_drm_info *);
@@ -220,14 +235,15 @@ static int dext_dma_begin_shutdown(uint64_t budget) {
     return holdError;
 }
 static int dext_compute_stop() {
-    assert(s_irqDeliver && s_irqReady && s_dmaShutdownPrepared);
+    assert(s_deviceRemoved || (s_irqDeliver && s_irqReady && s_dmaShutdownPrepared));
     events.push_back("compute_stop");
     if (!computeError) computeQuiescent = true;
     else computeQuiescent = false;
     return computeError;
 }
 static void linuxu_driver_shutdown() {
-    assert(s_irqDeliver && s_irqReady && s_modulesRunning && s_dmaShutdownPrepared);
+    assert(s_modulesRunning);
+    assert(s_deviceRemoved || (s_irqDeliver && s_irqReady && s_dmaShutdownPrepared));
     events.push_back("upstream_shutdown");
     // amdgpu_pci_remove() unplugs the DRM device first, so the aperture
     // mapping survives the removal.
@@ -246,8 +262,8 @@ static int dext_irq_fini_async(void (*callback)(void *), void *context) {
 }
 static void rt_device_free(void *device) {
     assert(device && device == s_rtDevice && irqDrained);
-    assert(!s_modulesRunning && !s_irqDeliver && s_dmaShutdownPrepared);
-    assert(!endpointReset && !dmaCompleted);
+    assert(!s_modulesRunning && !s_irqDeliver);
+    if (!s_deviceRemoved) assert(s_dmaShutdownPrepared && !endpointReset && !dmaCompleted);
     events.push_back("device_free");
 }
 static int dext_bar0_cpu_release_orphaned() {
@@ -279,7 +295,9 @@ static bool pciOpenExpected;
 static void dext_compute_set_pci_open(bool open) { assert(open == pciOpenExpected); }
 static void dext_compute_set_stage(int stage) { assert(stage == DEXT_COMPUTE_STAGE_NONE); }
 static int dext_dma_fini() {
-    assert(irqDrained && endpointReset && dmaCompleted && !s_rtDevice);
+    assert(irqDrained && dmaCompleted && !s_rtDevice);
+    // A removed device is never reset; its descriptors completed on removal.
+    assert(s_deviceRemoved ? dmaRemoved && !endpointReset : endpointReset);
     events.push_back("dma_fini");
     return dmaFiniError;
 }
@@ -319,6 +337,15 @@ static int dext_compute_query_info(uint64_t tag, uint64_t *out, int) {
     assert(tag == 4); out[0] = 2; return 1;
 }
 static int dext_compute_release_client(uint64_t) { assert(false); return 0; }
+
+static int dext_pci_close_removed() {
+    // Nothing left that could touch the device: interrupts drained,
+    // upstream removed, runtime device freed, DMA released.
+    assert(irqDrained && !s_modulesRunning && !s_rtDevice && dmaRemoved && !endpointReset);
+    events.push_back("pci_close_removed");
+    return 0;
+}
+static void power_device_removed() { events.push_back("power_lost"); }
 
 void MacLinuxGPU::FinishStop(IOService *provider) {
     assert(!s_dmaQuarantined && !s_sessionClosing && dmaCompleted);
@@ -582,6 +609,87 @@ static void clientExitReopen(bool queueExhausted) {
                 queueExhausted ? "queue-exhaustion-exit" : "client-exit-reopen");
 }
 
+// Surprise removal: the GPU leaves the bus with a client's session open.
+// The client is stopped first (IOKit terminates the clients, then the
+// provider). With "quarantined", the session was already quarantined (its
+// compute stop failed while the device was still there) when the provider
+// stop sees the device gone. Either way no reset, isolation or quarantine
+// follows: everything is released, the provider closes, every Stop
+// finishes, and the next client opens a new session.
+static void surpriseRemoval(bool quarantined) {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    MacLinuxGPUUserClient client, next;
+    MacLinuxGPUUserClient_IVars clientIvars{}, nextIvars{};
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+    s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
+    s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
+    bar0Aliases = 1;
+    client.ivars = &clientIvars;
+    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
+                   false, nullptr, nullptr};
+    driver.retain(); s_participants = 1;
+    // The KFD close cannot confirm anything once MES is gone.
+    computeError = -11006;
+    if (!quarantined) devicePresent = false;
+    assert(client.Stop(&driver) == kIOReturnSuccess);
+    assert(s_sessionClosing && s_participants == 0 && !clientStops);
+    if (quarantined) {
+        assert(s_dmaQuarantined && !s_deviceRemoved);
+        assert(saw("pci_quarantine") && saw("dma_quarantine"));
+    } else {
+        assert(!s_dmaQuarantined && s_deviceRemoved);
+    }
+    {
+        assert(irqCompletion);
+        auto callback = irqCompletion; auto context = irqContext;
+        irqCompletion = nullptr; irqContext = nullptr;
+        irqDrained = true; events.push_back("irq_drained");
+        callback(context);
+        queue.drain();
+    }
+    if (quarantined) {
+        // Retained until the provider stops and finds the device gone,
+        // which releases it (what MacLinuxGPU::Stop does).
+        assert(s_dmaQuarantined && !clientStops);
+        devicePresent = false;
+        assert(device_removed("provider stop"));
+        release_removed(&driver);
+    }
+    assert(!s_dmaQuarantined && !s_sessionClosing && !s_quarantineRetained && !s_deviceRemoved);
+    assert(clientStops == 1 && client.superStops == 1);
+    assert(driver.references == 1 && provider.references == 1 && s_sessionGeneration == 2);
+    assert(saw("pci_mark_removed") && saw("removal_begin") && saw("compute_removed"));
+    assert(saw("dma_removed") && saw("power_lost") && saw("removal_end"));
+    assert(saw("upstream_shutdown") && saw("device_free") && saw("pci_close_removed"));
+    assert(!saw("endpoint_reset") && !saw("pci_close"));
+    if (!quarantined) {
+        const std::vector<std::string> expected{
+            "pci_mark_removed", "removal_begin", "compute_removed", "dma_removed", "power_lost",
+            "compute_stop", "removal_end", "upstream_shutdown", "cancel_irqs",
+            "irq_drained", "enqueue_finish", "device_free", "release_bar0", "dma_removed",
+            "dma_fini", "pci_close_removed", "gart_reset", "super_client_stop"};
+        assert(events == expected);
+        assert(!saw("pci_quarantine") && !saw("hold_dma"));
+    }
+    const auto snapshot = state();
+    assert(!(snapshot[1] & (MLG_SESSION_FLAG_QUARANTINED | MLG_SESSION_FLAG_CLOSING |
+                            MLG_SESSION_FLAG_DEVICE_REMOVED)));
+    expectLog("device removed from the bus");
+    // The replugged device: a new client opens a new session.
+    devicePresent = true;
+    next.ivars = &nextIvars;
+    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
+                 false, nullptr, nullptr};
+    pciOpenExpected = true;
+    assert(ensure_open(&next) == kIOReturnSuccess);
+    assert(s_pciOpen && s_participants == 1 && saw("pci_open"));
+    std::printf("PASS production session shutdown: %s\n",
+                quarantined ? "surprise-removal-quarantined" : "surprise-removal");
+}
+
 static rt_drm_info observerDrm;
 int main(int argc, char **argv) {
     alarm(15);
@@ -589,6 +697,10 @@ int main(int argc, char **argv) {
     const std::string scenario = argv[1];
     if (scenario == "client-exit-reopen" || scenario == "queue-exhaustion-exit") {
         clientExitReopen(scenario == "queue-exhaustion-exit");
+        return 0;
+    }
+    if (scenario == "surprise-removal" || scenario == "surprise-removal-quarantined") {
+        surpriseRemoval(scenario == "surprise-removal-quarantined");
         return 0;
     }
     Fixture fixture;

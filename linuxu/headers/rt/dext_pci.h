@@ -40,6 +40,17 @@ int dext_pci_shutdown_reset(void);
 /* Permanently reject new seam accesses, drain admitted calls, and disable BM
  * without resetting or invalidating provider/token ownership. */
 int dext_pci_quarantine(void);
+/* Surprise removal. dext_pci_device_present asks the provider's
+ * configuration space directly (1 when it answers, or when no provider is
+ * open). dext_pci_mark_removed closes admission for good: nothing touches
+ * the device again and nothing resets or isolates it. dext_pci_close_removed
+ * closes the provider once no access is in flight and no interrupt source
+ * is left, then reopens admission and clears the fault records for the
+ * next device (0; -16 while something remains; -22 if not removed). */
+int dext_pci_device_present(void);
+void dext_pci_mark_removed(void);
+int dext_pci_removed(void);
+int dext_pci_close_removed(void);
 /* 1 when only dext_pci_quarantine() closed admission and nothing is admitted,
  * resetting or interrupt-owned (cached state). */
 int dext_pci_quarantine_releasable(void);

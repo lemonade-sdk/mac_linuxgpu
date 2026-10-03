@@ -269,9 +269,29 @@ static void process_death(void)
 	}
 	assert(!rt_kfd_session_close(s));
 	assert(kgd_frees == kgd_allocs);
+	/* 6. The device leaves the bus mid-session: MES answers nothing, a copy
+	 * is still queued and a queue still runs. Nothing on the bus can reach
+	 * the session's memory, so the close drops the queue and the copy and
+	 * frees everything at once. */
+	s = dying_client("unplugged", &q, &vram);
+	{
+		unsigned char word[64];
+
+		sdma_hold = true;
+		assert(rt_kfd_bo_read(s, vram, 0, word, sizeof(word)) == -ETIMEDOUT);
+		assert(rt_kfd_session_uncertain(s));
+	}
+	mes_dead = true;
+	fixture_remove_device(true);
+	assert(!rt_kfd_session_close(s));
+	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+	fixture_remove_device(false);
+	mes_dead = false;
+	fixture_sdma_finish(false);	/* the removed device never ran it */
 	puts("KFD process death: hung queue recovered through MES reset, slow MES "
 	     "acknowledgement, MES that never answers (kept, then recovered), "
-	     "destroy retried by settle, SDMA copy that outlived its timeout");
+	     "destroy retried by settle, SDMA copy that outlived its timeout, device "
+	     "removed mid-session");
 }
 
 int main(void)
