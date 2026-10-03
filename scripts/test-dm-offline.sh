@@ -18,6 +18,6 @@ MAKE
 include_string=$(make -s -f Makefile -f "$work/flags.mk" print-includes | tr '\n' ' ')
 read -r -a includes <<< "$include_string"
 clang -w -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -include linux/autoconf.h \
-  -g -O1 -fsanitize=address "${includes[@]}" linuxu/tests/test_dm_offline.c build/libmacamgdu.a \
+  -g -O1 -fsanitize=address "${includes[@]}" linuxu/tests/test_dm_offline.c linuxu/tests/dcn401_fixture.c build/libmacamgdu.a \
   -lpthread -o "$work/test_dm_offline"
 "$work/test_dm_offline"
