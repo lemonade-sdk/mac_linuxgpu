@@ -510,21 +510,100 @@ void put_device(struct device *dev)
 		kobject_put(&dev->kobj);
 }
 
+/* drivers/base/core.c get_device_parent(): a class device whose parent is
+ * not a class device lives in a "glue" directory named after its class
+ * under that parent, as /sys/devices/.../0000:03:00.0/drm/card0 does; a
+ * class device whose parent is one (card0-DP-1 under card0) sits directly
+ * in it. One glue directory per (parent, class), removed with its last
+ * device. A class device without a parent stays at the top level. */
+struct class_glue {
+	struct class_glue *next;
+	struct kobject *parent;
+	const struct class *class;
+	struct kobject *dir;
+	unsigned int users;
+};
+static pthread_mutex_t class_glue_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct class_glue *class_glues;
+
+static struct kobject *device_parent_get(struct device *dev)
+{
+	struct device *parent = dev->parent;
+	struct class_glue *glue;
+
+	if (!parent)
+		return NULL;
+	if (!dev->class || parent->class || !dev->class->name)
+		return &parent->kobj;
+	pthread_mutex_lock(&class_glue_lock);
+	for (glue = class_glues; glue; glue = glue->next)
+		if (glue->parent == &parent->kobj && glue->class == dev->class) {
+			glue->users++;
+			pthread_mutex_unlock(&class_glue_lock);
+			return glue->dir;
+		}
+	glue = calloc(1, sizeof(*glue));
+	if (glue)
+		glue->dir = kobject_create_and_add(dev->class->name, &parent->kobj);
+	if (!glue || !glue->dir) {
+		pthread_mutex_unlock(&class_glue_lock);
+		free(glue);
+		return ERR_PTR(-ENOMEM);
+	}
+	glue->parent = &parent->kobj;
+	glue->class = dev->class;
+	glue->users = 1;
+	glue->next = class_glues;
+	class_glues = glue;
+	pthread_mutex_unlock(&class_glue_lock);
+	return glue->dir;
+}
+
+/* After a device left @dir: drop the glue directory with its last device. */
+static void device_parent_put(struct kobject *dir)
+{
+	struct class_glue **link, *glue = NULL;
+
+	if (!dir)
+		return;
+	pthread_mutex_lock(&class_glue_lock);
+	for (link = &class_glues; *link; link = &(*link)->next)
+		if ((*link)->dir == dir) {
+			if (!--(*link)->users) {
+				glue = *link;
+				*link = glue->next;
+			}
+			break;
+		}
+	pthread_mutex_unlock(&class_glue_lock);
+	if (glue) {
+		kobject_put(glue->dir);
+		free(glue);
+	}
+}
+
 int device_add(struct device *dev)
 {
 	if (!dev) return -EINVAL;
-	int result = kobject_add(&dev->kobj, dev->parent ? &dev->parent->kobj : NULL, NULL);
-	if (result) return result;
+	struct kobject *parent = device_parent_get(dev);
+	if (IS_ERR(parent)) return PTR_ERR(parent);
+	int result = kobject_add(&dev->kobj, parent, NULL);
+	if (result) { device_parent_put(parent); return result; }
 	if (dev->groups) for (size_t i = 0; dev->groups[i]; ++i) {
 		result = sysfs_create_group(&dev->kobj, dev->groups[i]);
-		if (result) { kobject_del(&dev->kobj); return result; }
+		if (result) { device_del(dev); return result; }
 	}
 	return 0;
 }
 
 void device_del(struct device *dev)
 {
+	struct kobject *parent = dev->kobj.parent;
+	bool added = dev->kobj.state & 1;
+
 	kobject_del(&dev->kobj);
+	if (added)
+		device_parent_put(parent);
 }
 
 void device_destroy(struct class *class, dev_t devt)
@@ -591,7 +670,13 @@ struct device *device_create(struct class *class, struct device *parent,
 			err = -EEXIST;
 			goto fail_locked;
 		}
-	err = kobject_add(&dev->kobj, parent ? &parent->kobj : NULL, NULL);
+	{
+		struct kobject *dir = device_parent_get(dev);
+
+		err = IS_ERR(dir) ? PTR_ERR(dir) : kobject_add(&dev->kobj, dir, NULL);
+		if (err && !IS_ERR(dir))
+			device_parent_put(dir);
+	}
 	if (err)
 		goto fail_locked;
 	record->device = dev;
