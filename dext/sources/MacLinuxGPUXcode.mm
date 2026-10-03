@@ -258,6 +258,24 @@ static bool             s_finalCleanup = false;
 static bool             s_irqDrainFailed = false;
 static bool             s_releaseFailed = false;
 static bool             s_creatingObserver = false;
+// DriverKit runs a new user client's Start after NewUserClient returns, not
+// inside Create, so the requested role is recorded against the created
+// object and claimed by its Start. Both run on the driver's default queue.
+static const void      *s_pendingObservers[16];
+
+__attribute__((unused)) static bool pending_observer_add(const void *client)
+{
+    for (auto &slot : s_pendingObservers)
+        if (!slot) { slot = client; return true; }
+    return false;
+}
+
+__attribute__((unused)) static bool pending_observer_take(const void *client)
+{
+    for (auto &slot : s_pendingObservers)
+        if (slot == client) { slot = nullptr; return true; }
+    return false;
+}
 // Observer reads (SysfsRead, DrmInfo) run upstream callbacks on observer
 // queues. Admitted only while the upstream driver runs in an open session;
 // every session close and quarantine closes admission and waits first.
@@ -847,7 +865,13 @@ IMPL(MacLinuxGPU, NewUserClient)
     // Start normally recorded the role already; assert it before the client
     // is returned, so no RPC can run with the wrong role.
     auto *created = OSDynamicCast(MacLinuxGPUUserClient, clientService);
-    if (created && created->ivars) created->ivars->observer = observer;
+    if (created && created->ivars) {
+        created->ivars->observer = observer;
+    } else if (observer && !pending_observer_add(clientService)) {
+        clientService->release();
+        MACLINUXGPU_LOG("too many observer clients starting at once");
+        return kIOReturnNoResources;
+    }
     *userClient = typed;
     MACLINUXGPU_LOG("NewUserClient: MacLinuxGPUUserClient created%s",
                     observer ? " (observer)" : "");
@@ -923,7 +947,7 @@ IMPL(MacLinuxGPUUserClient, Start)
     if (ret != kIOReturnSuccess) return ret;
     MacLinuxGPU *driver = OSDynamicCast(MacLinuxGPU, provider);
     if (driver == nullptr) return kIOReturnUnsupported;
-    const bool observer = s_creatingObserver;
+    const bool observer = s_creatingObserver || pending_observer_take(this);
     if (s_driver != driver || s_stopping || (s_sessionClosing && !observer))
         return kIOReturnNotAttached;
     IODispatchQueue *ownerQueue = nullptr;
