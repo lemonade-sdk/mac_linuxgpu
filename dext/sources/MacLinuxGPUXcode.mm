@@ -317,6 +317,7 @@ static void observer_reads_close()
 // admission, opened and closed with the observer reads.
 static mlg_observer_gate s_lxCalls;
 static void observer_display_client_stop(uint64_t clientID);
+static uint64_t s_displayOwner; // the client whose OUTPUT is on screen, 0 for none
 struct MacLinuxGPUUserClient_IVars {
     MacLinuxGPU *ownerDriver;
     IOService *stopProvider;
@@ -702,6 +703,26 @@ static bool device_removed(const char *where)
     return s_deviceRemoved;
 }
 
+// What the display ops hold, released while the upstream driver runs: a
+// showing pattern or output (its configuration committed again, or, for a
+// removed device, nothing committed: rt/display.h), then the imported
+// surfaces, whose client mappings follow once the GPU can no longer reach
+// them (retired by the DMA hold until the endpoint reset when that is
+// later, released at once for a removed device).
+static void release_display_owners(const char *why)
+{
+    if (rt_display_showing()) {
+        MACLINUXGPU_LOG("%s: turning the display pattern or output off%s", why,
+                        s_deviceRemoved ? " (device removed: nothing is committed)" : "");
+        rt_display_stop();
+    }
+    __atomic_store_n(&s_displayOwner, 0, __ATOMIC_RELEASE);
+    if (rt_surface_count()) {
+        const unsigned released = rt_surface_remove_all();
+        MACLINUXGPU_LOG("%s: released %u imported surface(s)", why, released);
+    }
+}
+
 static void close_session(MacLinuxGPU *driver)
 {
     if (s_sessionClosing) return;
@@ -709,20 +730,10 @@ static void close_session(MacLinuxGPU *driver)
     s_finalCleanup = false;
     // No observer read may run an upstream callback past this point.
     observer_reads_close();
-    // A display test pattern goes first: the configuration it replaced is
-    // committed again and its client released while the driver runs. A
-    // quarantined session keeps every upstream owner, the client included.
-    if (s_modulesRunning && !s_dmaQuarantined && rt_display_showing()) {
-        MACLINUXGPU_LOG("session close: turning the display test pattern off");
-        rt_display_stop();
-    }
-    // A display agent's imported surfaces: their buffers go now; the
-    // client mappings follow once the GPU is done with them (retired by
-    // the DMA hold until the endpoint reset when that is later).
-    if (s_modulesRunning && !s_dmaQuarantined && rt_surface_count()) {
-        const unsigned released = rt_surface_remove_all();
-        MACLINUXGPU_LOG("session close: released %u imported surface(s)", released);
-    }
+    // The display goes first. A quarantined session keeps every upstream
+    // owner, the display's included, unless its device is gone.
+    if (s_modulesRunning && (!s_dmaQuarantined || s_deviceRemoved))
+        release_display_owners("session close");
     // Linux-file processes exit while the driver runs; a self-test whose
     // GPU work never completed leaves that work uncertain.
     if (lx_teardown_all() && !s_deviceRemoved) {
@@ -814,6 +825,7 @@ static void release_removed(MacLinuxGPU *driver)
     }
     s_dmaQuarantined = false;
     if (s_modulesRunning) {
+        release_display_owners("removal");
         const int stopped = dext_compute_stop();
         if (stopped) MACLINUXGPU_LOG("removal: compute stop returned %d; nothing can run", stopped);
         rt_removal_end();
@@ -2452,7 +2464,6 @@ static kern_return_t observer_drm_selftest(IOUserClientMethodArguments *argument
 // open session for the whole op). Every wait inside is upstream's own
 // bounded wait.
 static uint32_t s_displayRunning;
-static uint64_t s_displayOwner; // the client whose OUTPUT is on screen, 0 for none
 // Linux errno values the display ops report (rt/display.h and rt/surface.h
 // return negative Linux errnos).
 static constexpr int kLinuxENOENT = 2, kLinuxEIO = 5, kLinuxENOMEM = 12, kLinuxENOSPC = 28;

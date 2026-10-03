@@ -18,6 +18,10 @@
  * the memory can follow. It runs only for an import that succeeded; a
  * failed import leaves the mapping to the caller.
  *
+ * A device that left the bus (rt/removal.h): imports, copies and checks
+ * return -ENODEV; releasing still works, and the provider's release follows
+ * as usual (the removal completes the GPU's fences).
+ *
  * No fallback: any failing step returns its errno; nothing is copied by the
  * CPU instead.
  *

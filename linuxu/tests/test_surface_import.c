@@ -15,6 +15,7 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_device.h>
 #include <rt/dart.h>
 #include <rt/surface.h>
+#include <rt/removal.h>
 
 #include "amdgpu.h"
 #include "cs_fixture.h"
@@ -307,10 +308,33 @@ int main(void)
 	amdgpu_bo_free_kernel(&dst, &dst_gpu, &dst_cpu);
 	cs_fixture_stats(&after);
 	CHECK(after.faults == 0 && after.dart_faults == 0);
+
+	/* The GPU leaves the bus while an import is held: nothing reaches the
+	 * GPU any more, and releasing still returns the client's mapping. */
+	{
+		struct fake_surface held;
+		struct rt_surface_verify_result v;
+		struct rt_surface *other = NULL;
+
+		fake_surface_init(&held, SRC_PITCH, 0x77000000u);
+		provider.context = &held;
+		CHECK(rt_surface_import(pdev, held.segment, 3, held.size, W, H, SRC_PITCH, &provider,
+					&surface) == 0);
+		CHECK(rt_surface_add(11, surface));
+		CHECK(rt_removal_begin(pdev) == 0);
+		CHECK(rt_surface_verify(surface, 0x77000000u, NULL, 1000, &v) == -ENODEV);
+		CHECK(rt_surface_import(pdev, held.segment, 3, held.size, W, H, SRC_PITCH, &provider,
+					&other) == -ENODEV && !other);
+		CHECK(rt_surface_remove_all() == 1);
+		wait_released(&held);
+		rt_removal_end();
+		printf("surface: removal with an import held: checks refused, the import released\n");
+		fake_surface_free(&held);
+	}
 	cs_fixture_stop();
 	fake_surface_free(&surf);
 	fake_surface_free(&same);
 	printf("PASS surface import: DMA segments as an amdgpu dma-buf in the GART, SDMA copies of "
-	       "whole frames, damage and bands into VRAM, refusals, release after the BO\n");
+	       "whole frames, damage and bands into VRAM, refusals, release after the BO, removal\n");
 	return 0;
 }

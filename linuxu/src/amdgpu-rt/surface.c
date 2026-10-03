@@ -13,6 +13,7 @@
 #include <drm/drm_gem.h>
 #include <rt/dart.h>
 #include <rt/surface.h>
+#include <rt/removal.h>
 
 #include "amdgpu.h"
 #include "amdgpu_dma_buf.h"
@@ -134,7 +135,7 @@ int rt_surface_import(struct pci_dev *pdev, const struct rt_surface_segment *seg
 	if (!out || !provider || !provider->release)
 		return -EINVAL;
 	*out = NULL;
-	if (!dev)
+	if (!dev || rt_removal_active(drm_to_adev(dev)))
 		return -ENODEV;
 	if (!width || !height || pitch < (uint64_t)width * 4 || pitch & 3 ||
 	    (uint64_t)pitch * height > size || !segments_valid(segments, count, size))
@@ -329,7 +330,7 @@ int rt_surface_copy(struct rt_surface *src, struct drm_gem_object *dst, uint32_t
 		return -EINVAL;
 	bo = gem_to_amdgpu_bo(dst);
 	adev = amdgpu_ttm_adev(bo->tbo.bdev);
-	if (!adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
+	if (rt_removal_active(adev) || !adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
 	    !adev->mman.buffer_funcs_ring->sched.ready)
 		return -ENODEV;
 
@@ -444,7 +445,7 @@ int rt_surface_verify(struct rt_surface *surface, uint32_t seed, const void *cpu
 			     ~(uint64_t)(RT_SURFACE_SAMPLE_BYTES - 1);
 
 	adev = amdgpu_ttm_adev(gem_to_amdgpu_bo(surface->obj)->tbo.bdev);
-	if (!adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
+	if (rt_removal_active(adev) || !adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
 	    !adev->mman.buffer_funcs_ring->sched.ready)
 		return -ENODEV;
 	r = amdgpu_bo_create_kernel(adev, RT_SURFACE_SAMPLES * RT_SURFACE_SAMPLE_BYTES, PAGE_SIZE,

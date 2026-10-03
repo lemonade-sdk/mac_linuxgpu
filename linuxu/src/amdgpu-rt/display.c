@@ -24,6 +24,7 @@
 #include <drm/drm_print.h>
 #include <rt/display.h>
 #include <rt/surface.h>
+#include <rt/removal.h>
 
 #include "amdgpu.h"
 
@@ -96,6 +97,9 @@ static struct drm_device *display_device(struct pci_dev *pdev)
 	 * created and mode_config holds only zeroes. */
 	if (!dev || !drm_core_check_feature(dev, DRIVER_MODESET) ||
 	    !dev->mode_config.num_crtc || !dev->mode_config.num_connector)
+		return NULL;
+	/* A device that left the bus has no display to drive (rt/removal.h). */
+	if (rt_removal_active(drm_to_adev(dev)))
 		return NULL;
 	return dev;
 }
@@ -472,6 +476,14 @@ static int display_off_locked(void)
 
 	if (!dev)
 		return 0;
+	if (rt_display.saved && rt_removal_active(drm_to_adev(dev))) {
+		/* The device left the bus: there is no screen to restore. The
+		 * buffers and the client go as on a Linux unplug, where the
+		 * removed framebuffers' planes are disabled without hardware. */
+		drm_info(dev, "display test: device removed; the previous state is not committed\n");
+		snapshot_free(rt_display.saved);
+		rt_display.saved = NULL;
+	}
 	if (rt_display.saved) {
 		u64 start = ktime_get_ns();
 

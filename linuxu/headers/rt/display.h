@@ -25,6 +25,10 @@
  * A failing step is reported with its errno; no other mechanism is tried
  * in its place.
  *
+ * A device that left the bus (rt/removal.h) has no display: every call
+ * returns -ENODEV, and turning a pattern or output off commits nothing,
+ * releasing the buffers and the client as a Linux unplug does.
+ *
  * Every wait is upstream's own bounded wait (flip_done and vblank waits
  * time out, DC's register and DMUB waits time out). Display must be
  * enabled (amdgpu.dc, rt/bootstrap.h); otherwise the device has no CRTC

@@ -64,6 +64,7 @@
 #include <drm/gpu_scheduler.h>
 #include <rt/display.h>
 #include <rt/surface.h>
+#include <rt/removal.h>
 #include <rt/sysfs.h>
 
 extern const struct amdgpu_ip_block_version dm_ip_block;
@@ -837,6 +838,20 @@ static void display_test(void)
 		/* No output: refused before the surface is looked at. */
 		assert(rt_display_present(&fixture_pdev, (struct rt_surface *)&rect, &rect, 1, NULL) == -ENOENT);
 	}
+
+	/* The GPU leaves the bus while the pattern is on screen: nothing more
+	 * is driven, and turning it off commits nothing. */
+	r = rt_display_show(&fixture_pdev, "HDMI-A-1", RT_DISPLAY_PATTERN_BARS, &report);
+	assert(r == 0 && report.showing);
+	writes = fixture_reg_writes;
+	assert(rt_removal_begin(&fixture_pdev) == 0);
+	assert(rt_display_probe(&fixture_pdev, &report) == -ENODEV);
+	assert(rt_display_show(&fixture_pdev, NULL, RT_DISPLAY_PATTERN_WHITE, &report) == -ENODEV);
+	r = rt_display_off(&fixture_pdev, &report);
+	printf("dm-offline: display off after removal -> %d, %lu register writes\n", r,
+	       fixture_reg_writes - writes);
+	assert(r == 0 && !rt_display_showing());
+	rt_removal_end();
 
 	drm_dev_unregister(ddev);
 	assert(linuxu_sysfs_read(&fixture_dev.kobj, "drm/card0/card0-HDMI-A-1/status", text,

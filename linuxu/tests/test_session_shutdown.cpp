@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <string>
+#include <algorithm>
 #include <vector>
 #include <unistd.h>
 #include "retained_log.h"
@@ -205,14 +206,17 @@ static void rt_drm_info_close(rt_drm_info *drm) {
 
 static void rt_display_stop() {
     assert(displayShowing && !s_observerReads.admitting() && s_observerReads.drained());
-    assert(s_modulesRunning && !s_dmaQuarantined && lxTeardowns == 0);
-    events.push_back("display_off");
+    // Before Linux-file teardown in a close; for a removed device also from
+    // the release of a session that was quarantined first.
+    assert(s_modulesRunning && !s_dmaQuarantined && (lxTeardowns == 0 || s_deviceRemoved));
+    events.push_back(s_deviceRemoved ? "display_off_removed" : "display_off");
     displayShowing = false;
 }
 
 static unsigned rt_surface_remove_all() {
     assert(surfacesImported && !s_observerReads.admitting() && s_observerReads.drained());
-    assert(s_modulesRunning && !s_dmaQuarantined && !displayShowing && lxTeardowns == 0);
+    assert(s_modulesRunning && !s_dmaQuarantined && !displayShowing &&
+           (lxTeardowns == 0 || s_deviceRemoved));
     events.push_back("surfaces_release");
     const unsigned n = surfacesImported;
     surfacesImported = 0;
@@ -616,7 +620,7 @@ static void clientExitReopen(bool queueExhausted) {
 // stop sees the device gone. Either way no reset, isolation or quarantine
 // follows: everything is released, the provider closes, every Stop
 // finishes, and the next client opens a new session.
-static void surpriseRemoval(bool quarantined) {
+static void surpriseRemoval(bool quarantined, bool held = false) {
     MacLinuxGPU driver;
     IOPCIDevice provider;
     IODispatchQueue queue;
@@ -633,12 +637,27 @@ static void surpriseRemoval(bool quarantined) {
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
+    // A display agent was mirroring onto the GPU: an output on screen and
+    // two imported capture surfaces.
+    displayShowing = true;
+    surfacesImported = 2;
+    // "held": the session was quarantined before the close began, so the
+    // close keeps the display's owners until the removal releases them.
+    if (held) { s_dmaQuarantined = true; note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, -5); }
     if (!quarantined) devicePresent = false;
     assert(client.Stop(&driver) == kIOReturnSuccess);
     assert(s_sessionClosing && s_participants == 0 && !clientStops);
     if (quarantined) {
         assert(s_dmaQuarantined && !s_deviceRemoved);
         assert(saw("pci_quarantine") && saw("dma_quarantine"));
+        if (held) {
+            // Retained with every other owner while quarantined.
+            assert(displayShowing && surfacesImported == 2 && !saw("display_off"));
+        } else {
+            // The close began before anything quarantined: the display went
+            // off and its imports were released first, with the device there.
+            assert(!displayShowing && !surfacesImported && saw("display_off") && saw("surfaces_release"));
+        }
     } else {
         assert(!s_dmaQuarantined && s_deviceRemoved);
     }
@@ -665,10 +684,20 @@ static void surpriseRemoval(bool quarantined) {
     assert(saw("dma_removed") && saw("power_lost") && saw("removal_end"));
     assert(saw("upstream_shutdown") && saw("device_free") && saw("pci_close_removed"));
     assert(!saw("endpoint_reset") && !saw("pci_close"));
+    // The display's owners are gone before upstream removal; for a device
+    // already known removed nothing was committed.
+    assert(!displayShowing && !surfacesImported);
+    {
+        auto at = [](const char *e) { return std::find(events.begin(), events.end(), e) - events.begin(); };
+        const char *off = quarantined && !held ? "display_off" : "display_off_removed";
+        assert(at(off) < at("surfaces_release") && at("surfaces_release") < at("upstream_shutdown"));
+        if (!quarantined || held) assert(at("removal_begin") < at(off) && !saw("display_off"));
+    }
+    expectLog("released 2 imported surface(s)");
     if (!quarantined) {
         const std::vector<std::string> expected{
             "pci_mark_removed", "removal_begin", "compute_removed", "dma_removed", "power_lost",
-            "compute_stop", "removal_end", "upstream_shutdown", "cancel_irqs",
+            "display_off_removed", "surfaces_release", "compute_stop", "removal_end", "upstream_shutdown", "cancel_irqs",
             "irq_drained", "enqueue_finish", "device_free", "release_bar0", "dma_removed",
             "dma_fini", "pci_close_removed", "gart_reset", "super_client_stop"};
         assert(events == expected);
@@ -687,7 +716,7 @@ static void surpriseRemoval(bool quarantined) {
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));
     std::printf("PASS production session shutdown: %s\n",
-                quarantined ? "surprise-removal-quarantined" : "surprise-removal");
+                held ? "surprise-removal-held" : quarantined ? "surprise-removal-quarantined" : "surprise-removal");
 }
 
 static rt_drm_info observerDrm;
@@ -699,8 +728,9 @@ int main(int argc, char **argv) {
         clientExitReopen(scenario == "queue-exhaustion-exit");
         return 0;
     }
-    if (scenario == "surprise-removal" || scenario == "surprise-removal-quarantined") {
-        surpriseRemoval(scenario == "surprise-removal-quarantined");
+    if (scenario == "surprise-removal" || scenario == "surprise-removal-quarantined" ||
+        scenario == "surprise-removal-held") {
+        surpriseRemoval(scenario != "surprise-removal", scenario == "surprise-removal-held");
         return 0;
     }
     Fixture fixture;
@@ -787,7 +817,7 @@ int main(int argc, char **argv) {
             "super_client_stop", "super_client_stop", "super_driver_stop"};
         assert(events == expected && !displayShowing);
         fixture.assertReleased();
-        expectLog("session close: turning the display test pattern off");
+        expectLog("session close: turning the display pattern or output off");
         expectLog("session close: released 2 imported surface(s)");
     } else if (scenario == "success") {
         const std::vector<std::string> expected{
