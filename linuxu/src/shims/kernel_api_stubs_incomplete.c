@@ -42,6 +42,11 @@ int dynamic_pr_debug(const char *fmt, ...)
 int isascii(int c) { return (c & ~0x7f) == 0; }
 int isdigit(int c) { return (c >= '0' && c <= '9'); }
 int isgraph(int c) { return (c > 32 && c < 127); }
+int isxdigit(int c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+	       (c >= 'A' && c <= 'F');
+}
 int isspace(int c)
 {
 	return (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v');

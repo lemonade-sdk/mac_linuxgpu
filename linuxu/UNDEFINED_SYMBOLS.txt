@@ -106,7 +106,6 @@ drm_atomic_helper_set_config
 drm_atomic_helper_shutdown
 drm_atomic_helper_update_plane
 drm_buddy_print
-drm_crtc_helper_add
 drm_crtc_helper_set_config
 drm_crtc_helper_set_mode
 drm_crtc_init
@@ -143,7 +142,6 @@ drm_kms_helper_poll_disable
 drm_kms_helper_poll_enable
 drm_kms_helper_poll_fini
 drm_kms_helper_poll_init
-drm_privacy_screen_put
 drm_simple_encoder_init
 drm_suballoc_free
 drm_suballoc_manager_fini
@@ -202,6 +200,7 @@ isascii
 isdigit
 isgraph
 isspace
+isxdigit
 kill_anon_super
 ksys_sync_helper
 kthread_cancel_work_sync
