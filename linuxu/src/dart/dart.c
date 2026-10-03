@@ -912,6 +912,66 @@ void linuxu_dma_free_coherent(struct device *dev, size_t size, void *vaddr,
 #endif
 }
 
+/* ---- imported mappings (rt/dart.h) ---- */
+struct dart_import {
+	struct dart_import *next;
+	uint64_t iova, size;
+};
+static struct dart_import *dart_imports;	/* dart_lock */
+
+int linuxu_dart_import(uint64_t iova, uint64_t size)
+{
+	struct dart_import *e;
+	int r;
+
+	if (!iova || !size || size - 1 > UINT64_MAX - iova)
+		return -EINVAL;
+	e = malloc(sizeof(*e));
+	if (!e)
+		return -ENOMEM;
+	*e = (struct dart_import){ .iova = iova, .size = size };
+	pthread_mutex_lock(&dart_lock);
+	for (const struct dart_import *o = dart_imports; o; o = o->next)
+		if (iova < o->iova + o->size && o->iova < iova + size) {
+			pthread_mutex_unlock(&dart_lock);
+			free(e);
+			return -EINVAL;
+		}
+	r = dart_charge(size);
+	if (!r) {
+		e->next = dart_imports;
+		dart_imports = e;
+	}
+	pthread_mutex_unlock(&dart_lock);
+	if (r)
+		free(e);
+	return r;
+}
+
+void linuxu_dart_import_release(uint64_t iova, uint64_t size)
+{
+	struct dart_import **link, *e = NULL;
+
+	pthread_mutex_lock(&dart_lock);
+	for (link = &dart_imports; *link; link = &(*link)->next)
+		if ((*link)->iova == iova && (*link)->size == size) {
+			e = *link;
+			*link = e->next;
+			dart_refund(size);
+			break;
+		}
+	pthread_mutex_unlock(&dart_lock);
+	free(e);
+}
+
+static int dart_import_live_locked(uint64_t iova, uint64_t bytes)
+{
+	for (const struct dart_import *e = dart_imports; e; e = e->next)
+		if (iova >= e->iova && iova - e->iova < e->size && bytes <= e->size - (iova - e->iova))
+			return 1;
+	return 0;
+}
+
 /* ---- containment: what a device access may touch ---- */
 
 #ifdef LINUXU_DEXT_DK
@@ -950,7 +1010,7 @@ int linuxu_dart_contains(uint64_t iova, uint64_t bytes)
 	if (!bytes || bytes - 1 > UINT64_MAX - iova)
 		return 0;
 	pthread_mutex_lock(&dart_lock);
-	live = dart_live_locked(iova, bytes);
+	live = dart_live_locked(iova, bytes) || dart_import_live_locked(iova, bytes);
 	pthread_mutex_unlock(&dart_lock);
 	return live;
 }
@@ -1000,7 +1060,7 @@ void linuxu_dart_reset(void)
 			return;
 		}
 #endif
-	if (dart_table_count) { pthread_mutex_unlock(&dart_lock); return; }
+	if (dart_table_count || dart_imports) { pthread_mutex_unlock(&dart_lock); return; }
 	memset(dart_table, 0, sizeof(dart_table));
 	dart_table_count = 0;
 	dart_used = 0;

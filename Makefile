@@ -1206,3 +1206,12 @@ test-hsa-power-transport:
 test: test-kfd-power test-power-state test-hsa-power-transport
 CRASH_PATH_TESTS += test-kfd-power test-power-state test-hsa-power-transport
 .PHONY: test-kfd-power test-power-state test-hsa-power-transport
+
+# A client's memory, given as DMA segments, imported as an amdgpu dma-buf
+# and copied into VRAM by SDMA, on the CS fixture device (display agent
+# frames, docs/macos-displays.md).
+test-surface-import:
+	bash scripts/test-surface-import.sh
+
+test: test-surface-import
+.PHONY: test-surface-import

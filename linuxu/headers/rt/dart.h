@@ -65,6 +65,16 @@ void linuxu_dma_free_coherent(struct device *dev, size_t size, void *vaddr,
  * DART fault can take the device off the bus. */
 int linuxu_dart_contains(uint64_t iova, uint64_t bytes);
 
+/* A mapping made outside this layer: memory of another process that the
+ * platform mapped for the device (a display agent's IOSurface, mapped by
+ * the dext's IODMACommand). It is charged to the budget and is live for
+ * linuxu_dart_contains() from linuxu_dart_import() until
+ * linuxu_dart_import_release(); the IOVA range itself is the platform's.
+ * Returns 0, -EINVAL (empty, overflowing or overlapping a live import) or
+ * -ENOMEM (over budget). */
+int linuxu_dart_import(uint64_t iova, uint64_t size);
+void linuxu_dart_import_release(uint64_t iova, uint64_t size);
+
 /* Hold DMA releases while @stalled(@arg) reports that a GPU engine has
  * work it has been running longer than its job timeout: memory the driver
  * frees then stays mapped (and allocated) until no engine is stalled, so
