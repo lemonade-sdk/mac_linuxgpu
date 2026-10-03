@@ -25,6 +25,10 @@ struct IODMACommandSpecification { uint64_t options, maxAddressBits; };
 static size_t mock_objects, mock_dma_prepared, mock_api_calls;
 static size_t mock_fail_api, mock_complete_calls, mock_fail_allocation;
 static bool mock_complete_failure, mock_short_segment;
+/* Imports (several segments requested): how many segments the DART splits
+ * a mapping into, and whether one of them comes back misaligned. */
+static uint32_t mock_import_segments = 1;
+static bool mock_import_misaligned;
 /* The DART modeled by IODMACommand: it places every mapping at
  * mock_dart_iova, and (when nonzero) refuses PrepareForDMA for commands
  * narrower than mock_dart_refuse_below_bits. */
@@ -187,7 +191,7 @@ public:
     }
 };
 class IODMACommand : public MockObject {
-    IOBufferMemoryDescriptor *buffer = nullptr;
+    IOMemoryDescriptor *buffer = nullptr;
     uint64_t address_bits = 0;
 public:
     ~IODMACommand() override { assert(!buffer); }
@@ -200,13 +204,27 @@ public:
         command->address_bits = spec->maxAddressBits;
         *out = command; return 0;
     }
-    kern_return_t PrepareForDMA(uint64_t, IOBufferMemoryDescriptor *b,
+    kern_return_t PrepareForDMA(uint64_t, IOMemoryDescriptor *b,
             uint64_t, uint64_t size, uint64_t *, uint32_t *count, IOAddressSegment *seg) {
         if (mock_fail()) return -1;
-        assert(!buffer && *count == 1);
+        assert(!buffer && *count >= 1);
         if (address_bits < mock_dart_refuse_below_bits) return -1;
         buffer = b; b->retain(); ++mock_dma_prepared;
-        *seg = {mock_dart_iova, mock_short_segment ? size - 1 : size};
+        if (*count == 1) {
+            *seg = {mock_dart_iova, mock_short_segment ? size - 1 : size};
+        } else {
+            /* Equal runs of whole 16 KiB pages, each at its own IOVA. */
+            const uint32_t n = mock_import_segments < *count ? mock_import_segments : *count;
+            const uint64_t pages = size / 16384;
+            uint64_t done = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                const uint64_t run = i + 1 == n ? pages - done : pages / n;
+                seg[i] = {mock_dart_iova + i * 0x1000000ULL, run * 16384};
+                done += run;
+            }
+            if (mock_import_misaligned) seg[n - 1].address += 4096;
+            *count = n;
+        }
         mock_hook(mock_prepare_hook); return 0;
     }
     kern_return_t CompleteDMA(uint64_t) {

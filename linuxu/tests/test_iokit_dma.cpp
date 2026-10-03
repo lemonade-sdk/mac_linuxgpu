@@ -555,6 +555,108 @@ static void quarantine_release() {
     /* Intentional quarantine owns both references until process termination. */
 }
 
+/* A client's memory descriptor mapped for the device: retained, recorded
+ * like a coherent mapping, released only when its owner releases it, held
+ * by the shutdown hold and retained by a quarantine. */
+static IOMemoryDescriptor *client_memory(uint64_t bytes) {
+    IOBufferMemoryDescriptor *buffer = nullptr;
+    assert(IOBufferMemoryDescriptor::Create(0, bytes, 16384, &buffer) == 0);
+    return buffer;
+}
+static uint64_t import(IOMemoryDescriptor *memory, uint64_t bytes, uint32_t *count,
+                       uint64_t *addresses = nullptr) {
+    uint64_t a[DEXT_DMA_IMPORT_SEGMENTS_MAX], l[DEXT_DMA_IMPORT_SEGMENTS_MAX], id = 0;
+    if (dext_dma_import(memory, bytes, addresses ? addresses : a, l, count, &id) != 0) return 0;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < *count; ++i) {
+        assert(!(l[i] & 16383) && l[i]);
+        total += l[i];
+    }
+    assert(total == bytes && id);
+    return id;
+}
+static void import_lifetime() {
+    start();
+    mock_import_segments = 3;
+    IOMemoryDescriptor *memory = client_memory(10 * 16384);
+    uint32_t count = 8;
+    uint64_t addresses[DEXT_DMA_IMPORT_SEGMENTS_MAX];
+    const size_t completions = mock_complete_calls;
+    const uint64_t id = import(memory, 10 * 16384, &count, addresses);
+    assert(id && count == 3 && addresses[1] == mock_dart_iova + 0x1000000);
+    memory->release(); /* the caller's reference: the seam keeps its own */
+    assert(dext_dma_live_count() == 1 && mock_dma_prepared == 1);
+    /* Not a coherent allocation: no descriptor copy or range lookup finds it. */
+    assert(!dext_dma_copy_descriptor(nullptr) && dext_dma_free_coherent(nullptr, 0) == 0);
+    assert(dext_dma_fini() != 0);           /* a live mapping blocks fini */
+    assert(dext_dma_set_pci(&pci) != 0);
+    /* A stopping seam still takes the release (cleanup is admitted). */
+    assert(dext_dma_release_import(id + 1) != 0 && dext_dma_release_import(0) != 0);
+    assert(dext_dma_release_import(id) == 0 && mock_complete_calls == completions + 1);
+    assert(dext_dma_release_import(id) != 0);
+    clean();
+
+    /* Under the shutdown hold the release only retires the mapping; the
+     * endpoint reset completes it. */
+    start();
+    memory = client_memory(4 * 16384);
+    count = 4;
+    const uint64_t held = import(memory, 4 * 16384, &count);
+    memory->release();
+    assert(held && count == 3);
+    assert(dext_dma_begin_shutdown(4 * 16384 - 1) != 0); /* counts its bytes */
+    assert(dext_dma_begin_shutdown(4 * 16384) == 0);
+    assert(dext_dma_release_import(held) == 0);
+    assert(mock_dma_prepared == 1);
+    assert(dext_dma_begin_shutdown_reset() == 0);
+    assert(dext_dma_end_shutdown_reset(1) == 0 && mock_dma_prepared == 0);
+    clean();
+
+    /* Refusals leave nothing retained. */
+    start();
+    memory = client_memory(4 * 16384);
+    count = 4;
+    uint64_t a[4], l[4], none = 0;
+    assert(dext_dma_import(memory, 4 * 16384 - 4096, a, l, &count, &none) != 0);   /* not whole pages */
+    count = 0;
+    assert(dext_dma_import(memory, 4 * 16384, a, l, &count, &none) != 0);          /* no room */
+    count = DEXT_DMA_IMPORT_SEGMENTS_MAX + 1;
+    assert(dext_dma_import(memory, 4 * 16384, a, l, &count, &none) != 0);
+    count = 4;
+    mock_fail_api = mock_api_calls + 2;                                            /* PrepareForDMA */
+    assert(dext_dma_import(memory, 4 * 16384, a, l, &count, &none) != 0);
+    mock_fail_api = 0;
+    mock_import_misaligned = true;                                                 /* a 4 KiB-aligned run */
+    assert(dext_dma_import(memory, 4 * 16384, a, l, &count, &none) != 0);
+    mock_import_misaligned = false;
+    const uint64_t saved_iova = mock_dart_iova;
+    mock_dart_iova = 1ULL << 40;                                                   /* beyond 40 bits */
+    assert(dext_dma_set_address_bits(40) == 0);
+    count = 4;
+    assert(dext_dma_import(memory, 4 * 16384, a, l, &count, &none) != 0 && !none);
+    mock_dart_iova = saved_iova;
+    assert(dext_dma_set_address_bits(64) == 0);
+    assert(dext_dma_live_count() == 0 && mock_dma_prepared == 0);
+    memory->release();
+    clean();
+
+    /* A quarantine retains it: the release retires, never completes. */
+    start();
+    memory = client_memory(2 * 16384);
+    count = 2;
+    const uint64_t kept = import(memory, 2 * 16384, &count);
+    memory->release();
+    dext_dma_quarantine();
+    const size_t before = mock_complete_calls;
+    assert(dext_dma_release_import(kept) != 0 && mock_complete_calls == before);
+    assert(dext_dma_quarantine_releasable());
+    assert(dext_dma_lift_quarantine(1) == 0);
+    assert(dext_dma_begin_shutdown_reset() == 0 && dext_dma_end_shutdown_reset(1) == 0);
+    assert(mock_complete_calls == before + 1);
+    clean();
+    mock_import_segments = 1;
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "shutdown-reset-failed")) shutdown_failure(false);
@@ -564,6 +666,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "quarantine-complete")) quarantine_inflight(true);
         else if (!strcmp(argv[1], "orphaned-bar0")) orphaned_bar0_alias();
         else if (!strcmp(argv[1], "quarantine-release")) quarantine_release();
+        else if (!strcmp(argv[1], "import")) import_lifetime();
         else failed_completion(strcmp(argv[1], "unpublished") == 0);
     } else {
         reset_admission(); shutdown_retention(); probe_lifetime(); normal_and_rpc_failures(); stopping_during_allocation(); vmap_unwind(); cpu_pages_and_aliases();

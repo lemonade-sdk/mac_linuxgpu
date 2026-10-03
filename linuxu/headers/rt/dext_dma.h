@@ -101,6 +101,22 @@ int dext_dma_alloc_coherent(size_t size, void **cpu_addr, uint64_t *iova);
  * accounting and must not free or repurpose that storage. */
 int dext_dma_free_coherent(void *cpu_addr, size_t size);
 
+/* A client's memory mapped for the device: @descriptor (an
+ * IOMemoryDescriptor the client passed, for example a display agent's
+ * IOSurface pages) is retained and prepared for DMA by an IODMACommand on
+ * the bound device. On success *count (in: capacity, at most
+ * DEXT_DMA_IMPORT_SEGMENTS_MAX) segments are written, each of whole 16 KiB
+ * pages below the device's DMA width, together @length bytes, and
+ * *import_id names the mapping. It is recorded like a coherent mapping:
+ * release it with dext_dma_release_import() once the GPU can no longer
+ * reach it; under the shutdown hold the release is retired until the
+ * endpoint reset, a quarantine retains it, and fini refuses while it
+ * lives. -1 on any failure, with nothing retained. */
+#define DEXT_DMA_IMPORT_SEGMENTS_MAX 64u
+int dext_dma_import(void *descriptor, uint64_t length, uint64_t *addresses,
+		    uint64_t *lengths, uint32_t *count, uint64_t *import_id);
+int dext_dma_release_import(uint64_t import_id);
+
 /* CPU-only descriptor backing, without a DMA command or DART reservation.
  * Pages allocated here can participate in real contiguous CPU aliases. */
 void *dext_cpu_alloc_pages(size_t size);

@@ -32,6 +32,7 @@
  * desktop without DriverKit. */
 #include <stdint.h>
 #include <stdlib.h>
+#include <rt/dext_dma.h>
 
 #ifdef LINUXU_DEXT
 
@@ -149,7 +150,7 @@ public:
 
 /* CompleteDMA failure does not establish that DART has stopped referencing
  * this backing. Preserve both objects and block further sessions. */
-static int dext_dma_complete_now(IODMACommand *dma, IOBufferMemoryDescriptor *buf)
+static int dext_dma_complete_now(IODMACommand *dma, IOMemoryDescriptor *buf)
 {
 	dext_dma_acquire();
 	bool quarantined = g_dma_quarantined;
@@ -175,13 +176,13 @@ static int dext_dma_complete_now(IODMACommand *dma, IOBufferMemoryDescriptor *bu
 	return 0;
 }
 
-static int dext_dma_complete(IODMACommand *, IOBufferMemoryDescriptor *, uint64_t);
+static int dext_dma_complete(IODMACommand *, IOMemoryDescriptor *, uint64_t);
 
 /* Forward declarations: the side-table helpers are defined below but are
  * called from dext_dma_alloc_coherent / dext_dma_free_coherent above them
  * in this file.  (C requires declaration-before-use.) */
-static int dext_dma_store(IOBufferMemoryDescriptor *buf, IODMACommand *dma,
-			   uint64_t cpu_addr, uint64_t length);
+static int dext_dma_store(IOMemoryDescriptor *buf, IODMACommand *dma,
+			   uint64_t cpu_addr, uint64_t length, uint64_t import_id = 0);
 static int dext_dma_reap_obj(uint64_t cpu_addr);
 extern "C" int dext_copy_bar_memory(uint8_t bar, uint64_t *size,
 					     void **descriptor);
@@ -437,13 +438,14 @@ int dext_dma_free_coherent(void *cpu_addr, size_t size)
 /* ---- side-table: cpu_addr -> {buf, dma}. Entries stay occupied until
  * CompleteDMA and reference release finish, including concurrent callers. */
 struct dext_dma_entry {
-	IOBufferMemoryDescriptor *buf;
+	IOMemoryDescriptor       *buf;	/* a coherent buffer, or an imported client descriptor */
 	IODMACommand             *dma;
-	uint64_t                  cpu_addr;
+	uint64_t                  cpu_addr;	/* 0 for an import: no CPU mapping here */
 	uint64_t                  length;
 	int                        in_use;
 	bool                       releasing;
 	bool                       retired;
+	uint64_t                  import_id;	/* nonzero for an import (dext_dma_import) */
 };
 #define DEXT_DMA_TABLE 4096
 static struct dext_dma_entry dext_dma_table[DEXT_DMA_TABLE];
@@ -451,14 +453,14 @@ static struct dext_dma_entry dext_dma_table[DEXT_DMA_TABLE];
 /* Unpublished mappings created during upstream teardown still need the same
  * pin-until-reset rule. A full registry retains the references and latches a
  * cleanup failure instead of completing an untracked mapping prematurely. */
-static int dext_dma_complete(IODMACommand *dma, IOBufferMemoryDescriptor *buf,
+static int dext_dma_complete(IODMACommand *dma, IOMemoryDescriptor *buf,
                              uint64_t length)
 {
 	dext_dma_acquire();
 	if (g_dma_holding_frees) {
 		for (auto &entry : dext_dma_table) {
 			if (entry.in_use) continue;
-			entry = {buf, dma, 0, length, 1, true, true};
+			entry = {buf, dma, 0, length, 1, true, true, 0};
 			dext_dma_release();
 			return 0;
 		}
@@ -476,10 +478,10 @@ void *dext_dma_copy_descriptor(void *cpu_addr)
 {
 	dext_dma_acquire();
 	if (g_dma_quarantined) { dext_dma_release(); return nullptr; }
-	IOBufferMemoryDescriptor *found = nullptr;
+	IOMemoryDescriptor *found = nullptr;
 	for (int i = 0; i < DEXT_DMA_TABLE; ++i) {
 		const auto &e = dext_dma_table[i];
-		if (e.in_use && !e.releasing &&
+		if (e.in_use && !e.releasing && !e.import_id &&
 		    e.cpu_addr == (uint64_t)(uintptr_t)cpu_addr) {
 			found = e.buf;
 			found->retain();
@@ -924,7 +926,7 @@ extern "C" int dext_dma_end_shutdown_reset(int reset_succeeded)
 			}
 			bool retired = entry.in_use && entry.retired;
 			IODMACommand *dma = entry.dma;
-			IOBufferMemoryDescriptor *buf = entry.buf;
+			IOMemoryDescriptor *buf = entry.buf;
 			dext_dma_release();
 			if (!retired) continue;
 			if (dext_dma_complete_now(dma, buf)) {
@@ -983,7 +985,7 @@ extern "C" int dext_dma_commit_probe(void)
 			return 0;
 		}
 		IODMACommand *dma = retired ? retired->dma : nullptr;
-		IOBufferMemoryDescriptor *buf = retired ? retired->buf : nullptr;
+		IOMemoryDescriptor *buf = retired ? retired->buf : nullptr;
 		uint64_t bytes = retired ? retired->length : 0;
 		dext_dma_release();
 		if (!retired) {
@@ -1022,13 +1024,13 @@ static IOMemoryDescriptor *dext_dma_concat_ranges(const uint64_t *addresses,
 	size_t built = 0;
 	for (; built < count; ++built) {
 		const uint64_t addr = addresses[built], len = lengths[built];
-		IOBufferMemoryDescriptor *buf = nullptr;
+		IOMemoryDescriptor *buf = nullptr;
 		uint64_t offset = 0;
 		if (!len) break;
 		dext_dma_acquire();
 		for (int i = 0; i < DEXT_DMA_TABLE; ++i) {
 			auto &e = dext_dma_table[i];
-			if (e.in_use && !e.releasing && addr >= e.cpu_addr &&
+			if (e.in_use && !e.releasing && !e.import_id && addr >= e.cpu_addr &&
 			    addr - e.cpu_addr < e.length &&
 			    e.length - (addr - e.cpu_addr) >= len) {
 				buf = e.buf;
@@ -1181,8 +1183,8 @@ void dext_dma_vunmap_pages(const void *address)
 	}
 }
 
-static int dext_dma_store(IOBufferMemoryDescriptor *buf, IODMACommand *dma,
-			   uint64_t cpu_addr, uint64_t length)
+static int dext_dma_store(IOMemoryDescriptor *buf, IODMACommand *dma,
+			   uint64_t cpu_addr, uint64_t length, uint64_t import_id)
 {
 	int i;
 
@@ -1200,6 +1202,7 @@ static int dext_dma_store(IOBufferMemoryDescriptor *buf, IODMACommand *dma,
 			dext_dma_table[i].in_use   = 1;
 			dext_dma_table[i].releasing = false;
 			dext_dma_table[i].retired = false;
+			dext_dma_table[i].import_id = import_id;
 			dext_dma_release();
 			return 0;
 		}
@@ -1218,13 +1221,13 @@ static int dext_dma_reap_obj(uint64_t cpu_addr)
 	for (i = 0; i < DEXT_DMA_TABLE; i++) {
 		struct dext_dma_entry *e = &dext_dma_table[i];
 
-		if (e->in_use && e->cpu_addr == cpu_addr) {
+		if (e->in_use && !e->import_id && e->cpu_addr == cpu_addr) {
 			if (e->releasing) {
 				dext_dma_release();
 				return -1;
 			}
 			IODMACommand *dma = e->dma;
-			IOBufferMemoryDescriptor *buf = e->buf;
+			IOMemoryDescriptor *buf = e->buf;
 			e->releasing = true;
 			if (g_dma_holding_frees) {
 				e->retired = true;
@@ -1250,6 +1253,111 @@ static int dext_dma_reap_obj(uint64_t cpu_addr)
 	return -1; /* unknown cpu_addr: no-op (idempotent free contract) */
 }
 
+/* ---- a client's memory mapped for the device (rt/dext_dma.h) ----
+ * The client's memory descriptor (a display agent's IOSurface pages, passed
+ * as a structure-input descriptor) is retained and prepared for DMA by an
+ * IODMACommand on the bound device, then recorded in the same table as the
+ * coherent mappings: the shutdown hold retires its release until the
+ * endpoint reset, a quarantine retains it, and fini refuses while it lives. */
+static uint64_t g_dma_next_import = 1;
+
+int dext_dma_import(void *descriptor, uint64_t length, uint64_t *addresses,
+		    uint64_t *lengths, uint32_t *count, uint64_t *import_id)
+{
+	if (!descriptor || !length || (length & (DEXT_DART_COHERENT_ALIGN - 1)) ||
+	    !addresses || !lengths || !count || !*count || *count > DEXT_DMA_IMPORT_SEGMENTS_MAX ||
+	    !import_id)
+		return -1;
+	*import_id = 0;
+	auto *memory = static_cast<IOMemoryDescriptor *>(descriptor);
+	dext_dma_operation operation;
+	if (!operation.pci) return -1;
+	if (!operation.reserve_shutdown_bytes(length)) return -1;
+	const unsigned int bits = dext_dma_address_bits();
+	IODMACommandSpecification spec{};
+	spec.options = kIODMACommandSpecificationNoOptions;
+	spec.maxAddressBits = bits;
+	IODMACommand *dma = nullptr;
+	if (IODMACommand::Create(operation.pci, kIODMACommandCreateNoOptions, &spec, &dma) !=
+	    kIOReturnSuccess || !dma)
+		return -1;
+	IOAddressSegment segments[DEXT_DMA_IMPORT_SEGMENTS_MAX] = {};
+	uint32_t n = *count;
+	uint64_t flags = 0;
+	memory->retain();
+	if (dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions, memory, 0, length, &flags,
+			       &n, segments) != kIOReturnSuccess) {
+		dma->release();
+		memory->release();
+		DEXT_DMA_LOG("DMA import refused: PrepareForDMA of %llu bytes failed",
+			     (unsigned long long)length);
+		return -1;
+	}
+	operation.did_prepare();
+	/* Every segment whole host pages, below the device's reach, and
+	 * together exactly the descriptor's length. */
+	uint64_t total = 0;
+	bool usable = n && n <= *count;
+	for (uint32_t i = 0; usable && i < n; ++i) {
+		usable = segments[i].address && segments[i].length &&
+			!((segments[i].address | segments[i].length) & (DEXT_DART_COHERENT_ALIGN - 1)) &&
+			dext_dma_below(segments[i].address, segments[i].length, bits) &&
+			segments[i].length <= length - total;
+		if (usable) total += segments[i].length;
+	}
+	if (!usable || total != length) {
+		DEXT_DMA_LOG("DMA import refused: %u segment(s) unusable for the device (%u-bit)", n, bits);
+		(void)dext_dma_complete(dma, memory, length);
+		return -1;
+	}
+	dext_dma_acquire();
+	const uint64_t id = g_dma_next_import++;
+	dext_dma_release();
+	if (dext_dma_store(memory, dma, 0, length, id) != 0) {
+		(void)dext_dma_complete(dma, memory, length);
+		return -1;
+	}
+	for (uint32_t i = 0; i < n; ++i) {
+		addresses[i] = segments[i].address;
+		lengths[i] = segments[i].length;
+	}
+	*count = n;
+	*import_id = id;
+	return 0;
+}
+
+int dext_dma_release_import(uint64_t import_id)
+{
+	if (!import_id) return -1;
+	dext_dma_operation operation(true);
+	if (!operation.pci) return -1;
+	dext_dma_acquire();
+	for (auto &e : dext_dma_table) {
+		if (!e.in_use || e.import_id != import_id) continue;
+		if (e.releasing) { dext_dma_release(); return -1; }
+		IODMACommand *dma = e.dma;
+		IOMemoryDescriptor *memory = e.buf;
+		e.releasing = true;
+		if (g_dma_holding_frees) {
+			/* Kept mapped until the endpoint reset. */
+			e.retired = true;
+			const int result = g_dma_quarantined ? -1 : 0;
+			dext_dma_release();
+			return result;
+		}
+		const uint64_t length = e.length;
+		dext_dma_release();
+		if (dext_dma_complete(dma, memory, length) != 0)
+			return -1;
+		dext_dma_acquire();
+		e = {};
+		dext_dma_release();
+		return 0;
+	}
+	dext_dma_release();
+	return -1;
+}
+
 /* Diagnostics for the test/bringup harness. */
 int dext_dma_live_count(void)
 {
@@ -1266,6 +1374,8 @@ int dext_dma_live_count(void)
 } /* extern "C" */
 
 #else /* host build: identity-IOVA testable twins */
+extern "C" int dext_dma_import(void *, uint64_t, uint64_t *, uint64_t *, uint32_t *, uint64_t *) { return -1; }
+extern "C" int dext_dma_release_import(uint64_t) { return -1; }
 extern "C" int dext_dma_begin_reset(void) { return -1; }
 extern "C" void dext_dma_end_reset(void) {}
 extern "C" int dext_dma_begin_shutdown(uint64_t) { return -1; }
@@ -1290,6 +1400,7 @@ extern "C" int dext_cpu_free_pages(void *address, size_t size)
 
 
 #include <stdlib.h>
+#include <rt/dext_dma.h>
 
 extern "C" {
 
