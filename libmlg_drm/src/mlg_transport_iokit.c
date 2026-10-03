@@ -125,8 +125,10 @@ static int t_open(void *ctx, uint32_t dev, uint32_t flags)
 	if (r == -MLG_LX_ENODEV) {
 		/* The driver is attached but the GPU is not initialized yet:
 		 * initialize it, as a session client does (host window, then
-		 * InitDevice), then retry. */
-		if (!mlg_init_device(scalar_call, NULL))
+		 * InitDevice), then retry; the open fails with the reason the
+		 * initialization did. */
+		r = mlg_init_device(scalar_call, NULL);
+		if (!r)
 			r = scalar(MLG_SELECTOR_LX_OPEN, in, 2, out, 1);
 	}
 	return r ? r : (int)(int64_t)out[0];

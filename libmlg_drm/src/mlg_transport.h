@@ -17,7 +17,11 @@ int mlg_default_transport(struct mlg_transport *out);
 typedef int (*mlg_scalar_fn)(void *ctx, uint32_t selector, const uint64_t *in, uint32_t nin,
 			     uint64_t *out, uint32_t nout);
 /* Initialize the GPU as a session client does (mlg_init.c): place the host
- * window, then InitDevice. Returns InitDevice's result. */
+ * window, then InitDevice. Returns InitDevice's result, or, with no
+ * InitDevice call and the reason on stderr, -EOPNOTSUPP when the driver
+ * does not admit HostWindow from this client, -EIO when it answers an
+ * unusable window or does not take the base, -ENOMEM when the window
+ * cannot be reserved, or the query's own error. */
 int mlg_init_device(mlg_scalar_fn scalar, void *ctx);
 
 #endif

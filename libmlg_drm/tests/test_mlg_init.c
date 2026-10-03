@@ -1,8 +1,9 @@
 /* libmlg_drm's GPU bring-up from a Linux-file client (mlg_init.c), against
  * a fake user client: the host window is queried, a size-aligned base
  * inside a reservation of this process's address space is chosen, then
- * InitDevice runs and the reservation is released; a driver that refuses
- * HostWindow, or answers an unusable size, still gets InitDevice. */
+ * InitDevice runs and the reservation is released. A driver that refuses
+ * HostWindow, answers an unusable size or does not take the base fails the
+ * initialization, without InitDevice. */
 #include <errno.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -19,6 +20,7 @@
 static struct fake_client {
 	uint64_t window_bytes;		/* what the query answers */
 	int window_result;		/* the query's result (-ENOTTY: refused) */
+	int set_mismatch;		/* the set answers another base */
 	int init_result;
 	char log[16];			/* q: query, s: set, i: InitDevice */
 	unsigned int n;
@@ -69,7 +71,7 @@ static int fake_scalar(void *ctx, uint32_t selector, const uint64_t *in, uint32_
 		fake.log[fake.n++] = 's';
 		fake.base = in[0];
 		fake.base_reserved = protection_at(in[0], fake.window_bytes) == VM_PROT_NONE;
-		out[0] = in[0];
+		out[0] = in[0] + (fake.set_mismatch ? fake.window_bytes : 0);
 		out[1] = fake.window_bytes;
 		out[2] = 1;
 		return 0;
@@ -103,17 +105,30 @@ int main(void)
 	CHECK(!strcmp(fake.log, "qsi") && fake.base_reserved);
 	CHECK(protection_at(fake.base, gart) != VM_PROT_NONE);
 
-	/* A driver that does not admit HostWindow from this client. */
+	/* A driver that does not admit HostWindow from this client: no
+	 * InitDevice, an explained -EOPNOTSUPP. */
 	reset(gart, -MLG_LX_ENOTTY, 0);
-	CHECK(mlg_init_device(fake_scalar, NULL) == 0 && !strcmp(fake.log, "i"));
+	CHECK(mlg_init_device(fake_scalar, NULL) == -95 && !strcmp(fake.log, ""));
 
-	/* Sizes that cannot be a window: no base is chosen. */
+	/* Another query failure is returned as it is. */
+	reset(gart, -MLG_LX_ENODEV, 0);
+	CHECK(mlg_init_device(fake_scalar, NULL) == -MLG_LX_ENODEV && !strcmp(fake.log, ""));
+
+	/* Sizes that cannot be a window: -EIO, no base, no InitDevice. */
 	const uint64_t bad[] = { 0, 4096, 3ull << 20, 1ull << 46 };
 	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
 		reset(bad[i], 0, 0);
-		CHECK(mlg_init_device(fake_scalar, NULL) == 0 && !strcmp(fake.log, "qi"));
+		CHECK(mlg_init_device(fake_scalar, NULL) == -5 && !strcmp(fake.log, "q"));
 	}
+
+	/* A base the driver does not take: -EIO, no InitDevice, the
+	 * reservation released. */
+	reset(gart, 0, 0);
+	fake.set_mismatch = 1;
+	CHECK(mlg_init_device(fake_scalar, NULL) == -5 && !strcmp(fake.log, "qs"));
+	CHECK(protection_at(fake.base, gart) != VM_PROT_NONE);
 	puts("PASS libmlg_drm init: host window queried, placed size-aligned in a reservation, "
-	     "InitDevice, reservation released; refused or unusable windows still initialize");
+	     "InitDevice, reservation released; a refused, unusable or untaken window fails "
+	     "without InitDevice");
 	return 0;
 }
