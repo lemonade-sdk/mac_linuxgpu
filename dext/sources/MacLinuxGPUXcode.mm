@@ -69,6 +69,7 @@
 #include "session_state.h"
 #include <rt/bootstrap.h>
 #include <rt/cs_selftest.h>
+#include <rt/display.h>
 #include <rt/drm_info.h>
 #include <rt/lx_abi.h>
 #include <rt/lx_files.h>
@@ -158,6 +159,14 @@ static_assert(kMacAMDGPUMethodReleaseQuarantine == MLG_SELECTOR_RELEASE_QUARANTI
               kMacAMDGPUMethodPing == MLG_SELECTOR_PING, "observer selector numbers");
 static_assert(MLG_SELECTOR_SYSFS_READ > kMacAMDGPUMethodReleaseQuarantine &&
               MLG_SELECTOR_DRM_INFO > kMacAMDGPUMethodReleaseQuarantine, "Linux read selectors");
+static_assert(MLG_SELECTOR_DISPLAY > MLG_SELECTOR_DRM_SELFTEST &&
+              MLG_SELECTOR_DISPLAY < MLG_SELECTOR_LX_OPEN, "display selector");
+static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
+              MLG_DISPLAY_PATTERN_BARS == RT_DISPLAY_PATTERN_BARS &&
+              MLG_DISPLAY_PATTERN_WHITE == RT_DISPLAY_PATTERN_WHITE &&
+              MLG_DISPLAY_PATTERN_GRADIENT == RT_DISPLAY_PATTERN_GRADIENT &&
+              MLG_DISPLAY_NAME_MAX < RT_DISPLAY_NAME_BYTES &&
+              sizeof(struct rt_display_report) <= MLG_DISPLAY_REPORT_MAX, "display ABI");
 static_assert(DEXT_COMPUTE_QUERY_SESSION_STATE == MLG_QUERY_SESSION_STATE &&
               DEXT_COMPUTE_QUERY_PROBE_STATUS == MLG_QUERY_PROBE_STATUS &&
               DEXT_COMPUTE_QUERY_KERNEL_LOG == MLG_QUERY_KERNEL_LOG, "observer query tags");
@@ -639,6 +648,13 @@ static void close_session(MacLinuxGPU *driver)
     s_finalCleanup = false;
     // No observer read may run an upstream callback past this point.
     observer_reads_close();
+    // A display test pattern goes first: the configuration it replaced is
+    // committed again and its client released while the driver runs. A
+    // quarantined session keeps every upstream owner, the client included.
+    if (s_modulesRunning && !s_dmaQuarantined && rt_display_showing()) {
+        MACLINUXGPU_LOG("session close: turning the display test pattern off");
+        rt_display_stop();
+    }
     // Linux-file processes exit while the driver runs; a self-test whose
     // GPU work never completed leaves that work uncertain.
     if (lx_teardown_all()) {
@@ -1769,6 +1785,71 @@ static kern_return_t observer_drm_selftest(IOUserClientMethodArguments *argument
     return kIOReturnSuccess;
 }
 
+// Display: the in-driver display test (rt/display.h), one op at a time,
+// admitted like the other observer reads (the upstream driver runs in an
+// open session for the whole op). Every wait inside is upstream's own
+// bounded wait.
+static uint32_t s_displayRunning;
+static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
+{
+    const uint64_t *in = arguments->scalarInput;
+    uint64_t *out = arguments->scalarOutput;
+    const OSData *nameData = arguments->structureInput;
+    if (!in || arguments->scalarInputCount != 3 || !out ||
+        arguments->scalarOutputCount < MLG_DISPLAY_WORDS ||
+        arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
+        arguments->structureOutputMaximumSize < sizeof(struct rt_display_report) ||
+        !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, in, arguments->scalarInputCount))
+        return kIOReturnBadArgument;
+    char name[RT_DISPLAY_NAME_BYTES] = {};
+    if (nameData && nameData->getLength()) {
+        const char *bytes = static_cast<const char *>(nameData->getBytesNoCopy());
+        size_t length = nameData->getLength();
+        if (in[0] != MLG_DISPLAY_OP_SHOW || !bytes) return kIOReturnBadArgument;
+        if (bytes[length - 1] == '\0') --length;
+        if (!length || length > MLG_DISPLAY_NAME_MAX) return kIOReturnBadArgument;
+        for (size_t i = 0; i < length; ++i) {
+            if (bytes[i] <= ' ' || bytes[i] > '~') return kIOReturnBadArgument;
+            name[i] = bytes[i];
+        }
+    }
+    if (__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
+    if (!s_observerReads.enter()) {
+        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+        return kIOReturnNotReady;
+    }
+    auto *pdev = static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice));
+    struct rt_display_report report;
+    int r;
+    if (in[0] == MLG_DISPLAY_OP_PROBE) {
+        r = rt_display_probe(pdev, &report);
+    } else if (in[0] == MLG_DISPLAY_OP_SHOW) {
+        MACLINUXGPU_LOG("display test: show pattern %llu on %s", (unsigned long long)in[1],
+                        name[0] ? name : "every connected output");
+        r = rt_display_show(pdev, name[0] ? name : nullptr, (uint32_t)in[1], &report);
+    } else {
+        r = rt_display_off(pdev, &report);
+    }
+    s_observerReads.leave();
+    __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+    unsigned connected = 0, lit = 0;
+    for (uint32_t i = 0; i < report.connectors && i < RT_DISPLAY_CONNECTORS_MAX; ++i) {
+        connected += report.connector[i].status == 1;
+        lit += report.connector[i].lit != 0;
+    }
+    MACLINUXGPU_LOG("display test: op %llu -> %d (probe %d, commit %d, restore %d; %u connector(s), "
+                    "%u connected, %u lit, fb %ux%u, fill %llu ms, commit %llu ms)",
+                    (unsigned long long)in[0], r, report.probe_status, report.commit_status,
+                    report.restore_status, report.connectors, connected, lit, report.fb_width,
+                    report.fb_height, (unsigned long long)(report.fill_ns / 1000000),
+                    (unsigned long long)(report.commit_ns / 1000000));
+    arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
+    if (!arguments->structureOutput) return kIOReturnNoMemory;
+    out[0] = (uint64_t)(int64_t)r;
+    arguments->scalarOutputCount = MLG_DISPLAY_WORDS;
+    return kIOReturnSuccess;
+}
+
 // ----------------------------------------------------------------
 // ExternalMethod — the selector-RPC dispatch.
 //
@@ -1798,6 +1879,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (selector == MLG_SELECTOR_SYSFS_READ) return observer_sysfs_read(arguments);
         if (selector == MLG_SELECTOR_DRM_INFO) return observer_drm_info(arguments);
         if (selector == MLG_SELECTOR_DRM_SELFTEST) return observer_drm_selftest(arguments);
+        if (selector == MLG_SELECTOR_DISPLAY) return observer_display(arguments);
         __block kern_return_t result = kIOReturnNotAttached;
         ivars->onOwnerQueue = true;
         ivars->ownerQueue->DispatchSync(^{

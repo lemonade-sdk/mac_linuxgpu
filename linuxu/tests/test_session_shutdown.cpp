@@ -152,6 +152,11 @@ static bool lx_teardown_all() {
 }
 static unsigned rt_cs_selftest_parked() { return lxParked; }
 static void lx_client_stop(MacLinuxGPUUserClient *, IOService *) { assert(false); }
+// The display test (rt/display.h): a showing pattern is turned off while
+// the driver runs, after observer admission drained, never in quarantine.
+static bool displayShowing;
+static int rt_display_showing() { return displayShowing; }
+static void rt_display_stop();
 
 #include "session_shutdown_production.inc"
 
@@ -169,6 +174,13 @@ static void rt_drm_info_close(rt_drm_info *drm) {
     assert(s_modulesRunning && !s_dmaQuarantined && !s_observerDrm);
     ++drm->closes;
     events.push_back("observer_drm_close");
+}
+
+static void rt_display_stop() {
+    assert(displayShowing && !s_observerReads.admitting() && s_observerReads.drained());
+    assert(s_modulesRunning && !s_dmaQuarantined && lxTeardowns == 0);
+    events.push_back("display_off");
+    displayShowing = false;
 }
 
 static void *rt_device_get_pdev(void *device) {
@@ -416,6 +428,24 @@ static void checkObserverPolicy() {
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, info, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, huge, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, info, 1));
+    // Display: an explicit confirmation word, a known op, a pattern only
+    // for SHOW.
+    const uint64_t displayProbe[] = {MLG_DISPLAY_OP_PROBE, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayShow[] = {MLG_DISPLAY_OP_SHOW, MLG_DISPLAY_PATTERN_GRADIENT, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayOff[] = {MLG_DISPLAY_OP_OFF, 0, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayNoConfirm[] = {MLG_DISPLAY_OP_SHOW, 0, 0};
+    const uint64_t displayBadPattern[] = {MLG_DISPLAY_OP_SHOW, MLG_DISPLAY_PATTERNS, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayOffPattern[] = {MLG_DISPLAY_OP_OFF, 1, MLG_DISPLAY_CONFIRM};
+    const uint64_t displayBadOp[] = {3, 0, MLG_DISPLAY_CONFIRM};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayProbe, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayShow, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOff, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayShow, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayNoConfirm, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayBadPattern, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOffPattern, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayBadOp, 3));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, nullptr, 0));
     char path[MLG_SYSFS_PATH_MAX + 1];
     assert(mlg_sysfs_path_copy(path, "gpu_metrics", 11, false) && !std::strcmp(path, "gpu_metrics"));
     assert(mlg_sysfs_path_copy(path, "hwmon/hwmon0/temp1_input", 25, false) &&
@@ -538,6 +568,8 @@ int main(int argc, char **argv) {
     else if (scenario == "stop-release") { resetError = -5; resetFailures = 1; s_stopping = true; }
     else if (scenario == "pci-fault-cause") { transportFault = DEXT_PCI_FAULT_CONFIG; holdError = -1; }
     else if (scenario == "selftest-parked") lxParked = 1;
+    else if (scenario == "display-showing") displayShowing = true;
+    else if (scenario == "display-quarantined") { displayShowing = true; s_dmaQuarantined = true; }
     else if (scenario == "observer-reads") {
         // A running session admits observer reads; one is in flight and the
         // observers' render file is open.
@@ -574,6 +606,16 @@ int main(int argc, char **argv) {
         assert(events == expected);
         assert(observerDrm.closes == 1 && !s_observerDrm && !s_observerReads.enter());
         fixture.assertReleased();
+    } else if (scenario == "display-showing") {
+        // The pattern goes first, before Linux-file teardown and removal.
+        const std::vector<std::string> expected{
+            "display_off", "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
+            "irq_drained", "enqueue_finish", "device_free", "release_bar0",
+            "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset",
+            "super_client_stop", "super_client_stop", "super_driver_stop"};
+        assert(events == expected && !displayShowing);
+        fixture.assertReleased();
+        expectLog("session close: turning the display test pattern off");
     } else if (scenario == "success") {
         const std::vector<std::string> expected{
             "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
@@ -594,7 +636,7 @@ int main(int argc, char **argv) {
     } else {
         fixture.assertRetained(scenario == "irq-failure");
         assert(!saw("pci_close") && !saw("gart_reset"));
-        if (holdError || computeError || scenario == "pre-quarantined" ||
+        if (holdError || computeError || scenario == "pre-quarantined" || scenario == "display-quarantined" ||
             scenario == "raw-mapped" || scenario == "isolation-failure" ||
             scenario == "probe-retained" || lxParked) {
             assert(s_rtDevice && s_modulesRunning);
@@ -662,7 +704,7 @@ int main(int argc, char **argv) {
             assert(snapshot[6] == MLG_RELEASE_PCI_FAULT);
         }
         if (resetError || dmaFiniError) assert(snapshot[3] == (uint64_t)(int64_t)(resetError ? resetError : dmaFiniError));
-        if (computeError || holdError || scenario == "pre-quarantined" ||
+        if (computeError || holdError || scenario == "pre-quarantined" || scenario == "display-quarantined" ||
             scenario == "isolation-failure" || scenario == "raw-mapped" ||
             scenario == "probe-retained" || irqError || lxParked) {
             // Owners that were never removed (or live callbacks) cannot be

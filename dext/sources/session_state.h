@@ -93,8 +93,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * a session. They may call selectors that read cached state, the
  * entitlement-checked release selector, the two Linux read paths below,
  * which run upstream callbacks while the driver runs and never claim PCI,
- * join the session or touch queues, and the self-contained submission
- * self-test (DrmSelfTest). Linux-file clients are type 2
+ * join the session or touch queues, the self-contained submission
+ * self-test (DrmSelfTest) and the display test (Display). Linux-file clients are type 2
  * (MLG_USER_CLIENT_LINUX_FILE, linuxu/headers/rt/lx_abi.h). */
 #define MLG_USER_CLIENT_SESSION  0u
 #define MLG_USER_CLIENT_OBSERVER 1u
@@ -107,6 +107,9 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_SELECTOR_SYSFS_READ          80u
 #define MLG_SELECTOR_DRM_INFO            81u
 #define MLG_SELECTOR_DRM_SELFTEST        82u
+/* 83 is PowerControl (feature/power). 96-103 are the Linux-file selectors
+ * (linuxu/headers/rt/lx_abi.h). */
+#define MLG_SELECTOR_DISPLAY             84u
 
 /* SysfsRead: the amdgpu device's sysfs directory, read as Linux sysfs reads
  * it (the attribute's show(), or a bin_attribute's read()), or listed.
@@ -152,6 +155,38 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * A test whose work never completed keeps its process until the work
  * does (RT_CS_PARKED); the session then cannot close cleanly until it
  * has. IOReturn as DrmInfo; Busy while another test runs. */
+/* Display: the in-driver display test (linuxu/headers/rt/display.h), an
+ * in-kernel DRM client on the GPU's own outputs. It requires display to be
+ * on (personality MacLinuxGPUDisplay=true); otherwise every op returns
+ * -ENODEV. One op at a time.
+ *   scalar in:  [0] MLG_DISPLAY_OP_*
+ *               [1] pattern for SHOW (MLG_DISPLAY_PATTERN_*), else 0
+ *               [2] MLG_DISPLAY_CONFIRM
+ *   struct in:  SHOW only, optional: the connector name ("DP-1" or
+ *               "card0-DP-1"), at most MLG_DISPLAY_NAME_MAX bytes with an
+ *               optional trailing NUL; none means every connected output
+ *   struct out: struct rt_display_report (MLG_DISPLAY_REPORT_MAX at most;
+ *               its version field describes it)
+ *   scalar out: [0] 0 or the op's negative Linux errno, sign-extended
+ * PROBE runs each connector's detect and mode probe and commits nothing.
+ * SHOW records the current configuration, then commits the pattern at
+ * each output's preferred mode; a failure restores what was recorded and
+ * reports the failing step's errno (no other mechanism is tried). OFF
+ * commits the recorded configuration again and frees everything. A
+ * session close turns a showing pattern off before the driver is removed.
+ * IOReturn as DrmInfo; Busy while another display op runs. */
+#define MLG_DISPLAY_OP_PROBE    0u
+#define MLG_DISPLAY_OP_SHOW     1u
+#define MLG_DISPLAY_OP_OFF      2u
+#define MLG_DISPLAY_PATTERN_BARS     0u
+#define MLG_DISPLAY_PATTERN_WHITE    1u
+#define MLG_DISPLAY_PATTERN_GRADIENT 2u
+#define MLG_DISPLAY_PATTERNS    3u
+#define MLG_DISPLAY_CONFIRM     0x44495350ULL /* "DISP" */
+#define MLG_DISPLAY_NAME_MAX    31u
+#define MLG_DISPLAY_WORDS       1u
+#define MLG_DISPLAY_REPORT_MAX  1024u
+
 #define MLG_DRM_SELFTEST_CONFIRM    0x43535354ULL /* "CSST" */
 #define MLG_DRM_SELFTEST_WORDS      2u
 #define MLG_DRM_SELFTEST_RESULT_MAX 512u
@@ -226,6 +261,10 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		       input[1] <= MLG_SYSFS_CHUNK_MAX;
 	case MLG_SELECTOR_DRM_SELFTEST:
 		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
+	case MLG_SELECTOR_DISPLAY:
+		return input && input_count == 3 && input[2] == MLG_DISPLAY_CONFIRM &&
+		       input[0] <= MLG_DISPLAY_OP_OFF &&
+		       (input[0] == MLG_DISPLAY_OP_SHOW ? input[1] < MLG_DISPLAY_PATTERNS : !input[1]);
 	default:
 		return false;
 	}
