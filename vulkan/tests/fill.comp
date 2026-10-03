@@ -1,0 +1,11 @@
+// The offline RADV test's compute shader: element i of the buffer gets
+// value + i. Compiled to fill.spv.h with
+//   glslangValidator -V --target-env vulkan1.1 --vn fill_spv fill.comp -o fill.spv.h
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Data { uint data[]; };
+layout(push_constant) uniform Push { uint value; };
+void main()
+{
+	data[gl_GlobalInvocationID.x] = value + gl_GlobalInvocationID.x;
+}
