@@ -18,7 +18,7 @@
 struct waiter {
 	struct completion done;
 	int64_t result;
-	void *reply;
+	void *rbuf;
 	size_t cap, bytes;
 	int kept;
 };
@@ -46,23 +46,23 @@ static int lb_done(void *ctx, uint64_t token, int64_t result, const void *rbuf, 
 	w->result = result;
 	w->bytes = bytes;
 	if (bytes <= w->cap)
-		memcpy(w->reply, rbuf, bytes);
+		memcpy(w->rbuf, rbuf, bytes);
 	else
 		w->kept = 1;
 	complete(&w->done);
 	return !w->kept;
 }
 
-static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t bytes, void *reply,
+static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t bytes, void *rbuf,
 		    size_t cap, size_t *reply_bytes, int64_t *result, int async)
 {
-	struct waiter w = { .reply = reply, .cap = cap };
+	struct waiter w = { .rbuf = rbuf, .cap = cap };
 	uint64_t token = 0;
 	int r;
 
 	(void)ctx;
 	if (!async)
-		return rt_lx_ioctl(client, fd, cmd, frame, bytes, reply, cap, reply_bytes, result);
+		return rt_lx_ioctl(client, fd, cmd, frame, bytes, rbuf, cap, reply_bytes, result);
 	__atomic_add_fetch(&async_calls, 1, __ATOMIC_SEQ_CST);
 	init_completion(&w.done);
 	r = rt_lx_ioctl_async(client, fd, cmd, frame, bytes, lb_done, &w, &token);
@@ -70,7 +70,7 @@ static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t b
 		return r;
 	wait_for_completion(&w.done);
 	if (w.kept)
-		return rt_lx_result(client, token, reply, cap, reply_bytes, result);
+		return rt_lx_result(client, token, rbuf, cap, reply_bytes, result);
 	*reply_bytes = w.bytes;
 	*result = w.result;
 	return 0;

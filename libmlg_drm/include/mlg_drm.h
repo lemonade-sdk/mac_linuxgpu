@@ -70,9 +70,9 @@ struct mlg_transport {
 	int (*close)(void *ctx, int fd);
 	/* One request frame (rt/lx_abi.h). @async: the request waits. On 0,
 	 * *result is the ioctl's return value and the reply frame fills
-	 * @reply, *reply_bytes long. */
+	 * @rbuf, *reply_bytes long. */
 	int (*ioctl)(void *ctx, int fd, uint32_t cmd, const void *frame, size_t frame_bytes,
-		     void *reply, size_t reply_cap, size_t *reply_bytes, int64_t *result,
+		     void *rbuf, size_t rbuf_cap, size_t *reply_bytes, int64_t *result,
 		     int async);
 	/* Map @length bytes at @offset of @fd into this process: *addr and an
 	 * opaque *handle for unmap. */
