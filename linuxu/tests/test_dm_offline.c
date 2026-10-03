@@ -63,6 +63,7 @@
 #include <drm/drm_file.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/display.h>
+#include <rt/surface.h>
 #include <rt/sysfs.h>
 
 extern const struct amdgpu_ip_block_version dm_ip_block;
@@ -811,6 +812,31 @@ static void display_test(void)
 	assert(!strcmp(text, "disabled\n"));
 	printf("dm-offline: %lu client file(s) closed\n", fixture_files_closed);
 	assert(fixture_files_closed >= 6);
+
+	/* An output for a display agent: the exact mode or nothing. */
+	r = rt_display_output(&fixture_pdev, "HDMI-A-1", 1920, 1080, 59000, &report);
+	printf("dm-offline: display output 1920x1080@59.000 -> %d\n", r);
+	assert(r == -EINVAL && !report.showing && !rt_display_showing());
+	assert(rt_display_output(&fixture_pdev, "DP-1", 1920, 1080, 60000, &report) == -ENOENT);
+	r = rt_display_output(&fixture_pdev, "HDMI-A-1", 1920, 1080, 60000, &report);
+	printf("dm-offline: display output 1920x1080@60.000 -> %d (commit %d)\n", r, report.commit_status);
+	assert(r == 0 && report.showing && report.pattern == RT_DISPLAY_PATTERN_OUTPUT);
+	c = report_connector(&report, "HDMI-A-1");
+	assert(c && c->lit && c->lit_width == 1920 && c->lit_height == 1080);
+	{
+		const struct rt_surface_rect rect = { 0, 0, 16, 16 };
+		struct rt_display_present_stats ps;
+
+		assert(rt_display_present(&fixture_pdev, NULL, &rect, 1, &ps) == -EINVAL);
+		assert(ps.version == 1 && !ps.frames);
+	}
+	assert(rt_display_off(&fixture_pdev, &report) == 0 && !report.showing && !rt_display_showing());
+	{
+		const struct rt_surface_rect rect = { 0, 0, 16, 16 };
+
+		/* No output: refused before the surface is looked at. */
+		assert(rt_display_present(&fixture_pdev, (struct rt_surface *)&rect, &rect, 1, NULL) == -ENOENT);
+	}
 
 	drm_dev_unregister(ddev);
 	assert(linuxu_sysfs_read(&fixture_dev.kobj, "drm/card0/card0-HDMI-A-1/status", text,

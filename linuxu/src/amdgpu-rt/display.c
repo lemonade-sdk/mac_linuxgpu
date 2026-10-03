@@ -23,6 +23,7 @@
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <rt/display.h>
+#include <rt/surface.h>
 
 #include "amdgpu.h"
 
@@ -71,6 +72,15 @@ static struct {
 	uint32_t pattern;
 	uint64_t fill_ns, commit_ns;
 	int restore_status;
+	/* An output (rt_display_output): the second framebuffer, which one is
+	 * on screen, which needs a whole frame, and the last frame's damage. */
+	bool output;
+	struct drm_client_buffer *back;
+	bool stale[2];			/* [0] buffer, [1] back */
+	struct rt_surface_rect last[RT_DISPLAY_PRESENT_RECTS_MAX];
+	uint32_t last_count;
+	bool last_overflow;
+	uint64_t frames;
 } rt_display;
 static int rt_display_on;	/* atomic copy of "a pattern is showing" */
 
@@ -476,6 +486,12 @@ static int display_off_locked(void)
 		drm_client_buffer_delete(rt_display.buffer);
 		rt_display.buffer = NULL;
 	}
+	if (rt_display.back) {
+		drm_client_buffer_delete(rt_display.back);
+		rt_display.back = NULL;
+	}
+	rt_display.output = false;
+	rt_display.frames = 0;
 	drm_client_release(&rt_display.client);
 	memset(&rt_display.client, 0, sizeof(rt_display.client));
 	rt_display.dev = NULL;
@@ -846,6 +862,245 @@ int rt_display_modes(struct pci_dev *pdev, const char *name, struct rt_display_m
 	}
 	drm_connector_list_iter_end(&iter);
 	mutex_unlock(&dev->mode_config.mutex);
+	return ret;
+}
+
+/* ---- an output a display agent feeds ---- */
+
+static uint32_t mode_refresh_mhz(const struct drm_display_mode *mode)
+{
+	u64 total = (u64)mode->htotal * mode->vtotal;
+	uint32_t mhz = total ? (u32)div64_u64((u64)mode->clock * 1000000ull, total) : 0;
+
+	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+		mhz /= 2;
+	return mhz;
+}
+
+/* Put the connector's mode @width x @height @refresh_mhz (progressive) on
+ * the single lit modeset. */
+static int modeset_use_mode(struct drm_client_dev *client, uint32_t width, uint32_t height,
+			    uint32_t refresh_mhz)
+{
+	struct drm_device *dev = client->dev;
+	struct drm_mode_set *modeset, *lit = NULL;
+	struct drm_display_mode *mode, *found = NULL;
+	int ret = -EINVAL;
+
+	mutex_lock(&client->modeset_mutex);
+	drm_client_for_each_modeset(modeset, client)
+		if (modeset->mode && modeset->num_connectors)
+			lit = modeset;
+	if (lit) {
+		mutex_lock(&dev->mode_config.mutex);
+		list_for_each_entry(mode, &lit->connectors[0]->modes, head) {
+			uint32_t mhz = mode_refresh_mhz(mode);
+
+			if (mode->hdisplay == width && mode->vdisplay == height &&
+			    !(mode->flags & DRM_MODE_FLAG_INTERLACE) &&
+			    (mhz > refresh_mhz ? mhz - refresh_mhz : refresh_mhz - mhz) <= 50) {
+				found = mode;
+				break;
+			}
+		}
+		if (found) {
+			struct drm_display_mode *copy = drm_mode_duplicate(dev, found);
+
+			if (copy) {
+				drm_mode_destroy(dev, lit->mode);
+				lit->mode = copy;
+				lit->x = lit->y = 0;
+				ret = 0;
+			} else {
+				ret = -ENOMEM;
+			}
+		}
+		mutex_unlock(&dev->mode_config.mutex);
+	}
+	mutex_unlock(&client->modeset_mutex);
+	return ret;
+}
+
+int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t width,
+		      uint32_t height, uint32_t refresh_mhz, struct rt_display_report *report)
+{
+	struct drm_device *dev = display_device(pdev);
+	struct drm_client_buffer *buffers[2] = { NULL, NULL };
+	unsigned int lit;
+	u64 start;
+	int ret;
+
+	report_begin(report);
+	if (!dev)
+		return -ENODEV;
+	if (!connector || !connector[0] || strnlen(connector, RT_DISPLAY_NAME_BYTES) >= RT_DISPLAY_NAME_BYTES ||
+	    !width || !height || width > RT_DISPLAY_FB_MAX || height > RT_DISPLAY_FB_MAX || !refresh_mhz)
+		return -EINVAL;
+
+	mutex_lock(&rt_display_lock);
+	if (rt_display.dev)
+		(void)display_off_locked();
+	rt_display.restore_status = 0;
+	rt_display.commit_ns = rt_display.fill_ns = 0;
+	ret = drm_client_init(dev, &rt_display.client, "linuxu-display-output", NULL);
+	if (ret) {
+		memset(&rt_display.client, 0, sizeof(rt_display.client));
+		goto out;
+	}
+	rt_display.dev = dev;
+	rt_display.pattern = RT_DISPLAY_PATTERN_OUTPUT;
+	ret = drm_client_modeset_probe(&rt_display.client, 0, 0);
+	if (report)
+		report->probe_status = ret;
+	if (ret)
+		goto fail;
+	lit = modesets_select(&rt_display.client, connector);
+	if (lit != 1) {
+		ret = -ENOENT;
+		goto fail;
+	}
+	ret = modeset_use_mode(&rt_display.client, width, height, refresh_mhz);
+	if (ret) {
+		drm_info(dev, "display output: %s has no %ux%u mode at %u mHz\n", connector, width,
+			 height, refresh_mhz);
+		goto fail;
+	}
+	/* amdgpu clears new dumb buffers with SDMA: both start black. */
+	for (int i = 0; i < 2; i++) {
+		buffers[i] = drm_client_buffer_create_dumb(&rt_display.client, width, height,
+							   DRM_FORMAT_XRGB8888);
+		if (IS_ERR(buffers[i])) {
+			ret = PTR_ERR(buffers[i]);
+			buffers[i] = NULL;
+			goto fail;
+		}
+		if (!i)
+			rt_display.buffer = buffers[0];
+		else
+			rt_display.back = buffers[1];
+	}
+	modesets_attach(&rt_display.client, rt_display.buffer->fb);
+	ret = state_save(dev, &rt_display.saved);
+	if (ret)
+		goto fail;
+	start = ktime_get_ns();
+	ret = drm_client_modeset_commit(&rt_display.client);
+	rt_display.commit_ns = ktime_get_ns() - start;
+	if (report)
+		report->commit_status = ret;
+	if (ret) {
+		drm_err(dev, "display output: commit failed (%d)\n", ret);
+		goto fail;
+	}
+	rt_display.output = true;
+	rt_display.stale[0] = rt_display.stale[1] = true;
+	rt_display.last_count = 0;
+	rt_display.last_overflow = false;
+	rt_display.frames = 0;
+	__atomic_store_n(&rt_display_on, 1, __ATOMIC_RELEASE);
+	drm_info(dev, "display output: %s at %ux%u (%u mHz), two framebuffers (commit %llu ms)\n",
+		 connector, width, height, refresh_mhz, rt_display.commit_ns / 1000000);
+	report_state(dev, report);
+	mutex_unlock(&rt_display_lock);
+	return 0;
+
+fail:
+	(void)display_off_locked();
+out:
+	if (report) {
+		int probe = report->probe_status, commit = report->commit_status;
+
+		report_state(dev, report);
+		report->probe_status = probe;
+		report->commit_status = commit;
+	}
+	mutex_unlock(&rt_display_lock);
+	return ret;
+}
+
+int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
+		       const struct rt_surface_rect *rects, uint32_t count,
+		       struct rt_display_present_stats *stats)
+{
+	struct drm_device *dev = display_device(pdev);
+	struct rt_surface_rect list[2 * RT_DISPLAY_PRESENT_RECTS_MAX];
+	struct rt_display_present_stats local = { 0 };
+	struct rt_surface_copy_stats copied = { 0 };
+	struct drm_client_buffer *back;
+	uint32_t width, height, pitch, n = 0;
+	bool full;
+	u64 start;
+	int ret;
+
+	if (!stats)
+		stats = &local;
+	memset(stats, 0, sizeof(*stats));
+	stats->version = 1;
+	if (!dev)
+		return -ENODEV;
+	if (!surface || (count && !rects))
+		return -EINVAL;
+	mutex_lock(&rt_display_lock);
+	if (!rt_display.output || rt_display.dev != dev) {
+		mutex_unlock(&rt_display_lock);
+		return -ENOENT;
+	}
+	rt_surface_geometry(surface, &width, &height, &pitch);
+	back = rt_display.back;
+	if (width != back->fb->width || height != back->fb->height) {
+		mutex_unlock(&rt_display_lock);
+		return -EINVAL;
+	}
+	stats->frames = rt_display.frames;
+	if (!count) {
+		mutex_unlock(&rt_display_lock);
+		return 0;
+	}
+	/* The back buffer holds the frame before the one on screen: it needs
+	 * this frame's damage and the last one's, or a whole frame. */
+	full = rt_display.stale[1] || rt_display.last_overflow || count > RT_DISPLAY_PRESENT_RECTS_MAX;
+	if (full) {
+		list[n++] = (struct rt_surface_rect){ 0, 0, width, height };
+	} else {
+		memcpy(list, rects, count * sizeof(*rects));
+		memcpy(list + count, rt_display.last, rt_display.last_count * sizeof(*rects));
+		n = count + rt_display.last_count;
+	}
+	stats->full = full;
+	stats->rects = n;
+	start = ktime_get_ns();
+	ret = rt_surface_copy(surface, back->fb->obj[0], back->fb->pitches[0], list, n, 1000, &copied);
+	stats->copy_ns = ktime_get_ns() - start;
+	stats->copy_status = ret;
+	stats->jobs = copied.jobs;
+	stats->bytes = copied.bytes;
+	if (ret)
+		goto out;
+	modesets_attach(&rt_display.client, back->fb);
+	start = ktime_get_ns();
+	ret = drm_client_modeset_commit(&rt_display.client);
+	stats->flip_ns = ktime_get_ns() - start;
+	stats->flip_status = ret;
+	if (ret) {
+		/* The screen still shows the front buffer. */
+		modesets_attach(&rt_display.client, rt_display.buffer->fb);
+		goto out;
+	}
+	rt_display.back = rt_display.buffer;
+	rt_display.buffer = back;
+	rt_display.stale[1] = rt_display.stale[0];
+	rt_display.stale[0] = false;
+	if (count > RT_DISPLAY_PRESENT_RECTS_MAX) {
+		rt_display.last_overflow = true;
+		rt_display.last_count = 0;
+	} else {
+		rt_display.last_overflow = false;
+		memcpy(rt_display.last, rects, count * sizeof(*rects));
+		rt_display.last_count = count;
+	}
+	stats->frames = ++rt_display.frames;
+out:
+	mutex_unlock(&rt_display_lock);
 	return ret;
 }
 
