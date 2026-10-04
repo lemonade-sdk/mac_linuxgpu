@@ -375,16 +375,19 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             return false
         }
         self.display = display
-        // macOS brings the display online asynchronously.
+        // macOS brings the display online, then gives it a mode,
+        // asynchronously; the run loop must turn for the WindowServer's
+        // notifications to arrive (the agent is an NSApplication).
         for _ in 0..<50 {
             var count: UInt32 = 0
             CGGetOnlineDisplayList(0, nil, &count)
             var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
             CGGetOnlineDisplayList(count, &ids, &count)
-            if ids.contains(display.displayID) { return true }
-            Thread.sleep(forTimeInterval: 0.1)
+            if ids.contains(display.displayID) && currentMode() != nil { return true }
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         }
-        failure = "the virtual display \(display.displayID) did not come online"
+        failure = "the virtual display \(display.displayID) did not come online in a mode the monitor listed" +
+            (CGDisplayCopyDisplayMode(display.displayID).map { " (macOS chose \($0.pixelWidth)x\($0.pixelHeight) @ \($0.refreshRate) Hz)" } ?? "")
         return false
     }
 
