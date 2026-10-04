@@ -375,7 +375,7 @@ void __drm_err(const char *format, ...);
 /* Macros to make printk easier */
 
 #define _DRM_PRINTK(once, level, fmt, ...)				\
-	pr_info("[" DRM_NAME "] " fmt, ##__VA_ARGS__)
+	printk##once(KERN_##level "[" DRM_NAME "] " fmt, ##__VA_ARGS__)
 #define DRM_NAME "drm"
 
 /* NOTE: this is deprecated in favor of pr_info(). */

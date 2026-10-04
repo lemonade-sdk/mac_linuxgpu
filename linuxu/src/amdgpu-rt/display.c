@@ -80,6 +80,7 @@ struct display_snapshot {
 #define OUTPUT_BUFFERS		3
 #define OUTPUT_DAMAGE_MAX	128u
 #define OUTPUT_FLIP_TIMEOUT_MS	200u
+#define OUTPUT_COPY_TIMEOUT_MS	2000u
 
 extern struct dma_fence *drm_crtc_create_fence(struct drm_crtc *crtc);
 
@@ -1051,17 +1052,83 @@ static int modeset_use_mode(struct drm_client_dev *client, uint32_t width, uint3
  * flip's fence callback, a new frame) and never polls; its waits are
  * bounded as a backstop. Each buffer remembers the damage it missed while
  * others were drawn, so a copy is that plus the frame's own. */
-static void damage_add(struct output_damage *d, const struct rt_surface_rect *rects, uint32_t count)
+static uint64_t rect_area(const struct rt_surface_rect *r)
 {
-	if (d->full)
+	return (uint64_t)r->width * r->height;
+}
+
+/* @a becomes the bounding box of @a and @b when that box is no larger than
+ * the two apart: a rectangle inside another, the same rectangle twice, or
+ * two that overlap closely. Copying the box then copies no pixel twice and
+ * no more pixels than the two would. */
+static bool rect_absorb(struct rt_surface_rect *a, const struct rt_surface_rect *b)
+{
+	const uint64_t ax1 = (uint64_t)a->x + a->width, ay1 = (uint64_t)a->y + a->height;
+	const uint64_t bx1 = (uint64_t)b->x + b->width, by1 = (uint64_t)b->y + b->height;
+	const uint32_t x0 = min(a->x, b->x), y0 = min(a->y, b->y);
+	const uint64_t x1 = max(ax1, bx1), y1 = max(ay1, by1);
+
+	if ((x1 - x0) * (y1 - y0) > rect_area(a) + rect_area(b) || x1 - x0 > UINT32_MAX ||
+	    y1 - y0 > UINT32_MAX)
+		return false;
+	a->x = x0;
+	a->y = y0;
+	a->width = (uint32_t)(x1 - x0);
+	a->height = (uint32_t)(y1 - y0);
+	return true;
+}
+
+/* Add one rectangle, folding it into any it overlaps closely (repeatedly,
+ * as a fold can make a rectangle that absorbs others). The same region
+ * damaged in successive frames (a window redrawing in place) stays one
+ * rectangle, so a buffer that missed it and the frame that redraws it
+ * copy it once, not once per frame. */
+static void damage_add_rect(struct output_damage *d, const struct rt_surface_rect *r)
+{
+	struct rt_surface_rect cur = *r;
+
+	if (d->full || !cur.width || !cur.height)
 		return;
-	if (count > OUTPUT_DAMAGE_MAX - d->count) {
+	for (bool again = true; again;) {
+		again = false;
+		for (uint32_t i = 0; i < d->count; i++) {
+			struct rt_surface_rect box = d->rect[i];
+
+			if (rect_absorb(&box, &cur)) {
+				cur = box;
+				d->rect[i] = d->rect[--d->count];
+				again = true;
+				break;
+			}
+		}
+	}
+	if (d->count == OUTPUT_DAMAGE_MAX) {
 		d->full = true;
 		d->count = 0;
 		return;
 	}
-	memcpy(&d->rect[d->count], rects, count * sizeof(*rects));
-	d->count += count;
+	d->rect[d->count++] = cur;
+}
+
+static void damage_add(struct output_damage *d, const struct rt_surface_rect *rects, uint32_t count)
+{
+	for (uint32_t i = 0; i < count && !d->full; i++)
+		damage_add_rect(d, &rects[i]);
+}
+
+/* Most of the frame damaged: one copy of the whole frame. */
+static void damage_settle(struct output_damage *d, uint32_t width, uint32_t height)
+{
+	uint64_t area = 0;
+
+	if (d->full)
+		return;
+	for (uint32_t i = 0; i < d->count; i++)
+		area += rect_area(&d->rect[i]);
+	if (area * 10 >= (uint64_t)width * height * 9) {
+		d->full = true;
+		d->count = 0;
+	}
 }
 
 static void damage_merge(struct output_damage *d, const struct output_damage *add)
@@ -1178,9 +1245,26 @@ static int output_flip_wait(struct display_output *o)
 
 	if (!o->pending_flip)
 		return 0;
+	/* The flip waits for its copies (the implicit in-fence): those first,
+	 * under the bound of GPU work, then the flip, under the vblank's. */
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+		struct dma_fence *copy = o->pending_frame.copy[i];
+
+		if (!copy)
+			continue;
+		left = dma_fence_wait_timeout(copy, false, msecs_to_jiffies(OUTPUT_COPY_TIMEOUT_MS));
+		if (left <= 0) {
+			pr_err("display: the copy for the pending flip did not complete in %u ms (%ld)\n",
+			       OUTPUT_COPY_TIMEOUT_MS, left);
+			return left < 0 ? (int)left : -ETIME;
+		}
+	}
 	left = dma_fence_wait_timeout(o->pending_flip, false, msecs_to_jiffies(OUTPUT_FLIP_TIMEOUT_MS));
-	if (left <= 0)
+	if (left <= 0) {
+		pr_err("display: the flip did not complete within %u ms of its copy (%ld)\n",
+		       OUTPUT_FLIP_TIMEOUT_MS, left);
 		return left < 0 ? (int)left : -ETIME;
+	}
 	output_flip_account(o);
 	return 0;
 }
@@ -1274,6 +1358,7 @@ static int output_frame(struct display_output *o, struct rt_surface *surface,
 		b++;
 	copy = o->missed[b];
 	damage_merge(&copy, damage);
+	damage_settle(&copy, o->width, o->height);
 	r = rt_surface_copy_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b], o->fb[b]->fb->pitches[0],
 				   copy.full ? &full : copy.rect, copy.full ? 1 : copy.count, &o->engines,
 				   frame.copy, &cs);

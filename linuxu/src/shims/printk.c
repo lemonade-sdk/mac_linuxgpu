@@ -243,7 +243,7 @@ int printk_ratelimited(const char *fmt, ...)
 	return n;
 }
 
-int printk_once(const char *fmt, ...)
+int (printk_once)(const char *fmt, ...)
 {
 	va_list ap;
 	int n;

@@ -1359,16 +1359,7 @@ func runDisplayAgent(_ options: [String]) -> Int32 {
         guard let at = options.firstIndex(of: flag), at + 1 < options.count else { return nil }
         return options[at + 1]
     }
-    if options.contains("--create") {
-        // The agent talks to the WindowServer (CGVirtualDisplay,
-        // ScreenCaptureKit, the workload window) from the app's executable:
-        // as a background agent that has finished launching, or the Dock
-        // shows the app bouncing for as long as it runs.
-        let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
-        app.finishLaunching()
-        return runDisplayAgentCreate(options)
-    }
+    if options.contains("--create") { return runDisplayAgentCreate(options) }
     guard options.contains("--dry-run") else {
         print("display-agent: say --dry-run (print what it would create) or --create (make a virtual display)")
         return 2

@@ -376,15 +376,14 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         self.display = display
         // macOS brings the display online, then gives it a mode,
-        // asynchronously; the run loop must turn for the WindowServer's
-        // notifications to arrive (the agent is an NSApplication).
+        // asynchronously.
         for _ in 0..<50 {
             var count: UInt32 = 0
             CGGetOnlineDisplayList(0, nil, &count)
             var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
             CGGetOnlineDisplayList(count, &ids, &count)
             if ids.contains(display.displayID) && currentMode() != nil { return true }
-            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            Thread.sleep(forTimeInterval: 0.1)
         }
         failure = "the virtual display \(display.displayID) did not come online in a mode the monitor listed" +
             (CGDisplayCopyDisplayMode(display.displayID).map { " (macOS chose \($0.pixelWidth)x\($0.pixelHeight) @ \($0.refreshRate) Hz)" } ?? "")
@@ -699,6 +698,13 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     guard mirror.startOutput(mode) else { return teardown() }
     outputOn = true
     guard mirror.startCapture(mode) else { return teardown() }
+    // The agent talks to the WindowServer from the app's own executable:
+    // as a background agent that has finished launching, or the Dock shows
+    // the app bouncing for as long as it runs. Only once the virtual
+    // display has its mode: made an NSApplication before, the process does
+    // not see the new display's modes (CGDisplayCopyDisplayMode is nil).
+    NSApplication.shared.setActivationPolicy(.accessory)
+    NSApplication.shared.finishLaunching()
     if let error = workload.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) {
         mirror.failure = "workload: \(error)"
         return teardown()

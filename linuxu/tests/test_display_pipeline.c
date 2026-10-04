@@ -304,6 +304,30 @@ int main(void)
 		CHECK(screen_pixel(55, 55) == ((0x00c00003u) ^ (55u << 12) ^ 55u));
 	}
 
+	/* A window redrawing in place (the same rectangle every frame, with
+	 * a menu-bar item inside it): each flip copies the region once, not
+	 * once for the frame and again for each buffer that missed it. */
+	{
+		const struct rt_surface_rect win[2] = { { 300, 200, 400, 300 }, { 310, 210, 20, 20 } };
+		const uint64_t once = 400ull * 4 * 300;
+
+		for (int f = 0; f < 6; f++) {
+			uint64_t flipped;
+
+			CHECK(rt_display_stats(pdev, &st) == 0);
+			flipped = st.frames_flipped;
+			fake_fill(&surf, 0x00d00000u + (uint32_t)f, &win[0]);
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), win, 2,
+						 ktime_get_ns(), &st) == 0);
+			st = wait_flipped(pdev, flipped + 1);
+			if (f >= 2)
+				CHECK(st.last_bytes == once);
+		}
+		printf("pipeline: a window redrawn in place copies %llu bytes per flip\n",
+		       (unsigned long long)st.last_bytes);
+		CHECK(screen_pixel(500, 350) == ((0x00d00005u) ^ (500u << 12) ^ 350u));
+	}
+
 	/* A frame of another size is refused; nothing breaks. */
 	CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
 	printf("pipeline: average copy %llu us, latency %llu us (max %llu), worker submit %llu us per frame\n",

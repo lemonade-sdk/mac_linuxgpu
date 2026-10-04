@@ -28,10 +28,10 @@
 #define pr_warn_once(fmt, ...) printk_once(KERN_WARNING fmt, ##__VA_ARGS__)
 #define pr_notice(fmt, ...) printk(KERN_NOTICE fmt, ##__VA_ARGS__)
 #define pr_info(fmt, ...)   printk(KERN_INFO fmt, ##__VA_ARGS__)
-#define pr_info_once(fmt, ...)   printk(KERN_INFO fmt, ##__VA_ARGS__)
-#define pr_warning_once(fmt, ...)  printk(KERN_WARNING fmt, ##__VA_ARGS__)
-#define pr_notice_once(fmt, ...) printk(KERN_NOTICE fmt, ##__VA_ARGS__)
-#define pr_err_once(fmt, ...)    printk(KERN_ERR fmt, ##__VA_ARGS__)
+#define pr_info_once(fmt, ...)   printk_once(KERN_INFO fmt, ##__VA_ARGS__)
+#define pr_warning_once(fmt, ...)  printk_once(KERN_WARNING fmt, ##__VA_ARGS__)
+#define pr_notice_once(fmt, ...) printk_once(KERN_NOTICE fmt, ##__VA_ARGS__)
+#define pr_err_once(fmt, ...)    printk_once(KERN_ERR fmt, ##__VA_ARGS__)
 #define pr_cont(fmt, ...)   printk(KERN_CONT fmt, ##__VA_ARGS__)
 #define pr_fatal(fmt, ...)  printk(KERN_CRIT fmt, ##__VA_ARGS__)
 #define pr_emerg_ratelimited(fmt, ...)  printk(KERN_EMERG fmt, ##__VA_ARGS__)
@@ -56,7 +56,18 @@ extern asmlinkage int vprintk_emit(int facility, int level,
 extern int printk(const char *fmt, ...) __printf(1, 2);
 extern int dynamic_pr_debug(const char *fmt, ...) __printf(1, 2);
 extern int printk_ratelimited(const char *fmt, ...) __printf(1, 2);
-extern int printk_once(const char *fmt, ...) __printf(1, 2);
+extern int (printk_once)(const char *fmt, ...) __printf(1, 2);
+/* Once per call site, as Linux's DO_ONCE_LITE: a per-commit message
+ * (DRM_INFO_ONCE in DM's MST/DSC check) must not log every frame. */
+#define printk_once(fmt, ...)						\
+({									\
+	static bool __linuxu_printed_once;				\
+	bool __linuxu_first = !__atomic_exchange_n(&__linuxu_printed_once, \
+						   true, __ATOMIC_RELAXED); \
+	if (__linuxu_first)						\
+		printk(fmt, ##__VA_ARGS__);				\
+	__linuxu_first;							\
+})
 extern int printk_deferred(const char *fmt, ...) __printf(1, 2);
 extern int vprintk_deferred(const char *fmt, va_list args);
 extern int vprintk_sprint(const char *fmt, va_list args,
