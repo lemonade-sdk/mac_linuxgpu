@@ -146,7 +146,7 @@
       },
       {
         "patch": "patches/mesa/radv-macos-display-wsi.patch",
-        "sha256": "649c016d6c668f3d85f9010bb3c990ddb4ec3e3e00cc1f64ad03d1f6e7026f9b",
+        "sha256": "14eb3ad9366d4728c21f305de447c58a8ba584ffca949917fdd8b21f7ec2c488",
         "files": [
           "src/amd/vulkan/radv_instance.c",
           "src/amd/vulkan/radv_wsi.h",

@@ -1155,6 +1155,17 @@ test-libdrm-mlg: lib
 test: test-libdrm-mlg
 CRASH_PATH_TESTS += test-libdrm-mlg
 
+# drmMlgPlaceWindow: a window's place on the output (no device needed).
+test-mlg-place: libdrm-mlg
+	clang -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined \
+		-I$(LIBDRM_MLG)/include -I$(LIBDRM_MLG)/include/libdrm \
+		libmlg_drm/libdrm/tests/test_mlg_place.c -L$(LIBDRM_MLG)/lib -ldrm_mlg \
+		-Wl,-rpath,$(abspath $(LIBDRM_MLG)/lib) -o $(BUILD)/test-mlg-place
+	$(BUILD)/test-mlg-place
+
+test: test-mlg-place
+.PHONY: test-mlg-place
+
 # Client framebuffers on the display output (LX_SCANOUT): a libdrm-mlg
 # client on the primary node of the CS fixture with its DCN 4.0.1 display.
 test-scanout: lib

@@ -20,10 +20,19 @@ from.
   "auto"); without it the surface reports no presentation support. The
   swapchain attaches to the output, makes its images framebuffers of the
   primary node with modifiers both of the output's planes scan out, and
-  checks the first one with the driver. Each present goes on the primary
-  plane when the window fills its screen or is not on the monitor's
-  screen, else on an overlay plane at the window's rectangle
-  (MLG_WSI_MODE=fullscreen or windowed decides instead). FIFO: every frame
+  checks the first one with the driver. Each present is placed by
+  libdrm-mlg's drmMlgPlaceWindow from the window's content and the
+  monitor's screen in global points: the primary plane when the window
+  fills that screen, else an overlay plane at the window's rectangle in
+  CRTC pixels, clipped to the CRTC with the matching crop of the image,
+  following the window frame by frame. A window off the monitor (or with
+  less of it there than DC's smallest viewport) takes the frames off
+  (LX_SCANOUT HIDE): the desktop shows, the game goes on paced at the
+  refresh rate, and the frames come back with the window. A new place is
+  checked by the driver before it is used; a refusal names the place and
+  the scale. MLG_WSI_MODE=fullscreen or windowed decides instead of the
+  window, and a layer at another size than the images makes presents
+  return VK_SUBOPTIMAL_KHR. FIFO: every frame
   is shown, the next one handed over once the previous reached the screen;
   a per-image syncobj signals at the vblank that shows it, which acquire
   and VK_KHR_present_wait wait on. The last swapchain of the process gives
@@ -90,7 +99,7 @@ index 80925d1..df9f1f2 100644
    )
  endif
 diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
-index 4fae988..c3cb703 100644
+index 4fae988..ca7659d 100644
 --- a/src/vulkan/wsi/wsi_common_metal.c
 +++ b/src/vulkan/wsi/wsi_common_metal.c
 @@ -15,7 +15,49 @@
@@ -238,7 +247,7 @@ index 4fae988..c3cb703 100644
  static VkResult
  wsi_metal_create_mem(const struct wsi_swapchain *chain,
                       const struct wsi_image_info *info,
-@@ -929,3 +1017,923 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
+@@ -929,3 +1017,989 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
  
     return VK_SUCCESS;
  }
@@ -478,11 +487,10 @@ index 4fae988..c3cb703 100644
 +   VkResult status;
 +   uint64_t serial;
 +   uint64_t shown_present_id;          /* the newest present id on screen */
-+   /* What the last present did, to report changes. */
-+   uint32_t last_layer;
-+   int32_t last_x, last_y;
-+   uint32_t last_w, last_h;
-+   bool warned_away;
++   /* The last frame's placement (checked by the driver when it changes),
++    * and whether the window is off the monitor (nothing of ours on it). */
++   struct drm_mlg_placement last;
++   bool hidden;
 +   struct wsi_mlg_image images[0];
 +};
 +VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_mlg_swapchain, base.base, VkSwapchainKHR,
@@ -570,71 +578,75 @@ index 4fae988..c3cb703 100644
 +   return kept;
 +}
 +
-+/* Where the next present goes: the layer and the destination on the CRTC. */
-+static void
-+mlg_placement(struct wsi_mlg_swapchain *chain, uint32_t *layer, int32_t *x, int32_t *y,
-+              uint32_t *w, uint32_t *h)
++/* Where the next frame goes (drmMlgPlaceWindow): the window's content and
++ * the monitor's screen in global points, the output's mode, the image. 0, or
++ * -EINVAL with the reason in out->why. */
++static int
++mlg_placement(struct wsi_mlg_swapchain *chain, struct drm_mlg_placement *out)
 +{
++   struct drm_mlg_place_in in = {
++      .mode = chain->mode == MLG_MODE_FULLSCREEN ? DRM_MLG_PLACE_FULLSCREEN :
++              chain->mode == MLG_MODE_WINDOWED ? DRM_MLG_PLACE_WINDOWED : DRM_MLG_PLACE_AUTO,
++      .crtc_w = chain->output.width,
++      .crtc_h = chain->output.height,
++      .image_w = chain->extent.width,
++      .image_h = chain->extent.height,
++   };
 +   struct wsi_mlg_window win;
-+   const uint32_t mw = chain->output.width, mh = chain->output.height;
 +
 +   wsi_mlg_window_get(chain->window, &win);
-+   const bool on_monitor = win.has_window && chain->display_id &&
-+                           win.display_id == chain->display_id;
++   in.have_screen = chain->display_id &&
++                    wsi_mlg_display_bounds(chain->display_id, &in.screen_x, &in.screen_y,
++                                           &in.screen_w, &in.screen_h);
++   in.have_window = win.has_window;
++   /* Native full screen counts on the monitor's screen only. */
++   in.window_native_fullscreen = win.native_fullscreen && win.display_id == chain->display_id;
++   in.win_x = win.x;
++   in.win_y = win.y;
++   in.win_w = win.width;
++   in.win_h = win.height;
++   return drmMlgPlaceWindow(&in, out);
++}
 +
-+   if (chain->mode == MLG_MODE_FULLSCREEN ||
-+       (chain->mode == MLG_MODE_AUTO && (!on_monitor || win.fullscreen))) {
-+      if (chain->mode == MLG_MODE_AUTO && !on_monitor && win.has_window && chain->display_id &&
-+          !chain->warned_away) {
-+         mlg_error("the window left %s's screen; the frames stay full screen on %s",
-+                   chain->output.connector, chain->output.connector);
-+         chain->warned_away = true;
-+      }
-+      *layer = MLG_LX_LAYER_PRIMARY;
-+      *x = *y = 0;
-+      *w = mw;
-+      *h = mh;
-+      return;
-+   }
-+   *layer = MLG_LX_LAYER_OVERLAY;
-+   if (on_monitor && win.screen_width && win.screen_height) {
-+      /* Screen pixels to CRTC pixels (the same with the virtual display's
-+       * mode at 1x). */
-+      *x = (int32_t)((int64_t)win.x * mw / win.screen_width);
-+      *y = (int32_t)((int64_t)win.y * mh / win.screen_height);
-+      *w = (uint32_t)((uint64_t)win.width * mw / win.screen_width);
-+      *h = (uint32_t)((uint64_t)win.height * mh / win.screen_height);
-+   } else {
-+      /* A window elsewhere, or none: the image's size, centred. */
-+      *w = MIN2(chain->extent.width, mw);
-+      *h = MIN2(chain->extent.height, mh);
-+      *x = (int32_t)(mw - *w) / 2;
-+      *y = (int32_t)(mh - *h) / 2;
-+   }
-+   if (!*w || !*h) {
-+      *w = MIN2(chain->extent.width, mw);
-+      *h = MIN2(chain->extent.height, mh);
-+   }
++static bool
++mlg_same_placement(const struct drm_mlg_placement *a, const struct drm_mlg_placement *b)
++{
++   return a->layer == b->layer && a->src_x == b->src_x && a->src_y == b->src_y &&
++          a->src_w == b->src_w && a->src_h == b->src_h && a->dst_x == b->dst_x &&
++          a->dst_y == b->dst_y && a->dst_w == b->dst_w && a->dst_h == b->dst_h;
 +}
 +
 +static int
 +mlg_scanout_image(struct wsi_mlg_swapchain *chain, uint32_t op, struct wsi_mlg_image *image,
-+                  uint32_t layer, int32_t x, int32_t y, uint32_t w, uint32_t h,
-+                  struct mlg_lx_scanout_state *st)
++                  const struct drm_mlg_placement *p, struct mlg_lx_scanout_state *st)
 +{
 +   struct mlg_lx_scanout req = mlg_request(op);
 +
 +   req.fd = chain->card;
-+   req.layer = layer;
++   req.layer = p->layer;
 +   req.fb_id = image->fb_id;
 +   req.syncobj = image->syncobj;
-+   req.src_w = chain->extent.width;
-+   req.src_h = chain->extent.height;
-+   req.dst_x = x;
-+   req.dst_y = y;
-+   req.dst_w = w;
-+   req.dst_h = h;
++   req.src_x = p->src_x;
++   req.src_y = p->src_y;
++   req.src_w = p->src_w;
++   req.src_h = p->src_h;
++   req.dst_x = p->dst_x;
++   req.dst_y = p->dst_y;
++   req.dst_w = p->dst_w;
++   req.dst_h = p->dst_h;
 +   return drmMlgScanout(&req, st);
++}
++
++/* A driver check that failed, with what it was asked. */
++static void
++mlg_report_refusal(struct wsi_mlg_swapchain *chain, const char *what, const struct drm_mlg_placement *p,
++                   int r)
++{
++   mlg_error("%s on %s refused (%s): %s, image %u,%u %ux%u to %d,%d %ux%u "
++             "(scale %.3f x %.3f)", what, chain->output.connector, layer_name(p->layer),
++             strerror(-r), p->src_x, p->src_y, p->src_w, p->src_h, p->dst_x, p->dst_y, p->dst_w,
++             p->dst_h, p->src_w ? (double)p->dst_w / p->src_w : 0.0,
++             p->src_h ? (double)p->dst_h / p->src_h : 0.0);
 +}
 +
 +static VkResult
@@ -794,8 +806,7 @@ index 4fae988..c3cb703 100644
 +   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
 +   struct wsi_mlg_image *image = &chain->images[image_index];
 +   struct mlg_lx_scanout_state st;
-+   uint32_t layer, w, h;
-+   int32_t x, y;
++   struct drm_mlg_placement place;
 +   VkResult result;
 +   int r;
 +
@@ -819,27 +830,78 @@ index 4fae988..c3cb703 100644
 +      }
 +   }
 +
-+   mlg_placement(chain, &layer, &x, &y, &w, &h);
-+   r = mlg_scanout_image(chain, MLG_LX_SCANOUT_PRESENT, image, layer, x, y, w, h, &st);
++   r = mlg_placement(chain, &place);
 +   if (r) {
-+      mlg_error("present on %s (%s, %dx%d at %d,%d) failed: %s%s%s", chain->output.connector,
-+                layer_name(layer), w, h, x, y, strerror(-r),
-+                st.error ? "; the display output stopped with " : "",
++      mlg_error("placing a frame on %s: %s", chain->output.connector, place.why);
++      result = mlg_surface_lost(chain);
++      goto out;
++   }
++
++   if (!place.layer) {
++      /* The window is off the monitor: the desktop shows there, the game
++       * goes on, and its frames wait one refresh each (FIFO pacing). */
++      if (!chain->hidden) {
++         struct mlg_lx_scanout req = mlg_request(MLG_LX_SCANOUT_HIDE);
++
++         r = drmMlgScanout(&req, &st);
++         if (r) {
++            mlg_error("taking the frames off %s failed: %s", chain->output.connector,
++                      strerror(-r));
++            result = mlg_surface_lost(chain);
++            goto out;
++         }
++         for (uint32_t i = 0; i < chain->base.image_count; i++)
++            if (chain->images[i].state == MLG_IMAGE_SHOWN)
++               chain->images[i].state = MLG_IMAGE_IDLE;
++         fprintf(stderr, "mlg-wsi: %s: %s; the desktop shows there until the window "
++                 "comes back\n", chain->output.connector, place.why);
++         chain->hidden = true;
++      }
++      image->state = MLG_IMAGE_IDLE;
++      if (present_id > chain->shown_present_id)
++         chain->shown_present_id = present_id;
++      chain->last = place;
++      mtx_unlock(&chain->lock);
++      if (chain->output.refresh_mhz)
++         usleep((useconds_t)(1000000000ull / chain->output.refresh_mhz));
++      return result;
++   }
++   if (chain->hidden) {
++      fprintf(stderr, "mlg-wsi: %s: the window is back\n", chain->output.connector);
++      chain->hidden = false;
++   }
++   /* A new place is checked by the driver first: a refusal names it. */
++   if (!mlg_same_placement(&place, &chain->last)) {
++      r = mlg_scanout_image(chain, MLG_LX_SCANOUT_TEST, image, &place, &st);
++      if (r) {
++         mlg_report_refusal(chain, "a frame's place", &place, r);
++         result = mlg_surface_lost(chain);
++         goto out;
++      }
++   }
++   r = mlg_scanout_image(chain, MLG_LX_SCANOUT_PRESENT, image, &place, &st);
++   if (r) {
++      mlg_error("present on %s (%s at %d,%d %ux%u) failed: %s%s%s", chain->output.connector,
++                layer_name(place.layer), place.dst_x, place.dst_y, place.dst_w, place.dst_h,
++                strerror(-r), st.error ? "; the display output stopped with " : "",
 +                st.error ? strerror(-st.error) : "");
 +      result = mlg_surface_lost(chain);
 +      goto out;
 +   }
-+   if (layer != chain->last_layer || x != chain->last_x || y != chain->last_y ||
-+       w != chain->last_w || h != chain->last_h) {
-+      if (layer != chain->last_layer || getenv("MLG_WSI_DEBUG"))
-+         fprintf(stderr, "mlg-wsi: %s: %ux%u frames on %s at %d,%d %ux%u\n",
-+                 chain->output.connector, chain->extent.width, chain->extent.height,
-+                 layer_name(layer), x, y, w, h);
-+      chain->last_layer = layer;
-+      chain->last_x = x;
-+      chain->last_y = y;
-+      chain->last_w = w;
-+      chain->last_h = h;
++   if (place.layer != chain->last.layer || getenv("MLG_WSI_DEBUG"))
++      fprintf(stderr, "mlg-wsi: %s: %ux%u frames on %s at %d,%d %ux%u (image %u,%u %ux%u)\n",
++              chain->output.connector, chain->extent.width, chain->extent.height,
++              layer_name(place.layer), place.dst_x, place.dst_y, place.dst_w, place.dst_h,
++              place.src_x, place.src_y, place.src_w, place.src_h);
++   chain->last = place;
++   {
++      /* The layer at another size than the images: the application
++       * makes new ones (a window resized, full screen toggled). */
++      uint32_t lw = 0, lh = 0;
++
++      wsi_metal_layer_size(chain->surface->pLayer, &lw, &lh);
++      if (lw && lh && (lw != chain->extent.width || lh != chain->extent.height))
++         result = VK_SUBOPTIMAL_KHR;
 +   }
 +   image->state = MLG_IMAGE_QUEUED;
 +   image->serial = ++chain->serial;
@@ -1120,21 +1182,34 @@ index 4fae988..c3cb703 100644
 +      }
 +   }
 +
-+   /* The driver's check of the first frame where it will go. */
++   /* The driver's check of the first frame where it will go (and of
++    * the whole screen: a window may go full screen later). */
 +   {
-+      uint32_t layer, w, h;
-+      int32_t x, y;
++      struct drm_mlg_placement place, whole = {
++         .layer = MLG_LX_LAYER_PRIMARY, .src_w = chain->extent.width,
++         .src_h = chain->extent.height, .dst_w = chain->output.width,
++         .dst_h = chain->output.height,
++      };
 +
-+      mlg_placement(chain, &layer, &x, &y, &w, &h);
-+      r = mlg_scanout_image(chain, MLG_LX_SCANOUT_TEST, &chain->images[0], layer, x, y, w, h, &st);
++      r = mlg_placement(chain, &place);
 +      if (r) {
-+         mlg_error("%s refuses a %ux%u image (modifier 0x%llx) on %s at %d,%d %ux%u: %s",
-+                   chain->output.connector, chain->extent.width, chain->extent.height,
-+                   (unsigned long long)chain->images[0].base.drm_modifier, layer_name(layer),
-+                   x, y, w, h, strerror(-r));
++         mlg_error("placing frames on %s: %s", chain->output.connector, place.why);
 +         result = VK_ERROR_INITIALIZATION_FAILED;
 +         goto fail_images;
 +      }
++      for (int pass = 0; pass < 2; pass++) {
++         const struct drm_mlg_placement *p = pass ? &whole : &place;
++
++         if (!p->layer || (pass && mlg_same_placement(&place, &whole)))
++            continue;
++         r = mlg_scanout_image(chain, MLG_LX_SCANOUT_TEST, &chain->images[0], p, &st);
++         if (r) {
++            mlg_report_refusal(chain, "a swapchain image (modifier check)", p, r);
++            result = VK_ERROR_INITIALIZATION_FAILED;
++            goto fail_images;
++         }
++      }
++      chain->last = place;
 +   }
 +   fprintf(stderr, "mlg-wsi: %u %ux%u images on %s (%ux%u, modifier 0x%llx)\n", num_images,
 +           chain->extent.width, chain->extent.height, chain->output.connector,
@@ -1163,7 +1238,7 @@ index 4fae988..c3cb703 100644
 +
 +#endif /* LIBDRM_MLG_SCANOUT */
 diff --git a/src/vulkan/wsi/wsi_common_metal_layer.h b/src/vulkan/wsi/wsi_common_metal_layer.h
-index e9473b1..eb88a90 100644
+index e9473b1..571a7a6 100644
 --- a/src/vulkan/wsi/wsi_common_metal_layer.h
 +++ b/src/vulkan/wsi/wsi_common_metal_layer.h
 @@ -33,6 +33,11 @@ void
@@ -1178,22 +1253,26 @@ index e9473b1..eb88a90 100644
  CAMetalDrawable *
  wsi_metal_layer_acquire_drawable(const CAMetalLayer *metal_layer);
  
-@@ -52,4 +57,31 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+@@ -52,4 +57,35 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
     CAMetalDrawable **drawable_ptr, void *buffer,
     uint32_t width, uint32_t height, uint32_t row_pitch);
  
 +/* ---- the layer's window (mac_linuxgpu; wsi_common_metal.c's display
 + * engine presents need it) ---- */
 +
-+/* Where a layer's window is, in pixels of its screen, origin top left. */
++/* Where a layer's window is: its content rectangle in global points,
++ * origin top left (CoreGraphics' space, as CGDisplayBounds gives screens). */
 +struct wsi_mlg_window {
 +   bool has_window;        /* the layer is in a window on a screen */
-+   bool fullscreen;        /* the content covers the whole screen */
-+   uint32_t display_id;    /* the screen's CGDirectDisplayID */
-+   int32_t x, y;           /* the content rectangle */
-+   uint32_t width, height;
-+   uint32_t screen_width, screen_height;
++   bool native_fullscreen; /* AppKit's full screen */
++   uint32_t display_id;    /* the window's screen (CGDirectDisplayID) */
++   double x, y, width, height;
++   double scale;           /* the screen's backing scale (points to pixels) */
 +};
++
++/* The bounds of display @display_id in global points (CGDisplayBounds). */
++bool wsi_mlg_display_bounds(uint32_t display_id, double *x, double *y, double *width,
++                            double *height);
 +
 +struct wsi_mlg_window_cache;
 +
@@ -1211,7 +1290,7 @@ index e9473b1..eb88a90 100644
 +
  #endif // WSI_COMMON_METAL_LAYER_H
 diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
-index 67c3e7f..0f9e10d 100644
+index 67c3e7f..d6fd48e 100644
 --- a/src/vulkan/wsi/wsi_common_metal_layer.m
 +++ b/src/vulkan/wsi/wsi_common_metal_layer.m
 @@ -8,6 +8,12 @@
@@ -1249,7 +1328,7 @@ index 67c3e7f..0f9e10d 100644
  static VkResult
  get_mtl_pixel_format(VkFormat format, MTLPixelFormat *metal_format)
  {
-@@ -343,3 +364,225 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+@@ -343,3 +364,237 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
        *drawable_ptr = nil;
     }
  }
@@ -1306,27 +1385,39 @@ index 67c3e7f..0f9e10d 100644
 +      NSView *view = layer_view(layer);
 +      NSWindow *window = view.window;
 +      NSScreen *screen = window.screen;
-+      if (!view || !window || !screen)
++      NSArray<NSScreen *> *screens = [NSScreen screens];
++      if (!view || !window || !screen || !screens.count)
 +         return;
 +
 +      NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
-+      CGFloat scale = screen.backingScaleFactor;
 +      NSRect content = [window convertRectToScreen:[view convertRect:view.bounds toView:nil]];
-+      NSRect frame = screen.frame;
++      /* AppKit's global space has its origin at the bottom left of the
++       * first screen; CoreGraphics' at its top left, y downwards. */
++      const CGFloat top = NSMaxY(screens[0].frame);
 +
 +      out->has_window = number != nil;
 +      out->display_id = number.unsignedIntValue;
-+      out->x = (int32_t)lround((content.origin.x - frame.origin.x) * scale);
-+      out->y = (int32_t)lround((NSMaxY(frame) - NSMaxY(content)) * scale);
-+      out->width = (uint32_t)lround(content.size.width * scale);
-+      out->height = (uint32_t)lround(content.size.height * scale);
-+      out->screen_width = (uint32_t)lround(frame.size.width * scale);
-+      out->screen_height = (uint32_t)lround(frame.size.height * scale);
-+      out->fullscreen = (window.styleMask & NSWindowStyleMaskFullScreen) ||
-+                        (out->x <= 0 && out->y <= 0 &&
-+                         out->x + (int64_t)out->width >= out->screen_width &&
-+                         out->y + (int64_t)out->height >= out->screen_height);
++      out->x = content.origin.x;
++      out->y = top - NSMaxY(content);
++      out->width = content.size.width;
++      out->height = content.size.height;
++      out->scale = screen.backingScaleFactor;
++      out->native_fullscreen = (window.styleMask & NSWindowStyleMaskFullScreen) != 0;
 +   }
++}
++
++bool
++wsi_mlg_display_bounds(uint32_t display_id, double *x, double *y, double *width, double *height)
++{
++   CGRect bounds = CGDisplayBounds(display_id);
++
++   if (CGRectIsEmpty(bounds))
++      return false;
++   *x = bounds.origin.x;
++   *y = bounds.origin.y;
++   *width = bounds.size.width;
++   *height = bounds.size.height;
++   return true;
 +}
 +
 +static void

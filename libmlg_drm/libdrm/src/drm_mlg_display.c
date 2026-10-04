@@ -2,6 +2,8 @@
  * "the driver's display output"): LX_SCANOUT for primary-node proxies, and
  * the macOS display that stands for a connector's monitor. */
 #include <errno.h>
+#include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -137,5 +139,102 @@ int drmMlgConnectorDisplay(int fd, uint32_t connector_id, uint32_t *display_id)
 	if (matches > 1)
 		return -EEXIST;
 	*display_id = found;
+	return 0;
+}
+
+static void place_whole(const struct drm_mlg_place_in *in, struct drm_mlg_placement *out)
+{
+	out->layer = MLG_LX_LAYER_PRIMARY;
+	out->src_x = out->src_y = 0;
+	out->src_w = in->image_w;
+	out->src_h = in->image_h;
+	out->dst_x = out->dst_y = 0;
+	out->dst_w = in->crtc_w;
+	out->dst_h = in->crtc_h;
+}
+
+int drmMlgPlaceWindow(const struct drm_mlg_place_in *in, struct drm_mlg_placement *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!in->crtc_w || !in->crtc_h || !in->image_w || !in->image_h ||
+	    in->mode < DRM_MLG_PLACE_AUTO || in->mode > DRM_MLG_PLACE_WINDOWED ||
+	    (in->have_screen && (!(in->screen_w > 0) || !(in->screen_h > 0)))) {
+		snprintf(out->why, sizeof(out->why), "no mode, image or screen size to place with");
+		return -EINVAL;
+	}
+	if (in->mode == DRM_MLG_PLACE_FULLSCREEN) {
+		place_whole(in, out);
+		return 0;
+	}
+	if (!in->have_screen || !in->have_window) {
+		/* Nothing to relate the window to: full screen, or the image's
+		 * size centred when windowed was asked for. */
+		if (in->mode == DRM_MLG_PLACE_AUTO) {
+			place_whole(in, out);
+			return 0;
+		}
+		out->layer = MLG_LX_LAYER_OVERLAY;
+		out->src_w = in->image_w < in->crtc_w ? in->image_w : in->crtc_w;
+		out->src_h = in->image_h < in->crtc_h ? in->image_h : in->crtc_h;
+		out->dst_w = out->src_w;
+		out->dst_h = out->src_h;
+		out->dst_x = (int32_t)(in->crtc_w - out->dst_w) / 2;
+		out->dst_y = (int32_t)(in->crtc_h - out->dst_h) / 2;
+		return 0;
+	}
+	if (!(in->win_w > 0) || !(in->win_h > 0)) {
+		snprintf(out->why, sizeof(out->why), "the window has no size");
+		out->layer = 0;
+		return 0;
+	}
+
+	/* The window in CRTC pixels: a screen point is crtc/screen pixels. */
+	const double kx = in->crtc_w / in->screen_w, ky = in->crtc_h / in->screen_h;
+	const double x0 = (in->win_x - in->screen_x) * kx, y0 = (in->win_y - in->screen_y) * ky;
+	const double x1 = x0 + in->win_w * kx, y1 = y0 + in->win_h * ky;
+
+	if (in->mode == DRM_MLG_PLACE_AUTO &&
+	    (in->window_native_fullscreen ||
+	     (x0 <= 0.5 && y0 <= 0.5 && x1 >= in->crtc_w - 0.5 && y1 >= in->crtc_h - 0.5))) {
+		place_whole(in, out);
+		return 0;
+	}
+
+	/* The part on the CRTC, and the part of the image that maps there. */
+	const double vx0 = fmax(x0, 0), vy0 = fmax(y0, 0);
+	const double vx1 = fmin(x1, in->crtc_w), vy1 = fmin(y1, in->crtc_h);
+	if (vx1 <= vx0 || vy1 <= vy0) {
+		snprintf(out->why, sizeof(out->why), "the window is off the monitor's screen");
+		return 0;
+	}
+	const int32_t dx0 = (int32_t)lround(vx0), dy0 = (int32_t)lround(vy0);
+	const int32_t dx1 = (int32_t)lround(vx1), dy1 = (int32_t)lround(vy1);
+	if (dx1 - dx0 < DRM_MLG_MIN_VIEWPORT || dy1 - dy0 < DRM_MLG_MIN_VIEWPORT) {
+		snprintf(out->why, sizeof(out->why),
+			 "%dx%d pixels of the window are on the monitor, under DC's %d-pixel viewport",
+			 dx1 - dx0, dy1 - dy0, DRM_MLG_MIN_VIEWPORT);
+		return 0;
+	}
+	const double sx = in->image_w / (x1 - x0), sy = in->image_h / (y1 - y0);
+	double sx0 = floor((dx0 - x0) * sx + 1e-6), sy0 = floor((dy0 - y0) * sy + 1e-6);
+	double sx1 = ceil((dx1 - x0) * sx - 1e-6), sy1 = ceil((dy1 - y0) * sy - 1e-6);
+
+	sx0 = fmax(sx0, 0);
+	sy0 = fmax(sy0, 0);
+	sx1 = fmin(sx1, in->image_w);
+	sy1 = fmin(sy1, in->image_h);
+	if (sx1 - sx0 < 1 || sy1 - sy0 < 1) {
+		snprintf(out->why, sizeof(out->why), "no pixel of the image falls on the monitor");
+		return 0;
+	}
+	out->layer = MLG_LX_LAYER_OVERLAY;
+	out->dst_x = dx0;
+	out->dst_y = dy0;
+	out->dst_w = (uint32_t)(dx1 - dx0);
+	out->dst_h = (uint32_t)(dy1 - dy0);
+	out->src_x = (uint32_t)sx0;
+	out->src_y = (uint32_t)sy0;
+	out->src_w = (uint32_t)(sx1 - sx0);
+	out->src_h = (uint32_t)(sy1 - sy0);
 	return 0;
 }
