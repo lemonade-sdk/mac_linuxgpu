@@ -268,6 +268,39 @@ int dext_kfd_set_window(struct dext_kfd_client *c, uint64_t base, uint64_t size)
     if (!base || (base&(size-1)) || size>c->window_size) return -EINVAL;
     c->window_base=base; c->window_size=size; return 0;
 }
+/* KFD signal events (selectors 86/87): ids from 1, a mailbox per id. */
+static uint32_t kfd_events_next = 1, kfd_events_live;
+int dext_kfd_event_create(struct dext_kfd_client *c, uint32_t *id, uint32_t *trigger,
+                          uint64_t *mailbox_va)
+{
+    assert(c && c->live);
+    *id = *trigger = kfd_events_next++;
+    *mailbox_va = 0x7f0000000000ULL + (uint64_t)*id * 8;
+    kfd_events_live++;
+    return 0;
+}
+int dext_kfd_event_destroy(struct dext_kfd_client *c, uint32_t id)
+{
+    assert(c && c->live);
+    if (!id || id >= kfd_events_next || !kfd_events_live) return -ENOENT;
+    kfd_events_live--;
+    return 0;
+}
+int dext_kfd_event_set(struct dext_kfd_client *c, uint32_t id)
+{
+    assert(c && c->live);
+    return id && id < kfd_events_next ? 0 : -ENOENT;
+}
+int dext_kfd_wait_begin(struct dext_kfd_client *c, const uint32_t *ids, uint32_t count,
+                        int all, uint32_t timeout_ms, struct rt_kfd_wait **out)
+{
+    assert(c && c->live && out);
+    (void)all; (void)timeout_ms;
+    *out = NULL;
+    for (uint32_t i = 0; i < count; i++)
+        if (!ids[i] || ids[i] >= kfd_events_next) return -ENOENT;
+    return -EBUSY;	/* the test never runs a wait */
+}
 int dext_kfd_queue_abi(struct dext_aql_limits *out)
 { *out=(struct dext_aql_limits){.max_private_bytes=262128,.min_packets=64,.max_packets=4096}; return 0; }
 int dext_kfd_bo_alloc(struct dext_kfd_client *c, uint64_t size, uint64_t alignment,
@@ -404,6 +437,11 @@ int main(int argc, char **argv)
         dext_compute_select_client(3);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==1 && !words[2]);
         {
+            /* A legacy client has no KFD process: no signal events. */
+            uint64_t event[3];
+            assert(dext_compute_event(DEXT_COMPUTE_EVENT_CREATE,0,event)==-ENOTREADY_L);
+        }
+        {
             uint64_t topology[16];
             assert(dext_compute_query_info(10,topology,16)==16 && !topology[7]);
         }
@@ -412,6 +450,20 @@ int main(int argc, char **argv)
         dext_compute_set_kfd_policy(true);
         dext_compute_select_client(4);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        {
+            /* A KFD client's signal events. */
+            uint64_t event[3];
+            uint32_t id;
+            struct rt_kfd_wait *wait = (struct rt_kfd_wait *)1;
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_CREATE,0,event) && event[0] &&
+                   event[1]==event[0] && event[2]);
+            id = (uint32_t)event[0];
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_SET,id,event));
+            assert(dext_compute_event_wait_begin(&id,1,0,10,&wait)==-EBUSY_L && !wait);
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,id,event));
+            assert(dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,4000,event)==-ENOENT_L);
+            assert(dext_compute_event(7,id,event)==-EINVAL_L);
+        }
         assert(!dext_compute_host_window(1ULL<<37,window));
         ring=alloc_bo(2); meta=alloc_bo(2);
         assert(!dext_compute_aql_queue_create(ring,meta,64,&status,&q));
@@ -634,6 +686,20 @@ int main(int argc, char **argv)
         kfd_supported_error=0;
         dext_compute_select_client(11);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        {
+            /* A KFD client's signal events. */
+            uint64_t event[3];
+            uint32_t id;
+            struct rt_kfd_wait *wait = (struct rt_kfd_wait *)1;
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_CREATE,0,event) && event[0] &&
+                   event[1]==event[0] && event[2]);
+            id = (uint32_t)event[0];
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_SET,id,event));
+            assert(dext_compute_event_wait_begin(&id,1,0,10,&wait)==-EBUSY_L && !wait);
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,id,event));
+            assert(dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,4000,event)==-ENOENT_L);
+            assert(dext_compute_event(7,id,event)==-EINVAL_L);
+        }
         assert(!dext_compute_host_window(1ULL<<37,window));
         r0=alloc_bo(2); m0=alloc_bo(2);
         assert(!dext_compute_aql_queue_create(r0,m0,64,&status,&q0));
@@ -646,6 +712,20 @@ int main(int argc, char **argv)
         kfd_supported_error=0;
         dext_compute_select_client(12);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        {
+            /* A KFD client's signal events. */
+            uint64_t event[3];
+            uint32_t id;
+            struct rt_kfd_wait *wait = (struct rt_kfd_wait *)1;
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_CREATE,0,event) && event[0] &&
+                   event[1]==event[0] && event[2]);
+            id = (uint32_t)event[0];
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_SET,id,event));
+            assert(dext_compute_event_wait_begin(&id,1,0,10,&wait)==-EBUSY_L && !wait);
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,id,event));
+            assert(dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,4000,event)==-ENOENT_L);
+            assert(dext_compute_event(7,id,event)==-EINVAL_L);
+        }
         assert(!dext_compute_host_window(1ULL<<37,window));
         r0=alloc_bo(2); m0=alloc_bo(2);
         assert(!dext_compute_aql_queue_create(r0,m0,64,&status,&q0));
@@ -664,6 +744,20 @@ int main(int argc, char **argv)
         kfd_supported_error=0;
         dext_compute_select_client(13);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        {
+            /* A KFD client's signal events. */
+            uint64_t event[3];
+            uint32_t id;
+            struct rt_kfd_wait *wait = (struct rt_kfd_wait *)1;
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_CREATE,0,event) && event[0] &&
+                   event[1]==event[0] && event[2]);
+            id = (uint32_t)event[0];
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_SET,id,event));
+            assert(dext_compute_event_wait_begin(&id,1,0,10,&wait)==-EBUSY_L && !wait);
+            assert(!dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,id,event));
+            assert(dext_compute_event(DEXT_COMPUTE_EVENT_DESTROY,4000,event)==-ENOENT_L);
+            assert(dext_compute_event(7,id,event)==-EINVAL_L);
+        }
         assert(!dext_compute_host_window(1ULL<<37,window));
         r0=alloc_bo(2); m0=alloc_bo(2);
         assert(!dext_compute_aql_queue_create(r0,m0,64,&status,&q0));
