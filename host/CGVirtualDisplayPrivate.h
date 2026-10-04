@@ -33,6 +33,9 @@ NS_ASSUME_NONNULL_BEGIN
 @interface CGVirtualDisplaySettings : NSObject
 @property (retain, nonatomic) NSArray<CGVirtualDisplayMode *> *modes;
 @property (nonatomic) unsigned int hiDPI;
+/* Seconds the WindowServer is given to compose a frame for the display
+ * (0, the default: none). Sidecar sets 0.004. */
+@property (nonatomic) double refreshDeadline;
 @end
 
 @interface CGVirtualDisplay : NSObject

@@ -346,6 +346,10 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     var filter: DamageFilter?
     enum DamageMode { case raw, filtered, scroll }
     var damageMode = DamageMode.scroll
+    /// CGVirtualDisplaySettings.refreshDeadline (0: not set) and a capture
+    /// with no minimum frame interval, as Sidecar does (--refresh-deadline,
+    /// --frame-interval zero).
+    var refreshDeadline = 0.0, frameIntervalZero = false
     var measurement = PresentMeasurement()
     var last: PresentStats?
     var failure: String?
@@ -378,6 +382,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = UInt32(plan.hiDPI)
+        settings.refreshDeadline = refreshDeadline
         settings.modes = plan.modes.map {
             CGVirtualDisplayMode(width: UInt32($0.width), height: UInt32($0.height), refreshRate: $0.refreshRate)
         }
@@ -441,7 +446,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         configuration.width = mode.width
         configuration.height = mode.height
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
-        configuration.minimumFrameInterval = CMTime(value: 1000, timescale: CMTimeScale((mode.refreshRate * 1000).rounded()))
+        configuration.minimumFrameInterval = frameIntervalZero ? .zero :
+            CMTime(value: 1000, timescale: CMTimeScale((mode.refreshRate * 1000).rounded()))
         configuration.queueDepth = 6 // frames held until done (see held) and one being captured
         configuration.showsCursor = true
         let stream = SCStream(filter: SCContentFilter(display: scDisplay, excludingWindows: []),
@@ -492,7 +498,13 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
               let raw = info[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pixels = CMSampleBufferGetImageBuffer(sample),
               let surface = CVPixelBufferGetIOSurface(pixels)?.takeUnretainedValue() else { return }
-        let handlerStart = threadCPUNs()
+        let handlerStart = threadCPUNs(), handlerWall = uptimeNs()
+        // The frame's composition time on the virtual display, and how
+        // long after it this handler runs.
+        if let display = info[.displayTime] as? UInt64 {
+            let composed = machToNs(display)
+            measurement.delivered(lagNs: handlerWall > composed ? handlerWall - composed : 0)
+        }
         measurement.frames += 1
         let id = IOSurfaceGetID(surface)
         var handle = handles[id]
@@ -773,6 +785,24 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
     case let other:
         print("display-agent: unknown --damage \(other) (raw, filtered or scroll)")
         return .ended(1)
+    }
+    if !daemon {
+        // For measuring: Sidecar's settings (CGVirtualDisplaySettings'
+        // refreshDeadline; the capture's minimum frame interval).
+        if let text = option(options, "--refresh-deadline") {
+            guard let seconds = Double(text), seconds >= 0, seconds < 1 else {
+                print("display-agent: --refresh-deadline \(text): seconds from 0 to 1")
+                return .ended(1)
+            }
+            mirror.refreshDeadline = seconds
+        }
+        switch option(options, "--frame-interval") ?? "refresh" {
+        case "refresh": mirror.frameIntervalZero = false
+        case "zero": mirror.frameIntervalZero = true
+        case let other:
+            print("display-agent: unknown --frame-interval \(other) (refresh or zero)")
+            return .ended(1)
+        }
     }
     let workload = Workload(kind: daemon ? "still" : option(options, "--workload") ?? "still")
     let warmup = daemon ? Double.infinity : Double(option(options, "--warmup") ?? "") ?? 2

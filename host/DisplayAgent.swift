@@ -458,6 +458,15 @@ struct PresentMeasurement {
         filterFrames += 1
     }
 
+    /// From a frame's composition (its display time) to the frame handler.
+    var lagNs: UInt64 = 0, lagMaxNs: UInt64 = 0, lagFrames = 0
+
+    mutating func delivered(lagNs: UInt64) {
+        self.lagNs += lagNs
+        lagMaxNs = max(lagMaxNs, lagNs)
+        lagFrames += 1
+    }
+
     /// Waiting for the compositor to finish writing the captured buffer.
     var lockWaitNs: UInt64 = 0, lockWaitMaxNs: UInt64 = 0
 
@@ -495,6 +504,8 @@ struct PresentMeasurement {
         out.append(String(format: "agent per presented frame: PRESENT %.1f us CPU, %.1f us wall (max %.1f); whole frame handler %.1f us CPU",
                           Double(callCPUNs) / p / 1e3, Double(callWallNs) / p / 1e3,
                           Double(callWallMaxNs) / 1e3, Double(handlerCPUNs) / p / 1e3))
+        out.append(String(format: "composition to the frame handler: %.2f ms on average, %.2f ms at most (%d frames)",
+                          Double(lagNs) / Double(max(lagFrames, 1)) / 1e6, Double(lagMaxNs) / 1e6, lagFrames))
         out.append(String(format: "waiting for the compositor to finish the captured frame: %.1f us on average, %.1f us at most",
                           Double(lockWaitNs) / p / 1e3, Double(lockWaitMaxNs) / 1e3))
         let ff = Double(max(filterFrames, 1))

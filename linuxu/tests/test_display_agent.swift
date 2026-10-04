@@ -173,6 +173,7 @@ var m = PresentMeasurement()
 m.frames = 4; m.idleFrames = 1
 m.present(callCPUNs: 20_000, callWallNs: 40_000, handlerCPUNs: 60_000)
 m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000, lockWaitNs: 1_200_000)
+m.delivered(lagNs: 2_000_000); m.delivered(lagNs: 4_000_000)
 m.filtered(reported: [(0, 0, 100, 10)], kept: DamageFilter.Damage(rects: [(0, 0, 50, 10)], moves: [(0, 20, 100, 30, 25)]), ns: 30_000)
 m.filtered(reported: [(0, 0, 100, 10)], kept: DamageFilter.Damage(), ns: 10_000)
 m.observe(ps); m.observe(ps)
@@ -181,12 +182,13 @@ let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_40
 m.observe(big)
 check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
 let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
-check(measured.count == 10 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
-      measured[2].contains("600.0 us on average, 1200.0 us at most") &&
-      measured[3].contains("1 of 2 damaged frame(s) changed nothing; 4.0 KB reported, 1.0 KB kept per damaged frame (75% dropped); hashing 20.0 us") &&
-      measured[4].contains("1 frame(s) with moves, 6.0 KB moved per damaged frame; driver: 300 rows moved in VRAM, 2 move(s) copied from the surface instead; 51.2 KB per flip copied in VRAM") &&
-      measured[5].contains("8294.4 KB copied from the surface") && measured[7].contains("10.00 ms on average") &&
-      measured[9].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
+check(measured.count == 11 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+      measured[2].contains("composition to the frame handler: 3.00 ms on average, 4.00 ms at most (2 frames)") &&
+      measured[3].contains("600.0 us on average, 1200.0 us at most") &&
+      measured[4].contains("1 of 2 damaged frame(s) changed nothing; 4.0 KB reported, 1.0 KB kept per damaged frame (75% dropped); hashing 20.0 us") &&
+      measured[5].contains("1 frame(s) with moves, 6.0 KB moved per damaged frame; driver: 300 rows moved in VRAM, 2 move(s) copied from the surface instead; 51.2 KB per flip copied in VRAM") &&
+      measured[6].contains("8294.4 KB copied from the surface") && measured[8].contains("10.00 ms on average") &&
+      measured[10].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)
