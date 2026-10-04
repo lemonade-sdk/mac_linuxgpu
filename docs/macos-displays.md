@@ -237,6 +237,80 @@ Apple GPU. The AMD GPU only scans out.
   - teardown restored the monitor and removed the display, with no
     quarantine.
 
+### 1f. The frame pipeline (build 234)
+
+PRESENT no longer copies or flips in the call. It queues the frame
+(the surface, its damage and ScreenCaptureKit's capture time) in a
+one-frame mailbox and returns. The output's worker thread does the
+rest (`linuxu/src/amdgpu-rt/display.c`):
+
+- **Three scanout buffers.** The worker copies into a buffer that is
+  neither on screen nor waiting to flip. It copies the frame's damage,
+  plus whatever that buffer missed while other buffers were on screen.
+- **SDMA copies without per-frame allocation.** Jobs go to the
+  output's own scheduler entities. A frame of 1 MiB or more is split
+  into 64-row bands across both SDMA rings. The surfaces stay imported
+  and pinned, so a frame allocates and pins nothing.
+- **Nonblocking flips.** The copy fences sit in the buffer's
+  reservation, so the atomic commit waits for them on the GPU's behalf
+  (the implicit in-fence) and the CPU does not. The commit carries a
+  CRTC event whose out-fence signals at the flip, with the vblank
+  timestamp.
+- **No polling.** The worker sleeps on a condition variable. The flip
+  interrupt (through the out-fence callback), a new frame or stop
+  wakes it; nothing else does, so an idle output costs no wakeups. One
+  flip is in flight per CRTC.
+- **Mailbox replacement.** A frame that arrives while the previous one
+  still waits replaces it; their damage adds up. The replaced frame is
+  never copied and is counted as replaced.
+- **Statistics, version 2.** The worker reports frames received, flipped
+  and replaced; copy jobs and bytes; its submit time; GPU copy time
+  (submit to the copy fences); and capture-to-flip latency (the flip
+  fence's vblank timestamp minus the capture time, both on
+  CLOCK_UPTIME_RAW). PRESENT with no rectangle only reads them.
+
+The agent keeps each presented frame's sample buffer until the driver's
+counters show the frame was flipped (its copy is then done) or replaced.
+Until then ScreenCaptureKit cannot reuse the surface under a pending
+copy. Its queue depth is 6 to allow for this.
+
+**Measuring.** Each workload is a separate run:
+
+    display-agent --create --seconds 30 --workload still
+    display-agent --create --seconds 30 --workload move   # a window crossing the display every refresh
+    display-agent --create --seconds 30 --workload full   # a full-screen window changing every refresh
+
+Each run reports, for the window after `--warmup` (2 s by default):
+
+- frames captured, presented, flipped and replaced;
+- the PRESENT call's CPU and wall time, and the frame handler's CPU;
+- per flipped frame: bytes, copy jobs, worker submit time and GPU copy
+  time;
+- copy time against damage size (per MiB);
+- capture-to-scanout latency;
+- CPU and wakeups per second for the agent (from `proc_pid_rusage`)
+  and for the driver process (from `top`, which can read a `_driverkit`
+  process; `--dext-pid` overrides how it is found).
+
+**Zero-copy scanout from GTT** is not available on this GPU through
+upstream. DM puts a framebuffer in GTT only when
+`adev->mode_info.gpu_vm_support` is set, and `amdgpu_dm.c` sets that
+only for APUs (where it also programs the system aperture,
+`mmhub_read_system_context`). On a dGPU,
+`amdgpu_display_supported_domains` keeps scanout in VRAM. Scanning out
+over Thunderbolt would also put every refresh's full frame on the link,
+with underflow risk. The copy of only the damage, into VRAM, is the
+design.
+
+**A shared ring and a user-mode queue** (doorbell, AQL completion
+signals) instead of a PRESENT call per frame was the other option. It
+would remove one IOKit call per frame. The flip still needs the driver
+(an atomic commit), and the build 234 PRESENT returns once the frame is
+queued. Which is better is decided by the measured PRESENT cost: the
+agent reports its CPU and wall time per call. The ring is worth
+building only if that is material (tens of microseconds or more, or
+more than one wakeup per frame).
+
 ## 3b. System Information (implemented)
 
 What macOS System Information (`system_profiler SPDisplaysDataType` and
