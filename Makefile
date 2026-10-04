@@ -46,6 +46,22 @@ include mk/dext.mk
 
 BUILD := build
 DRM := $(LINUX)/drivers/gpu/drm
+
+# kmemcheck (canaries and tracking of every kmalloc, linuxu/src/kmem) is
+# compiled in only with DEBUG=1, as Xcode's Debug configuration does:
+# `make lib-dext DEBUG=1`. Without it the dext's linuxu objects contain
+# none of it; `make check-release` verifies that. The define reaches only
+# linuxu sources, never upstream objects, through a generated header
+# rewritten when the mode changes (so the objects that include it
+# rebuild). The host library the offline tests link is always a debug
+# build: those tests check the heap with it.
+DEBUG ?=
+MLG_DEBUG := $(if $(filter 1 yes true,$(DEBUG)),1,0)
+MLG_MODE_HEADER := $(BUILD)/gen/mlg_build_mode.h
+MLG_MODE_TEXT := $(if $(filter 1,$(MLG_DEBUG)),\#define DEBUG 1,/* release build: DEBUG undefined */)
+$(MLG_MODE_HEADER): FORCE
+	@mkdir -p $(dir $@)
+	@printf '%s\n' '$(MLG_MODE_TEXT)' | cmp -s - $@ 2>/dev/null || printf '%s\n' '$(MLG_MODE_TEXT)' > $@
 AMD := $(DRM)/amd
 
 # ---------------------------------------------------------------------------
@@ -190,6 +206,8 @@ $(addprefix $(BUILD)/driver/,$(FOLDED_ASSERT_OBJECTS)): HOSTCFLAGS += -O2 -fno-s
 
 # Pinned generic FIFO helper expects the Linux allocator's core macro includes.
 $(BUILD)/linuxu/shims/kfifo.o: HOSTCFLAGS += -include linux/kernel.h -include linux/bug.h
+# The host library is a debug build (linuxu sources only; see DEBUG above).
+$(addprefix $(BUILD)/linuxu/,$(LINUXU_SRCS:linuxu/src/%.c=%.o)): HOSTCFLAGS += -DDEBUG=1
 $(BUILD)/linuxu/shims/sort.o: HOSTCFLAGS += -include linux/compiler.h -include linux/preempt.h
 
 # ---------------------------------------------------------------------------
@@ -228,6 +246,10 @@ DK_CFLAGS += -include rt/device_string.h -mstrict-align \
 # Changing the memory backend must rebuild every KMD object, including ones
 # whose old depfiles predate the forced header.
 $(DK_DRIVER_OBJS) $(DK_LINUXU_OBJS): linuxu/headers/rt/device_string.h
+# linuxu objects follow DEBUG (the mode header), upstream objects never.
+DK_LINUXU_SRC_OBJS := $(addprefix $(DK_BUILD)/linuxu/,$(LINUXU_SRCS:linuxu/src/%.c=%.o))
+$(DK_LINUXU_SRC_OBJS): $(MLG_MODE_HEADER)
+$(DK_LINUXU_SRC_OBJS): DK_CFLAGS += -include $(MLG_MODE_HEADER)
 
 $(eval $(call compile_rules,$(DK_BUILD),DK_CFLAGS))
 $(foreach h,$(UPSTREAM_HELPERS),$(eval $(call helper_rule,$(DK_BUILD),DK_CFLAGS,$(word 1,$(subst :, ,$(h))),$(word 2,$(subst :, ,$(h))))))
@@ -563,6 +585,15 @@ test-dext-alloc:
 verify-source:
 	python3 scripts/verify-upstream.py
 
+# A release build (DEBUG unset) of the dext's library, checked for kmemcheck
+# (scripts/check-release.sh), and the allocator's tests in release mode.
+check-release:
+	$(MAKE) DEBUG= lib-dext
+	bash scripts/check-release.sh $(DK_LIB)
+	bash scripts/test-kmem-release.sh
+
+.PHONY: check-release
+
 # What the driver is built from: the Linux tree alone (Mesa and llama.cpp,
 # when checked out, are verified by verify-source and their own builds).
 verify-linux:
@@ -640,6 +671,12 @@ test-rcu-dk:
 	@mkdir -p $(BUILD)/tests
 	$(CC) -std=gnu11 -g -O1 -w -D__KERNEL__ -DLINUXU_DEXT_DK=1 -fsanitize=address,undefined -Ilinuxu/headers linuxu/tests/test_rcu.c linuxu/src/rcu.c -Wl,-dead_strip -lpthread -o $(BUILD)/tests/test_rcu_dk
 	$(BUILD)/tests/test_rcu_dk
+
+test-kmem-release:
+	bash scripts/test-kmem-release.sh
+
+test: test-kmem-release
+.PHONY: test-kmem-release
 
 test-wait-event:
 	@mkdir -p $(BUILD)/tests

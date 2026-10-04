@@ -273,7 +273,7 @@
 			outputPaths = ();
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\n# make runs scripts/bootstrap.sh first when setup is missing or stale\n# (pinned Linux submodule, patches/linux, locked firmware).\n/usr/bin/make -C \"$SRCROOT\" verify-source\n/usr/bin/make -C \"$SRCROOT\" -j4 lib-dext\n";
+			shellScript = "set -eu\n# make runs scripts/bootstrap.sh first when setup is missing or stale\n# (pinned Linux submodule, patches/linux, locked firmware).\n/usr/bin/make -C \"$SRCROOT\" verify-source\n# Debug builds compile the instrumentation in (DEBUG=1), release builds leave it out.\nif [ \"$CONFIGURATION\" = Debug ]; then mode=1; else mode=; fi\n/usr/bin/make -C \"$SRCROOT\" -j4 lib-dext DEBUG=$mode\n";
 		};
 		F00000000000000000000009 /* Bundle firmware */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -379,6 +379,7 @@
 				GCC_PREPROCESSOR_DEFINITIONS = (
 					"$(inherited)",
 					"LINUXU_DEXT=1",
+					"DEBUG=1",
 				);
 				HEADER_SEARCH_PATHS = (
 					"$(inherited)",

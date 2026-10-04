@@ -3,8 +3,9 @@
  * rt/dart.h — DMA→DART mapping layer. The host test backend uses identity
  * IOVAs. DriverKit coherent allocations use IODMACommand directly, while
  * streaming mappings use a DART-mapped bounce buffer with explicit copies at
- * DMA ownership boundaries. Both paths enforce the 1.5 GB live mapping
- * budget and report failures through dma_mapping_error().
+ * DMA ownership boundaries. Neither has a software ceiling on mapped bytes:
+ * a mapping fails when the platform refuses it (dma_mapping_error(), NULL
+ * or -ENOMEM), and live-mapped bytes are counted for diagnostics.
  *
  * The token table behind the counter is a small hash of live mappings,
  * so double-unmap and unmap-of-unknown are detectable no-ops and
@@ -35,9 +36,6 @@ struct scatterlist;
 extern "C" {
 #endif
 
-/* ~1.5 GB DART budget (matches rt_dart_ceiling in rt/rt.h). */
-#define LINUXU_DART_BUDGET  (1536ULL * 1024ULL * 1024ULL)
-
 /* dma_map_page equivalent over a struct page (backing = page host VA). */
 dma_addr_t linuxu_dma_map_page(struct device *dev, struct page *page,
 			       unsigned long offset, size_t size,
@@ -46,7 +44,7 @@ void linuxu_dma_unmap_page(struct device *dev, dma_addr_t iova, size_t size,
 			   enum dma_data_direction dir);
 
 /* Scatterlist map/unmap: each entry gets a valid IOVA and the mapped bytes
- * are budgeted. Returns the number of mapped entries, 0 on failure. */
+ * are counted. Returns the number of mapped entries, 0 on failure. */
 int linuxu_dma_map_sg(struct device *dev, struct scatterlist *sg, int nents,
 		      enum dma_data_direction dir);
 void linuxu_dma_unmap_sg(struct device *dev, struct scatterlist *sg,
@@ -67,11 +65,11 @@ int linuxu_dart_contains(uint64_t iova, uint64_t bytes);
 
 /* A mapping made outside this layer: memory of another process that the
  * platform mapped for the device (a display agent's IOSurface, mapped by
- * the dext's IODMACommand). It is charged to the budget and is live for
+ * the dext's IODMACommand). Its bytes are counted, and it is live for
  * linuxu_dart_contains() from linuxu_dart_import() until
  * linuxu_dart_import_release(); the IOVA range itself is the platform's.
  * Returns 0, -EINVAL (empty, overflowing or overlapping a live import) or
- * -ENOMEM (over budget). */
+ * -ENOMEM (no memory for the record). */
 int linuxu_dart_import(uint64_t iova, uint64_t size);
 void linuxu_dart_import_release(uint64_t iova, uint64_t size);
 
@@ -87,14 +85,14 @@ void linuxu_dart_set_hold(bool (*stalled)(void *arg), void *arg);
 unsigned int linuxu_dart_held(void);
 unsigned int linuxu_dart_release_held(void);
 
-/* Budget getters (test + future metrics). */
+/* Live-mapped bytes now and at most so far (diagnostics; there is no
+ * ceiling: the platform refuses what it cannot map). */
 uint64_t linuxu_dart_used(void);
 uint64_t linuxu_dart_peak(void);
-uint64_t linuxu_dart_budget(void);
 
 /* Test/teardown hooks: number of live entries in the token table
  * (must return to 0 on a clean run), and a full flush (clears the
- * table and resets the budget — not used by the driver). */
+ * table and resets the counters — not used by the driver). */
 int linuxu_dart_table_count(void);
 void linuxu_dart_reset(void);
 

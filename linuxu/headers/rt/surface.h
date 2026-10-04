@@ -54,7 +54,7 @@ struct rt_surface_provider {
 
 /* Import @count segments, @size bytes in all, laid out as a linear
  * @width x @height XRGB8888/BGRA surface with @pitch bytes per row. The
- * segments are charged to the DART budget (linuxu_dart_import) while
+ * segments are counted as DART-mapped (linuxu_dart_import) while
  * imported. Returns 0 and the surface, or -EINVAL, -ENOMEM, -ENODEV, or
  * the failing upstream step's errno. */
 int rt_surface_import(struct pci_dev *pdev, const struct rt_surface_segment *segments,

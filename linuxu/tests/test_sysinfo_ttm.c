@@ -105,7 +105,6 @@ int main(int argc, char **argv)
 	assert(argc == 2);
 	scenario = argv[1];
 	_Static_assert(PAGE_SIZE == 16384, "TTM page unit");
-	_Static_assert(LINUXU_DART_BUDGET == 1536ull * 1024 * 1024, "DART policy unchanged");
 	assert(si_meminfo(NULL) == -EINVAL && !NODE_DATA(-1) && !NODE_DATA(1));
 	if (!strcmp(scenario, "retry")) {
 		scenario = "denied";

@@ -23,6 +23,7 @@
 #include <linux/mm.h>
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
+#include <linux/mmzone.h>
 
 extern int kmemcheck_verify_all(void);
 
@@ -221,11 +222,39 @@ int main(void)
 	{
 		struct page *big = alloc_pages(GFP_KERNEL, 17);
 
-		/* 2^17 x 16 KB = 128 MB; pool is 1 GB so it should
-		 * fit; order 26 would be 1 TB and must fail */
+		/* 2^17 x 16 KB = 2 GiB: more than one chunk of
+		 * descriptors, so never contiguous; order 26 (1 TB) must
+		 * fail too */
 		if (big)
 			__free_pages(big, 17);
 		EXPECT(alloc_pages(GFP_KERNEL, 26) == NULL);
+	}
+
+	/* ---- no fixed pool: more than 2 GiB of pages live at once ---- */
+	{
+		/* 136 blocks of MAX_PAGE_ORDER (16 MiB each) is 2176 MiB,
+		 * past the 2 GiB the pool was once fixed at: descriptors come
+		 * in chunks as pages are needed, up to the machine's RAM. */
+		enum { BLOCKS = 136 };
+		struct page *blocks[BLOCKS];
+		unsigned long highest = 0;
+		int i;
+
+		for (i = 0; i < BLOCKS; i++) {
+			blocks[i] = alloc_pages(GFP_KERNEL, MAX_PAGE_ORDER);
+			EXPECT(blocks[i] != NULL);
+			EXPECT(page_address(blocks[i]) != NULL);
+			EXPECT(page_to_pfn(blocks[i]) != ~0UL);
+			EXPECT(pfn_to_page(page_to_pfn(blocks[i])) == blocks[i]);
+			EXPECT(virt_to_page(page_address(blocks[i])) == blocks[i]);
+			if (page_to_pfn(blocks[i]) > highest)
+				highest = page_to_pfn(blocks[i]);
+		}
+		EXPECT(highest >= (2ul << 30) / PAGE_SIZE);
+		/* the last page of the last block is addressable */
+		((unsigned char *)page_address(blocks[BLOCKS - 1]))[(PAGE_SIZE << MAX_PAGE_ORDER) - 1] = 0x5a;
+		for (i = 0; i < BLOCKS; i++)
+			__free_pages(blocks[i], MAX_PAGE_ORDER);
 	}
 
 	EXPECT(kmemcheck_verify_all() == 0);

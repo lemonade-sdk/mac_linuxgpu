@@ -8,9 +8,10 @@
  * twins in the #else branch so a host unit test can exercise the same
  * shape without DriverKit.
  *
- * The 1.5 GB DART budget is OWNED by dart.c (the single source of truth);
- * the seam only converts (host VA <-> IOVA) and owns the IODMACommand /
- * buffer lifetime.  dart.c charges/refunds the budget around these calls.
+ * dart.c accounts mapped bytes; the seam converts (host VA <-> IOVA) and
+ * owns the IODMACommand / buffer lifetime. No software ceiling applies: a
+ * mapping fails when the platform refuses it (memory, wiring, or the DART's
+ * IOVA window), and the seam logs the size and the refusing call's IOReturn.
  *
  * 16 KB host-page granularity: the allocated buffer is 16 KB aligned
  * (firmware/ucode loads need it).
@@ -39,13 +40,14 @@ int dext_dma_begin_reset(void);
 void dext_dma_end_reset(void);
 /* Retire mappings without releasing DART/backing while the owner stops all
  * compute queues and upstream workers with IRQ delivery still available.
- * Pass linuxu_dart_budget(): retired mappings keep consuming this ceiling
- * even after the Linux owner refunds its logical allocation charge. */
-int dext_dma_begin_shutdown(uint64_t dma_budget);
+ * The hold counts the bytes mapped when it starts and those mapped during
+ * it; retired mappings keep their DART IOVA until the endpoint reset, so
+ * the DART refuses a teardown mapping that would not fit beside them. */
+int dext_dma_begin_shutdown(void);
 /* Cover allocations freed inside upstream's synchronous probe unwind before
  * control returns to the lifecycle owner. A failed probe promotes this hold
  * through begin_shutdown; commit releases only retired buffers on success. */
-int dext_dma_begin_probe(uint64_t dma_budget);
+int dext_dma_begin_probe(void);
 int dext_dma_commit_probe(void);
 /* Permanent retention, even if an in-flight RPC prevented orderly shutdown.
  * Stops new mappings, keeps future frees/aliases, and preserves the provider. */

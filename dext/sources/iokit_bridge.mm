@@ -16,11 +16,15 @@
  *   ... (GPU DMAs to/from seg.address; CPU touches cpu.address) ...
  *   dma->CompleteDMA(...);  dma->release();  buf->release();
  *
- * The 1.5 GB DART budget is owned by the linuxu DART layer (dart.c), which
- * charges/refunds around ordinary calls. During shutdown, its frees
- * retire software ownership while this seam keeps the mappings prepared;
- * the hold snapshots the same ceiling and retains their byte charges until
- * reset, so teardown allocations cannot exceed the actual pinned budget.
+ * There is no software ceiling on mapped bytes. What bounds DMA is the
+ * platform: the memory and wiring a buffer needs, and the DART's IOVA
+ * window for the device (on a Thunderbolt PCIe port of an M-series Mac the
+ * device tree gives its dart-apciec a 2047 MiB window). A refusal surfaces
+ * as a failed mapping, logged with its size, the call that refused it and
+ * the IOReturn. During shutdown, frees retire software ownership while
+ * this seam keeps the mappings prepared until the endpoint reset; they
+ * still occupy the DART window, so the DART itself refuses teardown
+ * mappings that would not fit beside them.
  *
  * 16 KB host-page granularity: DART-pinned sysmem must be 16 KB aligned
  * (DART page size).  We round the size up and pass the 16 KB
@@ -33,11 +37,97 @@
 #include <stdint.h>
 #include <time.h>
 #include <stdlib.h>
+#include <string.h>
 #include <rt/dext_dma.h>
 /* rt/device_string.h's aperture gate (not the header: it redefines memcpy). */
 extern "C" void linuxu_aperture_set(uintptr_t base, uint64_t size);
 extern "C" void linuxu_aperture_gone(const char *why);
 extern "C" int linuxu_aperture_is_gone(void);
+
+/* A table of mapping records that grows a chunk at a time, as many as are
+ * live at once: no fixed count limits how many mappings the device has.
+ * Chunks never move, so a record's address stays valid while the table's
+ * lock is dropped; the chunk array is replaced (not resized in place) under
+ * that lock. Allocation happens outside the lock (grow()). */
+template <typename T, unsigned int Chunk, void *(*Alloc)(size_t), void (*Free)(void *, size_t)>
+class dext_chunked_table {
+	T **chunks_ = nullptr;
+	unsigned int count_ = 0;	/* chunks */
+public:
+	unsigned int capacity() const { return count_ * Chunk; }
+	T &operator[](unsigned int i) { return chunks_[i / Chunk][i % Chunk]; }
+	const T &operator[](unsigned int i) const { return chunks_[i / Chunk][i % Chunk]; }
+	template <typename Table, typename Ref>
+	class iter {
+		Table *t_; unsigned int i_;
+	public:
+		iter(Table *t, unsigned int i) : t_(t), i_(i) {}
+		Ref operator*() const { return (*t_)[i_]; }
+		iter &operator++() { ++i_; return *this; }
+		bool operator!=(const iter &o) const { return i_ != o.i_; }
+	};
+	iter<dext_chunked_table, T &> begin() { return {this, 0}; }
+	iter<dext_chunked_table, T &> end() { return {this, capacity()}; }
+	iter<const dext_chunked_table, const T &> begin() const { return {this, 0}; }
+	iter<const dext_chunked_table, const T &> end() const { return {this, capacity()}; }
+	/* Allocate one more chunk and a chunk array to hold it (without the
+	 * lock), then install(): */
+	struct growth { T *chunk; T **array; unsigned int slots; };
+	static bool allocate(growth &g, unsigned int chunks_now)
+	{
+		g.slots = chunks_now + 1;
+		g.chunk = static_cast<T *>(Alloc(Chunk * sizeof(T)));
+		g.array = static_cast<T **>(Alloc(g.slots * sizeof(T *)));
+		if (!g.chunk || !g.array) { release(g); return false; }
+		memset(static_cast<void *>(g.chunk), 0, Chunk * sizeof(T));
+		return true;
+	}
+	static void release(growth &g)
+	{
+		if (g.chunk) Free(g.chunk, Chunk * sizeof(T));
+		if (g.array) Free(g.array, g.slots * sizeof(T *));
+		g.chunk = nullptr; g.array = nullptr;
+	}
+	unsigned int chunks() const { return count_; }
+	/* With the lock held: add the chunk; g keeps the old array to free
+	 * after the lock is dropped. False (g unchanged) if the table grew
+	 * meanwhile so that g's array is too small. */
+	bool install(growth &g)
+	{
+		if (g.slots != count_ + 1) return false;
+		for (unsigned int i = 0; i < count_; ++i) g.array[i] = chunks_[i];
+		g.array[count_] = g.chunk;
+		T **old = chunks_;
+		const unsigned int old_slots = count_;
+		chunks_ = g.array;
+		++count_;
+		g.chunk = nullptr;
+		g.array = old;
+		g.slots = old_slots;
+		return true;
+	}
+	static void free_old(growth &g)
+	{
+		if (g.array) Free(g.array, g.slots * sizeof(T *));
+		g.array = nullptr;
+	}
+	/* With the lock held and no record in use: hand the storage to @g's
+	 * caller (free_storage() after the lock is dropped). */
+	struct storage { T **chunks; unsigned int count; };
+	storage take_storage()
+	{
+		storage st{chunks_, count_};
+		chunks_ = nullptr;
+		count_ = 0;
+		return st;
+	}
+	static void free_storage(storage &st)
+	{
+		for (unsigned int i = 0; i < st.count; ++i) Free(st.chunks[i], Chunk * sizeof(T));
+		if (st.chunks) Free(st.chunks, st.count * sizeof(T *));
+		st = {};
+	}
+};
 
 #ifdef LINUXU_DEXT
 
@@ -70,7 +160,6 @@ static bool g_dma_quarantined;
  * it and a quarantine no longer applies (dext_dma_device_removed). */
 static bool g_dma_removed;
 static uint64_t g_dma_shutdown_bytes;
-static uint64_t g_dma_shutdown_ceiling;
 static bool g_dma_cleanup_failed;
 static unsigned int g_dma_operations;
 /* DMA addressing width of the bound device, from its Linux DMA masks
@@ -96,18 +185,18 @@ struct dext_dma_snapshot {
 	bool provider, stopping, resetting, hold, probe, committing, quarantined, cleanup_failed;
 	bool cpu, vmaps;
 	unsigned int operations, bars, live, retired;
-	uint64_t bytes, ceiling;
+	uint64_t bytes;	/* pinned by the hold: live at its start, and mapped since */
 };
 static dext_dma_snapshot dext_dma_snapshot_locked(void);
 /* Capture only cached ownership under the DMA lock, then format and emit
  * after unlocking. Never query PCI/DART to diagnose a failed transition. */
 static void dext_dma_report(const char *stage, const dext_dma_snapshot &state)
 {
-	DEXT_DMA_LOG("DMA %s: provider=%d stopping=%d resetting=%d hold=%d probe=%d committing=%d quarantined=%d cleanup_failed=%d operations=%u bars=%u cpu=%d vmaps=%d live=%u retired=%u bytes=%llu/%llu",
+	DEXT_DMA_LOG("DMA %s: provider=%d stopping=%d resetting=%d hold=%d probe=%d committing=%d quarantined=%d cleanup_failed=%d operations=%u bars=%u cpu=%d vmaps=%d live=%u retired=%u bytes=%llu",
 		stage, state.provider, state.stopping, state.resetting, state.hold,
 		state.probe, state.committing, state.quarantined, state.cleanup_failed,
 		state.operations, state.bars, state.cpu, state.vmaps, state.live,
-		state.retired, (unsigned long long)state.bytes, (unsigned long long)state.ceiling);
+		state.retired, (unsigned long long)state.bytes);
 }
 
 /* A mapping RPC may outlive the stop request. Keep it visible to fini until
@@ -138,15 +227,15 @@ public:
 		--g_dma_operations;
 		dext_dma_release();
 	}
+	/* During a hold, count a new mapping's bytes as pinned until the
+	 * endpoint reset (refunded if it is never prepared). The DART bounds
+	 * what fits: retained mappings keep their IOVA, so it refuses one that
+	 * would not fit beside them. False under quarantine. */
 	bool reserve_shutdown_bytes(uint64_t bytes)
 	{
 		dext_dma_acquire();
 		if (g_dma_quarantined) { dext_dma_release(); return false; }
 		if (g_dma_holding_frees) {
-			if (bytes > g_dma_shutdown_ceiling - g_dma_shutdown_bytes) {
-				dext_dma_release();
-				return false;
-			}
 			g_dma_shutdown_bytes += bytes;
 			reserved = bytes;
 		}
@@ -185,6 +274,8 @@ static int dext_dma_complete_now(IODMACommand *dma, IOMemoryDescriptor *buf)
 }
 
 static int dext_dma_complete(IODMACommand *, IOMemoryDescriptor *, uint64_t);
+static void dext_dma_refused(const char *call, kern_return_t result, uint64_t bytes);
+static void dext_dma_drop_table_and_release(void);
 
 /* Forward declarations: the side-table helpers are defined below but are
  * called from dext_dma_alloc_coherent / dext_dma_free_coherent above them
@@ -256,7 +347,8 @@ int dext_dma_fini(void)
 		return -1;
 	}
 	g_dma_pci = nullptr;
-	dext_dma_release();
+	/* Nothing is recorded any more: the table's storage goes too. */
+	dext_dma_drop_table_and_release();
 	return 0;
 }
 
@@ -282,7 +374,7 @@ static bool dext_dma_below(uint64_t address, uint64_t length, unsigned int bits)
  * `bits` address bits. A mapping placed outside that range is never
  * published; *placed (optional) reports where the DART put it. */
 static int dext_dma_map(size_t size, unsigned int bits, void **cpu_addr, uint64_t *iova,
-			uint64_t *placed = nullptr)
+			uint64_t *placed = nullptr, bool log_refusal = true)
 {
 	uint64_t rounded;
 	IOBufferMemoryDescriptor *buf = nullptr;
@@ -312,16 +404,23 @@ static int dext_dma_map(size_t size, unsigned int bits, void **cpu_addr, uint64_
 	r = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionOutIn,
 					      rounded,
 					      DEXT_DART_COHERENT_ALIGN, &buf);
-	if (r != kIOReturnSuccess || !buf)
+	if (r != kIOReturnSuccess || !buf) {
+		dext_dma_refused("IOBufferMemoryDescriptor::Create", r ? r : kIOReturnNoMemory, rounded);
 		return kDextDMAFailed;
+	}
 	r = buf->SetLength(rounded);
-	if (r != kIOReturnSuccess) { buf->release(); return kDextDMAFailed; }
+	if (r != kIOReturnSuccess) {
+		buf->release();
+		dext_dma_refused("IOBufferMemoryDescriptor::SetLength", r, rounded);
+		return kDextDMAFailed;
+	}
 
 	/* 2. The in-process (host) pointer the CPU will use. */
 	IOAddressSegment cpu{};
 	r = buf->GetAddressRange(&cpu);
 	if (r != kIOReturnSuccess || !cpu.address || cpu.length < rounded) {
 		buf->release();
+		dext_dma_refused("IOBufferMemoryDescriptor::GetAddressRange", r ? r : kIOReturnNoMemory, rounded);
 		return kDextDMAFailed;
 	}
 
@@ -332,7 +431,11 @@ static int dext_dma_map(size_t size, unsigned int bits, void **cpu_addr, uint64_
 	spec.maxAddressBits = bits;
 	r = IODMACommand::Create(pci, kIODMACommandCreateNoOptions,
 				 &spec, &dma);
-	if (r != kIOReturnSuccess || !dma) { buf->release(); return kDextDMAFailed; }
+	if (r != kIOReturnSuccess || !dma) {
+		buf->release();
+		dext_dma_refused("IODMACommand::Create", r ? r : kIOReturnNoMemory, rounded);
+		return kDextDMAFailed;
+	}
 
 	/* 4. PrepareForDMA -> the GPU-visible IOVA (segment.address).
 	 * For a single contiguous buffer we expect exactly one segment
@@ -341,6 +444,8 @@ static int dext_dma_map(size_t size, unsigned int bits, void **cpu_addr, uint64_
 			       rounded, &flags, &count, &seg);
 	if (r != kIOReturnSuccess) {
 		dma->release(); buf->release();
+		/* Width probes (dext_dma_platform_supports_bits) expect refusals. */
+		if (log_refusal) dext_dma_refused("IODMACommand::PrepareForDMA", r, rounded);
 		return kDextDMAPrepareRefused;
 	}
 	operation.did_prepare();
@@ -348,6 +453,9 @@ static int dext_dma_map(size_t size, unsigned int bits, void **cpu_addr, uint64_
 	if (count != 1 || seg.length < rounded || !seg.address) {
 		/* An unusable mapping is never published. Failed completion still
 		 * retains its backing and permanently blocks the DMA seam. */
+		DEXT_DMA_LOG("DMA: mapping %llu bytes for the device failed: PrepareForDMA gave %u segment(s), the first %llu bytes at %#llx, not one covering it",
+			     (unsigned long long)rounded, count, (unsigned long long)seg.length,
+			     (unsigned long long)seg.address);
 		(void)dext_dma_complete(dma, buf, rounded);
 		return kDextDMAFailed;
 	}
@@ -384,8 +492,8 @@ extern "C" {
  *   *cpu_addr = the in-process host pointer (CPU reads/writes this)
  *   *iova     = the GPU-visible IOVA (segment.address from PrepareForDMA),
  *               below 2^dext_dma_address_bits()
- * Returns 0 on success, -1 on any DriverKit failure (budget is the
- * caller's responsibility — dart.c has already charged it). */
+ * Returns 0 on success, -1 when the platform refused it (logged with its
+ * size and reason) or the seam is stopping. */
 int dext_dma_alloc_coherent(size_t size, void **cpu_addr, uint64_t *iova)
 {
 	const unsigned int bits = dext_dma_address_bits();
@@ -415,7 +523,7 @@ int dext_dma_platform_supports_bits(unsigned int bits)
 	if (!provider) return -1;
 	void *cpu = nullptr;
 	uint64_t iova = 0, placed = 0;
-	int status = dext_dma_map(DEXT_DART_COHERENT_ALIGN, bits, &cpu, &iova, &placed);
+	int status = dext_dma_map(DEXT_DART_COHERENT_ALIGN, bits, &cpu, &iova, &placed, false);
 	if (status == kDextDMAMapped)
 		(void)dext_dma_free_coherent(cpu, DEXT_DART_COHERENT_ALIGN);
 	if (status == kDextDMAPrepareRefused && bits < 64 &&
@@ -456,8 +564,75 @@ struct dext_dma_entry {
 	bool                       retired;
 	uint64_t                  import_id;	/* nonzero for an import (dext_dma_import) */
 };
-#define DEXT_DMA_TABLE 4096
-static struct dext_dma_entry dext_dma_table[DEXT_DMA_TABLE];
+/* The dext's heap (linuxu/src/shims/dext_alloc.c, over IOMalloc). */
+extern "C" void *linuxu_dext_malloc(size_t size);
+extern "C" void linuxu_dext_free(void *pointer);
+static void *dext_table_alloc(size_t bytes) { return linuxu_dext_malloc(bytes); }
+static void dext_table_free(void *p, size_t) { linuxu_dext_free(p); }
+using dext_dma_table_t = dext_chunked_table<dext_dma_entry, 1024, dext_table_alloc, dext_table_free>;
+static dext_dma_table_t dext_dma_table;
+
+/* With the lock held: a free record, growing the table when every record
+ * is in use (the lock is dropped while it allocates, so callers re-check
+ * their state). nullptr when there is no memory for another chunk. */
+static dext_dma_entry *dext_dma_claim_locked(void)
+{
+	for (;;) {
+		for (auto &entry : dext_dma_table)
+			if (!entry.in_use) return &entry;
+		dext_dma_table_t::growth g{};
+		const unsigned int chunks = dext_dma_table.chunks();
+		dext_dma_release();
+		const bool allocated = dext_dma_table_t::allocate(g, chunks);
+		dext_dma_acquire();
+		if (!allocated) {
+			DEXT_DMA_LOG("DMA: no memory to record another mapping (%u recorded)",
+				     dext_dma_table.capacity());
+			return nullptr;
+		}
+		const bool installed = dext_dma_table.install(g);
+		dext_dma_release();
+		if (installed) dext_dma_table_t::free_old(g);
+		else dext_dma_table_t::release(g);
+		dext_dma_acquire();
+	}
+}
+
+/* With the lock held and no record in use: drop the lock and free the
+ * table's storage. */
+static void dext_dma_drop_table_and_release(void)
+{
+	auto storage = dext_dma_table.take_storage();
+	dext_dma_release();
+	dext_dma_table_t::free_storage(storage);
+}
+
+/* A mapping the platform refused: logged with its size, the call that
+ * refused it, its IOReturn and what is mapped now. A run of the same
+ * refusal logs its first and then every 256th. */
+static void dext_dma_refused(const char *call, kern_return_t result, uint64_t bytes)
+{
+	static const char *last_call;
+	static kern_return_t last_result;
+	static uint64_t last_bytes, repeats;
+	uint64_t mapped = 0;
+	unsigned int live = 0;
+
+	dext_dma_acquire();
+	for (const auto &entry : dext_dma_table)
+		if (entry.in_use) { mapped += entry.length; ++live; }
+	const bool same = call == last_call && result == last_result && bytes == last_bytes;
+	repeats = same ? repeats + 1 : 0;
+	last_call = call;
+	last_result = result;
+	last_bytes = bytes;
+	const uint64_t n = repeats;
+	dext_dma_release();
+	if (n & 255) return;
+	DEXT_DMA_LOG("DMA: mapping %llu bytes for the device failed: %s returned %#x (%llu bytes in %u mappings already mapped%s)",
+		     (unsigned long long)bytes, call, result, (unsigned long long)mapped, live,
+		     n ? "; the same refusal repeats" : "");
+}
 
 /* Unpublished mappings created during upstream teardown still need the same
  * pin-until-reset rule. A full registry retains the references and latches a
@@ -467,9 +642,8 @@ static int dext_dma_complete(IODMACommand *dma, IOMemoryDescriptor *buf,
 {
 	dext_dma_acquire();
 	if (g_dma_holding_frees) {
-		for (auto &entry : dext_dma_table) {
-			if (entry.in_use) continue;
-			entry = {buf, dma, 0, length, 1, true, true, 0};
+		if (dext_dma_entry *entry = dext_dma_claim_locked()) {
+			*entry = {buf, dma, 0, length, 1, true, true, 0};
 			dext_dma_release();
 			return 0;
 		}
@@ -488,8 +662,7 @@ void *dext_dma_copy_descriptor(void *cpu_addr)
 	dext_dma_acquire();
 	if (g_dma_quarantined) { dext_dma_release(); return nullptr; }
 	IOMemoryDescriptor *found = nullptr;
-	for (int i = 0; i < DEXT_DMA_TABLE; ++i) {
-		const auto &e = dext_dma_table[i];
+	for (const auto &e : dext_dma_table) {
 		if (e.in_use && !e.releasing && !e.import_id &&
 		    e.cpu_addr == (uint64_t)(uintptr_t)cpu_addr) {
 			found = e.buf;
@@ -693,8 +866,8 @@ static bool dext_dma_busy_locked(void)
 	if (g_dma_operations || g_dma_cleanup_failed || g_dma_holding_frees ||
 	    g_bar0_cpu_refs || dext_vmaps || dext_cpu_buffers)
 		return true;
-	for (int i = 0; i < DEXT_DMA_TABLE; ++i)
-		if (dext_dma_table[i].in_use) return true;
+	for (const auto &entry : dext_dma_table)
+		if (entry.in_use) return true;
 	return false;
 }
 
@@ -714,7 +887,6 @@ static dext_dma_snapshot dext_dma_snapshot_locked(void)
 	snapshot.cpu = dext_cpu_buffers != nullptr;
 	snapshot.vmaps = dext_vmaps != nullptr;
 	snapshot.bytes = g_dma_shutdown_bytes;
-	snapshot.ceiling = g_dma_shutdown_ceiling;
 	for (const auto &entry : dext_dma_table) {
 		if (!entry.in_use) continue;
 		if (entry.retired) ++snapshot.retired;
@@ -752,7 +924,7 @@ extern "C" void dext_dma_end_reset(void)
 #ifndef DEXT_DMA_HOLD_DRAIN_MS
 #define DEXT_DMA_HOLD_DRAIN_MS 2000
 #endif
-static int dext_dma_begin_hold(uint64_t dma_budget, bool probe)
+static int dext_dma_begin_hold(bool probe)
 {
 	dext_dma_acquire();
 	/* An operation in flight on another thread is not a reason to give up:
@@ -761,7 +933,7 @@ static int dext_dma_begin_hold(uint64_t dma_budget, bool probe)
 	 * unmapping. Each operation is short; wait for none to be in flight,
 	 * bounded, before deciding. Operations that begin after the hold are
 	 * covered by it. */
-	if (g_dma_operations && dma_budget && g_dma_pci && !g_dma_stopping &&
+	if (g_dma_operations && g_dma_pci && !g_dma_stopping &&
 	    !g_dma_resetting && !g_dma_holding_frees && !g_dma_cleanup_failed) {
 		const uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) +
 			(uint64_t)DEXT_DMA_HOLD_DRAIN_MS * 1000000ULL;
@@ -779,25 +951,17 @@ static int dext_dma_begin_hold(uint64_t dma_budget, bool probe)
 		dext_dma_release();
 		return 0;
 	}
-	if (!dma_budget || !g_dma_pci || g_dma_stopping || g_dma_resetting ||
+	if (!g_dma_pci || g_dma_stopping || g_dma_resetting ||
 	    g_dma_holding_frees || g_dma_cleanup_failed || g_dma_operations) {
 		const auto snapshot = dext_dma_snapshot_locked();
 		dext_dma_release();
 		dext_dma_report(probe ? "probe hold rejected" : "shutdown hold rejected", snapshot);
 		return -1;
 	}
+	/* The hold starts from what is mapped now. */
 	uint64_t total = 0;
-	for (const auto &entry : dext_dma_table) {
-		if (!entry.in_use) continue;
-		if (entry.length > dma_budget - total) {
-			const auto snapshot = dext_dma_snapshot_locked();
-			dext_dma_release();
-			dext_dma_report(probe ? "probe hold exceeds budget" : "shutdown hold exceeds budget", snapshot);
-			return -1;
-		}
-		total += entry.length;
-	}
-	g_dma_shutdown_ceiling = dma_budget;
+	for (const auto &entry : dext_dma_table)
+		if (entry.in_use) total += entry.length;
 	g_dma_shutdown_bytes = total;
 	g_dma_holding_frees = true;
 	g_dma_probe_hold = probe;
@@ -805,14 +969,14 @@ static int dext_dma_begin_hold(uint64_t dma_budget, bool probe)
 	return 0;
 }
 
-extern "C" int dext_dma_begin_shutdown(uint64_t dma_budget)
+extern "C" int dext_dma_begin_shutdown(void)
 {
-	return dext_dma_begin_hold(dma_budget, false);
+	return dext_dma_begin_hold(false);
 }
 
-extern "C" int dext_dma_begin_probe(uint64_t dma_budget)
+extern "C" int dext_dma_begin_probe(void)
 {
-	return dext_dma_begin_hold(dma_budget, true);
+	return dext_dma_begin_hold(true);
 }
 
 extern "C" void dext_dma_quarantine(void)
@@ -911,7 +1075,6 @@ extern "C" int dext_dma_lift_quarantine(int keep_hold)
 	if (!keep_hold) {
 		g_dma_holding_frees = false;
 		g_dma_shutdown_bytes = 0;
-		g_dma_shutdown_ceiling = 0;
 	}
 	dext_dma_release();
 	return 0;
@@ -976,7 +1139,6 @@ extern "C" int dext_dma_device_removed(void)
 	dext_dma_acquire();
 	g_dma_holding_frees = false;
 	g_dma_shutdown_bytes = 0;
-	g_dma_shutdown_ceiling = 0;
 	dext_dma_release();
 	return kept;
 }
@@ -1017,7 +1179,6 @@ extern "C" int dext_dma_end_shutdown_reset(int reset_succeeded)
 	if (!result) {
 		g_dma_holding_frees = false;
 		g_dma_shutdown_bytes = 0;
-		g_dma_shutdown_ceiling = 0;
 	}
 	g_dma_resetting = false;
 	--g_dma_operations;
@@ -1053,7 +1214,7 @@ extern "C" int dext_dma_commit_probe(void)
 			g_dma_holding_frees = false;
 			g_dma_probe_hold = false;
 			g_dma_probe_committing = false;
-			g_dma_shutdown_bytes = g_dma_shutdown_ceiling = 0;
+			g_dma_shutdown_bytes = 0;
 			--g_dma_operations;
 			dext_dma_release();
 			return 0;
@@ -1102,8 +1263,7 @@ static IOMemoryDescriptor *dext_dma_concat_ranges(const uint64_t *addresses,
 		uint64_t offset = 0;
 		if (!len) break;
 		dext_dma_acquire();
-		for (int i = 0; i < DEXT_DMA_TABLE; ++i) {
-			auto &e = dext_dma_table[i];
+		for (auto &e : dext_dma_table) {
 			if (e.in_use && !e.releasing && !e.import_id && addr >= e.cpu_addr &&
 			    addr - e.cpu_addr < e.length &&
 			    e.length - (addr - e.cpu_addr) >= len) {
@@ -1260,40 +1420,26 @@ void dext_dma_vunmap_pages(const void *address)
 static int dext_dma_store(IOMemoryDescriptor *buf, IODMACommand *dma,
 			   uint64_t cpu_addr, uint64_t length, uint64_t import_id)
 {
-	int i;
-
 	dext_dma_acquire();
-	if (g_dma_stopping || g_dma_cleanup_failed) {
+	dext_dma_entry *entry = g_dma_stopping || g_dma_cleanup_failed ? nullptr :
+		dext_dma_claim_locked();
+	if (!entry || g_dma_stopping || g_dma_cleanup_failed) {
 		dext_dma_release();
-		return -1;
+		return -1; /* the caller releases the objects */
 	}
-	for (i = 0; i < DEXT_DMA_TABLE; i++) {
-		if (!dext_dma_table[i].in_use) {
-			dext_dma_table[i].buf      = buf;
-			dext_dma_table[i].dma      = dma;
-			dext_dma_table[i].cpu_addr = cpu_addr;
-			dext_dma_table[i].length   = length;
-			dext_dma_table[i].in_use   = 1;
-			dext_dma_table[i].releasing = false;
-			dext_dma_table[i].retired = false;
-			dext_dma_table[i].import_id = import_id;
-			dext_dma_release();
-			return 0;
-		}
-	}
+	*entry = {buf, dma, cpu_addr, length, 1, false, false, import_id};
 	dext_dma_release();
-	return -1; /* table full: caller releases the objects */
+	return 0;
 }
 
 static int dext_dma_reap_obj(uint64_t cpu_addr)
 {
-	int i;
 	dext_dma_operation operation(true);
 	if (!operation.pci) return -1;
 
 	dext_dma_acquire();
-	for (i = 0; i < DEXT_DMA_TABLE; i++) {
-		struct dext_dma_entry *e = &dext_dma_table[i];
+	for (auto &entry : dext_dma_table) {
+		struct dext_dma_entry *e = &entry;
 
 		if (e->in_use && !e->import_id && e->cpu_addr == cpu_addr) {
 			if (e->releasing) {
@@ -1436,11 +1582,11 @@ int dext_dma_release_import(uint64_t import_id)
 /* Diagnostics for the test/bringup harness. */
 int dext_dma_live_count(void)
 {
-	int i, n = 0;
+	int n = 0;
 
 	dext_dma_acquire();
-	for (i = 0; i < DEXT_DMA_TABLE; i++)
-		if (dext_dma_table[i].in_use)
+	for (const auto &entry : dext_dma_table)
+		if (entry.in_use)
 			n++;
 	dext_dma_release();
 	return n;
@@ -1453,8 +1599,8 @@ extern "C" int dext_dma_import(void *, uint64_t, uint64_t *, uint64_t *, uint32_
 extern "C" int dext_dma_release_import(uint64_t) { return -1; }
 extern "C" int dext_dma_begin_reset(void) { return -1; }
 extern "C" void dext_dma_end_reset(void) {}
-extern "C" int dext_dma_begin_shutdown(uint64_t) { return -1; }
-extern "C" int dext_dma_begin_probe(uint64_t) { return -1; }
+extern "C" int dext_dma_begin_shutdown(void) { return -1; }
+extern "C" int dext_dma_begin_probe(void) { return -1; }
 extern "C" int dext_dma_commit_probe(void) { return -1; }
 extern "C" void dext_dma_quarantine(void) {}
 extern "C" int dext_dma_device_removed(void) { return 0; }
@@ -1493,8 +1639,24 @@ struct dext_dma_entry {
 	uint64_t cpu_addr;
 	int      in_use;
 };
-#define DEXT_DMA_TABLE 4096
-static struct dext_dma_entry dext_dma_table[DEXT_DMA_TABLE];
+static void *dext_table_alloc(size_t bytes) { return malloc(bytes); }
+static void dext_table_free(void *p, size_t) { free(p); }
+using dext_dma_table_t = dext_chunked_table<dext_dma_entry, 1024, dext_table_alloc, dext_table_free>;
+static dext_dma_table_t dext_dma_table;
+
+/* A free record, growing the table; nullptr when out of memory. */
+static dext_dma_entry *dext_dma_claim(void)
+{
+	for (;;) {
+		for (auto &entry : dext_dma_table)
+			if (!entry.in_use) return &entry;
+		dext_dma_table_t::growth g{};
+		if (!dext_dma_table_t::allocate(g, dext_dma_table.chunks()))
+			return nullptr;
+		dext_dma_table.install(g);
+		dext_dma_table_t::free_old(g);
+	}
+}
 
 int dext_dma_set_pci(void *pci_device)
 {
@@ -1533,7 +1695,6 @@ int dext_dma_alloc_coherent(size_t size, void **cpu_addr, uint64_t *iova)
 {
 	uint64_t rounded;
 	void *p;
-	int i;
 
 	if (!cpu_addr || !iova || size == 0 ||
 	    size > UINT64_MAX - (DEXT_DART_COHERENT_ALIGN - 1))
@@ -1550,15 +1711,9 @@ int dext_dma_alloc_coherent(size_t size, void **cpu_addr, uint64_t *iova)
 		free(p); /* beyond the device's DMA mask */
 		return -1;
 	}
-	for (i = 0; i < DEXT_DMA_TABLE; i++) {
-		if (!dext_dma_table[i].in_use) {
-			dext_dma_table[i].buf      = p;
-			dext_dma_table[i].cpu_addr = (uint64_t)(uintptr_t)p;
-			dext_dma_table[i].in_use   = 1;
-			break;
-		}
-	}
-	if (i == DEXT_DMA_TABLE) { free(p); return -1; }
+	dext_dma_entry *entry = dext_dma_claim();
+	if (!entry) { free(p); return -1; }
+	*entry = {p, (uint64_t)(uintptr_t)p, 1};
 	/* identity IOVA: the GPU-visible address == the host pointer */
 	*cpu_addr = p;
 	*iova     = (uint64_t)(uintptr_t)p;
@@ -1568,18 +1723,14 @@ int dext_dma_alloc_coherent(size_t size, void **cpu_addr, uint64_t *iova)
 int dext_dma_free_coherent(void *cpu_addr, size_t size)
 {
 	uint64_t a = (uint64_t)(uintptr_t)cpu_addr;
-	int i;
 
 	(void)size;
 	if (!cpu_addr)
 		return 0;
-	for (i = 0; i < DEXT_DMA_TABLE; i++) {
-		if (dext_dma_table[i].in_use &&
-		    dext_dma_table[i].cpu_addr == a) {
-			free(dext_dma_table[i].buf);
-			dext_dma_table[i].buf      = nullptr;
-			dext_dma_table[i].cpu_addr = 0;
-			dext_dma_table[i].in_use   = 0;
+	for (auto &entry : dext_dma_table) {
+		if (entry.in_use && entry.cpu_addr == a) {
+			free(entry.buf);
+			entry = {};
 			return 0;
 		}
 	}
@@ -1592,10 +1743,10 @@ int dext_dma_free_coherent(void *cpu_addr, size_t size)
 
 int dext_dma_live_count(void)
 {
-	int i, n = 0;
+	int n = 0;
 
-	for (i = 0; i < DEXT_DMA_TABLE; i++)
-		if (dext_dma_table[i].in_use)
+	for (const auto &entry : dext_dma_table)
+		if (entry.in_use)
 			n++;
 	return n;
 }

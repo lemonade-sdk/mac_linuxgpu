@@ -167,106 +167,43 @@ int main(void)
 		EXPECT(linuxu_dart_used() == 0);
 	}
 
-	/* ---- 4. the 1.5 GB budget ceiling ---- */
+	/* ---- 4. no software ceiling: the platform refuses, not a budget ---- */
 	{
-		uint64_t charge;
+		/* A mapping larger than any fixed budget this layer once had
+		 * (3 GiB of IOVA over one page: the identity map touches no
+		 * backing) is accounted and refunded exactly. */
+		const uint64_t big = 3ull << 30;
+		struct page *pg = alloc_page(GFP_KERNEL);
+		dma_addr_t big_iova;
 
-		/* one big mapping that would just exceed the budget
-		 * must fail with -ENOMEM and charge nothing */
-		charge = LINUXU_DART_BUDGET + 1; /* a single map over the whole ceiling must fail */
-		{
-			struct page *pg = alloc_page(GFP_KERNEL);
-			dma_addr_t big_iova;
-
-			EXPECT(pg != NULL);
-			/* the budget check happens before any memory
-			 * access, so the charged range needs no backing */
-			big_iova = dma_map_page(NULL, pg, 0, (size_t)charge,
-						 DMA_TO_DEVICE);
-			EXPECT(big_iova == (dma_addr_t)(uintptr_t)-ENOMEM);
-			EXPECT(linuxu_dart_used() == 0);
-			__free_pages(pg, 0);
-		}
-
-		/* fill the budget with live 16 KB page maps until the
-		 * next map must fail.  The page pool is grown to cover
-		 * the full 1.5 GB budget so the ceiling is the thing
-		 * that trips, not the pool. */
-		{
-			const uint64_t ntotal = LINUXU_DART_BUDGET / PAGE_SIZE;
-			dma_addr_t *iovas;
-			struct page **pages;
-			uint64_t n = 0;
-
-			iovas = malloc(ntotal * sizeof(*iovas));
-			pages = malloc(ntotal * sizeof(*pages));
-			EXPECT(iovas != NULL && pages != NULL);
-			/* grow the page pool so 1.5 GB of live pages
-			 * fit; the budget must be what trips */
-			EXPECT(linuxu_page_pool_extend(ntotal + 8) == 0);
-			/* the budget trips on the (ntotal+1)-th map: ntotal maps
-			 * exactly fill the 1.5 GB ceiling (the DART allows a map
-			 * that exactly fills it), so loop one past to hit it */
-			while (n < ntotal + 1) {
-				struct page *pg = alloc_page(GFP_KERNEL);
-				dma_addr_t a;
-
-				if (!pg)
-					break;
-				a = dma_map_page(NULL, pg, 0, PAGE_SIZE,
-						 DMA_BIDIRECTIONAL);
-				if (dma_mapping_error(NULL, a)) {
-					/* budget ceiling: nothing charged */
-					EXPECT(linuxu_dart_used() +
-					       PAGE_SIZE > LINUXU_DART_BUDGET);
-					__free_pages(pg, 0);
-					break;
-				}
-				iovas[n] = a;
-				pages[n] = pg;
-				n++;
-			}
-			EXPECT(n == ntotal);
-			EXPECT(linuxu_dart_used() == n * PAGE_SIZE);
-			EXPECT(linuxu_dart_peak() == n * PAGE_SIZE);
-
-			/* unmap one page: budget drops exactly one
-			 * PAGE_SIZE, and the freed slot lets the next
-			 * map succeed again */
-			{
-				struct page *pg2;
-				dma_addr_t a2;
-
-				dma_unmap_page(NULL, iovas[n - 1], PAGE_SIZE,
-					     DMA_BIDIRECTIONAL);
-				EXPECT(linuxu_dart_used() ==
-				       (n - 1) * PAGE_SIZE);
-				pg2 = alloc_page(GFP_KERNEL);
-				EXPECT(pg2 != NULL);
-				a2 = dma_map_page(NULL, pg2, 0, PAGE_SIZE,
-						 DMA_BIDIRECTIONAL);
-				EXPECT(dma_mapping_error(NULL, a2) == 0);
-				EXPECT(linuxu_dart_used() == n * PAGE_SIZE);
-				dma_unmap_page(NULL, a2, PAGE_SIZE,
-					     DMA_BIDIRECTIONAL);
-				__free_pages(pg2, 0);
-			}
-
-			/* clean up the rest: refund every byte */
-			for (i = 0; (uint64_t)i < n; i++) {
-				dma_unmap_page(NULL, iovas[i], PAGE_SIZE,
-					     DMA_BIDIRECTIONAL);
-				__free_pages(pages[i], 0);
-			}
-			free(iovas);
-			free(pages);
-		}
-		/* budget fully returned */
+		EXPECT(pg != NULL);
+		big_iova = dma_map_page(NULL, pg, 0, (size_t)big, DMA_TO_DEVICE);
+		EXPECT(dma_mapping_error(NULL, big_iova) == 0);
+		EXPECT(linuxu_dart_used() == big);
+		EXPECT(linuxu_dart_peak() >= big);
+		dma_unmap_page(NULL, big_iova, (size_t)big, DMA_TO_DEVICE);
 		EXPECT(linuxu_dart_used() == 0);
-		/* peak records the high-water mark: the full ceiling (we filled
-		 * all ntotal pages, exactly reaching the budget) */
-		EXPECT(linuxu_dart_peak() ==
-		       (LINUXU_DART_BUDGET / PAGE_SIZE) * PAGE_SIZE);
+		__free_pages(pg, 0);
+
+		/* Many live mappings at once, more than any fixed table of
+		 * 4096: each is accounted, all are refunded. */
+		{
+			enum { MANY = 6000 };
+			dma_addr_t *iovas = malloc(MANY * sizeof(*iovas));
+			struct page *page = alloc_page(GFP_KERNEL);
+
+			EXPECT(iovas != NULL && page != NULL);
+			for (i = 0; i < MANY; i++) {
+				iovas[i] = dma_map_page(NULL, page, 0, 64, DMA_BIDIRECTIONAL);
+				EXPECT(dma_mapping_error(NULL, iovas[i]) == 0);
+			}
+			EXPECT(linuxu_dart_used() == (uint64_t)MANY * 64);
+			for (i = 0; i < MANY; i++)
+				dma_unmap_page(NULL, iovas[i], 64, DMA_BIDIRECTIONAL);
+			EXPECT(linuxu_dart_used() == 0);
+			__free_pages(page, 0);
+			free(iovas);
+		}
 	}
 
 	/* ---- 5. teardown: no leaks in the token table ---- */

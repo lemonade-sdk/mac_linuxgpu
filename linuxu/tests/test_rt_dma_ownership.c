@@ -20,7 +20,7 @@ int main(void)
     assert(runtime && ops && standard);
     assert(runtime_dma != (uintptr_t)runtime && ops_dma != (uintptr_t)ops);
     assert(rt_dart_used(&dev) == 3 * PAGE_SIZE);
-    assert(rt_dart_ceiling(&dev) == linuxu_dart_budget());
+    assert(rt_dart_peak(&dev) >= rt_dart_used(&dev));
     struct sg_table table = {0};
     assert(linuxu_dma_ops.get_sgtable(&dev.pdev.dev, &table, ops, ops_dma,
                                     PAGE_SIZE, 0) == -EOPNOTSUPP);

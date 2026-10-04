@@ -38,7 +38,7 @@ struct drm_device;      /* upstream drm core — opaque here */
 /**
  * struct amdgpu_device_ext - per-device DeviceKit runtime glue
  *
- * @rt :        the rt_device (IOPCIDevice + MSI-X + DART budget owner).
+ * @rt :        the rt_device (IOPCIDevice + MSI-X + DART accounting).
  * @adev :      back-pointer to the upstream struct amdgpu_device.
  * @ddev :      back-pointer to the &struct drm_device embedded in @adev
  *              (== container_of(&adev->ddev) — kept explicit so the glue

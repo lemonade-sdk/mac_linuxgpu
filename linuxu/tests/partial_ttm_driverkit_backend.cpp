@@ -5,7 +5,7 @@ static IOPCIDevice test_pci;
 extern "C" void partial_ttm_bridge_start(void)
 {
 	assert(!dext_dma_set_pci(&test_pci));
-	assert(!dext_dma_begin_probe(1536ull << 20));
+	assert(!dext_dma_begin_probe());
 }
 extern "C" void partial_ttm_bridge_check(unsigned live, unsigned retired)
 {
@@ -18,7 +18,7 @@ extern "C" void partial_ttm_bridge_check(unsigned live, unsigned retired)
 }
 extern "C" void partial_ttm_bridge_finish(void)
 {
-	assert(!dext_dma_begin_shutdown(1536ull << 20));
+	assert(!dext_dma_begin_shutdown());
 	assert(!dext_dma_begin_shutdown_reset());
 	assert(!dext_dma_end_shutdown_reset(1));
 	assert(!dext_dma_live_count() && !dext_dma_fini());

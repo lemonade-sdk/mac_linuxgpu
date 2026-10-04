@@ -62,9 +62,8 @@ static void shutdown_retention() {
     start();
     void *first = allocate(), *second = allocate();
     const size_t completions = mock_complete_calls;
-    assert(dext_dma_begin_shutdown(16384) != 0); /* below actual pinned bytes */
-    assert(dext_dma_begin_shutdown(65536) == 0);
-    assert(dext_dma_begin_shutdown(65536) != 0);
+    assert(dext_dma_begin_shutdown() == 0);
+    assert(dext_dma_begin_shutdown() != 0); /* already holding */
     assert(dext_dma_begin_reset() != 0);
     assert(dext_dma_free_coherent(first, 16384) == 0);
     assert(mock_complete_calls == completions && mock_dma_prepared == 2);
@@ -75,7 +74,7 @@ static void shutdown_retention() {
     assert(dext_dma_begin_shutdown_reset() != 0); /* second is still owned */
     assert(mock_api_calls == calls_before_rejection); /* cached diagnostics only */
     expect_dma_log(cursor, "DMA shutdown reset has live owner:");
-    expect_dma_log(cursor, "live=1 retired=1 bytes=32768/65536");
+    expect_dma_log(cursor, "live=1 retired=1 bytes=32768");
     const void *page = second;
     void *alias = dext_dma_vmap_pages(&page, 1);
     assert(alias);
@@ -83,7 +82,7 @@ static void shutdown_retention() {
     cursor = log_tail();
     assert(dext_dma_begin_shutdown_reset() != 0); /* CPU alias still in use */
     expect_dma_log(cursor, "DMA shutdown reset rejected:");
-    expect_dma_log(cursor, "cpu=0 vmaps=1 live=0 retired=2 bytes=32768/65536");
+    expect_dma_log(cursor, "cpu=0 vmaps=1 live=0 retired=2 bytes=32768");
     dext_dma_vunmap_pages(alias);
     mock_fail_api = mock_api_calls + 1;
     void *failed = nullptr; uint64_t failed_iova = 0;
@@ -99,10 +98,15 @@ static void shutdown_retention() {
     mock_short_segment = false;
     assert(mock_dma_prepared == 4 && mock_complete_calls == completions);
     /* Linux returned all four allocations, but their deferred DART mappings
-     * remain charged. A fifth allocation must not reach PrepareForDMA. */
-    const size_t calls = mock_api_calls;
-    assert(dext_dma_alloc_coherent(16384, &unused, &iova) != 0);
-    assert(mock_api_calls == calls && mock_dma_prepared == 4);
+     * stay prepared and keep their IOVA. With the DART's window full beside
+     * them, a fifth allocation reaches PrepareForDMA and the DART refuses
+     * it; the refusal is logged, and its bytes do not stay counted. */
+    mock_dart_window = mock_dart_mapped;
+    cursor = log_tail();
+    assert(dext_dma_alloc_coherent(16384, &unused, &iova) != 0 && !unused);
+    expect_dma_log(cursor, "DMA: mapping 16384 bytes for the device failed: IODMACommand::PrepareForDMA returned 0xe00002be");
+    assert(mock_dma_prepared == 4 && g_dma_shutdown_bytes == 4 * 16384);
+    mock_dart_window = 0;
     assert(dext_dma_begin_shutdown_reset() == 0);
     assert(dext_dma_alloc_coherent(16384, &unused, &iova) != 0 && !unused);
     assert(dext_dma_set_pci(&pci) != 0);
@@ -111,20 +115,26 @@ static void shutdown_retention() {
     clean();
 
     start();
-    mock_prepare_hook = [] { assert(dext_dma_begin_shutdown(65536) != 0); };
+    mock_prepare_hook = [] { assert(dext_dma_begin_shutdown() != 0); };
     third = allocate();
-    mock_complete_hook = [] { assert(dext_dma_begin_shutdown(65536) != 0); };
+    mock_complete_hook = [] { assert(dext_dma_begin_shutdown() != 0); };
     assert(dext_dma_free_coherent(third, 16384) == 0);
     clean();
 
     start(); first = allocate();
-    assert(dext_dma_begin_shutdown(32768) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     assert(dext_dma_free_coherent(first, 16384) == 0);
+    /* An in-flight map counts before PrepareForDMA returns: a nested one
+     * the DART has no room for is refused, and both are accounted. */
+    mock_dart_window = 2 * 16384;
     mock_prepare_hook = [] {
         void *nested = nullptr; uint64_t address = 0;
+        assert(g_dma_shutdown_bytes == 2 * 16384);
         assert(dext_dma_alloc_coherent(16384, &nested, &address) != 0);
+        assert(g_dma_shutdown_bytes == 2 * 16384);
     };
-    second = allocate(); /* reservation also accounts for an in-flight map */
+    second = allocate();
+    mock_dart_window = 0;
     assert(dext_dma_free_coherent(second, 16384) == 0);
     assert(dext_dma_begin_shutdown_reset() == 0);
     assert(dext_dma_end_shutdown_reset(1) == 0);
@@ -132,7 +142,7 @@ static void shutdown_retention() {
 }
 static void shutdown_failure(bool completion_failure) {
     start(); void *cpu = allocate();
-    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     assert(dext_dma_free_coherent(cpu, 16384) == 0);
     assert(dext_dma_begin_shutdown_reset() == 0);
     mock_complete_failure = completion_failure;
@@ -145,7 +155,7 @@ static void shutdown_failure(bool completion_failure) {
 }
 static void probe_lifetime() {
     start();
-    assert(dext_dma_begin_probe(65536) == 0);
+    assert(dext_dma_begin_probe() == 0);
     void *live = allocate(), *retired = allocate(), *added = nullptr;
     assert(dext_dma_free_coherent(retired, 16384) == 0);
     const size_t before = mock_complete_calls;
@@ -163,21 +173,21 @@ static void probe_lifetime() {
     assert(dext_dma_free_coherent(added, 16384) == 0);
     clean();
 
-    start(); assert(dext_dma_begin_probe(65536) == 0);
+    start(); assert(dext_dma_begin_probe() == 0);
     retired = allocate();
     const size_t old = mock_complete_calls;
     assert(dext_dma_free_coherent(retired, 16384) == 0);
     /* This models cleanup inside a failed probe before its caller sees the
      * error. Only successful shutdown reset may release the retired DMA. */
     assert(mock_dma_prepared == 1 && mock_complete_calls == old);
-    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     assert(dext_dma_commit_probe() != 0);
     assert(dext_dma_begin_shutdown_reset() == 0);
     assert(dext_dma_end_shutdown_reset(1) == 0);
     clean();
 }
 static void probe_commit_failure() {
-    start(); assert(dext_dma_begin_probe(65536) == 0);
+    start(); assert(dext_dma_begin_probe() == 0);
     void *cpu = allocate();
     assert(dext_dma_free_coherent(cpu, 16384) == 0);
     mock_complete_failure = true;
@@ -203,7 +213,7 @@ static void quarantine_inflight(bool completing) {
         void *alias = dext_dma_vmap_pages(&page, 1); assert(alias);
         void *bar = dext_bar0_cpu_map(0, 4096); assert(bar);
         mock_prepare_hook = [] {
-            assert(dext_dma_begin_shutdown(65536) != 0);
+            assert(dext_dma_begin_shutdown() != 0);
             dext_dma_quarantine();
         };
         void *pending = nullptr; uint64_t address = 0;
@@ -495,7 +505,7 @@ static void orphaned_bar0_alias() {
     void *aperture = dext_bar0_cpu_map(0, 65536); assert(aperture);
     void *kmap = dext_bar0_cpu_map(4096, 4096); assert(kmap);
     assert(dext_bar0_live_count() == 2);
-    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     /* Refused while any DMA owner or other CPU alias remains. */
     assert(dext_bar0_cpu_release_orphaned() == -1 && dext_bar0_live_count() == 2);
     assert(dext_dma_free_coherent(ring, 16384) == 0);
@@ -531,7 +541,7 @@ static void quarantine_release() {
     start();
     void *owned = allocate(), *retired = allocate();
     void *aperture = dext_bar0_cpu_map(0, 4096); assert(aperture);
-    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     assert(dext_dma_free_coherent(retired, 16384) == 0);
     dext_dma_quarantine();
     assert(!dext_dma_quarantine_releasable());
@@ -610,8 +620,8 @@ static void import_lifetime() {
     const uint64_t held = import(memory, 4 * 16384, &count);
     memory->release();
     assert(held && count == 3);
-    assert(dext_dma_begin_shutdown(4 * 16384 - 1) != 0); /* counts its bytes */
-    assert(dext_dma_begin_shutdown(4 * 16384) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
+    assert(g_dma_shutdown_bytes == 4 * 16384); /* counts its bytes */
     assert(dext_dma_release_import(held) == 0);
     assert(mock_dma_prepared == 1);
     assert(dext_dma_begin_shutdown_reset() == 0);
@@ -682,7 +692,7 @@ static void hold_waits_for_inflight_operation() {
         inflight_release = true;
     });
     const auto start_time = std::chrono::steady_clock::now();
-    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(dext_dma_begin_shutdown() == 0);
     assert(std::chrono::steady_clock::now() - start_time >= std::chrono::milliseconds(15));
     unmapper.join(); releaser.join();
     mock_complete_hook = nullptr;
@@ -698,7 +708,7 @@ static void hold_waits_for_inflight_operation() {
     };
     std::thread stuck([cpu] { assert(dext_dma_free_coherent(cpu, 16384) == 0); });
     while (!inflight_entered) std::this_thread::yield();
-    assert(dext_dma_begin_shutdown(65536) != 0);
+    assert(dext_dma_begin_shutdown() != 0);
     inflight_release = true;
     stuck.join();
     mock_complete_hook = nullptr;
@@ -732,6 +742,46 @@ static void aperture_follows_bar0() {
     clean();
 }
 
+/* Large mappings: nothing in the seam caps their size or number. The DART
+ * window (modeled here at the 2047 MiB the device tree gives a Thunderbolt
+ * port's dart-apciec) is what refuses, and the refusal is logged with its
+ * size and reason. Under the shutdown hold, retired mappings keep their
+ * IOVA, so the DART refuses a teardown mapping that would not fit beside
+ * them; the reset completes them all. */
+static void large_mappings() {
+    start();
+    mock_dart_window = 2047ull << 20;
+    const uint64_t big = (1536ull << 20) + 16384;	/* past the old 1.5 GiB budget */
+    void *large = nullptr; uint64_t iova = 0;
+    assert(dext_dma_alloc_coherent(big, &large, &iova) == 0 && large && iova);
+    auto cursor = log_tail();
+    void *refused = nullptr;
+    assert(dext_dma_alloc_coherent(512ull << 20, &refused, &iova) != 0 && !refused);
+    expect_dma_log(cursor, "DMA: mapping 536870912 bytes for the device failed: IODMACommand::PrepareForDMA returned 0xe00002be (1610629120 bytes in 1 mappings already mapped)");
+    /* More live mappings than any fixed table of 4096. */
+    std::vector<void *> many;
+    for (unsigned i = 0; i < 4500; ++i) many.push_back(allocate());
+    assert(dext_dma_live_count() == 4501);
+    assert(dext_dma_begin_shutdown() == 0);
+    assert(g_dma_shutdown_bytes == big + 4500ull * 16384);
+    assert(dext_dma_free_coherent(large, big) == 0);	/* retired: still prepared */
+    cursor = log_tail();
+    void *teardown = nullptr;
+    assert(dext_dma_alloc_coherent(1ull << 30, &teardown, &iova) != 0 && !teardown);
+    expect_dma_log(cursor, "DMA: mapping 1073741824 bytes for the device failed: IODMACommand::PrepareForDMA returned 0xe00002be");
+    assert(g_dma_shutdown_bytes == big + 4500ull * 16384);
+    void *fits = nullptr;
+    assert(dext_dma_alloc_coherent(64ull << 20, &fits, &iova) == 0 && fits);
+    assert(g_dma_shutdown_bytes == big + 4500ull * 16384 + (64ull << 20));
+    assert(dext_dma_free_coherent(fits, 64ull << 20) == 0);
+    for (void *p : many) assert(dext_dma_free_coherent(p, 16384) == 0);
+    assert(dext_dma_begin_shutdown_reset() == 0);
+    assert(dext_dma_end_shutdown_reset(1) == 0);
+    assert(mock_dart_mapped == 0);
+    mock_dart_window = 0;
+    clean();
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "shutdown-reset-failed")) shutdown_failure(false);
@@ -742,6 +792,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[1], "orphaned-bar0")) orphaned_bar0_alias();
         else if (!strcmp(argv[1], "quarantine-release")) quarantine_release();
         else if (!strcmp(argv[1], "import")) import_lifetime();
+        else if (!strcmp(argv[1], "large")) large_mappings();
         else failed_completion(strcmp(argv[1], "unpublished") == 0);
     } else {
         reset_admission(); shutdown_retention(); probe_lifetime(); normal_and_rpc_failures(); stopping_during_allocation(); vmap_unwind(); cpu_pages_and_aliases();

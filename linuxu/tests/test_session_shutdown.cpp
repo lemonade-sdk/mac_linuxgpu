@@ -113,8 +113,7 @@ struct MacLinuxGPUUserClient : IOService {
     kern_return_t failedProbe();
 };
 
-static uint64_t linuxu_dart_budget();
-static int dext_dma_begin_shutdown(uint64_t);
+static int dext_dma_begin_shutdown();
 static int dext_compute_stop();
 static void linuxu_driver_shutdown();
 static void dext_dma_quarantine();
@@ -240,10 +239,13 @@ static int rt_pci_probe_cleanup_retained(void *device) {
     return probeCleanupRetained;
 }
 
-static uint64_t linuxu_dart_budget() { return 1ull << 30; }
-static int dext_dma_begin_shutdown(uint64_t budget) {
-    assert(budget == linuxu_dart_budget() && s_irqDeliver && s_irqReady);
+// What the device has mapped when the hold starts; the hold has no ceiling,
+// so any amount is held (the DART alone refuses what does not fit).
+static uint64_t mappedBytes = 64ull << 20, heldBytes;
+static int dext_dma_begin_shutdown() {
+    assert(s_irqDeliver && s_irqReady);
     events.push_back("hold_dma");
+    if (!holdError) heldBytes = mappedBytes;
     return holdError;
 }
 static int dext_compute_stop() {
@@ -1075,6 +1077,7 @@ int main(int argc, char **argv) {
         observerReadInFlight = true;
         s_observerDrm = &observerDrm;
     }
+    else if (scenario == "large-mapped") mappedBytes = 6ull << 30;	// past any old budget
     else assert(scenario == "success");
     if (scenario == "probe-retained")
         assert(fixture.observer.failedProbe() == kIOReturnError);
@@ -1114,7 +1117,8 @@ int main(int argc, char **argv) {
         fixture.assertReleased();
         expectLog("session close: turning the display pattern or output off");
         expectLog("session close: released 2 imported surface(s)");
-    } else if (scenario == "success") {
+    } else if (scenario == "success" || scenario == "large-mapped") {
+        assert(heldBytes == mappedBytes);
         const std::vector<std::string> expected{
             "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
             "irq_drained", "enqueue_finish", "device_free", "release_bar0",

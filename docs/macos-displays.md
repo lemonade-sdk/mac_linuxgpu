@@ -95,10 +95,13 @@ current mode.
   fence or flip fails, the call reports the failing step's errno. The
   agent stops that output's stream and reports the error. Nothing ever
   copies through the BAR with the CPU instead.
-- **Budget.** A 4K BGRA surface is 33 MB. Four surfaces for each of two
-  4K outputs is 265 MB of DART-mapped memory, which must fit within
-  `linuxu_dart_budget()`. The agent sizes its SCK queue depth to fit and
-  reports a refusal; it does not degrade silently.
+- **DART space.** A 4K BGRA surface is 33 MB. Four surfaces for each of two
+  4K outputs is 265 MB of DART-mapped memory, which must fit in the DART's
+  IOVA window for the GPU beside everything else mapped for it (on a
+  Thunderbolt port of an M-series Mac the device tree gives dart-apciec a
+  2047 MiB window). The import fails, logged, when the DART refuses it; the
+  agent sizes its SCK queue depth to fit and reports a refusal; it does not
+  degrade silently.
 
 ## 2. Host side: the display agent
 
@@ -467,7 +470,7 @@ committer.
     instead (CopyClientMemoryForType) and has the Apple GPU blit the
     IOSurface into them with Metal (one small GPU copy). That would be a
     design change, decided on hardware results, never a silent fallback.
-- What does the DART budget allow for N surfaces at 4K?
+- How many 4K surfaces fit in the DART window beside a running workload?
 - SCK latency and frame pacing against AMD vblank. Do we need
   `refreshDeadline` on CGVirtualDisplaySettings?
 - HDR and 10-bit (CGVirtualDisplayMode's transferFunction, an XRGB2101010

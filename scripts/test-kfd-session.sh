@@ -63,6 +63,8 @@ for source in "${sources[@]}"; do
   extra=()
   # Same per-object flags as the Makefile.
   case "$source" in
+    # kmemcheck tracks the heap (the leak check below): debug build.
+    linuxu/src/kmem/kmemalloc.c|linuxu/src/kmem/kmemcheck.c) extra=(-DDEBUG=1) ;;
     third_party/linux/lib/kfifo.c) extra=(-include linux/kernel.h -include linux/bug.h) ;;
     third_party/linux/lib/sort.c) extra=(-include linux/compiler.h -include linux/preempt.h) ;;
     # create_signal_event takes the user address of the event's slot even

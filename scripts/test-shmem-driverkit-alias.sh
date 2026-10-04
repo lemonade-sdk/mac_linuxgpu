@@ -13,7 +13,8 @@ common=(-g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all
 objects=()
 for source in linuxu/src/mm/{page,shmem}.c linuxu/src/kmem/{vmalloc,kmemalloc,kmemcheck}.c \
               linuxu/src/shims/{fd,task,kthread,printk}.c linuxu/src/dart/dart.c \
-              linuxu/src/{xarray,rcu,sync,bug}.c linuxu/tests/test_shmem_driverkit_alias.c; do
+              linuxu/src/{xarray,rcu,sync,bug}.c linuxu/tests/test_shmem_driverkit_alias.c \
+              linuxu/tests/iosysctl_host.c; do
   flags=()
   case "$source" in
     */mm/page.c|*/kmem/vmalloc.c|*/dart/dart.c) flags=(-DLINUXU_DEXT_DK=1) ;;
