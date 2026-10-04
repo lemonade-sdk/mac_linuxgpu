@@ -1194,6 +1194,10 @@ $(BUILD)/mlg-run: $(MLG_RUN_SRCS) tools/mlg-run/plan.h | libdrm-mlg
 
 mlg-run: $(BUILD)/mlg-run
 
+# Quake3e, Vulkan renderer only, for mlg-run --quake3 (build/quake3e).
+quake3e:
+	bash scripts/build-quake3e.sh
+
 test-mlg-run:
 	@mkdir -p $(BUILD)
 	clang -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -Itools/mlg-run \
@@ -1201,7 +1205,7 @@ test-mlg-run:
 	$(BUILD)/test-mlg-run-plan
 
 test: test-mlg-run
-.PHONY: mlg-run test-mlg-run
+.PHONY: mlg-run test-mlg-run quake3e
 
 # RADV's Metal surfaces on the fixture's display output (drmMlgScanout);
 # skips when RADV has not been built.
