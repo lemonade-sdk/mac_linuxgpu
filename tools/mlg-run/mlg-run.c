@@ -33,6 +33,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 
 #include "plan.h"
 
@@ -150,6 +151,90 @@ static int check_game_data(const char *basepath, const char *basegame, char *out
 	return 0;
 }
 
+/* A plane's "type" and how many XRGB8888 modifiers its IN_FORMATS lists. */
+static void plane_info(int card, uint32_t plane, uint64_t *type, unsigned *xrgb_mods)
+{
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(card, plane, DRM_MODE_OBJECT_PLANE);
+
+	*type = ~0ull;
+	*xrgb_mods = 0;
+	for (uint32_t i = 0; props && i < props->count_props; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(card, props->props[i]);
+
+		if (p && !strcmp(p->name, "type"))
+			*type = props->prop_values[i];
+		if (p && !strcmp(p->name, "IN_FORMATS")) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(card, (uint32_t)props->prop_values[i]);
+			drmModeFormatModifierIterator it = { 0 };
+
+			while (blob && drmModeFormatModifierBlobIterNext(blob, &it))
+				*xrgb_mods += it.fmt == 0x34325258u;	/* DRM_FORMAT_XRGB8888 */
+			drmModeFreePropertyBlob(blob);
+		}
+		drmModeFreeProperty(p);
+	}
+	drmModeFreeObjectProperties(props);
+}
+
+/* What the output has to scan a program's frames out with: its CRTC, the
+ * primary plane, the overlay planes the CRTC can use, and the monitor's
+ * EDID identity (what its macOS display is matched by). */
+static void describe_output(int card, const struct mlg_lx_scanout_state *st)
+{
+	drmModeResPtr res = drmModeGetResources(card);
+	drmModePlaneResPtr planes;
+
+	/* Primary and cursor planes are listed only to universal-plane clients. */
+	if (drmSetClientCap(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1))
+		fprintf(stderr, "  (universal planes refused: %s)\n", strerror(errno));
+	planes = drmModeGetPlaneResources(card);
+	int crtc_index = -1;
+
+	fprintf(stderr, "  output: %s (connector %u), CRTC %u, %ux%u at %u.%03u Hz\n", st->connector,
+		st->connector_id, st->crtc_id, st->width, st->height, st->refresh_mhz / 1000,
+		st->refresh_mhz % 1000);
+	for (int i = 0; res && i < res->count_crtcs; i++)
+		if (res->crtcs[i] == st->crtc_id)
+			crtc_index = i;
+	for (uint32_t i = 0; planes && i < planes->count_planes; i++) {
+		drmModePlanePtr p = drmModeGetPlane(card, planes->planes[i]);
+		uint64_t type;
+		unsigned mods;
+
+		if (!p)
+			continue;
+		if (crtc_index >= 0 && (p->possible_crtcs & (1u << crtc_index))) {
+			plane_info(card, p->plane_id, &type, &mods);
+			if (type == 1 || type == 0)
+				fprintf(stderr, "  plane %u: %s, %s, %u XRGB8888 modifiers\n", p->plane_id,
+					type == 1 ? "primary" : "overlay",
+					p->crtc_id ? "in use" : "free", mods);
+		}
+		drmModeFreePlane(p);
+	}
+	drmModeFreePlaneResources(planes);
+	drmModeFreeResources(res);
+
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(card, st->connector_id,
+								      DRM_MODE_OBJECT_CONNECTOR);
+	for (uint32_t i = 0; props && i < props->count_props; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(card, props->props[i]);
+
+		if (p && !strcmp(p->name, "EDID") && props->prop_values[i]) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(card, (uint32_t)props->prop_values[i]);
+			uint32_t vendor, product, serial;
+
+			if (blob && !drmMlgEdidIdentity(blob->data, blob->length, &vendor, &product, &serial))
+				fprintf(stderr, "  EDID identity: vendor %c%c%c (0x%04x), product 0x%04x, serial %u\n",
+					'@' + ((vendor >> 10) & 31), '@' + ((vendor >> 5) & 31), '@' + (vendor & 31),
+					vendor, product, serial);
+			drmModeFreePropertyBlob(blob);
+		}
+		drmModeFreeProperty(p);
+	}
+	drmModeFreeObjectProperties(props);
+}
+
 /* The display output and its macOS display, from the driver. */
 static int find_output(const char *wanted, struct plan_input *in, char *connector, size_t size)
 {
@@ -186,6 +271,7 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 	snprintf(connector, size, "%s", st.connector);
 	in->mode_width = st.width;
 	in->mode_height = st.height;
+	describe_output(card, &st);
 	r = drmMlgConnectorDisplay(card, st.connector_id, &display);
 	close(card);
 	if (r == -ENOENT) {
@@ -200,6 +286,10 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 		return -1;
 	}
 	CGRect bounds = CGDisplayBounds(display);
+	fprintf(stderr, "  macOS display %u (vendor 0x%04x, model 0x%04x, serial %u): %.0fx%.0f at %.0f,%.0f\n",
+		display, CGDisplayVendorNumber(display), CGDisplayModelNumber(display),
+		CGDisplaySerialNumber(display), bounds.size.width, bounds.size.height, bounds.origin.x,
+		bounds.origin.y);
 	in->have_display = true;
 	in->display_x = (int32_t)bounds.origin.x;
 	in->display_y = (int32_t)bounds.origin.y;
