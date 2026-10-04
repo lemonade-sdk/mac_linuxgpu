@@ -11,6 +11,8 @@
 #include <stdint.h>
 
 #include <linux/errno.h>
+#include <linux/dma-resv.h>
+#include <linux/jiffies.h>
 #include <linux/mm.h>
 #include <drm/drm_device.h>
 #include <drm/drm_gem.h>
@@ -23,6 +25,9 @@
 #include "amdgpu_object.h"
 #include "amdgpu_res_cursor.h"
 #include "lx_internal.h"
+
+/* How long a mapping waits for the kernel's own work on its buffer. */
+#define RT_LX_GEM_IDLE_MS	10000u
 
 int rt_lx_gem_map(struct drm_device *ddev, struct pci_dev *pdev,
 		  struct vm_area_struct *vma, uint64_t length, void **pinned,
@@ -62,6 +67,22 @@ int rt_lx_gem_map(struct drm_device *ddev, struct pci_dev *pdev,
 	if (r) {
 		amdgpu_bo_unreserve(abo);
 		return r;
+	}
+	/* As the Linux fault path does before it maps a page
+	 * (ttm_bo_vm_fault_idle): the kernel's own work on the buffer (the
+	 * clear of new VRAM, a move) finishes first, or it would overwrite
+	 * what the client writes through the mapping. */
+	{
+		long left = dma_resv_wait_timeout(abo->tbo.base.resv, DMA_RESV_USAGE_KERNEL, false,
+						  msecs_to_jiffies(RT_LX_GEM_IDLE_MS));
+
+		if (left <= 0) {
+			pr_err("lx: the kernel's work on a buffer to map did not finish in %u ms (%ld)\n",
+			       RT_LX_GEM_IDLE_MS, left);
+			amdgpu_bo_unpin(abo);
+			amdgpu_bo_unreserve(abo);
+			return left < 0 ? (int)left : -ETIME;
+		}
 	}
 	res = abo->tbo.resource;
 	if (res->mem_type == TTM_PL_VRAM) {

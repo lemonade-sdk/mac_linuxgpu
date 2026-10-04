@@ -34,7 +34,7 @@
 #include "test_scanout.h"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s (errno %d)\n", \
-	__FILE__, __LINE__, #c, errno); exit(1); } } while (0)
+	__FILE__, __LINE__, #c, errno); scanout_fx_report(); exit(1); } } while (0)
 
 #define W	1920u
 #define H	1080u

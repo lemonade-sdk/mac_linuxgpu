@@ -119,6 +119,39 @@ uint32_t scanout_fx_pipe_pixel(unsigned int pipe, uint64_t offset)
 	return fb ? *(uint32_t *)fb : 0;
 }
 
+static struct drm_crtc *output_crtc(void);
+
+void scanout_fx_report(void)
+{
+	const struct dc *dc = adev->dm.dc;
+	const uint32_t stride = regHUBPREQ1_DCSURF_PRIMARY_SURFACE_ADDRESS -
+				regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS;
+
+	for (unsigned int i = 0; i < 4; i++) {
+		const struct pipe_ctx *p = &dc->current_state->res_ctx.pipe_ctx[i];
+		uint32_t lo = RREG32(dcn401_dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_BASE_IDX] +
+				     regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS + i * stride);
+		uint32_t hi = RREG32(dcn401_dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH_BASE_IDX] +
+				     regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_HIGH + i * stride);
+
+		fprintf(stderr, "scanout: pipe %u: %s DC 0x%llx %dx%d, register 0x%llx pixel 0x%08x\n", i,
+			p->plane_state ? "plane" : "no plane",
+			p->plane_state ? (unsigned long long)p->plane_state->address.grph.addr.quad_part : 0ull,
+			p->plane_state ? p->plane_state->src_rect.width : 0,
+			p->plane_state ? p->plane_state->src_rect.height : 0,
+			((unsigned long long)hi << 32) | lo, scanout_fx_pipe_pixel(i, 0));
+	}
+	{
+		struct drm_crtc *crtc = output_crtc();
+		struct drm_framebuffer *fb = crtc && crtc->primary->state ? crtc->primary->state->fb : NULL;
+
+		if (fb)
+			fprintf(stderr, "scanout: primary plane: framebuffer %u of %s, %ux%u, buffer at 0x%llx\n",
+				fb->base.id, fb->comm, fb->width, fb->height,
+				(unsigned long long)amdgpu_bo_gpu_offset(gem_to_amdgpu_bo(fb->obj[0])));
+	}
+}
+
 /* Pipes whose surface starts with @value: a bit per pipe. */
 unsigned int scanout_fx_pipes_showing(uint32_t value)
 {
