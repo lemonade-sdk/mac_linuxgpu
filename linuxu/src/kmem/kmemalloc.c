@@ -25,6 +25,7 @@ struct kmemcheck_hdr {
 	uint64_t  magic;
 	uint64_t  canary_lo_pat;
 	void     *allocation;
+	size_t    slot;
 };
 extern int kmemcheck_track(struct kmemcheck_hdr *hdr, size_t user_size);
 extern int kmemcheck_untrack(struct kmemcheck_hdr *hdr);

@@ -165,15 +165,16 @@ check(PresentStats(Data(v1)) == nil && PresentStats(Data(count: 56)) == nil, "ve
 var m = PresentMeasurement()
 m.frames = 4; m.idleFrames = 1
 m.present(callCPUNs: 20_000, callWallNs: 40_000, handlerCPUNs: 60_000)
-m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000)
+m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000, lockWaitNs: 1_200_000)
 m.observe(ps); m.observe(ps)
 let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_400, lastCopy: 2_000_000, latency: 100_000_000)!
 m.observe(big)
 check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
 let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
-check(measured.count == 7 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
-      measured[2].contains("8294.4 KB copied") && measured[4].contains("10.00 ms on average") &&
-      measured[6].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
+check(measured.count == 8 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+      measured[2].contains("600.0 us on average, 1200.0 us at most") &&
+      measured[3].contains("8294.4 KB copied") && measured[5].contains("10.00 ms on average") &&
+      measured[7].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)
@@ -182,3 +183,84 @@ check(presentRects((0..<300).map { CGRect(x: $0, y: 0, width: 1, height: 1) }, w
       .elementsEqual([(0, 0, 640, 480)], by: ==))
 
 print("PASS display agent: report/modes decoding, EDID identity and primaries, virtual-display plans, refusals, add/update/remove, frame replies and damage")
+
+// ---- the display control model: per-monitor persistence, status, lines ----
+do {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlg-display-control-\(getpid())")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let prefsURL = dir.appendingPathComponent("displays.json")
+    // No file: every monitor is on.
+    var prefs = DisplayPrefs.load(from: prefsURL)
+    check(prefs.isOn("DEL-40DD-1096046924"))
+    prefs.set("DEL-40DD-1096046924", on: false)
+    prefs.set("DEL-40DD-1096046924", on: false)
+    try! prefs.save(to: prefsURL)
+    // Reloaded (a reboot, a replug): the choice holds, once.
+    var reloaded = DisplayPrefs.load(from: prefsURL)
+    check(reloaded == prefs && reloaded.off == ["DEL-40DD-1096046924"] && !reloaded.isOn("DEL-40DD-1096046924"))
+    check(reloaded.isOn("SAM-0F12-77"), "other monitors stay on")
+    // Keyed by identity, not connector: the same monitor on another
+    // connector stays off; another monitor on its old connector is on.
+    let connected = [(connector: "DP-2", key: "DEL-40DD-1096046924"), (connector: "DP-4", key: "SAM-0F12-77")]
+    check(connectorsToMirror(connected: connected, prefs: reloaded) == ["DP-4"])
+    reloaded.set("DEL-40DD-1096046924", on: true)
+    check(connectorsToMirror(connected: connected, prefs: reloaded) == ["DP-2", "DP-4"])
+    // A damaged file reads as defaults rather than failing the daemon.
+    try! Data("not json".utf8).write(to: prefsURL)
+    check(DisplayPrefs.load(from: prefsURL) == DisplayPrefs())
+
+    // The key from an EDID: vendor, product, serial.
+    let key = monitorKey(edid: edid(serial: 1096046924))
+    check(key == "LNX-0001-1096046924", key ?? "nil")
+    check(monitorKey(edid: edid(name: "", serial: 0, serialText: "SN12345")) == "LNX-0001-SN12345")
+    check(monitorKey(edid: Data(count: 128)) == nil && monitorKey(edid: nil) == nil)
+
+    // Status: written by the daemon, read by the menu bar.
+    let statusURL = dir.appendingPathComponent("display-status.json")
+    var status = DisplayStatus(daemon: 42, driverAttached: true, monitors: [
+        .init(key: "DEL-40DD-1096046924", connector: "DP-4", name: "DELL UP2716D", on: true,
+              state: .mirroring, mode: "2560x1440 @ 59.950 Hz", error: nil)])
+    try! status.save(to: statusURL)
+    check(DisplayStatus.load(from: statusURL) == status && status.summary == .mirroring)
+    status.monitors.append(.init(key: "SAM-0F12-77", connector: "DP-2", name: "SAMSUNG", on: true,
+                                 state: .error, mode: nil, error: "OUTPUT: busy"))
+    check(status.summary == .error)
+    check(DisplayStatus().summary == .off)
+
+    // A mirroring process's lines.
+    check(parseAgentLine("display-agent: DP-4 lit at 2560x1440 @ 59.950 Hz") == .mirroring("2560x1440 @ 59.950 Hz"))
+    check(parseAgentLine("display-agent: FAILED: PRESENT: Linux errno 62") == .failed("PRESENT: Linux errno 62"))
+    check(parseAgentLine("display-agent: capture surface 1 imported as handle 2") == .other)
+}
+print("PASS display control: per-monitor choices persist by EDID identity, status round trip, agent lines")
+
+// Presented frames' buffers: free once the driver is done reading them.
+do {
+    var frames = PresentedFrames<String>()
+    // A is queued; the worker takes it and starts copying.
+    check(frames.presented("A", received: 1, replaced: 0, flipped: 0) == [])
+    // B is queued (A was taken: the replaced count did not move).
+    check(frames.presented("B", received: 2, replaced: 0, flipped: 0) == [])
+    // C replaces B in the mailbox. A is still being copied: the driver's
+    // counts (flipped + replaced = 1 = A's received) do not mean A is done.
+    check(frames.presented("C", received: 3, replaced: 1, flipped: 0) == ["B"], "B was never read")
+    check(frames.count == 2, "A (copying) and C (newest) held")
+    // The worker took C; A flipped.
+    check(frames.presented("D", received: 4, replaced: 1, flipped: 1) == ["A"])
+    // C is the second frame taken: done at the second flip, not before.
+    check(frames.retire(flipped: 1) == [])
+    check(frames.retire(flipped: 2) == ["C"])
+    check(frames.count == 1, "D stays until the next PRESENT says what happened to it")
+    // A run of replacements frees each frame at once.
+    check(frames.presented("E", received: 5, replaced: 2, flipped: 2) == ["D"])
+    check(frames.presented("F", received: 6, replaced: 3, flipped: 2) == ["E"])
+    frames.removeAll()
+    check(frames.count == 0)
+    // Counts from an earlier run of the output (the first frame classifies nothing).
+    check(frames.presented("G", received: 101, replaced: 40, flipped: 59) == [])
+    check(frames.presented("H", received: 102, replaced: 40, flipped: 59) == [])
+    // G is frame 101; 40 before H were replaced, so G was the 61st taken.
+    check(frames.retire(flipped: 60) == [])
+    check(frames.retire(flipped: 61) == ["G"])
+}
+print("PASS presented frames: a buffer is held until its frame was replaced or flipped")

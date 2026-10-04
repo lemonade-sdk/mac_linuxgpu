@@ -330,6 +330,63 @@ int main(void)
 		CHECK(screen_pixel(500, 350) == ((0x00d00005u) ^ (500u << 12) ^ 350u));
 	}
 
+	/* A window moving across the screen (the agent's move workload), with
+	 * frames replaced in the mailbox while flips are held off: each frame
+	 * redraws the background where the window was and the window where it
+	 * is, damage being the two rectangles. Afterwards the screen must equal
+	 * the surface everywhere: no trail of an old position. */
+	{
+		const uint32_t ww = 240, wh = 160;
+		struct rt_surface_rect was = { 0, 0, 0, 0 };
+		int32_t x = 5, y = 7, dx = 37, dy = 23;
+		uint64_t flipped;
+		unsigned long bad = 0;
+
+		CHECK(rt_display_stats(pdev, &st) == 0);
+		flipped = st.frames_flipped;
+		fake_fill(&surf, 0x00f00000u, NULL);
+		{
+			const struct rt_surface_rect all = { 0, 0, W, H };
+
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1,
+						 ktime_get_ns(), &st) == 0);
+			st = wait_flipped(pdev, flipped + 1);
+		}
+		for (int f = 0; f < 120; f++) {
+			struct rt_surface_rect now = { (uint32_t)x, (uint32_t)y, ww, wh }, damage[2];
+			uint32_t n = 0;
+
+			if (was.width) {
+				fake_fill(&surf, 0x00f00000u, &was);	/* background back */
+				damage[n++] = was;
+			}
+			fake_fill(&surf, 0x00f10000u + (uint32_t)f, &now);
+			damage[n++] = now;
+			/* Every few frames, flips stall: frames pile up in the mailbox. */
+			vblank_hold = (f % 10) >= 6;
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), damage, n,
+						 ktime_get_ns(), &st) == 0);
+			usleep((f % 7) == 0 ? 1000 : 9000);
+			was = now;
+			x += dx; y += dy;
+			if (x < 0 || x + (int32_t)ww > (int32_t)W) { dx = -dx; x += 2 * dx; }
+			if (y < 0 || y + (int32_t)wh > (int32_t)H) { dy = -dy; y += 2 * dy; }
+		}
+		vblank_hold = 0;
+		CHECK(rt_display_stats(pdev, &st) == 0);
+		st = wait_flipped(pdev, st.frames_received - st.frames_replaced);
+		usleep(100000);
+		for (uint32_t py = 0; py < H; py++)
+			for (uint32_t px = 0; px < W; px++)
+				if (screen_pixel(px, py) != *pixel(&surf, px, py) && bad++ < 5)
+					printf("pipeline: moving window: pixel %u,%u is %08x, the surface has %08x\n",
+					       px, py, screen_pixel(px, py), *pixel(&surf, px, py));
+		CHECK(rt_display_stats(pdev, &st) == 0);
+		printf("pipeline: a moving window over 120 frames (%llu replaced in the mailbox): %lu pixels differ\n",
+		       (unsigned long long)st.frames_replaced, bad);
+		CHECK(bad == 0);
+	}
+
 	/* A frame of another size is refused; nothing breaks. */
 	CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
 	printf("pipeline: average copy %llu us, latency %llu us (max %llu), worker submit %llu us per frame\n",

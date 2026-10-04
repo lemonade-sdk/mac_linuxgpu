@@ -828,35 +828,32 @@ unsigned int wake_up_all_locked(struct wait_queue_head *queue)
 
 /* Sleep until the task is woken (linuxu_task_wake: wake queues,
  * wake_up_process, signals) or the timeout, parked (rt/park.h). Returns
- * the remaining Linux jiffies. A wait longer than the backstop maximum
- * returns early with time left, a spurious wake as Linux allows: callers
- * re-check their condition and sleep again. */
+ * the remaining Linux jiffies. As in Linux the timeout ends at a jiffy
+ * boundary (the tick @timeout jiffies after the current one), and a task
+ * still TASK_RUNNING (a poll, or a wake that came before the sleep) does
+ * not sleep at all. A wait longer than the backstop maximum returns early
+ * with time left, a spurious wake as Linux allows: callers re-check their
+ * condition and sleep again. */
 long schedule_timeout(long timeout)
 {
 	const uint64_t tick_ns = 1000000000ULL / HZ;
 	struct task_struct *task = current;
-	uint64_t now, deadline = 0;
-	bool first = true;
+	uint64_t now, expire = 0, deadline = 0;
 
 	if (timeout <= 0)
 		return 0;
 	now = linuxu_park_now_ns();
-	if (timeout != MAX_SCHEDULE_TIMEOUT)
-		deadline = (uint64_t)timeout > (UINT64_MAX - now) / tick_ns ?
-			UINT64_MAX : now + (uint64_t)timeout * tick_ns;
+	if (timeout != MAX_SCHEDULE_TIMEOUT) {
+		expire = now / tick_ns + (uint64_t)timeout;
+		deadline = expire > UINT64_MAX / tick_ns ? UINT64_MAX : expire * tick_ns;
+	}
 	for (;;) {
 		const unsigned long seq = __atomic_load_n(&task->wake_sequence, __ATOMIC_SEQ_CST);
 		const long state = __atomic_load_n(&task->state, __ATOMIC_ACQUIRE);
 		uint64_t until;
 
-		if (state == TASK_RUNNING) {
-			/* Called without a sleeping state: a polling caller.
-			 * Give up the CPU briefly rather than spin. */
-			if (first)
-				msleep(1);
+		if (state == TASK_RUNNING)
 			break;
-		}
-		first = false;
 		if ((state == TASK_INTERRUPTIBLE && signal_pending(task)) ||
 		    (state == TASK_KILLABLE && linuxu_task_fatal_signal_pending(task)))
 			break;
@@ -872,8 +869,8 @@ long schedule_timeout(long timeout)
 	__atomic_store_n(&task->state, TASK_RUNNING, __ATOMIC_RELEASE);
 	if (timeout == MAX_SCHEDULE_TIMEOUT)
 		return timeout;
-	now = linuxu_park_now_ns();
-	return now >= deadline ? 0 : (long)((deadline - now + tick_ns - 1) / tick_ns);
+	now = linuxu_park_now_ns() / tick_ns;
+	return now >= expire ? 0 : (long)(expire - now);
 }
 
 long schedule_timeout_interruptible(long timeout)

@@ -136,12 +136,13 @@
       },
       {
         "patch": "patches/mesa/radv-apple-silicon-vram.patch",
-        "sha256": "f0ca923af6037e86bbdf5d80164c8e345ae793d88b37760cafc80dbd5dd4f08d",
+        "sha256": "7ee56cf1a8be0bd4e31b4972cde077580a45af6fb7cef3ec94bc3dcee7b93dce",
         "files": [
           "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c",
-          "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c"
+          "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c",
+          "src/amd/vulkan/radv_device.c"
         ],
-        "reason": "Apple silicon maps PCIe BARs for the CPU as Device memory only, so memcpy into a CPU mapping of VRAM faults on unaligned stores (seen on the R9700: SIGBUS creating the device). On Apple silicon the winsys reports no CPU-visible VRAM and places any buffer that is not NO_CPU_ACCESS in GTT, whose mappings are normal memory."
+        "reason": "Apple silicon maps PCIe BARs for the CPU as Device memory only, so memcpy into a CPU mapping of VRAM faults on unaligned stores (seen on the R9700: SIGBUS creating the device). On Apple silicon the winsys reports no CPU-visible VRAM and places any buffer that is not NO_CPU_ACCESS in GTT, whose mappings are normal memory. Without CPU-visible VRAM, shader code is uploaded by SDMA into VRAM (NO_CPU_ACCESS arenas) instead of being fetched from GTT."
       },
       {
         "patch": "patches/mesa/radv-macos-display-wsi.patch",

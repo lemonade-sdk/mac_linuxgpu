@@ -145,6 +145,27 @@ int main(void)
 	}
 	assert(jiffies - start >= 3 && jiffies - start < 100);
 	{
+		/* A running task does not sleep in schedule_timeout or
+		 * schedule (a poll, or a wake that came first): the whole
+		 * timeout is left, as in Linux. */
+		struct timespec a, b;
+
+		__set_current_state(TASK_RUNNING);
+		clock_gettime(CLOCK_MONOTONIC, &a);
+		for (int i = 0; i < 1000; i++) {
+			assert(schedule_timeout(msecs_to_jiffies(50)) >= msecs_to_jiffies(50) - 1);
+			schedule();
+		}
+		clock_gettime(CLOCK_MONOTONIC, &b);
+		/* 2000 calls: a millisecond sleep in any of them shows. */
+		assert((b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec) < 500000000L);
+		/* A sleeping state still sleeps the timeout. */
+		start = jiffies;
+		__set_current_state(TASK_UNINTERRUPTIBLE);
+		assert(schedule_timeout(msecs_to_jiffies(20)) == 0);
+		assert(jiffies - start >= msecs_to_jiffies(20));
+	}
+	{
 		/* The producer above set ready without a wake: the backstop
 		 * found it and counted the missed wake. */
 		struct linuxu_park_stats st;

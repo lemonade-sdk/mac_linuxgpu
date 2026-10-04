@@ -430,8 +430,13 @@ struct PresentMeasurement {
     var bucketCopyNs = [UInt64](repeating: 0, count: 4)
     var lastFlipped: UInt64 = 0
 
-    mutating func present(callCPUNs: UInt64, callWallNs: UInt64, handlerCPUNs: UInt64) {
+    /// Waiting for the compositor to finish writing the captured buffer.
+    var lockWaitNs: UInt64 = 0, lockWaitMaxNs: UInt64 = 0
+
+    mutating func present(callCPUNs: UInt64, callWallNs: UInt64, handlerCPUNs: UInt64, lockWaitNs: UInt64 = 0) {
         presented += 1
+        self.lockWaitNs += lockWaitNs
+        lockWaitMaxNs = max(lockWaitMaxNs, lockWaitNs)
         self.callCPUNs += callCPUNs
         self.callWallNs += callWallNs
         callWallMaxNs = max(callWallMaxNs, callWallNs)
@@ -462,6 +467,8 @@ struct PresentMeasurement {
         out.append(String(format: "agent per presented frame: PRESENT %.1f us CPU, %.1f us wall (max %.1f); whole frame handler %.1f us CPU",
                           Double(callCPUNs) / p / 1e3, Double(callWallNs) / p / 1e3,
                           Double(callWallMaxNs) / 1e3, Double(handlerCPUNs) / p / 1e3))
+        out.append(String(format: "waiting for the compositor to finish the captured frame: %.1f us on average, %.1f us at most",
+                          Double(lockWaitNs) / p / 1e3, Double(lockWaitMaxNs) / 1e3))
         out.append(String(format: "driver per flipped frame: %.1f KB copied in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
                           Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
                           Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
@@ -483,6 +490,62 @@ struct PresentMeasurement {
     }
 }
 
+/// Presented frames whose capture buffers must stay unreused until the
+/// driver is done reading them. PRESENT only queues a frame (a mailbox of
+/// one); the driver's worker later takes it and copies it (SDMA reads the
+/// buffer) or a newer frame replaces it first (never read). A taken frame
+/// is done at its flip: the flip waits for its copy, and frames flip in
+/// the order they were taken. Which happened to a frame is known at the
+/// next PRESENT: the replaced count went up when it was still in the
+/// mailbox. The driver's counts alone do not say which frames are done:
+/// a replacement counts the newest frame while an older one taken before
+/// it may still be copying.
+struct PresentedFrames<Item> {
+    /// Taken frames: the flipped count at which each is done, oldest first.
+    private(set) var taken: [(item: Item, flip: UInt64)] = []
+    /// The newest frame: in the mailbox or taken, not known until the next PRESENT.
+    private(set) var newest: Item?
+    private var replaced: UInt64 = 0
+
+    var count: Int { taken.count + (newest == nil ? 0 : 1) }
+
+    /// @item was just queued; @received, @replaced and @flipped are the
+    /// driver's counts PRESENT returned for it. Returns the items now free.
+    mutating func presented(_ item: Item, received: UInt64, replaced nowReplaced: UInt64,
+                            flipped: UInt64) -> [Item] {
+        var free: [Item] = []
+        if let previous = newest {
+            if nowReplaced > replaced {
+                free.append(previous)      // still in the mailbox: never read
+            } else {
+                // Taken: every frame before this one was taken or replaced,
+                // so it was taken frame number (received - 1 - replaced).
+                taken.append((previous, received - 1 - nowReplaced))
+            }
+        }
+        newest = item
+        replaced = nowReplaced
+        free += retire(flipped: flipped)
+        return free
+    }
+
+    /// Frames flipped by @flipped are done.
+    mutating func retire(flipped: UInt64) -> [Item] {
+        var free: [Item] = []
+        while let first = taken.first, first.flip <= flipped {
+            free.append(first.item)
+            taken.removeFirst()
+        }
+        return free
+    }
+
+    mutating func removeAll() {
+        taken.removeAll()
+        newest = nil
+        replaced = 0
+    }
+}
+
 /// A frame's damage as PRESENT takes it: whole pixels inside the surface,
 /// at most 255 rectangles (more become the whole frame).
 func presentRects(_ dirty: [CGRect], width: Int, height: Int) -> [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)] {
@@ -497,4 +560,110 @@ func presentRects(_ dirty: [CGRect], width: Int, height: Int) -> [(x: UInt32, y:
     }
     if out.count > 255 { return [(0, 0, UInt32(width), UInt32(height))] }
     return out
+}
+
+// ----------------------------------------------------------------
+// MARK: - the display control model (daemon <-> menu bar)
+// ----------------------------------------------------------------
+
+/// A monitor's identity across connectors, replugs and GPUs: its EDID
+/// manufacturer, product code and serial (the serial string descriptor
+/// when the binary serial is 0). nil without a readable EDID.
+func monitorKey(edid: Data?) -> String? {
+    guard let edid, let summary = EDIDSummary(edid) else { return nil }
+    let serial = summary.serial != 0 ? String(summary.serial) : (summary.serialText ?? "0")
+    return String(format: "%@-%04X-%@", summary.vendor, summary.product, serial)
+}
+
+/// The user's per-monitor choices (the menu bar's toggles): a monitor is
+/// mirrored unless turned off. Persisted as JSON, keyed by monitorKey.
+struct DisplayPrefs: Codable, Equatable {
+    var off: [String] = []
+
+    func isOn(_ key: String) -> Bool { !off.contains(key) }
+    mutating func set(_ key: String, on: Bool) {
+        off.removeAll { $0 == key }
+        if !on { off.append(key); off.sort() }
+    }
+
+    static func load(from url: URL) -> DisplayPrefs {
+        guard let data = try? Data(contentsOf: url) else { return DisplayPrefs() }
+        return (try? JSONDecoder().decode(DisplayPrefs.self, from: data)) ?? DisplayPrefs()
+    }
+    func save(to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+}
+
+/// What the daemon reports for the menu bar.
+struct DisplayStatus: Codable, Equatable {
+    enum State: String, Codable { case off, starting, mirroring, error }
+    struct Monitor: Codable, Equatable {
+        var key: String
+        var connector: String
+        var name: String
+        var on: Bool
+        var state: State
+        var mode: String?          // "2560x1440 @ 59.950 Hz" while mirroring
+        var error: String?         // the last error line
+    }
+    var daemon: Int32 = 0          // the daemon's pid, 0 when it is not running
+    var driverAttached = false
+    var monitors: [Monitor] = []
+
+    /// The menu bar icon's state: an error on any monitor, else whether
+    /// any is mirrored.
+    var summary: State {
+        if monitors.contains(where: { $0.state == .error }) { return .error }
+        if monitors.contains(where: { $0.state == .mirroring }) { return .mirroring }
+        if monitors.contains(where: { $0.state == .starting }) { return .starting }
+        return .off
+    }
+
+    static func load(from url: URL) -> DisplayStatus? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(DisplayStatus.self, from: data)
+    }
+    func save(to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+}
+
+/// What a mirroring process's output line says about its monitor.
+enum AgentLine: Equatable {
+    case mirroring(String)
+    case failed(String)
+    case other
+}
+func parseAgentLine(_ line: String) -> AgentLine {
+    if let range = line.range(of: " lit at ") {
+        return .mirroring(String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces))
+    }
+    if let range = line.range(of: "FAILED: ") { return .failed(String(line[range.upperBound...])) }
+    return .other
+}
+
+/// The connected monitors to mirror: those with an identity the user has
+/// not turned off. (A monitor without a readable EDID cannot be told apart
+/// across replugs; it is mirrored, under its connector's name.)
+func connectorsToMirror(connected: [(connector: String, key: String)], prefs: DisplayPrefs) -> [String] {
+    connected.filter { prefs.isOn($0.key) }.map { $0.connector }
+}
+
+/// Where the daemon and the menu bar meet: the choices, the status, and the
+/// Darwin notifications each posts when it changed its file.
+enum DisplayControl {
+    static var directory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacLinuxGPU")
+    }
+    static var prefsURL: URL { directory.appendingPathComponent("displays.json") }
+    static var statusURL: URL { directory.appendingPathComponent("display-status.json") }
+    static let prefsChanged = "com.geramyloveless.maclinuxgpu.display-prefs"
+    static let statusChanged = "com.geramyloveless.maclinuxgpu.display-status"
 }
