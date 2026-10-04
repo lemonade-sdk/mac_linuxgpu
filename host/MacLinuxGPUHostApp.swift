@@ -458,6 +458,7 @@ private let kUserClientSession:  UInt32 = 0
 private let kUserClientObserver: UInt32 = 1
 private let kQuerySessionState:  UInt64 = 0x4c534553
 private let kSessionStateWords = 9
+private let kIOReturnNotPrivilegedValue = kern_return_t(bitPattern: 0xe00002c1)
 private let kIOReturnUnsupportedValue = kern_return_t(bitPattern: 0xe00002c7)
 private let kIOReturnNotAttachedValue = kern_return_t(bitPattern: 0xe00002d9)
 private let kIOReturnNotFoundValue = kern_return_t(bitPattern: 0xe00002f0)
@@ -700,6 +701,37 @@ enum DriverUpgrade {
             : instance.label + "; clients: " + instance.clients.joined(separator: "; ")
     }
 
+    /// Retire is refused with kIOReturnNotPrivileged (0xe00002c1) when the
+    /// caller lacks the session-release authorization the driver checks.
+    static let notPrivilegedAdvice = "refused Retire (kIOReturnNotPrivileged, 0xe00002c1): this app is not " +
+        "authorized to end the previous driver's sessions, so it leaves only once every app using it has " +
+        "disconnected"
+
+    /// The apps attached to an instance, as \"name (pid N)\", from IOKit's
+    /// IOUserClientCreator records (\"pid N, name\").
+    static func clientApps(_ instance: DriverInstance) -> [String] {
+        instance.clients.compactMap { creator -> String? in
+            let parts = creator.split(separator: ",", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, parts[0].hasPrefix("pid ") else { return creator }
+            // This app itself (the installer's own observer) is not a blocker.
+            if Int32(parts[0].dropFirst(4)) == getpid() { return nil }
+            return "\(parts[1]) (\(parts[0]))"
+        }
+    }
+
+    /// Ask our own monitoring apps to let go of a previous driver instance:
+    /// a Darwin notification whose state is the instance's registry ID. Apps
+    /// that follow it (amdgpu_mtopg) close their connection to that instance
+    /// and reopen only to the new driver.
+    static let retiringNotification = "com.geramyloveless.maclinuxgpu.driver-retiring"
+    static func announceRetiring(_ instance: DriverInstance) {
+        var token: Int32 = 0
+        guard notify_register_check(retiringNotification, &token) == 0 else { return }
+        notify_set_state(token, instance.registryID)
+        notify_post(retiringNotification)
+        notify_cancel(token)
+    }
+
     static let legacyAdvice = "it predates Retire and stays until its GPU leaves the bus or the Mac restarts. " +
         "Do not kill it. Builds 0.1.128 (232) to 0.1.129 (233) leave cleanly when the GPU enclosure is switched off; " +
         "switch it off, wait for the driver to go, then switch it on."
@@ -717,10 +749,13 @@ enum DriverUpgrade {
             DisplayAutostart.suspendForUpgrade()
         }
         for instance in DriverInstances.previous() {
+            announceRetiring(instance)
             let (result, status, session) = call(instance, kRetireOpQuiesce, force: force)
             guard let result else {
                 if status == kIOReturnUnsupportedValue {
                     report("Previous driver \(instance.label): " + legacyAdvice)
+                } else if status == kIOReturnNotPrivilegedValue {
+                    report("Previous driver \(instance.label) " + notPrivilegedAdvice + ".")
                 } else {
                     report(String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status))
                 }
@@ -764,6 +799,7 @@ enum DriverUpgrade {
                 announced = true
             }
             for instance in previous where stuck[instance.registryID] == nil {
+                announceRetiring(instance)
                 let (result, status, session) = call(instance, kRetireOpTerminate, force: force)
                 var line: String
                 if let result {
@@ -777,8 +813,16 @@ enum DriverUpgrade {
                     stuck[instance.registryID] = line
                 } else if status == kIOReturnNotFoundValue || status == kIOReturnNotAttachedValue {
                     line = "Previous driver \(instance.label) is leaving."
+                } else if status == kIOReturnNotPrivilegedValue {
+                    line = "Previous driver \(instance.label) " + notPrivilegedAdvice + "."
                 } else {
                     line = String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status)
+                }
+                // Whatever keeps it attached, by name: the user can quit it.
+                let apps = clientApps(instance)
+                if !apps.isEmpty {
+                    line += " Still connected: " + apps.joined(separator: ", ") + "; quit " +
+                        (apps.count == 1 ? "it" : "them") + " so the previous driver can leave."
                 }
                 if lastLine[instance.registryID] != line {
                     report(line)
