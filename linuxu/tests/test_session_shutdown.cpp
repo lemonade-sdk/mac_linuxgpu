@@ -186,6 +186,11 @@ static void observer_display_client_stop(uint64_t) { ++observerDisplayStops; }
 static unsigned powerRemovalHooks;
 static void power_before_removal() { ++powerRemovalHooks; }
 
+// The session's connectors leave the service's properties once the
+// observer reads are closed (displays_publish runs only inside them).
+static unsigned displayUnpublishes;
+static void displays_unpublish(MacLinuxGPU *) { ++displayUnpublishes; }
+
 #include "session_shutdown_production.inc"
 
 // An observer read in flight when the session closes: the close waits, and
@@ -593,6 +598,7 @@ static void clientExitReopen(bool queueExhausted) {
     assert(events == expected);
     // The power hook ran once, ahead of upstream removal.
     assert(powerRemovalHooks == 1);
+    assert(displayUnpublishes == 1);
     assert(!s_dmaQuarantined && !s_sessionClosing && !s_quarantineRetained);
     assert(s_sessionGeneration == 2 && clientStops == 1 && client.superStops == 1);
     assert(driver.references == 1 && provider.references == 1);

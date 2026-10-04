@@ -1223,3 +1223,17 @@ test-display-agent:
 
 test: test-display-agent
 .PHONY: test-display-agent
+
+# What the dext publishes on its IOService for System Information and our
+# tools (dext/sources/device_properties.h), with DriverKit container
+# substitutes.
+test-device-properties:
+	bash scripts/test-device-properties.sh
+
+# The host's view of the GPU and its monitors from those properties
+# (host/DeviceInfo.swift).
+test-device-info:
+	bash scripts/test-device-info.sh
+
+test: test-device-properties test-device-info
+.PHONY: test-device-properties test-device-info
