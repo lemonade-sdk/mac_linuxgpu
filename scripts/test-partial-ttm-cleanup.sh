@@ -80,7 +80,7 @@ for source in linuxu/src/amdgpu-rt/ttm_cleanup.c linuxu/src/mm/page.c \
   linuxu/src/shims/{task,kthread,printk,dma_fence,timekeeping}.c third_party/linux/lib/rbtree.c \
   linuxu/src/drm/dma_resv.c third_party/linux/drivers/gpu/buddy.c third_party/linux/drivers/gpu/drm/drm_mm.c \
   third_party/linux/drivers/gpu/drm/ttm/{ttm_resource,ttm_range_manager}.c third_party/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c linuxu/src/{sync,bug,spinlock,delay,rcu}.c linuxu/src/sync/ww_mutex.c \
-  linuxu/tests/test_partial_ttm_cleanup.c; do
+  linuxu/tests/test_partial_ttm_cleanup.c linuxu/tests/iosysctl_host.c; do
   flags=()
   case "$source" in
     */mm/page.c|*/dart/dart.c) flags=(-DLINUXU_DEXT_DK=1) ;;

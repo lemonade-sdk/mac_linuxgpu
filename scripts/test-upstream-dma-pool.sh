@@ -39,5 +39,5 @@ clang -w -std=gnu11 -g -O1 -D__KERNEL__ -include linux/autoconf.h \
   -Ilinuxu/headers -Ithird_party/linux/drivers/gpu/drm/ttm -I"$work" \
   linuxu/tests/test_upstream_dma_pool.c linuxu/src/dart/dart.c \
   linuxu/src/mm/list_lru.c linuxu/src/kmem/{kmemalloc,kmemcheck,vmalloc}.c \
-  linuxu/src/sync.c "$work/rcu.o" -Wl,-dead_strip -lpthread -o "$work/test_upstream_dma_pool"
+  linuxu/src/sync.c linuxu/tests/iosysctl_host.c "$work/rcu.o" -Wl,-dead_strip -lpthread -o "$work/test_upstream_dma_pool"
 "$work/test_upstream_dma_pool"

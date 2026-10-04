@@ -282,10 +282,12 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	assert(linuxu_page_pool_extend(16) == 0);
+	/* No ceiling here: a mapping the platform refuses (this fixture
+	 * refuses anything over four pages) fails, and nothing stays charged. */
 	dma_addr_t oversized = 0;
-	assert(!linuxu_dma_alloc_coherent(NULL, linuxu_dart_budget() + PAGE_SIZE,
-		&oversized, 0));
+	assert(!linuxu_dma_alloc_coherent(NULL, 8ull << 30, &oversized, 0));
 	assert(backing_allocations == 0 && linuxu_dart_used() == 0);
+	largest_allocation = 0;
 	fail_allocation = 1;
 	assert(alloc_pages(GFP_KERNEL, 2) == NULL);
 	assert(backing_live == 0 && linuxu_dart_used() == 0);
@@ -428,7 +430,7 @@ int main(int argc, char **argv)
 	check_device_mask_widths();
 	/* Churn can leave every lookup slot as a tombstone. Missing addresses
 	 * must terminate instead of hanging the driver's dispatch queue. */
-	for (unsigned long i = 0; i < LINUXU_VA_SLOTS; i++)
+	for (unsigned long i = 0; i < va_slot_count; i++)
 		va_slots[i].base = 1;
 	alarm(5);
 	assert(virt_to_page_internal((void *)0x40000) == NULL);
