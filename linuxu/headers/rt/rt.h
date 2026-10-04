@@ -207,19 +207,19 @@ int rt_irq_vector_count(struct rt_device *dev);
  *
  * In contrast to BAR MMIO, DART buffers are ordinary in-process pointers
  * (the cpu address of an IOBufferMemoryDescriptor).  These alloc/free
- * against the ~1.5 GB DART budget and return both the cpu address and the
- * device (IOVA) address the GPU will use in page tables.  The budget is
- * enforced by the layer; allocation fails loudly (returns NULL / 0) at
- * the ceiling rather than silently over-committing.
+ * through the DART layer and return both the cpu address and the device
+ * (IOVA) address the GPU will use in page tables.  An allocation the
+ * platform refuses fails (returns NULL / 0) and the seam logs why.
  * ------------------------------------------------------------------ */
 void *rt_dart_alloc(struct rt_device *dev, size_t size,
 		    uint64_t *dma_addr);
 void  rt_dart_free(struct rt_device *dev, void *cpu, size_t size,
 		   uint64_t dma_addr);
 
-/* Current DART budget usage / ceiling, in bytes. */
+/* Live DART-mapped bytes now and at most so far (no ceiling: the platform
+ * refuses what it cannot map). */
 uint64_t rt_dart_used(struct rt_device *dev);
-uint64_t rt_dart_ceiling(struct rt_device *dev);
+uint64_t rt_dart_peak(struct rt_device *dev);
 
 /* ---- PCI/IRQ (WP T1 host backend) ----
  * rt_pci_irq_* is the shim-internal seam between pci_stub.c's

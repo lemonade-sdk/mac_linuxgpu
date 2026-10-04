@@ -1,14 +1,18 @@
 /* linuxu shim: dart — DMA→DART mapping layer. The host test backend uses
  * identity IOVAs. DriverKit coherent allocations use IODMACommand directly;
  * streaming mappings use IODMACommand-backed bounce buffers because the SDK
- * cannot wrap arbitrary shim memory in an IOMemoryDescriptor. Both backends
- * enforce a 1.5 GB global budget of live-mapped IOVA bytes.
+ * cannot wrap arbitrary shim memory in an IOMemoryDescriptor.
+ *
+ * There is no software ceiling on mapped bytes, as in Linux: what limits
+ * DMA is the platform, whose refusals (memory, wiring, the DART's IOVA
+ * window) the DriverKit seam reports as a failed mapping, ENOMEM here. The
+ * used/peak counters account live-mapped bytes for diagnostics.
  *
  * Live mappings track their allocation and alias ownership. DriverKit
  * retains their accounting when completion fails; the host backend uses
- * a token hash for simulated mappings. Budget checks
- * are done inside the lock that covers table insertion, so the
- * used/peak counters are race-free across the shim's worker threads. */
+ * a token hash for simulated mappings. Accounting is done inside the lock
+ * that covers table insertion, so the used/peak counters are race-free
+ * across the shim's worker threads. */
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -23,9 +27,8 @@
 
 #ifdef LINUXU_DEXT_DK
 /* driverKit build: the real DART IOVA comes from the DriverKit IODMACommand
- * seam (dext/sources/iokit_bridge.m), not an identity host VA.  The budget
- * accounting below is unchanged — it is the single source of truth in both
- * builds. */
+ * seam (dext/sources/iokit_bridge.mm), not an identity host VA.  The
+ * accounting below is the same in both builds. */
 #include <rt/dext_dma.h>
 #endif
 
@@ -50,26 +53,17 @@ static int dart_iova_valid(uint64_t iova, uint64_t size)
 }
 #endif
 
-/* ---- budget ---- */
+/* ---- accounting ---- */
 static pthread_mutex_t dart_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t dart_used;
 static uint64_t dart_peak;
 
-
-static uint64_t dart_budget(void)
-{
-	return LINUXU_DART_BUDGET;
-}
-
 /* caller holds dart_lock */
-static int dart_charge(uint64_t bytes)
+static void dart_charge(uint64_t bytes)
 {
-	if (bytes > dart_budget() - dart_used)
-		return -ENOMEM;
 	dart_used += bytes;
 	if (dart_used > dart_peak)
 		dart_peak = dart_used;
-	return 0;
 }
 
 static void dart_refund(uint64_t bytes)
@@ -181,7 +175,7 @@ static struct dart_coherent *dart_coherent_detach(struct dart_coherent *e)
 }
 
 /* The caller marks releasing while holding dart_lock. A failed completion
- * keeps both the allocation record and its budget charge for quarantine. */
+ * keeps both the allocation record and its accounted bytes for quarantine. */
 static void dart_coherent_release(struct dart_coherent *e)
 {
 	int result = dext_dma_free_coherent(e->cpu, e->size);
@@ -235,15 +229,52 @@ struct dart_stream {
 	int releasing;
 	int held;	/* unmapped while an engine was stalled */
 };
-#define DART_STREAM_SLOTS 4096
-static struct dart_stream dart_streams[DART_STREAM_SLOTS];
+/* Slots grow in chunks that never move (a slot's address stays valid while
+ * dart_lock is dropped), as many as mappings are live at once. */
+#define DART_STREAM_CHUNK 256
+static struct dart_stream **dart_stream_chunks;	/* dart_lock */
+static unsigned int dart_stream_nchunks;
+static unsigned int dart_stream_capacity;
+
+static struct dart_stream *dart_stream_at(unsigned int i)
+{
+	return &dart_stream_chunks[i / DART_STREAM_CHUNK][i % DART_STREAM_CHUNK];
+}
+
+/* A free slot, reserved (releasing) for the caller; -1 when no memory is
+ * left for another chunk. Caller holds dart_lock. */
+static int dart_stream_reserve_locked(void)
+{
+	for (unsigned int i = 0; i < dart_stream_capacity; ++i) {
+		struct dart_stream *st = dart_stream_at(i);
+		if (!st->iova && !st->releasing) {
+			st->releasing = 1;
+			return (int)i;
+		}
+	}
+	if (dart_stream_capacity > (unsigned int)INT32_MAX - DART_STREAM_CHUNK)
+		return -1;
+	struct dart_stream **chunks = realloc(dart_stream_chunks,
+		(dart_stream_nchunks + 1) * sizeof(*chunks));
+	if (!chunks)
+		return -1;
+	dart_stream_chunks = chunks;
+	struct dart_stream *chunk = calloc(DART_STREAM_CHUNK, sizeof(*chunk));
+	if (!chunk)
+		return -1;
+	dart_stream_chunks[dart_stream_nchunks++] = chunk;
+	const unsigned int slot = dart_stream_capacity;
+	dart_stream_capacity += DART_STREAM_CHUNK;
+	chunk[0].releasing = 1;
+	return (int)slot;
+}
 
 static struct dart_stream *dart_stream_find(uint64_t iova)
 {
 	if (!iova) return NULL;
-	for (int i = 0; i < DART_STREAM_SLOTS; ++i)
-		if (dart_streams[i].iova == iova)
-			return &dart_streams[i];
+	for (unsigned int i = 0; i < dart_stream_capacity; ++i)
+		if (dart_stream_at(i)->iova == iova)
+			return dart_stream_at(i);
 	return NULL;
 }
 
@@ -296,17 +327,8 @@ dma_addr_t linuxu_dma_map_single(struct device *dev, void *source,
 	pthread_mutex_unlock(&dart_lock);
 	charged = (size + DART_COHERENT_ALIGN - 1) & ~(DART_COHERENT_ALIGN - 1);
 	pthread_mutex_lock(&dart_lock);
-	if (dart_charge(charged) != 0) {
-		pthread_mutex_unlock(&dart_lock);
-		return (dma_addr_t)(uintptr_t)-ENOMEM;
-	}
-	for (int i = 0; i < DART_STREAM_SLOTS; ++i)
-		if (!dart_streams[i].iova && !dart_streams[i].releasing) {
-			slot = i;
-			break;
-		}
-	if (slot < 0) dart_refund(charged);
-	else dart_streams[slot].releasing = 1; /* reserve across DriverKit calls */
+	slot = dart_stream_reserve_locked(); /* reserved across DriverKit calls */
+	if (slot >= 0) dart_charge(charged);
 	pthread_mutex_unlock(&dart_lock);
 	if (slot < 0) return (dma_addr_t)(uintptr_t)-ENOMEM;
 	if (dext_dma_alloc_coherent(charged, &bounce, &iova) != 0 || !bounce ||
@@ -314,11 +336,11 @@ dma_addr_t linuxu_dma_map_single(struct device *dev, void *source,
 		int release_failed = bounce && dext_dma_free_coherent(bounce, charged);
 		pthread_mutex_lock(&dart_lock);
 		if (release_failed) {
-			dart_streams[slot] = (struct dart_stream){.iova = iova,
+			*dart_stream_at(slot) = (struct dart_stream){.iova = iova,
 				.bounce = bounce, .charged = charged, .releasing = 1};
 			dart_table_count++;
 		} else {
-			memset(&dart_streams[slot], 0, sizeof(dart_streams[slot]));
+			memset(dart_stream_at(slot), 0, sizeof(struct dart_stream));
 			dart_refund(charged);
 		}
 		pthread_mutex_unlock(&dart_lock);
@@ -326,7 +348,7 @@ dma_addr_t linuxu_dma_map_single(struct device *dev, void *source,
 	}
 	if (dir != DMA_FROM_DEVICE) memcpy(bounce, source, size);
 	pthread_mutex_lock(&dart_lock);
-	dart_streams[slot] = (struct dart_stream){iova, source, bounce, size, charged, dir};
+	*dart_stream_at(slot) = (struct dart_stream){iova, source, bounce, size, charged, dir};
 	dart_table_count++;
 	pthread_mutex_unlock(&dart_lock);
 	return (dma_addr_t)iova;
@@ -545,22 +567,27 @@ static void dart_release_held_now(void)
 		/* A failed completion keeps it, as for any free. */
 		dart_coherent_release(e);
 	}
-	for (int i = 0; i < DART_STREAM_SLOTS; ++i) {
-		struct dart_stream entry;
+	for (unsigned int i = 0;; ++i) {
+		struct dart_stream entry, *st;
 
 		pthread_mutex_lock(&dart_lock);
-		if (!dart_streams[i].held) {
+		if (i >= dart_stream_capacity) {
+			pthread_mutex_unlock(&dart_lock);
+			break;
+		}
+		st = dart_stream_at(i);
+		if (!st->held) {
 			pthread_mutex_unlock(&dart_lock);
 			continue;
 		}
-		dart_streams[i].held = 0;
+		st->held = 0;
 		dart_held_count--;
-		entry = dart_streams[i];
+		entry = *st;
 		pthread_mutex_unlock(&dart_lock);
 		int result = dext_dma_free_coherent(entry.bounce, entry.charged);
 		pthread_mutex_lock(&dart_lock);
 		if (!result) {
-			memset(&dart_streams[i], 0, sizeof(dart_streams[i]));
+			memset(st, 0, sizeof(*st));
 			dart_refund(entry.charged);
 			dart_table_count--;
 		}
@@ -643,11 +670,8 @@ dma_addr_t linuxu_dma_map_page(struct device *dev, struct page *page,
 	iova = (uint64_t)(uintptr_t)host + offset;
 
 	pthread_mutex_lock(&dart_lock);
-	rc = dart_charge(charged);
-	if (rc == 0) {
-		rc = dart_table_insert(iova, charged, size, dir, false);
-		if (rc) dart_refund(charged);
-	}
+	rc = dart_table_insert(iova, charged, size, dir, false);
+	if (!rc) dart_charge(charged);
 	pthread_mutex_unlock(&dart_lock);
 	if (rc)
 		return (dma_addr_t)(uintptr_t)rc; /* -ENOMEM */
@@ -714,10 +738,7 @@ int linuxu_dma_map_sg(struct device *dev, struct scatterlist *sg, int nents,
 	}
 #else
 	pthread_mutex_lock(&dart_lock);
-	if (dart_charge(total) != 0) {
-		pthread_mutex_unlock(&dart_lock);
-		return 0;
-	}
+	dart_charge(total);
 	entry = sg;
 	for (int i = 0; i < nents; i++) {
 		if (entry->page)
@@ -799,17 +820,14 @@ void *linuxu_dma_alloc_coherent(struct device *dev, size_t size,
 	if (!coherent)
 		return NULL;
 	pthread_mutex_lock(&dart_lock);
-	rc = dart_charge(rounded);
-	if (!rc) dart_allocations_inflight++;
+	dart_charge(rounded);
+	dart_allocations_inflight++;
 	pthread_mutex_unlock(&dart_lock);
-	if (rc) {
-		free(coherent);
-		return NULL;
-	}
 	/* driverKit: the real DART IOVA comes from the IODMACommand seam.
 	 * The seam allocates the buffer (IOBufferMemoryDescriptor) and DMA-
 	 * maps it; we get back the host pointer (p) AND the GPU-visible
-	 * IOVA (iova). Budget and bookkeeping are reserved before allocation. */
+	 * IOVA (iova). Accounting and bookkeeping are reserved before
+	 * allocation; a refusal is reported by the seam, with its reason. */
 	p = NULL;
 	iova = 0;
 	rc = dext_dma_alloc_coherent(rounded, &p, &iova);
@@ -846,15 +864,8 @@ void *linuxu_dma_alloc_coherent(struct device *dev, size_t size,
 	rc = 0;
 #endif
 	pthread_mutex_lock(&dart_lock);
-	{
-		int charge_rc = dart_charge(rounded);
-
-		rc = charge_rc;
-		if (!rc) {
-			rc = dart_table_insert(iova, rounded, size, DMA_BIDIRECTIONAL, true);
-			if (rc) dart_refund(rounded);
-		}
-	}
+	rc = dart_table_insert(iova, rounded, size, DMA_BIDIRECTIONAL, true);
+	if (!rc) dart_charge(rounded);
 	pthread_mutex_unlock(&dart_lock);
 	if (rc) {
 		free(p);
@@ -922,7 +933,6 @@ static struct dart_import *dart_imports;	/* dart_lock */
 int linuxu_dart_import(uint64_t iova, uint64_t size)
 {
 	struct dart_import *e;
-	int r;
 
 	if (!iova || !size || size - 1 > UINT64_MAX - iova)
 		return -EINVAL;
@@ -937,15 +947,11 @@ int linuxu_dart_import(uint64_t iova, uint64_t size)
 			free(e);
 			return -EINVAL;
 		}
-	r = dart_charge(size);
-	if (!r) {
-		e->next = dart_imports;
-		dart_imports = e;
-	}
+	dart_charge(size);
+	e->next = dart_imports;
+	dart_imports = e;
 	pthread_mutex_unlock(&dart_lock);
-	if (r)
-		free(e);
-	return r;
+	return 0;
 }
 
 void linuxu_dart_import_release(uint64_t iova, uint64_t size)
@@ -982,8 +988,8 @@ static int dart_live_locked(uint64_t iova, uint64_t bytes)
 		if (!e->releasing && iova >= e->iova && iova - e->iova < e->size &&
 		    bytes <= e->size - (iova - e->iova))
 			return 1;
-	for (int i = 0; i < DART_STREAM_SLOTS; ++i) {
-		const struct dart_stream *st = &dart_streams[i];
+	for (unsigned int i = 0; i < dart_stream_capacity; ++i) {
+		const struct dart_stream *st = dart_stream_at(i);
 		if (st->iova && (!st->releasing || st->held) && iova >= st->iova &&
 		    iova - st->iova < st->charged && bytes <= st->charged - (iova - st->iova))
 			return 1;
@@ -1032,11 +1038,6 @@ uint64_t linuxu_dart_peak(void)
 	return v;
 }
 
-uint64_t linuxu_dart_budget(void)
-{
-	return dart_budget();
-}
-
 int linuxu_dart_table_count(void)
 {
 	pthread_mutex_lock(&dart_lock);
@@ -1054,8 +1055,8 @@ void linuxu_dart_reset(void)
 		pthread_mutex_unlock(&dart_lock);
 		return;
 	}
-	for (int i = 0; i < DART_STREAM_SLOTS; ++i)
-		if (dart_streams[i].iova || dart_streams[i].releasing) {
+	for (unsigned int i = 0; i < dart_stream_capacity; ++i)
+		if (dart_stream_at(i)->iova || dart_stream_at(i)->releasing) {
 			pthread_mutex_unlock(&dart_lock);
 			return;
 		}

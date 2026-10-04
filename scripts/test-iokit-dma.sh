@@ -27,3 +27,4 @@ clang++ -x objective-c++ -std=c++17 -fno-exceptions -fno-objc-exceptions -g -O1 
 "$test_dir/test_iokit_dma" orphaned-bar0
 "$test_dir/test_iokit_dma" quarantine-release
 "$test_dir/test_iokit_dma" import
+"$test_dir/test_iokit_dma" large

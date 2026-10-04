@@ -73,7 +73,7 @@ extern void *dma_alloc_attrs(struct device *dev, size_t size,
 extern void dma_free_attrs(struct device *dev, size_t size, void *vaddr,
 			   dma_addr_t dma_handle, unsigned long attrs);
 
-/* ---- core map/unmap (host DART layer: real token + 1.5 GB budget,
+/* ---- core map/unmap (host DART layer: real token + mapped-byte accounting,
  * see rt/dart.h + linuxu/src/dart/dart.c) ---- */
 extern dma_addr_t linuxu_dma_map_page(struct device *dev, struct page *page,
 				      unsigned long offset, size_t size,
@@ -205,7 +205,7 @@ int dma_set_mask_and_coherent(struct device *dev, u64 mask);
 bool dma_supported(struct device *dev, u64 mask, int *align);
 u64 dma_get_mask(struct device *dev);
 
-/* ---- page map (host DART: real IOVA token + budget) ---- */
+/* ---- page map (host DART: real IOVA token + accounting) ---- */
 static inline dma_addr_t dma_map_page(struct device *dev, struct page *page,
 				      unsigned long offset, size_t size,
 				      enum dma_data_direction dir)
@@ -219,7 +219,7 @@ static inline void dma_unmap_page(struct device *dev, dma_addr_t dma_handle,
 	linuxu_dma_unmap_page(dev, dma_handle, size, dir);
 }
 
-/* ---- sg map/unmap (host DART: per-entry IOVA + budget) ---- */
+/* ---- sg map/unmap (host DART: per-entry IOVA + accounting) ---- */
 static inline int dma_map_sg(struct device *dev, struct scatterlist *sg,
 			      int nents, enum dma_data_direction dir,
 			      unsigned long attrs)

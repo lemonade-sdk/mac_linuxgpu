@@ -13,6 +13,8 @@
 
 using kern_return_t = int;
 constexpr int kIOReturnSuccess = 0;
+constexpr int kIOReturnNoMemory = (int)0xe00002bd;
+constexpr int kIOReturnNoResources = (int)0xe00002be;
 constexpr int kIOMemoryDirectionOutIn = 0;
 constexpr int kIODMACommandSpecificationNoOptions = 0;
 constexpr int kIODMACommandCreateNoOptions = 0;
@@ -34,6 +36,9 @@ static bool mock_import_misaligned;
  * narrower than mock_dart_refuse_below_bits. */
 static uint64_t mock_dart_iova = 0x100000;
 static uint64_t mock_dart_refuse_below_bits;
+/* The DART's IOVA window: when nonzero, PrepareForDMA refuses a mapping
+ * (kIOReturnNoResources) that would not fit beside those still prepared. */
+static uint64_t mock_dart_window, mock_dart_mapped;
 static uint64_t mock_last_address_bits, mock_dma_commands;
 static std::map<void *, size_t> mock_allocations;
 static std::function<void()> mock_prepare_hook, mock_complete_hook, mock_map_hook, mock_address_hook;
@@ -51,6 +56,10 @@ static void IOFree(void *p, size_t size) {
     assert(it != mock_allocations.end() && it->second == size);
     mock_allocations.erase(it); free(p);
 }
+/* The dext heap (linuxu/src/shims/dext_alloc.c) where a test does not
+ * link it: the host's. */
+extern "C" __attribute__((weak)) void *linuxu_dext_malloc(size_t size) { return malloc(size); }
+extern "C" __attribute__((weak)) void linuxu_dext_free(void *pointer) { free(pointer); }
 #define IOLog(...) ((void)0)
 static void IOSleep(unsigned) {}
 
@@ -192,7 +201,7 @@ public:
 };
 class IODMACommand : public MockObject {
     IOMemoryDescriptor *buffer = nullptr;
-    uint64_t address_bits = 0;
+    uint64_t address_bits = 0, mapped_bytes = 0;
 public:
     ~IODMACommand() override { assert(!buffer); }
     static kern_return_t Create(IOPCIDevice *pci, uint64_t,
@@ -210,7 +219,10 @@ public:
         /* The IIG declaration passes IOAddressSegment segments[32]. */
         assert(!buffer && *count >= 1 && *count <= 32);
         if (address_bits < mock_dart_refuse_below_bits) return -1;
+        if (mock_dart_window && size > mock_dart_window - mock_dart_mapped)
+            return kIOReturnNoResources;
         buffer = b; b->retain(); ++mock_dma_prepared;
+        mapped_bytes = size; mock_dart_mapped += size;
         if (*count == 1) {
             *seg = {mock_dart_iova, mock_short_segment ? size - 1 : size};
         } else {
@@ -232,6 +244,7 @@ public:
         ++mock_complete_calls; assert(buffer);
         mock_hook(mock_complete_hook);
         if (mock_complete_failure) return -1;
+        mock_dart_mapped -= mapped_bytes; mapped_bytes = 0;
         buffer->release(); buffer = nullptr; --mock_dma_prepared; return 0;
     }
 };

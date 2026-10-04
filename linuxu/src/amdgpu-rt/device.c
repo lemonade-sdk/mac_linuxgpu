@@ -409,7 +409,7 @@ void rt_mmio_free(void *cookie)
 #endif
 }
 
-/* ---- DART budget ---- */
+/* ---- DART buffers ---- */
 void *rt_dart_alloc(struct rt_device *dev, size_t size, uint64_t *dma_addr)
 {
 	if (!dev || !dma_addr)
@@ -432,10 +432,9 @@ uint64_t rt_dart_used(struct rt_device *dev)
 	return dev ? linuxu_dart_used() : 0;
 }
 
-uint64_t rt_dart_ceiling(struct rt_device *dev)
+uint64_t rt_dart_peak(struct rt_device *dev)
 {
-	(void)dev;
-	return linuxu_dart_budget();
+	return dev ? linuxu_dart_peak() : 0;
 }
 
 /* ---- IRQ (host list; dext IOInterruptSource hook is a TODO) ---- */

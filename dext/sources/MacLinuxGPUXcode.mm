@@ -91,7 +91,6 @@
 #include <rt/power.h>
 #include <rt/removal.h>
 
-extern "C" uint64_t linuxu_dart_budget(void);
 
 // The ABI headers the compute selectors carry (copied from mac_amdgpu,
 // self-contained).  The AQLDispatch / ComputeDispatch struct layouts.
@@ -810,7 +809,7 @@ static void close_session(MacLinuxGPU *driver)
         MACLINUXGPU_LOG("session close: raw BAR mapping lifetime uncertain; retaining backing");
     }
     if (s_pciOpen && !s_dmaQuarantined && !s_deviceRemoved) {
-        const int held = dext_dma_begin_shutdown(linuxu_dart_budget());
+        const int held = dext_dma_begin_shutdown();
         if (held != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_SHUTDOWN_HOLD, held);
@@ -3335,7 +3334,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
 
         // Upstream probe can free DMA during its own error unwind, before
         // returning here. Keep that backing pinned until success or FLR.
-        const int probeHeld = dext_dma_begin_probe(linuxu_dart_budget());
+        const int probeHeld = dext_dma_begin_probe();
         if (probeHeld != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_PROBE_HOLD, probeHeld);

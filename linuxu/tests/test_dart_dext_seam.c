@@ -10,9 +10,9 @@
  * same contract, verified on hardware by the p3-hw-gate.
  *
  *   1. coherent alloc: non-NULL, 16 KB-aligned, identity IOVA, writable.
- *   2. the 1.5 GB DART budget charged + refunded exactly.
+ *   2. mapped bytes accounted + refunded exactly.
  *   3. 16 KB minimum: a 1-byte request still gets a 16 KB buffer.
- *   4. tear-down: budget back to 0, token table empty (no leaks). */
+ *   4. tear-down: accounting back to 0, token table empty (no leaks). */
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -52,7 +52,7 @@ int main(void)
 		dma_free_coherent(NULL, size, cpu, iova);
 	}
 
-	/* ---- 2. the DART budget charged + refunded exactly ---- */
+	/* ---- 2. mapped bytes accounted + refunded exactly ---- */
 	{
 		size_t size = 256 * 1024; /* 256 KB -> rounds to 256 KB */
 		used_before = linuxu_dart_used();
