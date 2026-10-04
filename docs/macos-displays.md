@@ -404,6 +404,55 @@ DriverKit container substitutes, every allocation failure),
    questions) and SDMA reads over Thunderbolt.
 5. Mode-change sync, measurements, then the async hotplug notification.
 
+## 4. A client's frames on the output, with no copy (LX_SCANOUT)
+
+A process that renders on the GPU (RADV) shows its frames on the monitor
+the output drives without them crossing Thunderbolt: its framebuffers go
+into the output's own commits. The output's worker stays the only
+committer.
+
+- **The primary node, never as DRM master.** A Linux-file client opens
+  `/dev/dri/card0` (`MLG_LX_DEV_PRIMARY`). drm_open makes the first opener
+  master; the display hooks (`rt_display_lx_hooks`) drop that again
+  before the file is installed, under the display lock, so the driver's
+  own modesets (`drm_client_modeset_commit`, which fail while any file is
+  master) keep working. The client gets the KMS queries (resources,
+  connectors, encoders, CRTCs, planes, properties, blobs) and ADDFB2, RMFB
+  and CLOSEFB (`lx_describe.c`); nothing that changes the display.
+- **LX_SCANOUT** (selector 104, `rt/lx_abi.h`): ATTACH to the output (by
+  connector, or whichever it drives; one client at a time, which gets an
+  overlay plane of the CRTC reserved), TEST, PRESENT, DETACH, STATE. A
+  present names a framebuffer of the client's primary file, a layer and a
+  syncobj of that file:
+  - `MLG_LX_LAYER_PRIMARY`: the frame replaces the desktop on the primary
+    plane. Desktop frames that arrive meanwhile wait in the mailbox (the
+    newest only, damage merged; counted as held) and are copied and shown
+    once the client leaves the plane.
+  - `MLG_LX_LAYER_OVERLAY`: the frame is on the overlay plane at a
+    rectangle over the desktop, which keeps flowing on the primary plane.
+- **The worker** builds each commit from the desktop buffer and the
+  client's frame (`output_scene`), with the flip's CRTC fence as before.
+  The client's syncobj gets that fence at the commit, so it signals at the
+  vblank that shows the frame. One client frame waits in the mailbox; a
+  present while one waits is -EBUSY. The rendering is waited for by the
+  commit itself (the framebuffer's implicit fences, which amdgpu_dm's
+  prepare_fb collects), bounded like the copies.
+- **Leaving.** DETACH commits the desktop back on the primary plane and
+  turns the overlay off, and returns after that flip. A client that goes
+  away does the same before its files close (`client_gone`), so upstream's
+  framebuffer cleanup never has to turn a plane off. Turning the output
+  off or relighting it ends the attachment.
+- **libdrm-mlg**: the primary node in the device list, `xf86drmMode.h` for
+  the queries and framebuffers, `drmMlgScanout`, and
+  `drmMlgConnectorDisplay`, which finds the macOS display that stands for
+  a connector's monitor (the vendor, model and serial number the agent
+  gives the virtual display for that EDID).
+- **Tests**: `test-scanout` (a libdrm-mlg client on the fixture output:
+  KMS queries, framebuffers, both layers, held desktop frames, the
+  mailbox, detach, admission, relighting under a client, the client's
+  death), `test-mlg-drm` (the primary node's requests), `test-libdrm-mlg`
+  (the primary node in the device list).
+
 ## 5. Open questions
 
 - Can a DriverKit user client keep a structure-input memory descriptor

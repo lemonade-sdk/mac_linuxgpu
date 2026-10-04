@@ -384,7 +384,8 @@ int drmSetClientCap(int fd, uint64_t capability, uint64_t value)
 	return drmIoctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
 }
 
-/* Render nodes have no authentication (as libdrm sees on a render node). */
+/* No authentication: render nodes need none, and primary-node files here
+ * are never DRM master, so there is no master to authenticate with. */
 int drmGetMagic(int fd, drm_magic_t *magic)
 {
 	(void)fd;
@@ -432,6 +433,24 @@ void drmMsg(const char *format, ...)
 
 /* ---- devices ---- */
 
+static int render_minor_of_path(const char *path);
+
+/* The node a path names: DRM_NODE_RENDER, DRM_NODE_PRIMARY or -1. */
+static int node_of_path(const char *path)
+{
+	static const char card[] = DRM_DIR_NAME "/" DRM_PRIMARY_MINOR_NAME;
+	char *end = NULL;
+	long minor;
+
+	if (path && !strncmp(path, card, sizeof(card) - 1)) {
+		minor = strtol(path + sizeof(card) - 1, &end, 10);
+		if (end != path + sizeof(card) - 1 && !*end && minor == DRM_MLG_PRIMARY_MINOR)
+			return DRM_NODE_PRIMARY;
+		return -1;
+	}
+	return render_minor_of_path(path) < 0 ? -1 : DRM_NODE_RENDER;
+}
+
 static int render_minor_of_path(const char *path)
 {
 	static const char prefix[] = DRM_DIR_NAME "/" DRM_RENDER_MINOR_NAME;
@@ -462,6 +481,7 @@ static int make_device(drmDevicePtr *out)
 		drmPciBusInfo bus;
 		drmPciDeviceInfo info;
 		char render[sizeof(DRM_MLG_RENDER_PATH)];
+		char primary[sizeof(DRM_MLG_PRIMARY_PATH)];
 	} *d;
 
 	if (mlg_pci_identity(&id))
@@ -471,6 +491,8 @@ static int make_device(drmDevicePtr *out)
 		return -ENOMEM;
 	memcpy(d->render, DRM_MLG_RENDER_PATH, sizeof(d->render));
 	d->nodes[DRM_NODE_RENDER] = d->render;
+	memcpy(d->primary, DRM_MLG_PRIMARY_PATH, sizeof(d->primary));
+	d->nodes[DRM_NODE_PRIMARY] = d->primary;
 	d->bus = (drmPciBusInfo){ .domain = id.domain, .bus = id.bus, .dev = id.dev,
 				  .func = id.func };
 	d->info = (drmPciDeviceInfo){ .vendor_id = id.vendor_id, .device_id = id.device_id,
@@ -478,7 +500,7 @@ static int make_device(drmDevicePtr *out)
 				      .subdevice_id = id.subdevice_id,
 				      .revision_id = id.revision_id };
 	d->dev.nodes = d->nodes;
-	d->dev.available_nodes = 1 << DRM_NODE_RENDER;
+	d->dev.available_nodes = 1 << DRM_NODE_RENDER | 1 << DRM_NODE_PRIMARY;
 	d->dev.bustype = DRM_BUS_PCI;
 	d->dev.businfo.pci = &d->bus;
 	d->dev.deviceinfo.pci = &d->info;
@@ -526,7 +548,8 @@ int drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device)
 	(void)flags;
 	if (!device)
 		return -EINVAL;
-	if (major(dev_id) != DRM_MLG_MAJOR || minor(dev_id) != DRM_MLG_RENDER_MINOR)
+	if (major(dev_id) != DRM_MLG_MAJOR || (minor(dev_id) != DRM_MLG_RENDER_MINOR &&
+					       minor(dev_id) != DRM_MLG_PRIMARY_MINOR))
 		return -ENODEV;
 	return make_device(device);
 }
@@ -556,18 +579,24 @@ int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b)
 
 int drmGetNodeTypeFromFd(int fd)
 {
-	if (!drm_file_is_node(fd)) {
+	const int type = drm_file_node_type(fd);
+
+	if (type < 0) {
 		errno = EBADF;
 		return -1;
 	}
-	return DRM_NODE_RENDER;
+	return type;
 }
 
 int drmGetNodeTypeFromDevId(dev_t devid)
 {
-	if (major(devid) != DRM_MLG_MAJOR || minor(devid) != DRM_MLG_RENDER_MINOR)
+	if (major(devid) != DRM_MLG_MAJOR)
 		return -ENODEV;
-	return DRM_NODE_RENDER;
+	if (minor(devid) == DRM_MLG_RENDER_MINOR)
+		return DRM_NODE_RENDER;
+	if (minor(devid) == DRM_MLG_PRIMARY_MINOR)
+		return DRM_NODE_PRIMARY;
+	return -ENODEV;
 }
 
 char *drmGetRenderDeviceNameFromFd(int fd)
@@ -577,19 +606,20 @@ char *drmGetRenderDeviceNameFromFd(int fd)
 
 char *drmGetDeviceNameFromFd2(int fd)
 {
-	return drmGetRenderDeviceNameFromFd(fd);
+	const int type = drm_file_node_type(fd);
+
+	return type == DRM_NODE_PRIMARY ? strdup(DRM_MLG_PRIMARY_PATH) :
+	       type == DRM_NODE_RENDER ? strdup(DRM_MLG_RENDER_PATH) : NULL;
 }
 
 char *drmGetDeviceNameFromFd(int fd)
 {
-	return drmGetRenderDeviceNameFromFd(fd);
+	return drmGetDeviceNameFromFd2(fd);
 }
 
-/* No primary node: the display stack is not built. */
 char *drmGetPrimaryDeviceNameFromFd(int fd)
 {
-	(void)fd;
-	return NULL;
+	return drm_file_is_node(fd) ? strdup(DRM_MLG_PRIMARY_PATH) : NULL;
 }
 
 /* ---- buffers ---- */
@@ -853,7 +883,7 @@ char *drmGetFormatModifierName(uint64_t modifier)
 
 int drmFileOpen(const char *path, int flags, ...)
 {
-	int dfd, fd;
+	int dfd, fd, node;
 
 	if (!is_drm_path(path)) {
 		mode_t mode = 0;
@@ -867,17 +897,19 @@ int drmFileOpen(const char *path, int flags, ...)
 		}
 		return open(path, flags, mode);
 	}
-	if (render_minor_of_path(path) < 0) {
-		/* Only the render node exists. */
+	node = node_of_path(path);
+	if (node < 0) {
+		/* Only the render node and the primary node exist. */
 		errno = ENOENT;
 		return -1;
 	}
-	dfd = mlg_open(DRM_MLG_RENDER_PATH, flags & (O_ACCMODE | O_CLOEXEC | O_NONBLOCK));
+	dfd = mlg_open(node == DRM_NODE_PRIMARY ? DRM_MLG_PRIMARY_PATH : DRM_MLG_RENDER_PATH,
+		       flags & (O_ACCMODE | O_CLOEXEC | O_NONBLOCK));
 	if (dfd < 0)
 		return -1;
 	fd = drm_file_wrap(dfd, !!(flags & O_CLOEXEC));
 	if (fd >= 0)
-		drm_file_set_node(fd);
+		drm_file_set_node(fd, node);
 	return fd;
 }
 
@@ -885,13 +917,16 @@ int drmFileStat(const char *path, struct stat *st)
 {
 	if (!is_drm_path(path))
 		return stat(path, st);
-	if (render_minor_of_path(path) < 0 || !drmAvailable()) {
+	const int node = node_of_path(path);
+
+	if (node < 0 || !drmAvailable()) {
 		errno = ENOENT;
 		return -1;
 	}
 	memset(st, 0, sizeof(*st));
 	st->st_mode = S_IFCHR | 0666;
-	st->st_rdev = makedev(DRM_MLG_MAJOR, DRM_MLG_RENDER_MINOR);
+	st->st_rdev = makedev(DRM_MLG_MAJOR, node == DRM_NODE_PRIMARY ? DRM_MLG_PRIMARY_MINOR :
+			      DRM_MLG_RENDER_MINOR);
 	st->st_nlink = 1;
 	return 0;
 }

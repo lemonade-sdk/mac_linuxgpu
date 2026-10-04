@@ -24,17 +24,24 @@ int drm_file_driver_fd(int fd);
 /* Whether @fd is a proxy for an opened device node (not a syncobj,
  * sync_file or dma-buf descriptor). */
 bool drm_file_is_node(int fd);
-/* Mark proxy @fd as an opened device node. */
-void drm_file_set_node(int fd);
-/* The driver file of some opened device node, or -1 when none is open. It
- * may be released at any time by a concurrent close; requests on it then
- * fail with EBADF. */
+/* The node type of proxy @fd (DRM_NODE_PRIMARY or DRM_NODE_RENDER), or -1
+ * when it is not an opened device node. */
+int drm_file_node_type(int fd);
+/* Mark proxy @fd as an opened device node of @type (DRM_NODE_*). */
+void drm_file_set_node(int fd, int type);
+/* The driver file of some opened device node, a render node first, or -1
+ * when none is open. It may be released at any time by a concurrent close;
+ * requests on it then fail with EBADF. */
 int drm_file_any_node(void);
 
-/* The render node every descriptor of this library belongs to: one GPU per
- * driver. */
+/* The nodes every descriptor of this library belongs to: one GPU per
+ * driver. The primary node is never DRM master (the driver's display
+ * output does the modesetting); it carries the KMS queries and the
+ * framebuffers a client shows with drmMlgScanout. */
 #define DRM_MLG_RENDER_MINOR	128
 #define DRM_MLG_RENDER_PATH	"/dev/dri/renderD128"
+#define DRM_MLG_PRIMARY_MINOR	0
+#define DRM_MLG_PRIMARY_PATH	"/dev/dri/card0"
 #define DRM_MLG_MAJOR		226
 
 /* Linux open(2) flag values the driver decodes (DRM_CLOEXEC, DRM_RDWR). */

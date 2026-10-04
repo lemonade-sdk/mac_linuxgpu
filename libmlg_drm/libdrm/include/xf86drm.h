@@ -214,6 +214,37 @@ extern void *drmFileMmap(void *addr, size_t length, int prot, int flags, int fd,
 			 off_t offset);
 extern int drmFileMunmap(void *addr, size_t length);
 
+/* ---- the driver's display output (mac_linuxgpu) ----
+ *
+ * The driver mirrors the macOS desktop to a monitor on the GPU (its
+ * display output) and is the only one that commits to it. A client shows
+ * its own framebuffers there instead of the desktop, or over it, with no
+ * copy: framebuffers of a primary-node descriptor (drmModeAddFB2 on
+ * "/dev/dri/card0", xf86drmMode.h) handed to the output's next commit. See
+ * rt/lx_abi.h (LX_SCANOUT) for the operations and layers. */
+#define LIBDRM_MLG_SCANOUT 1
+
+#include <rt/lx_abi.h>
+
+/* One LX_SCANOUT operation. @req->fd is a primary-node descriptor of this
+ * library (its proxy; translated here). Returns 0 or -errno, and fills
+ * *@state either way. */
+extern int drmMlgScanout(const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state);
+
+/* The macOS display (CGDirectDisplayID) that stands for the monitor on
+ * connector @connector_id: the one whose vendor, model and serial number
+ * are the ones the display agent gives a virtual display for that monitor's
+ * EDID (host/DisplayAgent.swift). 0 with *@display_id, -ENOENT when no
+ * online display matches, -EEXIST when more than one does, or -errno from
+ * reading the EDID through @fd. */
+extern int drmMlgConnectorDisplay(int fd, uint32_t connector_id, uint32_t *display_id);
+/* The identity a display agent gives the monitor with this EDID base
+ * block: the PNP vendor word, the product code and the serial number (the
+ * numeric one, else an FNV-1a hash of the serial string descriptor, else
+ * 0). -EINVAL for a block that is not an EDID. */
+extern int drmMlgEdidIdentity(const void *edid, size_t length, uint32_t *vendor,
+			      uint32_t *product, uint32_t *serial);
+
 #if defined(__cplusplus)
 }
 #endif

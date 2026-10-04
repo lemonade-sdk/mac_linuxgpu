@@ -1101,10 +1101,10 @@ LIBDRM_MLG_OBJS := $(addprefix $(LIBDRM_MLG)/obj/,$(notdir $(LIBDRM_MLG_SRCS:.c=
 LIBDRM_MLG_UAPI := drm.h drm_mode.h drm_fourcc.h amdgpu_drm.h
 LIBDRM_MLG_VERSION := 2.4.133
 LIBDRM_MLG_HEADERS := $(addprefix $(LIBDRM_MLG)/include/libdrm/,$(LIBDRM_MLG_UAPI) \
-	linux/bits.h linux/const.h)
+	linux/bits.h linux/const.h) $(LIBDRM_MLG)/include/rt/lx_abi.h
 LIBDRM_MLG_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -g -fPIC -MMD -MP \
 	-Ilibmlg_drm/libdrm/include -Ilibmlg_drm/libdrm/src -Ilibmlg_drm/include \
-	-I$(LIBDRM_MLG)/include/libdrm
+	-I$(LIBDRM_MLG)/include/libdrm -I$(LIBDRM_MLG)/include
 
 # The uapi headers as the kernel installs them (scripts/headers_install.sh
 # strips the sparse annotations).
@@ -1118,6 +1118,11 @@ $(LIBDRM_MLG)/include/libdrm/linux/%.h: $(LINUX)/include/uapi/linux/%.h
 	@mkdir -p $(dir $@)
 	cp $< $@
 
+# The Linux-file ABI (LX_SCANOUT's structures), for mlg_drm.h and xf86drm.h.
+$(LIBDRM_MLG)/include/rt/lx_abi.h: linuxu/headers/rt/lx_abi.h
+	@mkdir -p $(dir $@)
+	cp $< $@
+
 $(LIBDRM_MLG)/obj/%.o: libmlg_drm/libdrm/src/%.c $(LIBDRM_MLG_HEADERS)
 	@mkdir -p $(dir $@)
 	clang $(LIBDRM_MLG_CFLAGS) -c $< -o $@
@@ -1128,9 +1133,10 @@ libdrm-mlg: libmlg_drm $(LIBDRM_MLG_HEADERS) $(LIBDRM_MLG_OBJS)
 	@mkdir -p $(LIBDRM_MLG)/lib/pkgconfig $(LIBDRM_MLG)/include/libdrm
 	cp $(MLG_DRM_BUILD)/libmlg_drm.dylib $(LIBDRM_MLG)/lib/
 	clang -dynamiclib -install_name @rpath/libdrm_mlg.dylib $(LIBDRM_MLG_OBJS) \
-		-L$(LIBDRM_MLG)/lib -lmlg_drm -Wl,-rpath,@loader_path \
+		-L$(LIBDRM_MLG)/lib -lmlg_drm -Wl,-rpath,@loader_path -framework CoreGraphics \
 		-o $(LIBDRM_MLG)/lib/libdrm_mlg.dylib
 	cp libmlg_drm/libdrm/include/xf86drm.h $(LIBDRM_MLG)/include/
+	cp libmlg_drm/libdrm/include/xf86drmMode.h $(LIBDRM_MLG)/include/
 	cp libmlg_drm/libdrm/include/libsync.h $(LIBDRM_MLG)/include/libdrm/
 	cp libmlg_drm/libdrm/include/amdgpu.h $(LIBDRM_MLG)/include/libdrm/
 	cp libmlg_drm/include/mlg_drm.h $(LIBDRM_MLG)/include/
@@ -1148,6 +1154,15 @@ test-libdrm-mlg: lib
 
 test: test-libdrm-mlg
 CRASH_PATH_TESTS += test-libdrm-mlg
+
+# Client framebuffers on the display output (LX_SCANOUT): a libdrm-mlg
+# client on the primary node of the CS fixture with its DCN 4.0.1 display.
+test-scanout: lib
+	bash scripts/test-scanout.sh
+
+test: test-scanout
+CRASH_PATH_TESTS += test-scanout
+.PHONY: test-scanout
 
 # The Vulkan path: Mesa's RADV for macOS on libdrm-mlg (pinned Mesa in
 # third_party/mesa, fetched on demand), and llama.cpp's Vulkan backend on it.

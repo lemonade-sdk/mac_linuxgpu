@@ -12,13 +12,14 @@
 #include <unistd.h>
 
 #include "mlg_drm.h"
+#include "xf86drm.h"
 #include "drm_internal.h"
 
 struct drm_file {
 	ino_t ino;		/* the proxy socket's inode */
 	int kept;		/* this library's end */
 	int driver_fd;
-	bool node;
+	int node;	/* DRM_NODE_* + 1 for an opened device node, else 0 */
 };
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -186,27 +187,32 @@ int drm_file_driver_fd(int fd)
 	return driver_fd;
 }
 
-bool drm_file_is_node(int fd)
+int drm_file_node_type(int fd)
 {
 	struct drm_file *f;
-	bool node = false;
+	int type = -1;
 
 	pthread_mutex_lock(&lock);
 	f = lookup_locked(fd);
-	if (f)
-		node = f->node;
+	if (f && f->node)
+		type = f->node - 1;
 	pthread_mutex_unlock(&lock);
-	return node;
+	return type;
 }
 
-void drm_file_set_node(int fd)
+bool drm_file_is_node(int fd)
+{
+	return drm_file_node_type(fd) >= 0;
+}
+
+void drm_file_set_node(int fd, int type)
 {
 	struct drm_file *f;
 
 	pthread_mutex_lock(&lock);
 	f = lookup_locked(fd);
 	if (f)
-		f->node = true;
+		f->node = type + 1;
 	pthread_mutex_unlock(&lock);
 }
 
@@ -215,6 +221,9 @@ int drm_file_any_node(void)
 	int driver_fd = -1;
 
 	pthread_mutex_lock(&lock);
+	for (size_t i = 0; i < nfiles && driver_fd < 0; ++i)
+		if (files[i].node == DRM_NODE_RENDER + 1)
+			driver_fd = files[i].driver_fd;
 	for (size_t i = 0; i < nfiles && driver_fd < 0; ++i)
 		if (files[i].node)
 			driver_fd = files[i].driver_fd;

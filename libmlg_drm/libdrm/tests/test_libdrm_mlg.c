@@ -54,13 +54,16 @@ int test_libdrm_mlg(void)
 {
 	const unsigned int base = lx_loopback_open_files();
 
-	/* The device list: one PCI device with a render node. */
+	/* The device list: one PCI device with a render node and a primary
+	 * node. */
 	drmDevicePtr devices[4];
 	CHECK(drmGetDevices2(0, NULL, 0) == 1);
 	CHECK(drmGetDevices2(0, devices, 4) == 1);
 	drmDevicePtr dev = devices[0];
-	CHECK(dev->bustype == DRM_BUS_PCI && dev->available_nodes == 1 << DRM_NODE_RENDER);
+	CHECK(dev->bustype == DRM_BUS_PCI &&
+	      dev->available_nodes == (1 << DRM_NODE_RENDER | 1 << DRM_NODE_PRIMARY));
 	CHECK(!strcmp(dev->nodes[DRM_NODE_RENDER], "/dev/dri/renderD128"));
+	CHECK(!strcmp(dev->nodes[DRM_NODE_PRIMARY], "/dev/dri/card0"));
 	CHECK(dev->deviceinfo.pci->vendor_id == 0x1002 && dev->deviceinfo.pci->device_id == 0x7551);
 	CHECK(dev->businfo.pci->bus == 0xc3 && dev->deviceinfo.pci->revision_id == 0xc0);
 
@@ -71,8 +74,24 @@ int test_libdrm_mlg(void)
 	drmDevicePtr by_id;
 	CHECK(drmGetDeviceFromDevId(st.st_rdev, 0, &by_id) == 0 && drmDevicesEqual(by_id, dev));
 	drmFreeDevice(&by_id);
-	CHECK(drmFileStat("/dev/dri/card0", &st) == -1 && errno == ENOENT);
-	CHECK(drmFileOpen("/dev/dri/card0", O_RDWR) == -1 && errno == ENOENT);
+	/* The primary node: never DRM master, so nothing to authenticate. */
+	CHECK(drmFileStat("/dev/dri/card0", &st) == 0 && S_ISCHR(st.st_mode));
+	CHECK(major(st.st_rdev) == 226 && minor(st.st_rdev) == 0);
+	CHECK(drmGetNodeTypeFromDevId(st.st_rdev) == DRM_NODE_PRIMARY);
+	CHECK(drmFileStat("/dev/dri/card1", &st) == -1 && errno == ENOENT);
+	CHECK(drmFileOpen("/dev/dri/card1", O_RDWR) == -1 && errno == ENOENT);
+	{
+		int card = drmFileOpen("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+		char *name;
+
+		CHECK(card >= 0 && drmGetNodeTypeFromFd(card) == DRM_NODE_PRIMARY);
+		CHECK(!drmIsMaster(card));
+		name = drmGetDeviceNameFromFd2(card);
+		CHECK(name && !strcmp(name, "/dev/dri/card0"));
+		free(name);
+		close(card);
+		CHECK(files_reach(base));
+	}
 	CHECK(drmFileStat("/", &st) == 0 && S_ISDIR(st.st_mode));
 	int null_fd = drmFileOpen("/dev/null", O_RDONLY | O_CLOEXEC);
 	CHECK(null_fd >= 0 && drmIoctl(null_fd, DRM_IOCTL_VERSION, NULL) == -1 && errno == EBADF);
@@ -85,7 +104,9 @@ int test_libdrm_mlg(void)
 	char *name = drmGetRenderDeviceNameFromFd(fd);
 	CHECK(name && !strcmp(name, "/dev/dri/renderD128"));
 	free(name);
-	CHECK(drmGetPrimaryDeviceNameFromFd(fd) == NULL);
+	name = drmGetPrimaryDeviceNameFromFd(fd);
+	CHECK(name && !strcmp(name, "/dev/dri/card0"));
+	free(name);
 	drmDevicePtr of_fd;
 	CHECK(drmGetDevice2(fd, 0, &of_fd) == 0 && drmDevicesEqual(of_fd, dev));
 	drmFreeDevice(&of_fd);
