@@ -269,6 +269,8 @@ struct copy_batch {
 	uint32_t packets;
 	struct dma_fence *last;
 	struct rt_surface_copy_stats *stats;
+	/* What every job of the batch waits for (not referenced here). */
+	struct dma_fence *deps[RT_SURFACE_ENGINES_MAX];
 };
 
 static int batch_submit(struct copy_batch *b)
@@ -306,6 +308,17 @@ static int batch_copy(struct copy_batch *b, uint64_t src, uint64_t dst, uint64_t
 			if (r) {
 				b->job = NULL;
 				return r;
+			}
+			for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+				if (!b->deps[i])
+					continue;
+				/* The reference is the job's, even on failure. */
+				r = drm_sched_job_add_dependency(&b->job->base, dma_fence_get(b->deps[i]));
+				if (r) {
+					amdgpu_job_free(b->job);
+					b->job = NULL;
+					return r;
+				}
 			}
 		}
 		amdgpu_emit_copy_buffer(b->adev, &b->job->ibs[0], src, dst, chunk, 0);
@@ -700,16 +713,27 @@ static uint64_t rect_bytes(const struct rt_surface *src, uint32_t dst_pitch,
 	return (uint64_t)*w * 4 * *h;
 }
 
-int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
-			   uint32_t dst_pitch, const struct rt_surface_rect *rects, uint32_t count,
-			   struct rt_surface_engines *engines,
-			   struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
-			   struct rt_surface_copy_stats *stats)
+/* @r inside a frame of @width x @height, and its source rows too. */
+static bool vram_copy_valid(const struct rt_surface_vram_copy *c, uint32_t width, uint32_t height)
+{
+	const struct rt_surface_rect *r = &c->dst;
+
+	return r->width && r->height && r->x < width && r->width <= width - r->x &&
+	       r->y < height && r->height <= height - r->y && c->src_y < height &&
+	       r->height <= height - c->src_y;
+}
+
+int rt_surface_frame_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
+			    uint32_t dst_pitch, const struct rt_surface_frame_plan *plan,
+			    struct rt_surface_engines *engines,
+			    struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
+			    struct rt_surface_copy_stats *stats)
 {
 	struct copy_batch batch[RT_SURFACE_ENGINES_MAX] = { 0 };
 	struct rt_surface_copy_stats local[RT_SURFACE_ENGINES_MAX] = { 0 };
 	struct amdgpu_device *adev;
-	struct amdgpu_bo *dst_bo, *src_bo;
+	struct amdgpu_bo *dst_bo, *src_bo, *prev_bo = NULL;
+	struct dma_fence *vram_done = NULL;
 	uint64_t total = 0, half;
 	unsigned int use, e = 0;
 	u64 start = ktime_get_ns();
@@ -719,20 +743,29 @@ int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, u
 		fences[i] = NULL;
 	if (stats)
 		memset(stats, 0, sizeof(*stats));
-	if (!src || !dst || !rects || !count || !engines || !engines->count ||
+	if (!src || !dst || !plan || (plan->count && !plan->rects) || !engines || !engines->count ||
 	    dst_pitch < (uint64_t)src->width * 4 || dst->size < (uint64_t)dst_pitch * src->height)
 		return -EINVAL;
+	if (plan->vram_count) {
+		if (!plan->vram || !plan->prev || plan->prev == dst || !plan->prev_address ||
+		    plan->prev->size < (uint64_t)dst_pitch * src->height)
+			return -EINVAL;
+		for (uint32_t i = 0; i < plan->vram_count; i++)
+			if (!vram_copy_valid(&plan->vram[i], src->width, src->height))
+				return -EINVAL;
+		prev_bo = gem_to_amdgpu_bo(plan->prev);
+	}
 	dst_bo = gem_to_amdgpu_bo(dst);
 	src_bo = gem_to_amdgpu_bo(src->obj);
 	adev = amdgpu_ttm_adev(dst_bo->tbo.bdev);
 	if (rt_removal_active(adev))
 		return -ENODEV;
-	for (uint32_t i = 0; i < count; i++) {
+	for (uint32_t i = 0; i < plan->count; i++) {
 		uint32_t x, y, w, h;
 
-		total += rect_bytes(src, dst_pitch, &rects[i], &x, &y, &w, &h);
+		total += rect_bytes(src, dst_pitch, &plan->rects[i], &x, &y, &w, &h);
 	}
-	if (!total)
+	if (!total && !plan->vram_count)
 		return 0;
 	/* Large damage goes to both engines, about half each. */
 	use = total >= (1u << 20) ? engines->count : 1;
@@ -743,10 +776,45 @@ int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, u
 		batch[i].ring = engines->ring[i];
 		batch[i].stats = &local[i];
 	}
-	for (uint32_t i = 0; !r && i < count; i++) {
+	/* From the previous framebuffer, on the first engine, once the
+	 * copies that drew it are done. Full-width rows are one range. */
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+		batch[0].deps[i] = plan->vram_count ? plan->prev_fences[i] : NULL;
+	for (uint32_t i = 0; !r && i < plan->vram_count; i++) {
+		const struct rt_surface_rect *d = &plan->vram[i].dst;
+		const uint64_t before = local[0].bytes;
+
+		if (stats)
+			stats->rows += d->height;
+		if (!d->x && d->width == src->width) {
+			r = batch_copy(&batch[0], plan->prev_address + (u64)plan->vram[i].src_y * dst_pitch,
+				       dst_address + (u64)d->y * dst_pitch,
+				       (u64)(d->height - 1) * dst_pitch + (u64)d->width * 4);
+		} else {
+			for (uint32_t row = 0; !r && row < d->height; row++)
+				r = batch_copy(&batch[0],
+					       plan->prev_address + (u64)(plan->vram[i].src_y + row) * dst_pitch +
+					       (u64)d->x * 4,
+					       dst_address + (u64)(d->y + row) * dst_pitch + (u64)d->x * 4,
+					       (u64)d->width * 4);
+		}
+		local[0].vram_bytes += local[0].bytes - before;
+		local[0].bytes = before;
+	}
+	if (!r && plan->vram_count) {
+		/* Its own job: the surface's copies on another engine wait for
+		 * it, as they may write over what it wrote. */
+		batch_submit(&batch[0]);
+		vram_done = batch[0].last ? dma_fence_get(batch[0].last) : NULL;
+		for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+			batch[0].deps[i] = NULL;
+		for (unsigned int i = 1; i < use; i++)
+			batch[i].deps[0] = vram_done;
+	}
+	for (uint32_t i = 0; !r && i < plan->count; i++) {
 		uint32_t x, y, w, h;
 
-		if (!rect_bytes(src, dst_pitch, &rects[i], &x, &y, &w, &h))
+		if (!rect_bytes(src, dst_pitch, &plan->rects[i], &x, &y, &w, &h))
 			continue;
 		if (stats)
 			stats->rows += h;
@@ -792,9 +860,35 @@ int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, u
 		if (stats) {
 			stats->jobs += local[i].jobs;
 			stats->bytes += local[i].bytes;
+			stats->vram_bytes += local[i].vram_bytes;
 		}
+	}
+	if (vram_done) {
+		if (prev_bo && !amdgpu_bo_reserve(prev_bo, true)) {
+			amdgpu_bo_fence(prev_bo, vram_done, true);
+			amdgpu_bo_unreserve(prev_bo);
+		} else {
+			dma_fence_wait(vram_done, false);
+		}
+		dma_fence_put(vram_done);
 	}
 	if (stats)
 		stats->ns = ktime_get_ns() - start;
 	return r;
+}
+
+int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
+			   uint32_t dst_pitch, const struct rt_surface_rect *rects, uint32_t count,
+			   struct rt_surface_engines *engines,
+			   struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
+			   struct rt_surface_copy_stats *stats)
+{
+	const struct rt_surface_frame_plan plan = { .rects = rects, .count = count };
+
+	if (!rects || !count) {
+		for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+			fences[i] = NULL;
+		return -EINVAL;
+	}
+	return rt_surface_frame_submit(src, dst, dst_address, dst_pitch, &plan, engines, fences, stats);
 }

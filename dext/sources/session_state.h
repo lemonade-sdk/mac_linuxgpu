@@ -296,10 +296,11 @@ static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_c
  *           that copies and flips (rt_display_output)
  *           struct out: struct rt_display_report
  *   PRESENT [1] handle; struct in: struct mlg_display_present; queues the
- *           frame (its dirty rectangles and capture time) for the worker
+ *           frame (its dirty rectangles, rows that scrolled and capture
+ *           time) for the worker
  *           and returns without waiting for the copy or the flip
  *           (rt_display_present); no rectangle only reads the statistics
- *           struct out: struct rt_display_present_stats (version 2) */
+ *           struct out: struct rt_display_present_stats (version 3) */
 #define MLG_DISPLAY_OP_IMPORT   5u
 #define MLG_DISPLAY_OP_VERIFY   6u
 #define MLG_DISPLAY_OP_RELEASE  7u
@@ -316,12 +317,23 @@ struct mlg_display_rect {
 	uint32_t x, y, width, height;
 };
 
+/* Rows that scrolled (rt_display_move): width x height at (x, y) are the
+ * previous frame's pixels at (x, src_y). */
+struct mlg_display_move {
+	uint32_t x, y, width, height;
+	uint32_t src_y;
+	uint32_t reserved; /* 0 */
+};
+#define MLG_DISPLAY_PRESENT_MOVES_MAX 32u
+
 struct mlg_display_present {
 	uint32_t count;
-	uint32_t reserved;
+	uint32_t moves; /* struct mlg_display_move after the rectangles; 0 before build 240 */
 	uint64_t capture_ns; /* when the frame was captured, mach_absolute_time in ns */
-	struct mlg_display_rect rect[]; /* count, at most MLG_DISPLAY_PRESENT_RECTS_MAX */
+	struct mlg_display_rect rect[]; /* count, at most MLG_DISPLAY_PRESENT_RECTS_MAX, then the
+					 * moves; the request at most MLG_DISPLAY_PRESENT_BYTES_MAX */
 };
+#define MLG_DISPLAY_PRESENT_BYTES_MAX 4096u /* an inline structure input */
 #define MLG_DISPLAY_PATTERN_BARS     0u
 #define MLG_DISPLAY_PATTERN_WHITE    1u
 #define MLG_DISPLAY_PATTERN_GRADIENT 2u

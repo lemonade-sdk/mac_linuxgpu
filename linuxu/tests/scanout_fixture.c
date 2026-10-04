@@ -260,7 +260,7 @@ int scanout_fx_desktop_present(uint32_t value)
 
 	for (uint64_t i = 0; i < (uint64_t)PITCH * H / 4; i++)
 		((uint32_t *)desk_mem)[i] = value;
-	return rt_display_present(pdev, rt_surface_get_hold(1, desk_handle), &all, 1, ktime_get_ns(),
+	return rt_display_present(pdev, rt_surface_get_hold(1, desk_handle), &all, 1, NULL, 0, ktime_get_ns(),
 				  &st);
 }
 

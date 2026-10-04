@@ -81,8 +81,9 @@ struct rt_surface_rect {
 struct rt_surface_copy_stats {
 	uint32_t jobs;		/* SDMA jobs submitted (up to 1024 copy packets each) */
 	uint32_t rows;		/* rows covered */
-	uint64_t bytes;
+	uint64_t bytes;		/* from the surface (over PCIe) */
 	uint64_t ns;		/* submit to fence signalled */
+	uint64_t vram_bytes;	/* from the previous framebuffer (rt_surface_frame_submit) */
 };
 
 /* ---- pinning check: does the GPU see what the client writes? ----
@@ -170,6 +171,35 @@ int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, u
 			   struct rt_surface_engines *engines,
 			   struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
 			   struct rt_surface_copy_stats *stats);
+
+/* One frame into a framebuffer, in order: rectangles of the previous
+ * framebuffer @prev (same size and pitch, pinned in VRAM at @prev_address,
+ * drawn by the copies @prev_fences, which the first job waits for) at the
+ * same columns, from row @src_y to row dst.y (the same rows, or rows that
+ * scrolled), then the surface's rectangles. VRAM to VRAM never crosses
+ * PCIe; @dst is never @prev, so a vertical move cannot overlap itself. */
+struct rt_surface_vram_copy {
+	struct rt_surface_rect dst;
+	uint32_t src_y;
+};
+struct rt_surface_frame_plan {
+	struct drm_gem_object *prev;	/* NULL: no VRAM copies */
+	uint64_t prev_address;
+	struct dma_fence *prev_fences[RT_SURFACE_ENGINES_MAX];
+	const struct rt_surface_vram_copy *vram;
+	uint32_t vram_count;
+	const struct rt_surface_rect *rects;	/* from the surface, clipped to it */
+	uint32_t count;
+};
+
+/* rt_surface_copy_submit() with a plan: the VRAM copies on the first engine
+ * (the surface's copies on another engine wait for them), every rectangle
+ * of the plan inside the frame (-EINVAL otherwise, nothing submitted). */
+int rt_surface_frame_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
+			    uint32_t dst_pitch, const struct rt_surface_frame_plan *plan,
+			    struct rt_surface_engines *engines,
+			    struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
+			    struct rt_surface_copy_stats *stats);
 
 /* Copy @count rectangles of @src into @dst (an amdgpu BO, linear, @dst_pitch
  * bytes per row, at least the surface's size) at the same coordinates, on

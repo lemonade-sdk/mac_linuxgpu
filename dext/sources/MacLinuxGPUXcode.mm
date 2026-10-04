@@ -190,10 +190,13 @@ static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               sizeof(struct rt_surface_verify_result) <= MLG_DISPLAY_REPORT_MAX &&
               sizeof(struct rt_display_present_stats) <= MLG_DISPLAY_REPORT_MAX &&
               sizeof(struct mlg_display_rect) == sizeof(struct rt_surface_rect) &&
-              sizeof(struct rt_display_present_stats) == 120 &&
+              sizeof(struct rt_display_present_stats) == 144 &&
               offsetof(struct mlg_display_present, rect) == 16 &&
               sizeof(struct mlg_display_present) + MLG_DISPLAY_PRESENT_RECTS_MAX *
-                  sizeof(struct mlg_display_rect) <= 4096, "display ABI");
+                  sizeof(struct mlg_display_rect) <= MLG_DISPLAY_PRESENT_BYTES_MAX &&
+              sizeof(struct mlg_display_move) == sizeof(struct rt_display_move) &&
+              offsetof(struct mlg_display_move, src_y) == offsetof(struct rt_display_move, src_y) &&
+              MLG_DISPLAY_PRESENT_MOVES_MAX == RT_DISPLAY_MOVES_MAX, "display ABI");
 static_assert(DEXT_COMPUTE_QUERY_SESSION_STATE == MLG_QUERY_SESSION_STATE &&
               DEXT_COMPUTE_QUERY_PROBE_STATUS == MLG_QUERY_PROBE_STATUS &&
               DEXT_COMPUTE_QUERY_KERNEL_LOG == MLG_QUERY_KERNEL_LOG, "observer query tags");
@@ -2964,14 +2967,17 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
             a->structureOutputMaximumSize < sizeof(struct rt_display_present_stats))
             return kIOReturnBadArgument;
         const auto *request = static_cast<const struct mlg_display_present *>(data->getBytesNoCopy());
-        if (request->count > MLG_DISPLAY_PRESENT_RECTS_MAX ||
-            data->getLength() != sizeof(*request) + request->count * sizeof(struct mlg_display_rect))
+        if (request->count > MLG_DISPLAY_PRESENT_RECTS_MAX || request->moves > MLG_DISPLAY_PRESENT_MOVES_MAX ||
+            data->getLength() > MLG_DISPLAY_PRESENT_BYTES_MAX ||
+            data->getLength() != sizeof(*request) + request->count * sizeof(struct mlg_display_rect) +
+                                     request->moves * sizeof(struct mlg_display_move))
             return kIOReturnBadArgument;
+        const auto *moves = reinterpret_cast<const struct rt_display_move *>(request->rect + request->count);
         struct rt_display_present_stats stats{};
         int r = -kLinuxENOENT;
         if (__atomic_load_n(&s_displayOwner, __ATOMIC_ACQUIRE) != clientID) {
             /* Only the client that lit the output presents or reads it. */
-        } else if (!request->count) {
+        } else if (!request->count && !request->moves) {
             r = rt_display_stats(pdev, &stats);
         } else {
             /* The hold goes to the output's worker, which releases it once
@@ -2980,7 +2986,8 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
             if (surface)
                 r = rt_display_present(pdev, surface,
                                        reinterpret_cast<const struct rt_surface_rect *>(request->rect),
-                                       request->count, request->capture_ns, &stats);
+                                       request->count, request->moves ? moves : nullptr, request->moves,
+                                       request->capture_ns, &stats);
         }
         if (r && r != -kLinuxENOENT)
             MACLINUXGPU_LOG("display: PRESENT failed %d (worker error %d)", r, stats.error);

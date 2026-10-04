@@ -176,14 +176,31 @@ int rt_display_monitor(struct pci_dev *pdev, const char *connector,
  * The worker copies into one of three framebuffers with SDMA and flips to
  * it with a nonblocking commit (display.c describes the pipeline). No
  * rectangle means nothing changed: only the statistics come back. A
- * worker error is returned by every later call. */
+ * worker error is returned by every later call.
+ *
+ * @moves are rows that scrolled: each says that @width x @height pixels at
+ * (@x, @y) of this frame are the pixels at (@x, @src_y) of the frame
+ * presented before it, so the worker copies them from the framebuffer it
+ * drew last (VRAM to VRAM) instead of from the surface over PCIe. Their
+ * destinations are not in @rects. A frame that replaces one the worker
+ * has not taken, or that comes before any frame was drawn, has its moves
+ * (and those of the frame it replaces) copied from the surface instead:
+ * the rows they come from were never drawn (counted in moves_dropped).
+ * Each move must lie inside the frame (-EINVAL). */
+#define RT_DISPLAY_MOVES_MAX	32u
+
+struct rt_display_move {
+	uint32_t x, y, width, height;
+	uint32_t src_y;
+	uint32_t reserved;		/* 0 */
+};
 #define RT_DISPLAY_PATTERN_OUTPUT	0xffu
 
 struct rt_surface;
 struct rt_surface_rect;
 
 struct rt_display_present_stats {
-	uint32_t version;		/* 2 */
+	uint32_t version;		/* 3 */
 	uint32_t engines;		/* SDMA engines the output copies with */
 	uint64_t frames_received;	/* presents with damage */
 	uint64_t frames_flipped;	/* frames that reached the screen */
@@ -199,12 +216,19 @@ struct rt_display_present_stats {
 	uint32_t full_frames;		/* frames copied whole */
 	uint64_t aperture_ops;		/* CPU string operations on the VRAM aperture
 					 * (rt/device_string.h), all users, since boot */
+	/* Version 3. */
+	uint64_t vram_bytes;		/* copied from the framebuffer drawn before
+					 * (what a buffer missed, moves); bytes is
+					 * what came from the surface over PCIe */
+	uint64_t moved_rows;		/* rows of moves copied in VRAM */
+	uint64_t moves_dropped;		/* moves copied from the surface instead */
 };
 
 int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t width,
 		      uint32_t height, uint32_t refresh_mhz, struct rt_display_report *report);
 int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
-		       const struct rt_surface_rect *rects, uint32_t count, uint64_t capture_ns,
+		       const struct rt_surface_rect *rects, uint32_t count,
+		       const struct rt_display_move *moves, uint32_t move_count, uint64_t capture_ns,
 		       struct rt_display_present_stats *stats);
 
 /* The output's statistics; -ENOENT without an output. */

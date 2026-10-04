@@ -230,12 +230,12 @@ int main(void)
 		u64 t0 = ktime_get_ns(), dt;
 
 		cs_fixture_stats(&before);
-		r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1, ktime_get_ns(), &st);
+		r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1, NULL, 0, ktime_get_ns(), &st);
 		dt = ktime_get_ns() - t0;
 		printf("pipeline: present 1 -> %d in %llu us (queued: received %llu, flipped %llu)\n", r,
 		       (unsigned long long)dt / 1000, (unsigned long long)st.frames_received,
 		       (unsigned long long)st.frames_flipped);
-		CHECK(r == 0 && st.version == 2 && st.engines == 2 && st.frames_received == 1);
+		CHECK(r == 0 && st.version == 3 && st.engines == 2 && st.frames_received == 1);
 		st = wait_flipped(pdev, 1);
 		cs_fixture_stats(&after);
 		printf("pipeline: frame 1 flipped: %llu bytes in %llu job(s), copy %llu us, latency %llu us, "
@@ -250,27 +250,32 @@ int main(void)
 	}
 
 	/* Frames 2-4, one at a time (each flips before the next): the worker
-	 * alternates between the two buffers not on screen. Frame 2 lands in
-	 * the buffer the output started on, stale, so it is copied whole;
-	 * frame 3 in frame 1's buffer: frame 2's damage and its own; frame 4
-	 * in frame 2's: frame 3's damage and its own. */
+	 * alternates between the two buffers not on screen. Only a frame's
+	 * own damage comes from the surface (over PCIe); what its buffer
+	 * missed comes from the buffer drawn last, in VRAM. Frame 2 lands in
+	 * the buffer the output started on, stale: all of it from frame 1's
+	 * buffer; frame 3 in frame 1's buffer: frame 2's damage from frame
+	 * 2's; frame 4 in frame 2's: frame 3's damage from frame 3's. */
 	{
 		const struct rt_surface_rect box[3] = { { 100, 100, 200, 50 }, { 400, 300, 64, 64 },
 							{ 0, 1000, W, 80 } };
+		const uint64_t vram[3] = { (uint64_t)PITCH * H, 200 * 4 * 50, 64 * 4 * 64 };
 
 		for (int f = 0; f < 3; f++) {
+			const uint64_t vram_before = st.vram_bytes;
+
 			fake_fill(&surf, 0x00b00000u + (uint32_t)f, &box[f]);
-			r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &box[f], 1, ktime_get_ns(), &st);
+			r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &box[f], 1, NULL, 0, ktime_get_ns(), &st);
 			CHECK(r == 0);
 			st = wait_flipped(pdev, 2 + (uint64_t)f);
-			printf("pipeline: frame %d flipped: %llu bytes total, last %llu, full frames %u\n", 2 + f,
-			       (unsigned long long)st.bytes, (unsigned long long)st.last_bytes, st.full_frames);
+			printf("pipeline: frame %d flipped: %llu bytes from the surface (last %llu), %llu in VRAM, full frames %u\n",
+			       2 + f, (unsigned long long)st.bytes, (unsigned long long)st.last_bytes,
+			       (unsigned long long)(st.vram_bytes - vram_before), st.full_frames);
 			CHECK(!st.error && st.frames_flipped == 2 + (uint64_t)f);
-			if (f == 1)
-				CHECK(st.last_bytes == 200 * 4 * 50 + 64 * 4 * 64);
+			CHECK(st.last_bytes == (uint64_t)box[f].width * 4 * box[f].height);
+			CHECK(st.vram_bytes - vram_before == vram[f]);
 		}
-		CHECK(st.full_frames == 2);
-		CHECK(st.last_bytes == (uint64_t)W * 4 * 80 + 64 * 4 * 64);
+		CHECK(st.full_frames == 1);
 		CHECK(screen_pixel(150, 120) == ((0x00b00000u) ^ (150u << 12) ^ 120u));
 		CHECK(screen_pixel(410, 310) == ((0x00b00001u) ^ (410u << 12) ^ 310u));
 		CHECK(screen_pixel(5, 1010) == ((0x00b00002u) ^ (5u << 12) ^ 1010u));
@@ -289,7 +294,7 @@ int main(void)
 		usleep(40000);
 		for (int f = 0; f < 4; f++) {
 			fake_fill(&surf, 0x00c00000u + (uint32_t)f, (f & 1) ? &b : &a);
-			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), (f & 1) ? &b : &a, 1,
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), (f & 1) ? &b : &a, 1, NULL, 0,
 						 ktime_get_ns(), &st) == 0);
 			usleep(5000);
 		}
@@ -319,7 +324,7 @@ int main(void)
 			CHECK(rt_display_stats(pdev, &st) == 0);
 			flipped = st.frames_flipped;
 			fake_fill(&surf, 0x00d00000u + (uint32_t)f, &win[0]);
-			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), win, 2,
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), win, 2, NULL, 0,
 						 ktime_get_ns(), &st) == 0);
 			st = wait_flipped(pdev, flipped + 1);
 			if (f >= 2)
@@ -348,7 +353,7 @@ int main(void)
 		{
 			const struct rt_surface_rect all = { 0, 0, W, H };
 
-			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1,
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1, NULL, 0,
 						 ktime_get_ns(), &st) == 0);
 			st = wait_flipped(pdev, flipped + 1);
 		}
@@ -364,7 +369,7 @@ int main(void)
 			damage[n++] = now;
 			/* Every few frames, flips stall: frames pile up in the mailbox. */
 			vblank_hold = (f % 10) >= 6;
-			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), damage, n,
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), damage, n, NULL, 0,
 						 ktime_get_ns(), &st) == 0);
 			usleep((f % 7) == 0 ? 1000 : 9000);
 			was = now;
@@ -387,6 +392,138 @@ int main(void)
 		CHECK(bad == 0);
 	}
 
+	/* Scrolling: a document under a fixed header (whole width), then a
+	 * scroll view inside a window (part of the width). Each frame moves
+	 * the rows that scrolled (VRAM to VRAM from the buffer drawn last)
+	 * and damages only the rows it exposed, plus now and then a header
+	 * row (a clock). Some frames pile up in the mailbox: their moves
+	 * become damage. Afterwards the screen equals the surface. */
+	{
+		static const struct {
+			uint32_t x, y, w, h;
+		} view[2] = { { 0, 64, W, H - 64 }, { 300, 200, 1000, 700 } };
+
+		for (int v = 0; v < 2; v++) {
+			const uint32_t vx = view[v].x, vy = view[v].y, vw = view[v].w, vh = view[v].h;
+			int32_t off = 1000;
+			uint64_t flipped, moved0, dropped0, vram0, bytes0, frames0;
+			unsigned long bad = 0;
+
+			CHECK(rt_display_stats(pdev, &st) == 0);
+			flipped = st.frames_flipped;
+			fake_fill(&surf, 0x00e00000u, NULL);	/* the header, the rest of the desktop */
+			for (uint32_t y = 0; y < vh; y++)
+				for (uint32_t x = 0; x < vw; x++)
+					*pixel(&surf, vx + x, vy + y) = ((uint32_t)(off + (int32_t)y) * 0x9e3779b1u) ^ (x << 12);
+			{
+				const struct rt_surface_rect all = { 0, 0, W, H };
+
+				CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), &all, 1, NULL, 0,
+							 ktime_get_ns(), &st) == 0);
+				st = wait_flipped(pdev, flipped + 1);
+			}
+			moved0 = st.moved_rows;
+			dropped0 = st.moves_dropped;
+			vram0 = st.vram_bytes;
+			bytes0 = st.bytes;
+			frames0 = st.frames_received;
+			for (int f = 0; f < 60; f++) {
+				static const int32_t steps[] = { 3, 17, 40, 1, 120, -9, -64, 25, 7, -1 };
+				const int32_t step = steps[f % 10];
+				const uint32_t k = (uint32_t)(step < 0 ? -step : step);
+				struct rt_display_move mv = { vx, step > 0 ? vy : vy + k, vw, vh - k,
+							      step > 0 ? vy + k : vy, 0 };
+				struct rt_surface_rect damage[2] = {
+					{ vx, step > 0 ? vy + vh - k : vy, vw, k },
+				};
+				uint32_t n = 1;
+
+				off += step;
+				for (uint32_t y = 0; y < vh; y++)
+					for (uint32_t x = 0; x < vw; x++)
+						*pixel(&surf, vx + x, vy + y) =
+							((uint32_t)(off + (int32_t)y) * 0x9e3779b1u) ^ (x << 12);
+				if (v == 0 && (f % 4) == 0) {
+					const struct rt_surface_rect clock = { W - 200, 20, 120, 24 };
+
+					fake_fill(&surf, 0x00c10000u + (uint32_t)f, &clock);
+					damage[n++] = clock;
+				}
+				vblank_hold = (f % 12) >= 9;
+				CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), damage, n, &mv, 1,
+							 ktime_get_ns(), &st) == 0);
+				usleep((f % 5) == 0 ? 1000 : 9000);
+			}
+			vblank_hold = 0;
+			CHECK(rt_display_stats(pdev, &st) == 0);
+			st = wait_flipped(pdev, st.frames_received - st.frames_replaced);
+			usleep(100000);
+			for (uint32_t py = 0; py < H; py++)
+				for (uint32_t px = 0; px < W; px++)
+					if (screen_pixel(px, py) != *pixel(&surf, px, py) && bad++ < 5)
+						printf("pipeline: scroll %d: pixel %u,%u is %08x, the surface has %08x\n",
+						       v, px, py, screen_pixel(px, py), *pixel(&surf, px, py));
+			CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+			printf("pipeline: scrolling %s over 60 frames: %llu rows moved in VRAM, %llu moves copied from the surface (mailbox), %.1f KB from the surface and %.1f KB in VRAM per frame; %lu pixels differ\n",
+			       v ? "a view inside a window" : "under a fixed header",
+			       (unsigned long long)(st.moved_rows - moved0), (unsigned long long)(st.moves_dropped - dropped0),
+			       (double)(st.bytes - bytes0) / 1e3 / (double)(st.frames_received - frames0),
+			       (double)(st.vram_bytes - vram0) / 1e3 / (double)(st.frames_received - frames0), bad);
+			CHECK(bad == 0);
+			CHECK(st.moved_rows > moved0 && st.moves_dropped > dropped0 && st.vram_bytes > vram0);
+		}
+	}
+
+	/* A move outside the frame is refused, the surface hold released and
+	 * the output unharmed. */
+	{
+		const struct rt_display_move out[] = {
+			{ 0, H - 10, W, 11, 0, 0 },	/* rows past the bottom */
+			{ 0, 0, W, 10, H - 5, 0 },	/* source rows past the bottom */
+			{ W - 10, 0, 11, 10, 0, 0 },	/* columns past the right */
+			{ 0, 0, 0, 10, 0, 0 },		/* empty */
+			{ 0, 0, 10, 10, 0, 1 },		/* reserved set */
+		};
+		/* Edges: the whole frame up a row (source to the last row), then
+		 * down a row (destination to the last row), only the exposed
+		 * row damaged each time. */
+		const struct rt_display_move up = { 0, 0, W, H - 1, 1, 0 }, down = { 0, 1, W, H - 1, 0, 0 };
+		const struct rt_surface_rect last = { 0, H - 1, W, 1 }, first = { 0, 0, W, 1 };
+		unsigned long bad = 0;
+		uint64_t flipped;
+
+		for (unsigned int i = 0; i < sizeof(out) / sizeof(out[0]); i++)
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), NULL, 0, &out[i], 1,
+						 ktime_get_ns(), &st) == -EINVAL);
+		CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+		for (int pass = 0; pass < 2; pass++) {
+			flipped = st.frames_flipped;
+			if (pass == 0) {
+				for (uint32_t y = 0; y + 1 < H; y++)
+					for (uint32_t x = 0; x < W; x++)
+						*pixel(&surf, x, y) = *pixel(&surf, x, y + 1);
+				fake_fill(&surf, 0x00d20000u, &last);
+			} else {
+				for (uint32_t y = H - 1; y > 0; y--)
+					for (uint32_t x = 0; x < W; x++)
+						*pixel(&surf, x, y) = *pixel(&surf, x, y - 1);
+				fake_fill(&surf, 0x00d30000u, &first);
+			}
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), pass ? &first : &last, 1,
+						 pass ? &down : &up, 1, ktime_get_ns(), &st) == 0);
+			st = wait_flipped(pdev, flipped + 1);
+		}
+		usleep(50000);
+		for (uint32_t py = 0; py < H; py++)
+			for (uint32_t px = 0; px < W; px++)
+				if (screen_pixel(px, py) != *pixel(&surf, px, py) && bad++ < 5)
+					printf("pipeline: edge moves: pixel %u,%u is %08x, the surface has %08x\n",
+					       px, py, screen_pixel(px, py), *pixel(&surf, px, py));
+		printf("pipeline: moves past the frame refused; the whole frame up and down a row: %lu pixels differ\n", bad);
+		CHECK(bad == 0);
+		CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+	}
+
 	/* A frame of another size is refused; nothing breaks. */
 	CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
 	printf("pipeline: average copy %llu us, latency %llu us (max %llu), worker submit %llu us per frame\n",
@@ -398,7 +535,7 @@ int main(void)
 	/* Off: the worker stops, the screen is restored, no frame is lost
 	 * in flight. */
 	CHECK(rt_display_off(pdev, &report) == 0 && !report.showing && !rt_display_showing());
-	CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), NULL, 0, 0, &st) == -ENOENT);
+	CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), NULL, 0, NULL, 0, 0, &st) == -ENOENT);
 	CHECK(rt_surface_remove(1, handle) == 0);
 	for (int i = 0; i < 5000 && !surf.releases; i++)
 		usleep(1000);
@@ -431,12 +568,12 @@ int main(void)
 		for (int f = 0; f < 4; f++) {
 			CHECK(rt_display_stats(pdev, &st) == 0);
 			flipped = st.frames_flipped;
-			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1, NULL, 0,
 						 ktime_get_ns(), &st) == 0);
 			st = wait_flipped(pdev, flipped + 1);
 		}
 		/* A frame queued and the device leaves the bus. */
-		CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+		CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1, NULL, 0,
 					 ktime_get_ns(), &st) == 0);
 		/* Live: flips write registers and the copies run on SDMA. */
 		cs_fixture_stats(&later);
@@ -453,7 +590,7 @@ int main(void)
 			/* DMUB commands and kmap'd VRAM writes go through these. */
 			linuxu_device_memcpy(aperture + 64, &win, sizeof(win));
 			linuxu_device_memset(aperture + 4096, 0, 256);
-			r = rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+			r = rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1, NULL, 0,
 					       ktime_get_ns(), &st);
 			CHECK(r == 0 || r == -ENODEV);
 			usleep(17000);

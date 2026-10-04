@@ -57,7 +57,7 @@ _Static_assert(sizeof(struct rt_display_mode) == 16 && sizeof(struct rt_display_
 	       "rt_display_modes layout");
 
 /* host/DisplayAgent.swift decodes these. */
-_Static_assert(sizeof(struct rt_display_present_stats) == 120, "rt_display_present_stats layout");
+_Static_assert(sizeof(struct rt_display_present_stats) == 144, "rt_display_present_stats layout");
 _Static_assert(sizeof(struct rt_surface_verify_result) == 64, "rt_surface_verify_result layout");
 
 static DEFINE_MUTEX(rt_display_lock);
@@ -151,6 +151,13 @@ struct display_output {
 	struct dma_fence_cb flip_cb;
 	struct output_frame pending_frame;
 	bool pending_desktop, pending_client;	/* what the pending flip shows */
+	/* The framebuffer the last desktop frame was drawn into (always the
+	 * front or the pending one), -1 before the first, and its copies:
+	 * the next frame copies what its buffer missed, and rows that
+	 * scrolled, from it. */
+	int drawn;
+	struct dma_fence *drawn_copy[RT_SURFACE_ENGINES_MAX];
+	struct rt_surface_vram_copy vram[OUTPUT_DAMAGE_MAX + RT_DISPLAY_MOVES_MAX];
 	struct task_struct *worker;
 	/* The worker sleeps on this until a kick (a frame, a flip, stop) or
 	 * its timeout; nothing polls. A plain condition variable: linuxu's
@@ -163,6 +170,8 @@ struct display_output {
 	spinlock_t lock;
 	struct rt_surface *next;
 	struct output_damage next_damage;
+	struct rt_display_move next_moves[RT_DISPLAY_MOVES_MAX];
+	uint32_t next_move_count;
 	uint64_t next_capture_ns, next_received_ns;
 	bool flip_done;
 	struct rt_display_present_stats stats;
@@ -1512,8 +1521,30 @@ static void layer_drop(struct output_layer *cl)
 /* One step: copy a desktop frame (@surface, may be NULL) into a free
  * buffer, wait for the previous flip, then commit the desktop with the
  * client's frame @cl (may be NULL), or with the client taken off (@off). */
+/* The rectangle a move writes. */
+static struct rt_surface_rect move_dst(const struct rt_display_move *m)
+{
+	return (struct rt_surface_rect){ m->x, m->y, m->width, m->height };
+}
+
+/* Every move inside a frame of @width x @height, source rows too. */
+static bool moves_valid(const struct rt_display_move *moves, uint32_t count, uint32_t width,
+			uint32_t height)
+{
+	for (uint32_t i = 0; i < count; i++) {
+		const struct rt_display_move *m = &moves[i];
+
+		if (!m->width || !m->height || m->reserved || m->x >= width || m->width > width - m->x ||
+		    m->y >= height || m->height > height - m->y || m->src_y >= height ||
+		    m->height > height - m->src_y)
+			return false;
+	}
+	return true;
+}
+
 static int output_frame(struct display_output *o, struct rt_surface *surface,
-			struct output_damage *damage, uint64_t capture_ns, uint64_t received_ns,
+			struct output_damage *damage, const struct rt_display_move *moves,
+			uint32_t move_count, uint64_t capture_ns, uint64_t received_ns,
 			struct output_layer *cl, bool off)
 {
 	struct rt_surface_rect full = { 0, 0, o->width, o->height };
@@ -1524,30 +1555,87 @@ static int output_frame(struct display_output *o, struct rt_surface *surface,
 	u64 start = ktime_get_ns();
 
 	if (surface) {
-		struct output_damage copy;
+		struct output_damage copy = { .count = 0 };
+		struct rt_surface_frame_plan plan = { 0 };
 		struct rt_surface_copy_stats cs;
+		uint64_t moved_rows = 0, dropped = 0;
+		uint32_t n = 0;
 
 		b = 0;
 		while (b == o->front || b == o->pending)
 			b++;
-		copy = o->missed[b];
-		damage_merge(&copy, damage);
+		if (o->drawn == b) {
+			pr_err("display: framebuffer %d is both the one drawn last and the one to draw\n", b);
+			rt_surface_release(surface);
+			return -EINVAL;
+		}
+		if (o->drawn >= 0) {
+			/* What this buffer missed, and the rows that scrolled,
+			 * from the buffer drawn last: VRAM to VRAM. */
+			const struct output_damage *m = &o->missed[b];
+
+			if (m->full) {
+				o->vram[n++] = (struct rt_surface_vram_copy){ full, 0 };
+			} else {
+				for (uint32_t i = 0; i < m->count; i++, n++)
+					o->vram[n] = (struct rt_surface_vram_copy){ m->rect[i], m->rect[i].y };
+			}
+			for (uint32_t i = 0; i < move_count; i++, n++) {
+				o->vram[n] = (struct rt_surface_vram_copy){ move_dst(&moves[i]), moves[i].src_y };
+				moved_rows += moves[i].height;
+			}
+			plan.prev = o->fb[o->drawn]->fb->obj[0];
+			plan.prev_address = o->fb_address[o->drawn];
+			for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+				plan.prev_fences[i] = o->drawn_copy[i];
+			plan.vram = o->vram;
+			plan.vram_count = n;
+			damage_merge(&copy, damage);
+		} else {
+			/* Nothing drawn yet: everything from the surface. */
+			copy = o->missed[b];
+			damage_merge(&copy, damage);
+			for (uint32_t i = 0; i < move_count; i++) {
+				struct rt_surface_rect d = move_dst(&moves[i]);
+
+				damage_add(&copy, &d, 1);
+			}
+			dropped = move_count;
+		}
 		damage_settle(&copy, o->width, o->height);
-		r = rt_surface_copy_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b],
-					   o->fb[b]->fb->pitches[0], copy.full ? &full : copy.rect,
-					   copy.full ? 1 : copy.count, &o->engines, frame.copy, &cs);
+		plan.rects = copy.full ? &full : copy.rect;
+		plan.count = copy.full ? 1 : copy.count;
+		r = rt_surface_frame_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b],
+					    o->fb[b]->fb->pitches[0], &plan, &o->engines, frame.copy, &cs);
 		rt_surface_release(surface);
 		if (r)
 			return r;
 		frame.submitted_ns = ktime_get_ns();
 		frame.bytes = cs.bytes;
 		memset(&o->missed[b], 0, sizeof(o->missed[b]));
-		for (int i = 0; i < OUTPUT_BUFFERS; i++)
-			if (i != b)
-				damage_merge(&o->missed[i], damage);
+		for (int i = 0; i < OUTPUT_BUFFERS; i++) {
+			if (i == b)
+				continue;
+			damage_merge(&o->missed[i], damage);
+			for (uint32_t k = 0; k < move_count; k++) {
+				struct rt_surface_rect d = move_dst(&moves[k]);
+
+				damage_add(&o->missed[i], &d, 1);
+			}
+		}
+		/* This buffer is the source of the next frame's VRAM copies. */
+		o->drawn = b;
+		for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+			if (o->drawn_copy[i])
+				dma_fence_put(o->drawn_copy[i]);
+			o->drawn_copy[i] = frame.copy[i] ? dma_fence_get(frame.copy[i]) : NULL;
+		}
 		spin_lock_irqsave(&o->lock, flags);
 		o->stats.copy_jobs += cs.jobs;
 		o->stats.bytes += cs.bytes;
+		o->stats.vram_bytes += cs.vram_bytes;
+		o->stats.moved_rows += moved_rows;
+		o->stats.moves_dropped += dropped;
 		o->stats.copy_submit_ns += frame.submitted_ns - start;
 		o->stats.full_frames += copy.full;
 		spin_unlock_irqrestore(&o->lock, flags);
@@ -1629,6 +1717,8 @@ static int output_worker(void *arg)
 
 	while (!kthread_should_stop()) {
 		struct output_damage damage;
+		struct rt_display_move moves[RT_DISPLAY_MOVES_MAX];
+		uint32_t move_count = 0;
 		struct output_layer cl = { 0 };
 		struct rt_surface *surface = NULL;
 		uint64_t capture_ns = 0, received_ns = 0;
@@ -1661,6 +1751,9 @@ static int output_worker(void *arg)
 			o->next = NULL;
 			damage = o->next_damage;
 			memset(&o->next_damage, 0, sizeof(o->next_damage));
+			move_count = o->next_move_count;
+			memcpy(moves, o->next_moves, move_count * sizeof(moves[0]));
+			o->next_move_count = 0;
 			capture_ns = o->next_capture_ns;
 			received_ns = o->next_received_ns;
 		}
@@ -1684,8 +1777,8 @@ static int output_worker(void *arg)
 				output_detached(o);
 			break;
 		}
-		r = output_frame(o, surface, &damage, capture_ns, received_ns, has_cl ? &cl : NULL,
-				 detach);
+		r = output_frame(o, surface, &damage, moves, move_count, capture_ns, received_ns,
+				 has_cl ? &cl : NULL, detach);
 		if (!r && detach) {
 			/* The detach returns once the desktop is on screen. */
 			r = output_flip_wait(o);
@@ -1772,6 +1865,9 @@ static void output_free(struct display_output *o)
 		layer_drop(&o->client.next);
 		o->client.has_next = false;
 	}
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+		if (o->drawn_copy[i])
+			dma_fence_put(o->drawn_copy[i]);
 	if (o->engines.count)
 		rt_surface_engines_fini(&o->engines);
 	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
@@ -1832,11 +1928,12 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 	o->width = width;
 	o->height = height;
 	o->front = o->pending = -1;
+	o->drawn = -1;
 	init_completion(&o->client.detached);
 	spin_lock_init(&o->lock);
 	pthread_mutex_init(&o->sleep_lock, NULL);
 	pthread_cond_init(&o->sleep_cond, NULL);
-	o->stats.version = 2;
+	o->stats.version = 3;
 	ret = drm_client_modeset_probe(&rt_display.client, 0, 0);
 	if (report)
 		report->probe_status = ret;
@@ -1943,7 +2040,8 @@ out:
 }
 
 int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
-		       const struct rt_surface_rect *rects, uint32_t count, uint64_t capture_ns,
+		       const struct rt_surface_rect *rects, uint32_t count,
+		       const struct rt_display_move *moves, uint32_t move_count, uint64_t capture_ns,
 		       struct rt_display_present_stats *stats)
 {
 	struct drm_device *dev = display_device(pdev);
@@ -1959,7 +2057,7 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 		rt_surface_release(surface);
 		return -ENODEV;
 	}
-	if (!surface || (count && !rects)) {
+	if (!surface || (count && !rects) || (move_count && !moves) || move_count > RT_DISPLAY_MOVES_MAX) {
 		rt_surface_release(surface);
 		return -EINVAL;
 	}
@@ -1974,9 +2072,9 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 	spin_lock_irqsave(&o->lock, flags);
 	if (o->stats.error) {
 		ret = o->stats.error;
-	} else if (width != o->width || height != o->height) {
+	} else if (width != o->width || height != o->height || !moves_valid(moves, move_count, width, height)) {
 		ret = -EINVAL;
-	} else if (count) {
+	} else if (count || move_count) {
 		struct output_damage add = { .count = 0 };
 
 		/* The newest frame replaces one not yet taken; damage adds up. */
@@ -1984,6 +2082,26 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 		if (replaced)
 			o->stats.frames_replaced++;
 		damage_add(&add, rects, count);
+		if (replaced) {
+			/* Moves are relative to the frame before; the worker never
+			 * drew the one replaced, so its moves and these become
+			 * damage (copied from the surface). */
+			for (uint32_t i = 0; i < o->next_move_count; i++) {
+				struct rt_surface_rect d = move_dst(&o->next_moves[i]);
+
+				damage_add(&add, &d, 1);
+			}
+			for (uint32_t i = 0; i < move_count; i++) {
+				struct rt_surface_rect d = move_dst(&moves[i]);
+
+				damage_add(&add, &d, 1);
+			}
+			o->stats.moves_dropped += o->next_move_count + move_count;
+			o->next_move_count = 0;
+		} else {
+			memcpy(o->next_moves, moves, move_count * sizeof(moves[0]));
+			o->next_move_count = move_count;
+		}
 		damage_merge(&o->next_damage, &add);
 		o->next = surface;
 		surface = NULL;

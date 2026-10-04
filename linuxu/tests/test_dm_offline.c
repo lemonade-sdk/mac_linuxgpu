@@ -608,7 +608,7 @@ static void display_test(void)
 	r = rt_display_output(&fixture_pdev, "HDMI-A-1", 1920, 1080, 60000, &report);
 	printf("dm-offline: display output without SDMA -> %d\n", r);
 	assert(r == -ENODEV && !report.showing && !rt_display_showing());
-	assert(rt_display_present(&fixture_pdev, NULL, NULL, 0, 0, NULL) == -EINVAL);
+	assert(rt_display_present(&fixture_pdev, NULL, NULL, 0, NULL, 0, 0, NULL) == -EINVAL);
 
 	/* The GPU leaves the bus while the pattern is on screen: nothing more
 	 * is driven, and turning it off commits nothing. */
