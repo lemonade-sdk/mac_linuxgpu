@@ -46,6 +46,15 @@ static int arg(struct plan *p, int *added, const char *fmt, long value, const ch
 	return 0;
 }
 
+/* An argument the input owns (a path may be longer than args[]). */
+static int arg_text(struct plan *p, const char *text)
+{
+	if (p->argc == PLAN_MAX_ARGS)
+		return -1;
+	p->argv[p->argc++] = (char *)text;
+	return 0;
+}
+
 /* Quake3e: "+set name value". */
 static int set(struct plan *p, int *added, const char *name, long value, const char *text)
 {
@@ -65,6 +74,15 @@ int plan_make(const struct plan_input *in, struct plan *out, char *why, size_t w
 	}
 	if (in->argc < 1 || !in->argv || !in->argv[0]) {
 		snprintf(why, why_size, "no program to run");
+		return -1;
+	}
+	if ((in->basepath || in->basegame) && !in->quake3) {
+		snprintf(why, why_size, "--basepath and --basegame are Quake3e settings (--quake3)");
+		return -1;
+	}
+	if (in->basegame && (!in->basegame[0] || strlen(in->basegame) >= sizeof(out->args[0]) ||
+			     strchr(in->basegame, '/'))) {
+		snprintf(why, why_size, "--basegame %s: a directory name in the base path", in->basegame);
 		return -1;
 	}
 	if (in->argc > PLAN_MAX_ARGS - 32) {
@@ -89,7 +107,16 @@ int plan_make(const struct plan_input *in, struct plan *out, char *why, size_t w
 
 	if (in->quake3) {
 		const bool windowed = in->mode == PLAN_MODE_WINDOWED;
-		int r = set(out, &added, "cl_renderer", 0, "vulkan") ||
+		int r = 0;
+
+		/* The game data: fs_basepath and fs_basegame are read at start
+		 * (OpenArena's is baseoa). */
+		if (in->basepath)
+			r = r || arg(out, &added, NULL, 0, "+set") || arg(out, &added, NULL, 0, "fs_basepath") ||
+			    arg_text(out, in->basepath);
+		if (in->basegame)
+			r = r || set(out, &added, "fs_basegame", 0, in->basegame);
+		r = r || set(out, &added, "cl_renderer", 0, "vulkan") ||
 			set(out, &added, "r_swapInterval", 1, NULL) ||
 			set(out, &added, "r_fullscreen", windowed ? 0 : 1, NULL);
 

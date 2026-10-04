@@ -3,7 +3,8 @@
  * display output drives, whatever the program would pick on its own.
  *
  *   mlg-run [--output CONNECTOR|auto] [--mode auto|fullscreen|windowed]
- *           [--quake3] [--icd RADEON_ICD.json] [--loader libvulkan.1.dylib]
+ *           [--quake3 [--basepath DIR] [--basegame NAME]]
+ *           [--icd RADEON_ICD.json] [--loader libvulkan.1.dylib]
  *           [--dry-run] -- PROGRAM [ARGS...]
  *
  * It finds the RADV ICD and the Vulkan loader, asks the driver which
@@ -12,10 +13,13 @@
  * plan.c: only RADV for the loader, the loader for SDL, MLG_WSI_OUTPUT and
  * MLG_WSI_MODE for RADV's presentation, SDL's full screen on its own
  * screen. --quake3 adds Quake3e's settings that put its window on that
- * screen in that mode. --dry-run prints all that and runs nothing.
+ * screen in that mode; --basepath and --basegame name the game data (for
+ * OpenArena: the directory that holds baseoa, and baseoa), which must hold
+ * .pk3 files. --dry-run prints all that and runs nothing.
  *
  * Every missing piece is an error that says what is missing; nothing is
  * run in its place. */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -23,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <CoreGraphics/CoreGraphics.h>
@@ -34,7 +39,8 @@
 static void usage(void)
 {
 	fprintf(stderr,
-		"usage: mlg-run [--output CONNECTOR|auto] [--mode auto|fullscreen|windowed] [--quake3]\n"
+		"usage: mlg-run [--output CONNECTOR|auto] [--mode auto|fullscreen|windowed]\n"
+		"               [--quake3 [--basepath DIR] [--basegame NAME]]\n"
 		"               [--icd RADEON_ICD.json] [--loader libvulkan.1.dylib] [--dry-run]\n"
 		"               -- PROGRAM [ARGS...]\n");
 }
@@ -111,6 +117,39 @@ static int find_loader(const char *given, char *out, size_t size)
 	return -1;
 }
 
+/* Quake3e's game data: @basepath/@basegame (baseq3 without --basegame)
+ * holds .pk3 files. The resolved base path goes to @out. */
+static int check_game_data(const char *basepath, const char *basegame, char *out, size_t size)
+{
+	char dir[PATH_MAX];
+	DIR *d;
+	struct dirent *e;
+	bool pk3 = false;
+
+	if (!realpath(basepath, out)) {
+		fprintf(stderr, "mlg-run: --basepath %s: %s\n", basepath, strerror(errno));
+		return -1;
+	}
+	(void)size;
+	snprintf(dir, sizeof(dir), "%s/%s", out, basegame ? basegame : "baseq3");
+	d = opendir(dir);
+	if (!d) {
+		fprintf(stderr, "mlg-run: no game directory %s: %s\n", dir, strerror(errno));
+		return -1;
+	}
+	while ((e = readdir(d)) && !pk3) {
+		size_t n = strlen(e->d_name);
+
+		pk3 = n > 4 && !strcasecmp(e->d_name + n - 4, ".pk3");
+	}
+	closedir(d);
+	if (!pk3) {
+		fprintf(stderr, "mlg-run: %s holds no .pk3 game data\n", dir);
+		return -1;
+	}
+	return 0;
+}
+
 /* The display output and its macOS display, from the driver. */
 static int find_output(const char *wanted, struct plan_input *in, char *connector, size_t size)
 {
@@ -171,8 +210,8 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 
 int main(int argc, char **argv)
 {
-	const char *output = "auto", *icd_arg = NULL, *loader_arg = NULL;
-	char icd[PATH_MAX], loader[PATH_MAX], connector[MLG_LX_SCANOUT_NAME_BYTES], why[160];
+	const char *output = "auto", *icd_arg = NULL, *loader_arg = NULL, *basepath_arg = NULL;
+	char icd[PATH_MAX], loader[PATH_MAX], basepath[PATH_MAX], connector[MLG_LX_SCANOUT_NAME_BYTES], why[160];
 	struct plan_input in = { .mode = PLAN_MODE_AUTO };
 	static struct plan plan;
 	bool dry_run = false;
@@ -196,6 +235,10 @@ int main(int argc, char **argv)
 				fprintf(stderr, "mlg-run: --mode %s: auto, fullscreen or windowed\n", argv[i]);
 				return 2;
 			}
+		} else if (!strcmp(a, "--basepath") && i + 1 < argc) {
+			basepath_arg = argv[++i];
+		} else if (!strcmp(a, "--basegame") && i + 1 < argc) {
+			in.basegame = argv[++i];
 		} else if (!strcmp(a, "--icd") && i + 1 < argc) {
 			icd_arg = argv[++i];
 		} else if (!strcmp(a, "--loader") && i + 1 < argc) {
@@ -215,6 +258,11 @@ int main(int argc, char **argv)
 	in.argc = argc - i;
 	in.argv = argv + i;
 
+	if (basepath_arg) {
+		if (check_game_data(basepath_arg, in.basegame, basepath, sizeof(basepath)))
+			return 1;
+		in.basepath = basepath;
+	}
 	if (find_icd(icd_arg, icd, sizeof(icd)) || find_loader(loader_arg, loader, sizeof(loader)) ||
 	    find_output(output, &in, connector, sizeof(connector)))
 		return 1;

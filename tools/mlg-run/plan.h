@@ -27,6 +27,8 @@ struct plan_input {
 	const char *connector;	/* the output's connector ("DP-1") */
 	enum plan_mode mode;
 	bool quake3;		/* the program is Quake3e: add its placement settings */
+	const char *basepath;	/* Quake3e: the directory that holds the game data, or NULL */
+	const char *basegame;	/* Quake3e: the game directory in it ("baseoa"), or NULL */
 	/* The macOS display that stands for the monitor, if there is one. */
 	bool have_display;
 	int32_t display_x, display_y;	/* its bounds in global points */

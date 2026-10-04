@@ -65,6 +65,19 @@ int main(void)
 	CHECK(!strcmp(setting(&p, "vid_xpos"), "2152") && !strcmp(setting(&p, "vid_ypos"), "60"));
 	CHECK(p.argv[p.argc] == NULL);
 
+	/* OpenArena's data: the base path and game directory, read at start. */
+	in.basepath = "/Users/someone/Games/OpenArena/openarena-0.8.8";
+	in.basegame = "baseoa";
+	CHECK(plan_make(&in, &p, why, sizeof(why)) == 0);
+	CHECK(!strcmp(setting(&p, "fs_basepath"), "/Users/someone/Games/OpenArena/openarena-0.8.8"));
+	CHECK(!strcmp(setting(&p, "fs_basegame"), "baseoa"));
+	CHECK(!strcmp(setting(&p, "r_mode"), "-2"));
+	in.basegame = "../baseoa";
+	CHECK(plan_make(&in, &p, why, sizeof(why)) == -1 && strstr(why, "--basegame"));
+	in.basegame = NULL;
+	CHECK(plan_make(&in, &p, why, sizeof(why)) == 0 && !setting(&p, "fs_basegame"));
+	in.basepath = NULL;
+
 	/* Windowed: three quarters of the screen, centred on it. */
 	in.mode = PLAN_MODE_WINDOWED;
 	CHECK(plan_make(&in, &p, why, sizeof(why)) == 0);
@@ -94,6 +107,9 @@ int main(void)
 	CHECK(plan_make(&in, &p, why, sizeof(why)) == 0);
 	CHECK(p.argc == 1 && !strcmp(p.argv[0], "vkcube") && p.argv[1] == NULL);
 	CHECK(env_of(&p, "MLG_WSI_OUTPUT") && !setting(&p, "r_mode"));
+	in.basegame = "baseoa";
+	CHECK(plan_make(&in, &p, why, sizeof(why)) == -1 && strstr(why, "--quake3"));
+	in.basegame = NULL;
 
 	/* Refusals. */
 	in.connector = "";
@@ -108,7 +124,7 @@ int main(void)
 	CHECK(plan_make(&in, &p, why, sizeof(why)) == -1 && strstr(why, "size"));
 
 	printf("PASS mlg-run plan: RADV-only loader environment, MLG_WSI_OUTPUT/MODE, SDL on its "
-	       "screen, Quake3e placement full screen and windowed, with and without a macOS "
-	       "display, refusals\n");
+	       "screen, Quake3e placement full screen and windowed, game data (OpenArena), "
+	       "with and without a macOS display, refusals\n");
 	return 0;
 }
