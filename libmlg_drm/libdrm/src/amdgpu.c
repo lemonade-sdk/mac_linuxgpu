@@ -45,6 +45,7 @@
 #include "amdgpu_drm.h"
 #include "amdgpu.h"
 #include "drm_internal.h"
+#include "../../../linuxu/headers/rt/amdgpu_ids.h"
 
 #define MIN2(a, b) ((a) < (b) ? (a) : (b))
 #define MAX2(a, b) ((a) > (b) ? (a) : (b))
@@ -457,34 +458,13 @@ int amdgpu_device_get_fd(amdgpu_device_handle dev)
 	return dev->fd;
 }
 
-/* Product names by PCI device and revision, from libdrm's data/amdgpu.ids
- * (MIT): the RDNA4 boards, those a Thunderbolt enclosure takes today.
- * Others get Mesa's generic name. */
-static const struct {
-	uint16_t device;
-	uint8_t revision;
-	const char *name;
-} marketing_names[] = {
-	{ 0x7550, 0xc0, "AMD Radeon RX 9070 XT" },
-	{ 0x7550, 0xc2, "AMD Radeon RX 9070 GRE" },
-	{ 0x7550, 0xc3, "AMD Radeon RX 9070" },
-	{ 0x7551, 0xc0, "AMD Radeon AI Pro R9700" },
-	{ 0x7551, 0xc1, "AMD Radeon AI Pro R9700S" },
-	{ 0x7551, 0xc8, "AMD Radeon AI Pro R9600D" },
-	{ 0x7590, 0xc0, "AMD Radeon RX 9060 XT" },
-	{ 0x7590, 0xc1, "AMD Radeon RX 9060 XT LP" },
-	{ 0x7590, 0xc7, "AMD Radeon RX 9060" },
-	{ 0x7590, 0xcf, "AMD Radeon RX 9050" },
-	{ 0x7590, 0xdf, "AMD Radeon RX 9050 4GB" },
-};
-
+/* Product names: libdrm's data/amdgpu.ids, shared with the dext. Others
+ * get Mesa's generic name. */
 const char *amdgpu_get_marketing_name(amdgpu_device_handle dev)
 {
-	for (size_t i = 0; i < sizeof(marketing_names) / sizeof(marketing_names[0]); ++i)
-		if (marketing_names[i].device == dev->dev_info.device_id &&
-		    marketing_names[i].revision == dev->dev_info.pci_rev)
-			return marketing_names[i].name;
-	return NULL;
+	if (dev->dev_info.device_id > 0xffff || dev->dev_info.pci_rev > 0xff)
+		return NULL;
+	return amdgpu_ids_name((uint16_t)dev->dev_info.device_id, (uint8_t)dev->dev_info.pci_rev);
 }
 
 int amdgpu_query_sw_info(amdgpu_device_handle dev, enum amdgpu_sw_info info, void *value)

@@ -63,6 +63,7 @@
 #include <drm/drm_file.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/display.h>
+#include <rt/identity.h>
 #include <rt/surface.h>
 #include <rt/removal.h>
 #include <rt/sysfs.h>
@@ -700,6 +701,58 @@ static void display_test(void)
 		assert(rt_display_modes(&fixture_pdev, "DP-1", &modes) == 0 && !modes.count &&
 		       modes.status == connector_status_disconnected);
 		assert(rt_display_modes(&fixture_pdev, "DP-9", &modes) == -ENOENT);
+	}
+
+	/* The monitor on a connector, as the dext publishes it for our tools:
+	 * the EDID's monitor name descriptor and the physical size, from what
+	 * the probe left (no detection). */
+	{
+		struct rt_display_monitor monitor;
+
+		assert(rt_display_monitor(&fixture_pdev, "HDMI-A-1", &monitor) == 0);
+		printf("dm-offline: HDMI-A-1 monitor \"%s\", %ux%u mm\n", monitor.name,
+		       monitor.width_mm, monitor.height_mm);
+		assert(monitor.status == connector_status_connected &&
+		       !strcmp(monitor.name, "LINUXU TEST") && monitor.width_mm == 600 &&
+		       monitor.height_mm == 340);
+		assert(rt_display_monitor(&fixture_pdev, "card0-DP-2", &monitor) == 0 &&
+		       !strcmp(monitor.name, "LINUXU DP"));
+		assert(rt_display_monitor(&fixture_pdev, "DP-1", &monitor) == 0 &&
+		       monitor.status == connector_status_disconnected && !monitor.name[0] &&
+		       !monitor.width_mm);
+		assert(rt_display_monitor(&fixture_pdev, "DP-9", &monitor) == -ENOENT);
+		assert(rt_display_monitor(&fixture_pdev, "", &monitor) == -EINVAL);
+		assert(rt_display_monitor(&fixture_pdev, "DP-2", NULL) == -EINVAL);
+	}
+
+	/* The board as the driver knows it (rt/identity.h): copies of the
+	 * device's own fields. This fixture runs no KFD, so it has no ISA
+	 * target. */
+	{
+		struct rt_device_identity id;
+		struct atom_context *atom = adev->mode_info.atom_context;
+		static struct pci_dev unbound;
+
+		assert(rt_device_identity(&fixture_pdev, &id) == 0);
+		printf("dm-offline: identity %04x:%04x rev %02x, GC %u.%u.%u, VRAM %llu MB %s, "
+		       "VBIOS \"%s\" \"%s\"\n", id.vendor, id.device, id.revision,
+		       id.gc_version >> 24, (id.gc_version >> 16) & 0xff, (id.gc_version >> 8) & 0xff,
+		       (unsigned long long)(id.vram_bytes >> 20), id.vram_type_name, id.vbios_pn,
+		       id.vbios_version);
+		assert(id.version == RT_IDENTITY_VERSION && id.vendor == 0x1002 &&
+		       id.device == 0x7551 && id.revision == 0xc0);
+		assert(id.gc_version == IP_VERSION(12, 0, 1) && !id.gfx_target_version &&
+		       !id.gfx_target[0]);
+		assert(id.vram_bytes == adev->gmc.real_vram_size && id.vram_bytes &&
+		       id.visible_vram_bytes == adev->gmc.visible_vram_size &&
+		       id.vram_type == adev->gmc.vram_type &&
+		       id.compute_units == adev->gfx.cu_info.number);
+		assert(atom && !strncmp(id.vbios_pn, (const char *)atom->vbios_pn, strlen(id.vbios_pn)) &&
+		       !strncmp(id.vbios_version, (const char *)atom->vbios_ver_str,
+				strlen(id.vbios_version)));
+		assert(!id.product_name[0]);
+		assert(rt_device_identity(&unbound, &id) == -ENODEV && id.device == 0);
+		assert(rt_device_identity(&fixture_pdev, NULL) == -EINVAL);
 	}
 
 	/* drm_sysfs connector files, read as a Linux tool reads them. */

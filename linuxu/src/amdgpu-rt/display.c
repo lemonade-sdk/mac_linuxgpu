@@ -17,6 +17,7 @@
 #include <drm/drm_crtc.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
@@ -873,6 +874,40 @@ int rt_display_modes(struct pci_dev *pdev, const char *name, struct rt_display_m
 			m->flags = (mode->type & DRM_MODE_TYPE_PREFERRED ? RT_DISPLAY_MODE_PREFERRED : 0) |
 				   (mode->flags & DRM_MODE_FLAG_INTERLACE ? RT_DISPLAY_MODE_INTERLACE : 0);
 		}
+		ret = 0;
+		break;
+	}
+	drm_connector_list_iter_end(&iter);
+	mutex_unlock(&dev->mode_config.mutex);
+	return ret;
+}
+
+int rt_display_monitor(struct pci_dev *pdev, const char *name, struct rt_display_monitor *out)
+{
+	struct drm_device *dev = display_device(pdev);
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	int ret = -ENOENT;
+
+	if (!out)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	if (!dev)
+		return -ENODEV;
+	if (!name || !name[0])
+		return -EINVAL;
+	mutex_lock(&dev->mode_config.mutex);
+	drm_connector_list_iter_begin(dev, &iter);
+	drm_client_for_each_connector_iter(connector, &iter) {
+		const struct drm_property_blob *edid = connector->edid_blob_ptr;
+
+		if (!connector_named(connector, name))
+			continue;
+		out->status = connector->status;
+		out->width_mm = connector->display_info.width_mm;
+		out->height_mm = connector->display_info.height_mm;
+		if (edid && edid->length >= EDID_LENGTH)
+			drm_edid_get_monitor_name(edid->data, out->name, sizeof(out->name));
 		ret = 0;
 		break;
 	}
