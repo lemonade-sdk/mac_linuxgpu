@@ -18,7 +18,10 @@
  * .pk3 files. --dry-run prints all that and runs nothing.
  *
  * Every missing piece is an error that says what is missing; nothing is
- * run in its place. */
+ * run in its place. With --quake3, mlg-run stays the game's parent and
+ * passes its output through: Quake3e falls back to another r_mode by
+ * itself when the one it was given fails, and mlg-run stops the game and
+ * fails instead (the mode is part of what it forces). */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,7 +35,12 @@
 
 #include <CoreGraphics/CoreGraphics.h>
 
+#include <signal.h>
+#include <util.h>
+#include <sys/wait.h>
+
 #include <xf86drm.h>
+#include <xf86drmMode.h>
 
 #include "plan.h"
 
@@ -150,6 +158,90 @@ static int check_game_data(const char *basepath, const char *basegame, char *out
 	return 0;
 }
 
+/* A plane's "type" and how many XRGB8888 modifiers its IN_FORMATS lists. */
+static void plane_info(int card, uint32_t plane, uint64_t *type, unsigned *xrgb_mods)
+{
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(card, plane, DRM_MODE_OBJECT_PLANE);
+
+	*type = ~0ull;
+	*xrgb_mods = 0;
+	for (uint32_t i = 0; props && i < props->count_props; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(card, props->props[i]);
+
+		if (p && !strcmp(p->name, "type"))
+			*type = props->prop_values[i];
+		if (p && !strcmp(p->name, "IN_FORMATS")) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(card, (uint32_t)props->prop_values[i]);
+			drmModeFormatModifierIterator it = { 0 };
+
+			while (blob && drmModeFormatModifierBlobIterNext(blob, &it))
+				*xrgb_mods += it.fmt == 0x34325258u;	/* DRM_FORMAT_XRGB8888 */
+			drmModeFreePropertyBlob(blob);
+		}
+		drmModeFreeProperty(p);
+	}
+	drmModeFreeObjectProperties(props);
+}
+
+/* What the output has to scan a program's frames out with: its CRTC, the
+ * primary plane, the overlay planes the CRTC can use, and the monitor's
+ * EDID identity (what its macOS display is matched by). */
+static void describe_output(int card, const struct mlg_lx_scanout_state *st)
+{
+	drmModeResPtr res = drmModeGetResources(card);
+	drmModePlaneResPtr planes;
+
+	/* Primary and cursor planes are listed only to universal-plane clients. */
+	if (drmSetClientCap(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1))
+		fprintf(stderr, "  (universal planes refused: %s)\n", strerror(errno));
+	planes = drmModeGetPlaneResources(card);
+	int crtc_index = -1;
+
+	fprintf(stderr, "  output: %s (connector %u), CRTC %u, %ux%u at %u.%03u Hz\n", st->connector,
+		st->connector_id, st->crtc_id, st->width, st->height, st->refresh_mhz / 1000,
+		st->refresh_mhz % 1000);
+	for (int i = 0; res && i < res->count_crtcs; i++)
+		if (res->crtcs[i] == st->crtc_id)
+			crtc_index = i;
+	for (uint32_t i = 0; planes && i < planes->count_planes; i++) {
+		drmModePlanePtr p = drmModeGetPlane(card, planes->planes[i]);
+		uint64_t type;
+		unsigned mods;
+
+		if (!p)
+			continue;
+		if (crtc_index >= 0 && (p->possible_crtcs & (1u << crtc_index))) {
+			plane_info(card, p->plane_id, &type, &mods);
+			if (type == 1 || type == 0)
+				fprintf(stderr, "  plane %u: %s, %s, %u XRGB8888 modifiers\n", p->plane_id,
+					type == 1 ? "primary" : "overlay",
+					p->crtc_id ? "in use" : "free", mods);
+		}
+		drmModeFreePlane(p);
+	}
+	drmModeFreePlaneResources(planes);
+	drmModeFreeResources(res);
+
+	drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(card, st->connector_id,
+								      DRM_MODE_OBJECT_CONNECTOR);
+	for (uint32_t i = 0; props && i < props->count_props; i++) {
+		drmModePropertyPtr p = drmModeGetProperty(card, props->props[i]);
+
+		if (p && !strcmp(p->name, "EDID") && props->prop_values[i]) {
+			drmModePropertyBlobPtr blob = drmModeGetPropertyBlob(card, (uint32_t)props->prop_values[i]);
+			uint32_t vendor, product, serial;
+
+			if (blob && !drmMlgEdidIdentity(blob->data, blob->length, &vendor, &product, &serial))
+				fprintf(stderr, "  EDID identity: vendor %c%c%c (0x%04x), product 0x%04x, serial %u\n",
+					'@' + ((vendor >> 10) & 31), '@' + ((vendor >> 5) & 31), '@' + (vendor & 31),
+					vendor, product, serial);
+			drmModeFreePropertyBlob(blob);
+		}
+		drmModeFreeProperty(p);
+	}
+	drmModeFreeObjectProperties(props);
+}
+
 /* The display output and its macOS display, from the driver. */
 static int find_output(const char *wanted, struct plan_input *in, char *connector, size_t size)
 {
@@ -186,6 +278,7 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 	snprintf(connector, size, "%s", st.connector);
 	in->mode_width = st.width;
 	in->mode_height = st.height;
+	describe_output(card, &st);
 	r = drmMlgConnectorDisplay(card, st.connector_id, &display);
 	close(card);
 	if (r == -ENOENT) {
@@ -200,12 +293,82 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 		return -1;
 	}
 	CGRect bounds = CGDisplayBounds(display);
+	fprintf(stderr, "  macOS display %u (vendor 0x%04x, model 0x%04x, serial %u): %.0fx%.0f at %.0f,%.0f\n",
+		display, CGDisplayVendorNumber(display), CGDisplayModelNumber(display),
+		CGDisplaySerialNumber(display), bounds.size.width, bounds.size.height, bounds.origin.x,
+		bounds.origin.y);
 	in->have_display = true;
 	in->display_x = (int32_t)bounds.origin.x;
 	in->display_y = (int32_t)bounds.origin.y;
 	in->display_width = (uint32_t)bounds.size.width;
 	in->display_height = (uint32_t)bounds.size.height;
 	return 0;
+}
+
+static pid_t child;
+
+static void forward(int sig)
+{
+	if (child > 0)
+		kill(child, sig);
+}
+
+/* Quake3e as a child, its output passed through and watched for its own
+ * mode fallback. Returns mlg-run's exit status. */
+static int run_watched(char *const *argv)
+{
+	int fds[2], status = 0;
+	bool fallback = false;
+	FILE *out;
+	char line[4096];
+
+	/* A terminal, so the game's output comes line by line as it would to
+	 * one. */
+	if (openpty(&fds[0], &fds[1], NULL, NULL, NULL)) {
+		fprintf(stderr, "mlg-run: openpty failed: %s\n", strerror(errno));
+		return 1;
+	}
+	child = fork();
+	if (child < 0) {
+		fprintf(stderr, "mlg-run: fork failed: %s\n", strerror(errno));
+		return 1;
+	}
+	if (!child) {
+		dup2(fds[1], STDOUT_FILENO);
+		dup2(fds[1], STDERR_FILENO);
+		close(fds[0]);
+		close(fds[1]);
+		execvp(argv[0], argv);
+		fprintf(stderr, "mlg-run: running %s failed: %s\n", argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(fds[1]);
+	signal(SIGINT, forward);
+	signal(SIGTERM, forward);
+	signal(SIGHUP, forward);
+	out = fdopen(fds[0], "r");
+	/* The terminal reads EIO once the game and its children closed it. */
+	while (out && fgets(line, sizeof(line), out)) {
+		fputs(line, stdout);
+		fflush(stdout);
+		if (!fallback && plan_quake3_mode_fallback(line)) {
+			fallback = true;
+			fprintf(stderr, "mlg-run: Quake3e could not set the mode it was given and fell back "
+				"to another one; stopping it (the lines above say why)\n");
+			kill(child, SIGTERM);
+		}
+	}
+	if (out)
+		fclose(out);
+	while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+		;
+	if (fallback)
+		return 1;
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "mlg-run: %s ended by signal %d\n", argv[0], WTERMSIG(status));
+		return 128 + WTERMSIG(status);
+	}
+	return WEXITSTATUS(status);
 }
 
 int main(int argc, char **argv)
@@ -289,6 +452,8 @@ int main(int argc, char **argv)
 			fprintf(stderr, "mlg-run: setenv %s failed: %s\n", plan.env_name[e], strerror(errno));
 			return 1;
 		}
+	if (in.quake3)
+		return run_watched(plan.argv);
 	execvp(plan.argv[0], plan.argv);
 	fprintf(stderr, "mlg-run: running %s failed: %s\n", plan.argv[0], strerror(errno));
 	return 127;

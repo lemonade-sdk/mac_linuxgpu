@@ -61,7 +61,7 @@ clang -Wall -Werror -fno-objc-arc -g -O1 -c vulkan/tests/metal_layer.m -o "$work
 objects+=("$work/test_radv_scanout.o" "$work/metal_layer.o")
 lib=$(cd $pkg && pwd)
 clang "${objects[@]}" build/libmacamgdu.a -L"$lib" -lmlg_drm -Wl,-rpath,"$lib" \
-  -framework IOKit -framework CoreFoundation -framework QuartzCore -framework Foundation \
+  -framework IOKit -framework CoreFoundation -framework QuartzCore -framework Foundation -framework AppKit \
   -lpthread -o "$work/test_radv_scanout"
 if [ -n "${RADV_TEST_KEEP:-}" ]; then cp "$work/test_radv_scanout" "$RADV_TEST_KEEP"; fi
 MESA_SHADER_CACHE_DISABLE=true "$work/test_radv_scanout" "$(cd "$(dirname "$icd")" && pwd)/$(basename "$icd")"

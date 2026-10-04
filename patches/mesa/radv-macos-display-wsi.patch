@@ -9,7 +9,10 @@ GPU or the macOS compositor, whatever window the application presents
 from.
 
 - RADV advertises VK_EXT_metal_surface, and the surface and swapchain
-  extensions, on the macOS platform.
+  extensions, on the macOS platform; also VK_MVK_macos_surface, which
+  SDL2 before 2.26 requires of a Vulkan library (Quake3e bundles 2.24.1).
+  Its surfaces (an NSView backed by a CAMetalLayer, or the layer) are
+  Metal surfaces.
 - wsi_common_metal.c: a driver that is neither software nor Metal (RADV)
   presents its Metal surfaces through the display engine when libdrm
   defines LIBDRM_MLG_SCANOUT. Other drivers are unchanged.
@@ -33,15 +36,18 @@ from.
   whatever links the WSI.
 
 diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
-index e6407ac..6e2dd01 100644
+index e6407ac..767e405 100644
 --- a/src/amd/vulkan/radv_instance.c
 +++ b/src/amd/vulkan/radv_instance.c
-@@ -248,6 +248,9 @@ static const struct vk_instance_extension_table radv_instance_extensions_support
+@@ -248,6 +248,12 @@ static const struct vk_instance_extension_table radv_instance_extensions_support
  #ifndef VK_USE_PLATFORM_WIN32_KHR
     .EXT_headless_surface = true,
  #endif
 +#ifdef VK_USE_PLATFORM_METAL_EXT
 +   .EXT_metal_surface = true,
++#endif
++#ifdef VK_USE_PLATFORM_MACOS_MVK
++   .MVK_macos_surface = true,
 +#endif
  };
  
@@ -84,10 +90,10 @@ index 80925d1..df9f1f2 100644
    )
  endif
 diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
-index 4fae988..78536bf 100644
+index 4fae988..c3cb703 100644
 --- a/src/vulkan/wsi/wsi_common_metal.c
 +++ b/src/vulkan/wsi/wsi_common_metal.c
-@@ -15,6 +15,43 @@
+@@ -15,7 +15,49 @@
  #include "wsi_common_private.h"
  #include "wsi_common_metal_layer.h"
  
@@ -129,9 +135,15 @@ index 4fae988..78536bf 100644
 +#endif
 +
  #include "vulkan/vulkan_core.h"
++#ifdef VK_USE_PLATFORM_MACOS_MVK
++#include "vulkan/vulkan_macos.h"
++#endif
++
++#include <stdio.h>
  
  #include <assert.h>
-@@ -34,6 +71,8 @@ wsi_metal_surface_get_support(VkIcdSurfaceBase *surface,
+ 
+@@ -34,6 +76,8 @@ wsi_metal_surface_get_support(VkIcdSurfaceBase *surface,
                                   uint32_t queueFamilyIndex,
                                   VkBool32* pSupported)
  {
@@ -140,7 +152,7 @@ index 4fae988..78536bf 100644
     *pSupported = true;
     return VK_SUCCESS;
  }
-@@ -48,6 +87,7 @@ wsi_metal_surface_get_capabilities(VkIcdSurfaceBase *surface,
+@@ -48,6 +92,7 @@ wsi_metal_surface_get_capabilities(VkIcdSurfaceBase *surface,
                                   struct wsi_device *wsi_device,
                                   VkSurfaceCapabilities2KHR* caps)
  {
@@ -148,7 +160,7 @@ index 4fae988..78536bf 100644
     VkIcdSurfaceMetal *metal_surface = (VkIcdSurfaceMetal *)surface;
     assert(metal_surface->pLayer);
  
-@@ -216,6 +256,8 @@ wsi_metal_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+@@ -216,6 +261,8 @@ wsi_metal_surface_get_formats(VkIcdSurfaceBase *icd_surface,
                                   uint32_t* pSurfaceFormatCount,
                                   VkSurfaceFormatKHR* pSurfaceFormats)
  {
@@ -157,7 +169,7 @@ index 4fae988..78536bf 100644
     VK_FROM_HANDLE(vk_physical_device, pdev, wsi_device->pdevice);
     VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
  
-@@ -245,6 +287,8 @@ wsi_metal_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+@@ -245,6 +292,8 @@ wsi_metal_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
                                    uint32_t* pSurfaceFormatCount,
                                    VkSurfaceFormat2KHR* pSurfaceFormats)
  {
@@ -166,7 +178,7 @@ index 4fae988..78536bf 100644
     VK_FROM_HANDLE(vk_physical_device, pdev, wsi_device->pdevice);
     VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
  
-@@ -274,6 +318,8 @@ wsi_metal_surface_get_present_modes(VkIcdSurfaceBase *surface,
+@@ -274,6 +323,8 @@ wsi_metal_surface_get_present_modes(VkIcdSurfaceBase *surface,
                                         uint32_t* pPresentModeCount,
                                         VkPresentModeKHR* pPresentModes)
  {
@@ -175,7 +187,7 @@ index 4fae988..78536bf 100644
     if (pPresentModes == NULL) {
        *pPresentModeCount = ARRAY_SIZE(present_modes);
        return VK_SUCCESS;
-@@ -697,6 +743,9 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+@@ -697,6 +748,9 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
  {
     VkIcdSurfaceMetal *metal_surface = (VkIcdSurfaceMetal *)icd_surface;
     assert(metal_surface->pLayer);
@@ -185,7 +197,48 @@ index 4fae988..78536bf 100644
  
     assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
  
-@@ -929,3 +978,923 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
+@@ -854,6 +908,40 @@ wsi_CreateMetalSurfaceEXT(
+    return VK_SUCCESS;
+ }
+ 
++#ifdef VK_USE_PLATFORM_MACOS_MVK
++/* VK_MVK_macos_surface, which SDL2 before 2.26 requires (its Cocoa Vulkan
++ * library check) even where it then creates a Metal surface: pView is an
++ * NSView backed by a CAMetalLayer, or the CAMetalLayer itself. The surface
++ * is a Metal one; everything else treats it as such. */
++VKAPI_ATTR VkResult VKAPI_CALL
++wsi_CreateMacOSSurfaceMVK(
++   VkInstance _instance,
++   const VkMacOSSurfaceCreateInfoMVK* pCreateInfo,
++   const VkAllocationCallbacks* pAllocator,
++   VkSurfaceKHR* pSurface)
++{
++   VK_FROM_HANDLE(vk_instance, instance, _instance);
++   const CAMetalLayer *layer = wsi_metal_layer_of_view(pCreateInfo->pView);
++   VkIcdSurfaceMetal *surface;
++
++   if (!layer) {
++      fprintf(stderr, "vkCreateMacOSSurfaceMVK: pView is neither a CAMetalLayer nor a view "
++              "backed by one\n");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   surface = vk_alloc2(&instance->alloc, pAllocator, sizeof *surface, 8,
++                       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (surface == NULL)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   surface->base.platform = VK_ICD_WSI_PLATFORM_METAL;
++   surface->pLayer = layer;
++
++   *pSurface = VkIcdSurfaceBase_to_handle(&surface->base);
++   return VK_SUCCESS;
++}
++#endif
++
+ static VkResult
+ wsi_metal_create_mem(const struct wsi_swapchain *chain,
+                      const struct wsi_image_info *info,
+@@ -929,3 +1017,923 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
  
     return VK_SUCCESS;
  }
@@ -1110,10 +1163,22 @@ index 4fae988..78536bf 100644
 +
 +#endif /* LIBDRM_MLG_SCANOUT */
 diff --git a/src/vulkan/wsi/wsi_common_metal_layer.h b/src/vulkan/wsi/wsi_common_metal_layer.h
-index e9473b1..d28927e 100644
+index e9473b1..eb88a90 100644
 --- a/src/vulkan/wsi/wsi_common_metal_layer.h
 +++ b/src/vulkan/wsi/wsi_common_metal_layer.h
-@@ -52,4 +52,31 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+@@ -33,6 +33,11 @@ void
+ wsi_metal_layer_set_hdr_metadata(const CAMetalLayer *metal_layer,
+                                  const VkHdrMetadataEXT *metadata);
+ 
++/* @view's CAMetalLayer: @view itself when it is one, its layer when it is
++ * an NSView backed by one, else NULL. */
++const CAMetalLayer *
++wsi_metal_layer_of_view(const void *view);
++
+ CAMetalDrawable *
+ wsi_metal_layer_acquire_drawable(const CAMetalLayer *metal_layer);
+ 
+@@ -52,4 +57,31 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
     CAMetalDrawable **drawable_ptr, void *buffer,
     uint32_t width, uint32_t height, uint32_t row_pitch);
  
@@ -1146,7 +1211,7 @@ index e9473b1..d28927e 100644
 +
  #endif // WSI_COMMON_METAL_LAYER_H
 diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
-index 67c3e7f..abaac80 100644
+index 67c3e7f..0f9e10d 100644
 --- a/src/vulkan/wsi/wsi_common_metal_layer.m
 +++ b/src/vulkan/wsi/wsi_common_metal_layer.m
 @@ -8,6 +8,12 @@
@@ -1162,7 +1227,29 @@ index 67c3e7f..abaac80 100644
  
  void
  wsi_metal_layer_size(const CAMetalLayer *metal_layer,
-@@ -343,3 +349,225 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+@@ -40,6 +46,21 @@ wsi_metal_layer_size(const CAMetalLayer *metal_layer,
+    }
+ }
+ 
++const CAMetalLayer *
++wsi_metal_layer_of_view(const void *view)
++{
++   @autoreleasepool {
++      id object = (id)view;
++
++      if ([object isKindOfClass:[CAMetalLayer class]])
++         return (const CAMetalLayer *)object;
++      if ([object isKindOfClass:[NSView class]] &&
++          [((NSView *)object).layer isKindOfClass:[CAMetalLayer class]])
++         return (const CAMetalLayer *)((NSView *)object).layer;
++      return NULL;
++   }
++}
++
+ static VkResult
+ get_mtl_pixel_format(VkFormat format, MTLPixelFormat *metal_format)
+ {
+@@ -343,3 +364,225 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
        *drawable_ptr = nil;
     }
  }

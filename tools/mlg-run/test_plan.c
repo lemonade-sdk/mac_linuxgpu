@@ -123,8 +123,13 @@ int main(void)
 	in.mode_width = in.mode_height = 0;
 	CHECK(plan_make(&in, &p, why, sizeof(why)) == -1 && strstr(why, "size"));
 
+	/* Quake3e's own mode fallback, which mlg-run stops the game for. */
+	CHECK(plan_quake3_mode_fallback("Setting r_mode -2 failed, falling back on r_mode 3"));
+	CHECK(plan_quake3_mode_fallback("Setting r_mode 6 failed, falling back on r_mode 3\n"));
+	CHECK(!plan_quake3_mode_fallback("...setting mode -2: 2560 1440"));
+
 	printf("PASS mlg-run plan: RADV-only loader environment, MLG_WSI_OUTPUT/MODE, SDL on its "
-	       "screen, Quake3e placement full screen and windowed, game data (OpenArena), "
+	       "screen, Quake3e placement full screen and windowed, game data (OpenArena), mode fallback, "
 	       "with and without a macOS display, refusals\n");
 	return 0;
 }

@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #define VK_USE_PLATFORM_METAL_EXT 1
+#define VK_USE_PLATFORM_MACOS_MVK 1
 #include <vulkan/vulkan.h>
 
 #include "mlg_drm.h"
@@ -42,6 +43,9 @@
 
 void *test_metal_layer(unsigned width, unsigned height);
 void test_metal_layer_release(void *layer);
+void *test_metal_view(void *layer);
+void *test_plain_view(void);
+void test_view_release(void *view);
 
 typedef VkResult (VKAPI_PTR *PFN_negotiate)(uint32_t *version);
 
@@ -102,24 +106,30 @@ int main(int argc, char **argv)
 	{
 		VkExtensionProperties ext[64];
 		uint32_t n = 64;
-		int metal = 0;
+		int metal = 0, mvk = 0;
 
 		VK(vkEnumerateInstanceExtensionProperties(NULL, &n, ext));
-		for (uint32_t i = 0; i < n; i++)
+		for (uint32_t i = 0; i < n; i++) {
 			metal |= !strcmp(ext[i].extensionName, VK_EXT_METAL_SURFACE_EXTENSION_NAME);
-		CHECK(metal);
+			mvk |= !strcmp(ext[i].extensionName, VK_MVK_MACOS_SURFACE_EXTENSION_NAME);
+		}
+		/* SDL2 before 2.26 refuses a Vulkan library without
+		 * VK_MVK_macos_surface. */
+		CHECK(metal && mvk);
 	}
 	IFN(vkCreateInstance);
-	const char *inst_ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_METAL_SURFACE_EXTENSION_NAME };
+	const char *inst_ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_EXT_METAL_SURFACE_EXTENSION_NAME,
+				   VK_MVK_MACOS_SURFACE_EXTENSION_NAME };
 	VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 		.pApplicationName = "mac_linuxgpu radv scanout", .apiVersion = VK_API_VERSION_1_3 };
 	VkInstanceCreateInfo ici = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pApplicationInfo = &app, .enabledExtensionCount = 2, .ppEnabledExtensionNames = inst_ext };
+		.pApplicationInfo = &app, .enabledExtensionCount = 3, .ppEnabledExtensionNames = inst_ext };
 	VK(vkCreateInstance(&ici, NULL, &instance));
 	IFN(vkEnumeratePhysicalDevices);
 	IFN(vkGetPhysicalDeviceQueueFamilyProperties);
 	IFN(vkCreateDevice);
 	IFN(vkCreateMetalSurfaceEXT);
+	IFN(vkCreateMacOSSurfaceMVK);
 	IFN(vkDestroySurfaceKHR);
 	IFN(vkGetPhysicalDeviceSurfaceSupportKHR);
 	IFN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
@@ -159,6 +169,30 @@ int main(int argc, char **argv)
 	CHECK(supported);
 
 	VkSurfaceCapabilitiesKHR caps;
+	/* VK_MVK_macos_surface: a view backed by the layer (SDL2's Metal view),
+	 * or the layer itself, is the same surface; a view without one is
+	 * refused. */
+	{
+		void *view = test_metal_view(layer), *plain = test_plain_view();
+		VkMacOSSurfaceCreateInfoMVK mci = { .sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK,
+			.pView = view };
+		VkSurfaceKHR mvk;
+
+		CHECK(vkCreateMacOSSurfaceMVK);
+		VK(vkCreateMacOSSurfaceMVK(instance, &mci, NULL, &mvk));
+		VK(vkGetPhysicalDeviceSurfaceSupportKHR(phys, qf, mvk, &supported));
+		CHECK(supported);
+		VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, mvk, &caps));
+		CHECK(caps.currentExtent.width == 1920 && caps.currentExtent.height == 1080);
+		vkDestroySurfaceKHR(instance, mvk, NULL);
+		mci.pView = layer;
+		VK(vkCreateMacOSSurfaceMVK(instance, &mci, NULL, &mvk));
+		vkDestroySurfaceKHR(instance, mvk, NULL);
+		mci.pView = plain;
+		CHECK(vkCreateMacOSSurfaceMVK(instance, &mci, NULL, &mvk) == VK_ERROR_INITIALIZATION_FAILED);
+		test_view_release(plain);
+		test_view_release(view);
+	}
 	VK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(phys, surface, &caps));
 	CHECK(caps.currentExtent.width == 1920 && caps.currentExtent.height == 1080);
 	CHECK(caps.minImageCount == 3 && caps.supportedCompositeAlpha == VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR);
@@ -353,7 +387,7 @@ int main(int argc, char **argv)
 	test_metal_layer_release(layer);
 	lx_loopback_exit();
 	scanout_fixture_finish();
-	printf("PASS radv scanout: VK_EXT_metal_surface on the display engine, MLG_WSI_OUTPUT, FIFO "
+	printf("PASS radv scanout: VK_EXT_metal_surface (and VK_MVK_macos_surface) on the display engine, MLG_WSI_OUTPUT, FIFO "
 	       "frames on the primary plane, the desktop given back, a windowed overlay\n");
 	return 0;
 }
