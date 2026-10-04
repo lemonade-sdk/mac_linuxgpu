@@ -33,6 +33,7 @@
 #include <drm/drm_ioctl.h>
 #include <drm/amdgpu_drm.h>
 #include <rt/lx_files.h>
+#include <rt/lx_timing.h>
 
 extern int usleep(unsigned int usec);
 
@@ -45,6 +46,20 @@ extern int usleep(unsigned int usec);
 #define FIXTURE_BAR2_LEN (2ULL << 20)
 
 static int opens, releases;
+
+/* The device files the runtime adds (rt_lx_timing_register). */
+static const struct device_attribute *timing_attr;
+static struct device *timing_dev;
+static int timing_registrations;
+int device_create_file(struct device *dev, const struct device_attribute *attr)
+{
+	if (timing_attr && timing_dev == dev && attr == timing_attr)
+		return -EEXIST;
+	timing_dev = dev;
+	timing_attr = attr;
+	timing_registrations++;
+	return 0;
+}
 static DECLARE_WAIT_QUEUE_HEAD(syncobj_wq);
 static uint32_t signaled;	/* syncobj handles <= this are signaled */
 static int waiters;
@@ -629,6 +644,21 @@ int main(void)
 		CHECK(call->done && call->result == -EINTR);
 		CHECK(releases == 2);	/* a's render file; b's stays open */
 		free(call);
+	}
+	/* Hop timing: the device's mlg_lx_timing file, added once, shows the
+	 * requests made above by number with each hop's mean. */
+	{
+		static char text[16384];
+		char version[64];
+
+		CHECK(timing_registrations == 1 && timing_dev == &pdev.dev && timing_attr &&
+		      !strcmp(timing_attr->attr.name, "mlg_lx_timing"));
+		CHECK(timing_attr->show(&pdev.dev, (struct device_attribute *)timing_attr, text) > 0);
+		CHECK(strstr(text, "# primitives ns: clock="));
+		snprintf(version, sizeof(version), "\n0x%02x ", (unsigned int)(DRM_IOCTL_VERSION & 0xff));
+		const char *line = strstr(text, version);
+		CHECK(line && strstr(line, " pages=") && strstr(line, " ioctl=") && strstr(line, " release="));
+		CHECK(rt_lx_timing_show(text, 8) < 8);	/* bounded */
 	}
 	rt_lx_client_destroy(b);
 	CHECK(releases == 3 && opens == 3);

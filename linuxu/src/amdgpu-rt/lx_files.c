@@ -21,6 +21,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_ioctl.h>
 #include <rt/chrdev.h>
+#include <rt/lx_timing.h>
 #include <rt/lx_files.h>
 #include <rt/process.h>
 #include "lx_internal.h"
@@ -68,6 +69,7 @@ struct lx_async {
 	uint32_t cmd;
 	void *frame;
 	size_t frame_bytes;
+	uint64_t queued_ns;	/* when the request arrived (rt/lx_timing.h) */
 	rt_lx_done_fn done;
 	void *ctx;
 	pthread_t thread;
@@ -128,6 +130,7 @@ int rt_lx_client_create(struct pci_dev *pdev, int pid, const char *comm,
 		kfree(c);
 		return -ENOMEM;
 	}
+	rt_lx_timing_register(&pdev->dev);
 	*out = c;
 	return 0;
 }
@@ -465,11 +468,15 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 	uint8_t *out;
 	long ret;
 	int r;
+	uint64_t t0 = rt_lx_time_ns(), t1;
 
 	(void)frame_bytes;
 	r = pages_acquire(c, segs, head->nsegs, &pages);
 	if (r)
 		return r;
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_PAGES, t1 - t0);
+	t0 = t1;
 	for (uint32_t i = 0; i < head->nsegs; ++i)
 		if (segs[i].dir & MLG_LX_SEG_IN)
 			pages_copy(&pages, segs[i].va,
@@ -481,12 +488,18 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 			(uint64_t)INT64_MAX : now + head->timeout_ns;
 		pages_copy(&pages, head->timeout_va, &deadline, sizeof(deadline), true);
 	}
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_COPYIN, t1 - t0);
+	t0 = t1;
 	r = linuxu_process_enter(c->proc, &saved);
 	if (r) {
 		pages_release(c, &pages);
 		return r;
 	}
 	file = fget(fd);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_ENTER, t1 - t0);
+	t0 = t1;
 	if (!file) {
 		ret = -EBADF;
 	} else {
@@ -498,10 +511,16 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 			ret = -ENOTTY;
 		else
 			ret = file->f_op->unlocked_ioctl(file, cmd, (unsigned long)head->arg);
+		t1 = rt_lx_time_ns();
+		rt_lx_timing_add(cmd, RT_LX_HOP_IOCTL, t1 - t0);
+		t0 = t1;
 		fput(file);
 	}
 	linuxu_process_leave(&saved);
 	ret = lx_errno(ret);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_LEAVE, t1 - t0);
+	t0 = t1;
 
 	/* Linux leaves whatever the call wrote in user memory, failed or
 	 * not: every OUT segment goes back. */
@@ -520,7 +539,11 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 		rh.out_segments++;
 	}
 	memcpy(rep, &rh, sizeof(rh));
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_COPYOUT, t1 - t0);
+	t0 = t1;
 	pages_release(c, &pages);
+	rt_lx_timing_add(cmd, RT_LX_HOP_RELEASE, rt_lx_time_ns() - t0);
 	*reply_bytes = rh.total_bytes;
 	*result = ret;
 	return 0;
@@ -530,7 +553,7 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 		const void *frame, size_t frame_bytes, void *rep,
 		size_t rep_cap, size_t *reply_bytes, int64_t *result)
 {
-	uint64_t out_bytes = 0;
+	uint64_t out_bytes = 0, t0 = rt_lx_time_ns(), t1;
 	void *copy;
 	int r;
 
@@ -552,11 +575,15 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 		r = -ENOSPC;
 	if (!r)
 		r = call_begin(c);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_FRAME, t1 - t0);
 	if (!r) {
 		r = run_ioctl(c, fd, cmd, copy, frame_bytes, out_bytes, rep, reply_bytes, result);
+		t1 = rt_lx_time_ns();
 		call_end(c);
 	}
 	kvfree(copy);
+	rt_lx_timing_add(cmd, RT_LX_HOP_FINISH, rt_lx_time_ns() - t1);
 	return r;
 }
 
@@ -568,6 +595,8 @@ static void *async_main(void *arg)
 	struct rt_lx_client *c = a->c;
 	uint64_t out_bytes = 0;
 	int consumed = 0;
+
+	rt_lx_timing_add(a->cmd, RT_LX_HOP_SPAWN, rt_lx_time_ns() - a->queued_ns);
 
 	a->status = mlg_lx_frame_check(a->frame, a->frame_bytes, a->cmd, &out_bytes);
 	if (!a->status) {
@@ -665,6 +694,7 @@ int rt_lx_ioctl_async(struct rt_lx_client *c, int fd, uint32_t cmd,
 	}
 	memcpy(a->frame, frame, frame_bytes);
 	a->frame_bytes = frame_bytes;
+	a->queued_ns = rt_lx_time_ns();
 	a->c = c;
 	a->fd = fd;
 	a->cmd = cmd;

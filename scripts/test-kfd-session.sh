@@ -33,7 +33,7 @@ cflags=("${hostcflags[@]}" -DRT_KFD_COPY_TIMEOUT_MS=200 -DRT_KFD_SETTLE_MS=200
 sources=(linuxu/tests/test_kfd_session.c linuxu/tests/kfd_session_fixture.c
   linuxu/src/amdgpu-rt/tmpring_gc12.c
   linuxu/src/amdgpu-rt/kfd_session.c linuxu/src/amdgpu-rt/process_file.c
-  linuxu/src/amdgpu-rt/lx_files.c linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c
+  linuxu/src/amdgpu-rt/lx_files.c linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c linuxu/src/amdgpu-rt/lx_timing.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_chardev.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_process.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_process_queue_manager.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v12.c

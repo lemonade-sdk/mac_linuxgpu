@@ -79,6 +79,7 @@
 #include <rt/drm_info.h>
 #include <rt/lx_abi.h>
 #include <rt/lx_files.h>
+#include <rt/lx_timing.h>
 #include <rt/kfd_session.h>
 #include <rt/wait_pool.h>
 #include <rt/sysfs.h>
@@ -2383,7 +2384,8 @@ static void event_wait_main(void *arg)
 }
 
 static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client *lx,
-                             uint64_t selector, IOUserClientMethodArguments *a)
+                             uint64_t selector, IOUserClientMethodArguments *a,
+                             uint64_t entered_ns, uint64_t admitted_ns)
 {
     const uint64_t *in = a->scalarInput;
     uint64_t *out = a->scalarOutput;
@@ -2431,15 +2433,24 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
         }
         LxOutput reply;
         if (!lx_output(a, reply)) return kIOReturnBadArgument;
+        const uint32_t cmd = (uint32_t)in[1];
+        const uint64_t args_ns = rt_lx_time_ns();
+        rt_lx_timing_add(cmd, RT_LX_HOP_ADMIT, admitted_ns - entered_ns);
+        rt_lx_timing_add(cmd, RT_LX_HOP_ARGS, args_ns - admitted_ns);
         size_t bytes = 0;
         int64_t result = 0;
-        const int r = rt_lx_ioctl(lx, (int)in[0], (uint32_t)in[1], frame.bytes, frame.length,
+        const int r = rt_lx_ioctl(lx, (int)in[0], cmd, frame.bytes, frame.length,
                                   reply.bytes, reply.capacity, &bytes, &result);
         if (r) return lx_transport_error(r);
+        const uint64_t ran_ns = rt_lx_time_ns();
         out[0] = (uint64_t)result;
         out[1] = bytes;
         a->scalarOutputCount = 2;
-        return lx_output_done(a, reply, bytes);
+        const kern_return_t ret = lx_output_done(a, reply, bytes);
+        const uint64_t done_ns = rt_lx_time_ns();
+        rt_lx_timing_add(cmd, RT_LX_HOP_REPLY, done_ns - ran_ns);
+        rt_lx_timing_add(cmd, RT_LX_HOP_TOTAL, done_ns - entered_ns);
+        return ret;
     }
     case MLG_SELECTOR_LX_RESULT: {
         if (nin != 1 || a->scalarOutputCount < 2) return kIOReturnBadArgument;
@@ -2488,11 +2499,12 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
 static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t selector,
                                         IOUserClientMethodArguments *arguments)
 {
+    const uint64_t entered_ns = rt_lx_time_ns();
     struct rt_lx_client *lx = nullptr;
     kern_return_t ret = lx_state(client, &lx);
     if (ret != kIOReturnSuccess) return ret;
     if (!s_lxCalls.enter()) return kIOReturnNotReady;
-    ret = lx_call(client, lx, selector, arguments);
+    ret = lx_call(client, lx, selector, arguments, entered_ns, rt_lx_time_ns());
     s_lxCalls.leave();
     return ret;
 }
