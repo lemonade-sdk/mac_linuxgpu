@@ -18,7 +18,10 @@
  * .pk3 files. --dry-run prints all that and runs nothing.
  *
  * Every missing piece is an error that says what is missing; nothing is
- * run in its place. */
+ * run in its place. With --quake3, mlg-run stays the game's parent and
+ * passes its output through: Quake3e falls back to another r_mode by
+ * itself when the one it was given fails, and mlg-run stops the game and
+ * fails instead (the mode is part of what it forces). */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -31,6 +34,10 @@
 #include <unistd.h>
 
 #include <CoreGraphics/CoreGraphics.h>
+
+#include <signal.h>
+#include <util.h>
+#include <sys/wait.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -298,6 +305,72 @@ static int find_output(const char *wanted, struct plan_input *in, char *connecto
 	return 0;
 }
 
+static pid_t child;
+
+static void forward(int sig)
+{
+	if (child > 0)
+		kill(child, sig);
+}
+
+/* Quake3e as a child, its output passed through and watched for its own
+ * mode fallback. Returns mlg-run's exit status. */
+static int run_watched(char *const *argv)
+{
+	int fds[2], status = 0;
+	bool fallback = false;
+	FILE *out;
+	char line[4096];
+
+	/* A terminal, so the game's output comes line by line as it would to
+	 * one. */
+	if (openpty(&fds[0], &fds[1], NULL, NULL, NULL)) {
+		fprintf(stderr, "mlg-run: openpty failed: %s\n", strerror(errno));
+		return 1;
+	}
+	child = fork();
+	if (child < 0) {
+		fprintf(stderr, "mlg-run: fork failed: %s\n", strerror(errno));
+		return 1;
+	}
+	if (!child) {
+		dup2(fds[1], STDOUT_FILENO);
+		dup2(fds[1], STDERR_FILENO);
+		close(fds[0]);
+		close(fds[1]);
+		execvp(argv[0], argv);
+		fprintf(stderr, "mlg-run: running %s failed: %s\n", argv[0], strerror(errno));
+		_exit(127);
+	}
+	close(fds[1]);
+	signal(SIGINT, forward);
+	signal(SIGTERM, forward);
+	signal(SIGHUP, forward);
+	out = fdopen(fds[0], "r");
+	/* The terminal reads EIO once the game and its children closed it. */
+	while (out && fgets(line, sizeof(line), out)) {
+		fputs(line, stdout);
+		fflush(stdout);
+		if (!fallback && plan_quake3_mode_fallback(line)) {
+			fallback = true;
+			fprintf(stderr, "mlg-run: Quake3e could not set the mode it was given and fell back "
+				"to another one; stopping it (the lines above say why)\n");
+			kill(child, SIGTERM);
+		}
+	}
+	if (out)
+		fclose(out);
+	while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+		;
+	if (fallback)
+		return 1;
+	if (WIFSIGNALED(status)) {
+		fprintf(stderr, "mlg-run: %s ended by signal %d\n", argv[0], WTERMSIG(status));
+		return 128 + WTERMSIG(status);
+	}
+	return WEXITSTATUS(status);
+}
+
 int main(int argc, char **argv)
 {
 	const char *output = "auto", *icd_arg = NULL, *loader_arg = NULL, *basepath_arg = NULL;
@@ -379,6 +452,8 @@ int main(int argc, char **argv)
 			fprintf(stderr, "mlg-run: setenv %s failed: %s\n", plan.env_name[e], strerror(errno));
 			return 1;
 		}
+	if (in.quake3)
+		return run_watched(plan.argv);
 	execvp(plan.argv[0], plan.argv);
 	fprintf(stderr, "mlg-run: running %s failed: %s\n", plan.argv[0], strerror(errno));
 	return 127;

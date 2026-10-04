@@ -152,3 +152,8 @@ int plan_make(const struct plan_input *in, struct plan *out, char *why, size_t w
 	out->argv[out->argc] = NULL;
 	return 0;
 }
+
+bool plan_quake3_mode_fallback(const char *line)
+{
+	return strstr(line, "failed, falling back on r_mode") != NULL;
+}

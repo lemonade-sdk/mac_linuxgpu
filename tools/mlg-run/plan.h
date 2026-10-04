@@ -49,6 +49,10 @@ struct plan {
 
 /* 0, or -1 with a reason in @why. */
 int plan_make(const struct plan_input *in, struct plan *out, char *why, size_t why_size);
+/* Whether a line Quake3e printed says it gave up the mode mlg-run set
+ * ("Setting r_mode -2 failed, falling back on r_mode 3"). */
+bool plan_quake3_mode_fallback(const char *line);
+
 /* "auto", "fullscreen", "windowed" -> 0 with *mode, else -1. */
 int plan_mode_parse(const char *text, enum plan_mode *mode);
 const char *plan_mode_name(enum plan_mode mode);
