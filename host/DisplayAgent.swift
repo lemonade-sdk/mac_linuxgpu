@@ -498,3 +498,109 @@ func presentRects(_ dirty: [CGRect], width: Int, height: Int) -> [(x: UInt32, y:
     if out.count > 255 { return [(0, 0, UInt32(width), UInt32(height))] }
     return out
 }
+
+// ----------------------------------------------------------------
+// MARK: - the display control model (daemon <-> menu bar)
+// ----------------------------------------------------------------
+
+/// A monitor's identity across connectors, replugs and GPUs: its EDID
+/// manufacturer, product code and serial (the serial string descriptor
+/// when the binary serial is 0). nil without a readable EDID.
+func monitorKey(edid: Data?) -> String? {
+    guard let edid, let summary = EDIDSummary(edid) else { return nil }
+    let serial = summary.serial != 0 ? String(summary.serial) : (summary.serialText ?? "0")
+    return String(format: "%@-%04X-%@", summary.vendor, summary.product, serial)
+}
+
+/// The user's per-monitor choices (the menu bar's toggles): a monitor is
+/// mirrored unless turned off. Persisted as JSON, keyed by monitorKey.
+struct DisplayPrefs: Codable, Equatable {
+    var off: [String] = []
+
+    func isOn(_ key: String) -> Bool { !off.contains(key) }
+    mutating func set(_ key: String, on: Bool) {
+        off.removeAll { $0 == key }
+        if !on { off.append(key); off.sort() }
+    }
+
+    static func load(from url: URL) -> DisplayPrefs {
+        guard let data = try? Data(contentsOf: url) else { return DisplayPrefs() }
+        return (try? JSONDecoder().decode(DisplayPrefs.self, from: data)) ?? DisplayPrefs()
+    }
+    func save(to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+}
+
+/// What the daemon reports for the menu bar.
+struct DisplayStatus: Codable, Equatable {
+    enum State: String, Codable { case off, starting, mirroring, error }
+    struct Monitor: Codable, Equatable {
+        var key: String
+        var connector: String
+        var name: String
+        var on: Bool
+        var state: State
+        var mode: String?          // "2560x1440 @ 59.950 Hz" while mirroring
+        var error: String?         // the last error line
+    }
+    var daemon: Int32 = 0          // the daemon's pid, 0 when it is not running
+    var driverAttached = false
+    var monitors: [Monitor] = []
+
+    /// The menu bar icon's state: an error on any monitor, else whether
+    /// any is mirrored.
+    var summary: State {
+        if monitors.contains(where: { $0.state == .error }) { return .error }
+        if monitors.contains(where: { $0.state == .mirroring }) { return .mirroring }
+        if monitors.contains(where: { $0.state == .starting }) { return .starting }
+        return .off
+    }
+
+    static func load(from url: URL) -> DisplayStatus? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(DisplayStatus.self, from: data)
+    }
+    func save(to url: URL) throws {
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try encoder.encode(self).write(to: url, options: .atomic)
+    }
+}
+
+/// What a mirroring process's output line says about its monitor.
+enum AgentLine: Equatable {
+    case mirroring(String)
+    case failed(String)
+    case other
+}
+func parseAgentLine(_ line: String) -> AgentLine {
+    if let range = line.range(of: " lit at ") {
+        return .mirroring(String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces))
+    }
+    if let range = line.range(of: "FAILED: ") { return .failed(String(line[range.upperBound...])) }
+    return .other
+}
+
+/// The connected monitors to mirror: those with an identity the user has
+/// not turned off. (A monitor without a readable EDID cannot be told apart
+/// across replugs; it is mirrored, under its connector's name.)
+func connectorsToMirror(connected: [(connector: String, key: String)], prefs: DisplayPrefs) -> [String] {
+    connected.filter { prefs.isOn($0.key) }.map { $0.connector }
+}
+
+/// Where the daemon and the menu bar meet: the choices, the status, and the
+/// Darwin notifications each posts when it changed its file.
+enum DisplayControl {
+    static var directory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacLinuxGPU")
+    }
+    static var prefsURL: URL { directory.appendingPathComponent("displays.json") }
+    static var statusURL: URL { directory.appendingPathComponent("display-status.json") }
+    static let prefsChanged = "com.geramyloveless.maclinuxgpu.display-prefs"
+    static let statusChanged = "com.geramyloveless.maclinuxgpu.display-status"
+}

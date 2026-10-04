@@ -1577,6 +1577,7 @@ private final class InstallerController: NSObject, ObservableObject,
     @Published var registeredVersion = "—"
     @Published var runningStatus = "not checked"
     @Published var displayAutostart = DisplayAutostart.isEnabled
+    @Published var menuBarShown = MenuBarAgent.isEnabled
     /// The GPU and its monitors (readGPUDevices), refreshed while the app runs.
     @Published var gpuSummary = ""
 
@@ -1859,12 +1860,21 @@ private final class InstallerController: NSObject, ObservableObject,
                     self.append("Display autostart is on: monitors on the GPU appear as Mac displays (log: \(DisplayAutostart.logURL.path)).")
                 }
                 self.displayAutostart = DisplayAutostart.isEnabled
+                if let error = MenuBarAgent.enableUnlessHidden() {
+                    self.append("Menu bar item: \(error)")
+                }
+                self.menuBarShown = MenuBarAgent.isEnabled
             } else {
                 self.status = "Driver not attached"
                 self.append(result + ". Registration alone does not show that the dext is running.")
             }
             self.isWorking = false
         }
+    }
+
+    func setMenuBarShown(_ on: Bool) {
+        if let error = on ? MenuBarAgent.enable() : MenuBarAgent.disable() { append("Menu bar item: \(error)") }
+        menuBarShown = MenuBarAgent.isEnabled
     }
 
     func setDisplayAutostart(_ on: Bool) {
@@ -1926,6 +1936,10 @@ private struct InstallerView: View {
             Toggle("Show monitors on the GPU as Mac displays automatically", isOn: Binding(
                 get: { controller.displayAutostart },
                 set: { controller.setDisplayAutostart($0) }))
+                .disabled(controller.needsCopy || controller.isWorking)
+            Toggle("Show MacLinuxGPU in the menu bar", isOn: Binding(
+                get: { controller.menuBarShown },
+                set: { controller.setMenuBarShown($0) }))
                 .disabled(controller.needsCopy || controller.isWorking)
             if !controller.gpuSummary.isEmpty {
                 GroupBox("GPU") {
@@ -2065,6 +2079,9 @@ struct AppMain {
         }
         if args[1] == "display-autostart" {
             exit(runDisplayAutostart(Array(args.dropFirst(2))))
+        }
+        if args[1] == "menu-bar" {
+            exit(runMenuBar())
         }
         if ["display-probe", "display-test", "display-off"].contains(args[1]) {
             exit(runDisplayCommand(args[1], Array(args.dropFirst(2))))

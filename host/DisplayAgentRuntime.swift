@@ -873,19 +873,38 @@ private final class DriverWatch {
     }
 }
 
+/// One monitor's mirroring process, as the daemon follows it.
+private final class MirrorChild {
+    let connector: String
+    let process = Process()
+    var exited = false
+    var state: DisplayStatus.State = .starting
+    var mode: String?
+    var lastError: String?
+    var buffer = ""
+    init(connector: String) { self.connector = connector }
+}
+
 /// display-agent --create --daemon: the per-user LaunchAgent
-/// (DisplayAutostart) that makes the GPU's monitor a Mac display whenever
-/// the driver runs. It waits for the driver (IOKit matching notifications,
-/// no polling) and then runs the mirroring in a child process,
-/// `display-agent --create --init --follow-hotplug`: the child brings the
-/// GPU up if needed, mirrors the connected monitor and exits when the
-/// monitor or the driver leaves; the daemon starts a new one when they come
-/// back. (A process sees the modes of one virtual display only: see
-/// agentBecomeBackground.) The daemon itself never talks to the WindowServer,
-/// so it never shows in the Dock. SIGTERM (launchctl bootout) stops the
-/// child and ends the daemon.
+/// (DisplayAutostart) that makes each monitor on the GPU a Mac display
+/// whenever the driver runs.
+///
+/// It waits for the driver (IOKit matching notifications), holds a session
+/// so the GPU is up, and reads the monitors from the driver's cached
+/// hotplug state every 2 s (a probe when the hotplug epoch moves). Each
+/// connected monitor the user has not turned off (DisplayPrefs, by EDID
+/// identity) is mirrored by its own child, `display-agent --create --init
+/// --follow-hotplug --connector C`: a process sees the modes of one
+/// virtual display only (agentBecomeBackground). Turning a monitor off
+/// stops its child, which removes its virtual display and restores the
+/// monitor. The children's output goes to the log; what they report
+/// (mirroring at a mode, or their error) is published for the menu bar in
+/// DisplayStatus, with a Darwin notification. The menu bar's changes to
+/// DisplayPrefs arrive the same way. SIGTERM stops the children and the
+/// daemon. The daemon itself never talks to the WindowServer.
 func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     agentHandleSignals()
+    setvbuf(stdout, nil, _IOLBF, 0)
     agentLog("display-agent: daemon started (pid \(getpid()))")
     guard let watch = DriverWatch(bundleIdentifier: "com.geramyloveless.MacAMDGPUHost.MacAMDGPU") else {
         agentLog("display-agent: could not watch for the driver (IOKit notifications)")
@@ -895,62 +914,180 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         agentLog("display-agent: the app's executable path is unknown")
         return 1
     }
-    var connector: [String] = []
-    if let wanted = option(options, "--connector") { connector = ["--connector", wanted] }
-    var child: Process?
-    var childExited = false
+    var prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+    var prefsToken: Int32 = 0
+    notify_register_dispatch(DisplayControl.prefsChanged, &prefsToken, DispatchQueue.main) { _ in
+        prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        agentLog("display-agent: display choices changed")
+    }
+    defer { notify_cancel(prefsToken) }
+
+    var children: [String: MirrorChild] = [:]
+    var retryAt: [String: Date] = [:]
+    var lastErrors: [String: String] = [:]
+    var monitors: [(connector: String, key: String, name: String)] = []
+    var published: DisplayStatus?
+    var session: MacLinuxGPUHost?, observer: MacLinuxGPUHost?
+    var epoch: UInt32 = .max
+
+    func publish() {
+        var status = DisplayStatus(daemon: getpid(), driverAttached: watch.present, monitors: [])
+        for m in monitors {
+            let child = children[m.connector]
+            let on = prefs.isOn(m.key)
+            var state: DisplayStatus.State = .off
+            var mode: String?, error: String?
+            if let child {
+                state = child.state; mode = child.mode; error = child.lastError
+            } else if on, let last = lastErrors[m.connector] {
+                state = .error; error = last
+            } else if on {
+                state = .starting
+            }
+            status.monitors.append(.init(key: m.key, connector: m.connector, name: m.name, on: on,
+                                         state: state, mode: mode, error: error))
+        }
+        guard status != published else { return }
+        published = status
+        do { try status.save(to: DisplayControl.statusURL) }
+        catch { agentLog("display-agent: could not write \(DisplayControl.statusURL.path): \(error)") }
+        notify_post(DisplayControl.statusChanged)
+    }
+
+    func stop(_ child: MirrorChild) {
+        if !child.exited { child.process.terminate() }
+        let deadline = Date().addingTimeInterval(15)
+        while !child.exited && Date() < deadline {
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.2))
+        }
+    }
+
+    func start(_ connector: String) {
+        let child = MirrorChild(connector: connector)
+        child.process.executableURL = URL(fileURLWithPath: executable)
+        child.process.arguments = ["display-agent", "--create", "--init", "--follow-hotplug",
+                                   "--warmup", "1000000000", "--connector", connector]
+        let pipe = Pipe()
+        child.process.standardOutput = pipe
+        child.process.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            DispatchQueue.main.async {
+                guard !data.isEmpty else { return }
+                FileHandle.standardOutput.write(data)
+                child.buffer += String(decoding: data, as: UTF8.self)
+                while let newline = child.buffer.firstIndex(of: "\n") {
+                    let line = String(child.buffer[..<newline])
+                    child.buffer.removeSubrange(...newline)
+                    switch parseAgentLine(line) {
+                    case .mirroring(let mode): child.state = .mirroring; child.mode = mode; child.lastError = nil
+                    case .failed(let error): child.lastError = error
+                    case .other: break
+                    }
+                }
+                publish()
+            }
+        }
+        child.process.terminationHandler = { process in
+            DispatchQueue.main.async {
+                pipe.fileHandleForReading.readabilityHandler = nil
+                child.exited = true
+                // 0: the monitor left or it was stopped; 3: no monitor.
+                if process.terminationStatus != 0 && process.terminationStatus != 3 {
+                    child.state = .error
+                    if child.lastError == nil { child.lastError = "the mirroring process ended with status \(process.terminationStatus)" }
+                }
+            }
+        }
+        do {
+            try child.process.run()
+        } catch {
+            lastErrors[connector] = "could not start the mirroring process: \(error)"
+            retryAt[connector] = Date().addingTimeInterval(10)
+            return
+        }
+        children[connector] = child
+        agentLog("display-agent: \(connector): mirroring process \(child.process.processIdentifier) started")
+    }
+
+    func closeClients() {
+        _ = observer?.closeUserClient(); observer = nil
+        _ = session?.closeUserClient(); session = nil
+        epoch = .max
+        monitors = []
+    }
+
     while !agentInterrupted {
         if !watch.present {
+            for child in children.values { stop(child) }
+            children = [:]
+            closeClients()
+            publish()
             agentLog("display-agent: waiting for the driver")
             while !agentInterrupted && !watch.present {
                 _ = RunLoop.main.run(mode: .default, before: .distantFuture)
             }
             continue
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = ["display-agent", "--create", "--init", "--follow-hotplug",
-                             "--warmup", "1000000000"] + connector
-        childExited = false
-        process.terminationHandler = { _ in
-            DispatchQueue.main.async { childExited = true }
-        }
-        do {
-            try process.run()
-        } catch {
-            agentLog("display-agent: could not start the mirroring process: \(error)")
-            return 1
-        }
-        child = process
-        agentLog("display-agent: mirroring process \(process.processIdentifier) started")
-        // Until the child ends, or a signal or the driver leaving ends it.
-        while !childExited && !agentInterrupted && watch.present {
-            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(1))
-        }
-        if !childExited {
-            process.terminate()	// SIGTERM: it restores the monitor and removes its display
-            let deadline = Date().addingTimeInterval(10)
-            while !childExited && Date() < deadline {
-                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.2))
+        // A session keeps the GPU up; the observer reads its cached state.
+        if session == nil || observer == nil {
+            closeClients()
+            let s = MacLinuxGPUHost(), o = MacLinuxGPUHost()
+            guard s.openUserClient(), s.initDevice(), o.openUserClient(observer: true) else {
+                _ = s.closeUserClient(); _ = o.closeUserClient()
+                agentLog("display-agent: the GPU could not be brought up; retrying in 10 s")
+                let until = Date().addingTimeInterval(10)
+                while !agentInterrupted && watch.present && Date() < until {
+                    _ = RunLoop.main.run(mode: .default, before: until)
+                }
+                continue
             }
+            session = s; observer = o
         }
-        child = nil
-        if !childExited { continue }
-        let status = process.terminationStatus
-        agentLog("display-agent: mirroring process ended (status \(status))")
-        if agentInterrupted { break }
-        let pause: TimeInterval
-        switch status {
-        case 0: pause = 2       // the monitor left: watch for it again
-        case 3: pause = 5       // no monitor connected yet
-        default: pause = 10     // an error: retry after a pause
+        // The monitors: the cached hotplug state; probe when it moved.
+        let (kr, _, report) = observer!.display(.status)
+        guard kr == kIOReturnSuccess, let report else { closeClients(); continue }
+        if report.hotplugEpoch != epoch {
+            epoch = report.hotplugEpoch
+            let (pkr, _, probed) = observer!.display(.probe)
+            let current = (pkr == kIOReturnSuccess ? probed : nil) ?? report
+            monitors = current.connectors.filter { $0.connected }.map { c in
+                let edid = observer!.connectorEDID(c.name)
+                let summary = edid.flatMap { EDIDSummary($0) }
+                return (c.name, monitorKey(edid: edid) ?? "connector-\(c.name)",
+                        summary?.name ?? c.name)
+            }
+            agentLog("display-agent: monitors: " + (monitors.isEmpty ? "none" :
+                monitors.map { "\($0.connector) \($0.name) [\($0.key)]" }.joined(separator: ", ")))
         }
-        let until = Date().addingTimeInterval(pause)
-        while !agentInterrupted && watch.present && Date() < until {
-            _ = RunLoop.main.run(mode: .default, before: until)
+        // Reconcile the children with the choices and the monitors.
+        let wanted = Set(connectorsToMirror(connected: monitors.map { ($0.connector, $0.key) }, prefs: prefs))
+        for (connector, child) in children where child.exited || !wanted.contains(connector) {
+            if !child.exited { stop(child) }
+            if child.state == .error, let error = child.lastError {
+                lastErrors[connector] = error
+                retryAt[connector] = Date().addingTimeInterval(10)
+            } else {
+                lastErrors[connector] = nil
+            }
+            children[connector] = nil
+            agentLog("display-agent: \(connector): mirroring process ended")
         }
+        for connector in wanted where children[connector] == nil {
+            if let at = retryAt[connector], at > Date() { continue }
+            retryAt[connector] = nil
+            start(connector)
+        }
+        for connector in Array(lastErrors.keys) where !wanted.contains(connector) { lastErrors[connector] = nil }
+        publish()
+        _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
     }
-    if let child, child.isRunning { child.terminate(); child.waitUntilExit() }
+    for child in children.values { stop(child) }
+    children = [:]
+    closeClients()
+    published = nil
+    try? DisplayStatus(daemon: 0, driverAttached: watch.present, monitors: []).save(to: DisplayControl.statusURL)
+    notify_post(DisplayControl.statusChanged)
     agentLog("display-agent: daemon stopped")
     return 0
 }
@@ -1098,4 +1235,174 @@ func runDisplayAutostart(_ options: [String]) -> Int32 {
               "; log \(DisplayAutostart.logURL.path)")
     }
     return 0
+}
+
+// ----------------------------------------------------------------
+// MARK: - menu bar (MacLinuxGPUHost menu-bar)
+// ----------------------------------------------------------------
+
+/// The menu bar item: each monitor on the GPU with an On/Off toggle, its
+/// live state, the autostart setting, the log and the app. It only reads
+/// the daemon's DisplayStatus and writes DisplayPrefs (with a Darwin
+/// notification each way); it never creates a virtual display itself. Runs
+/// as a background agent (never in the Dock), from its own LaunchAgent
+/// (MenuBarAgent).
+private final class MenuBarController: NSObject, NSMenuDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    var status = DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()
+    var token: Int32 = 0
+
+    override init() {
+        super.init()
+        let menu = NSMenu()
+        menu.delegate = self
+        item.menu = menu
+        notify_register_dispatch(DisplayControl.statusChanged, &token, DispatchQueue.main) { [weak self] _ in
+            self?.reload()
+        }
+        reload()
+    }
+
+    func reload() {
+        status = DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()
+        let running = status.daemon != 0 && kill(status.daemon, 0) == 0
+        let state: DisplayStatus.State = running ? status.summary : .off
+        let symbol = state == .error ? "exclamationmark.triangle" : "display"
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "MacLinuxGPU displays")
+        image?.isTemplate = true
+        item.button?.image = image
+        item.button?.appearsDisabled = state == .off
+        item.button?.toolTip = "MacLinuxGPU displays: " + (running ? state.rawValue : "the display agent is not running")
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        reload()
+        menu.removeAllItems()
+        let running = status.daemon != 0 && kill(status.daemon, 0) == 0
+        menu.addItem(withTitle: "MacLinuxGPU Displays", action: nil, keyEquivalent: "").isEnabled = false
+        if !running {
+            menu.addItem(withTitle: DisplayAutostart.isEnabled ? "The display agent is not running"
+                                                               : "Displays are not started automatically",
+                         action: nil, keyEquivalent: "").isEnabled = false
+        } else if !status.driverAttached {
+            menu.addItem(withTitle: "No GPU attached", action: nil, keyEquivalent: "").isEnabled = false
+        } else if status.monitors.isEmpty {
+            menu.addItem(withTitle: "No monitor connected to the GPU", action: nil, keyEquivalent: "").isEnabled = false
+        }
+        if running {
+            for monitor in status.monitors {
+                let toggle = NSMenuItem(title: "\(monitor.name) (\(monitor.connector))",
+                                        action: #selector(toggleMonitor(_:)), keyEquivalent: "")
+                toggle.target = self
+                toggle.state = monitor.on ? .on : .off
+                toggle.representedObject = monitor.key
+                menu.addItem(toggle)
+                let line: String
+                switch monitor.state {
+                case .off: line = "Off"
+                case .starting: line = "Starting…"
+                case .mirroring: line = "Mirroring at " + (monitor.mode ?? "?")
+                case .error: line = "Error: " + (monitor.error ?? "unknown")
+                }
+                let detail = NSMenuItem(title: "    " + line, action: nil, keyEquivalent: "")
+                detail.isEnabled = false
+                menu.addItem(detail)
+            }
+        }
+        menu.addItem(.separator())
+        let auto = NSMenuItem(title: "Start displays automatically", action: #selector(toggleAutostart(_:)),
+                              keyEquivalent: "")
+        auto.target = self
+        auto.state = DisplayAutostart.isEnabled ? .on : .off
+        menu.addItem(auto)
+        let log = NSMenuItem(title: "Open log", action: #selector(openLog), keyEquivalent: "")
+        log.target = self
+        menu.addItem(log)
+        let app = NSMenuItem(title: "Open MacLinuxGPU", action: #selector(openApp), keyEquivalent: "")
+        app.target = self
+        menu.addItem(app)
+    }
+
+    @objc func toggleMonitor(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        var prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        prefs.set(key, on: !prefs.isOn(key))
+        do {
+            try prefs.save(to: DisplayControl.prefsURL)
+            notify_post(DisplayControl.prefsChanged)
+        } catch {
+            NSSound.beep()
+        }
+    }
+
+    @objc func toggleAutostart(_ sender: NSMenuItem) {
+        _ = DisplayAutostart.isEnabled ? DisplayAutostart.disable() : DisplayAutostart.enable()
+        reload()
+    }
+
+    @objc func openLog() {
+        NSWorkspace.shared.open(DisplayAutostart.logURL)
+    }
+
+    @objc func openApp() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
+    }
+}
+
+func runMenuBar() -> Int32 {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let controller = MenuBarController()
+    withExtendedLifetime(controller) { app.run() }
+    return 0
+}
+
+/// The menu bar item as a per-user LaunchAgent: at login, with the display
+/// agent. The installer enables it unless the user hid it in the app.
+enum MenuBarAgent {
+    static let label = "com.geramyloveless.maclinuxgpu.menu-bar"
+    private static let hiddenKey = "MenuBarHidden"
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+    static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+    private static var domain: String { "gui/\(getuid())" }
+
+    static func enable(executable: String = Bundle.main.executablePath ?? "") -> String? {
+        UserDefaults.standard.set(false, forKey: hiddenKey)
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [executable, "menu-bar"],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "LimitLoadToSessionType": "Aqua",
+            "ProcessType": "Interactive",
+        ]
+        do {
+            try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+                .write(to: plistURL, options: .atomic)
+        } catch {
+            return "could not write \(plistURL.path): \(error.localizedDescription)"
+        }
+        DisplayAutostart.launchctl(["bootout", "\(domain)/\(label)"])
+        let started = DisplayAutostart.launchctl(["bootstrap", domain, plistURL.path])
+        return started.status == 0 ? nil : "launchctl bootstrap failed (\(started.status)): \(started.output)"
+    }
+
+    static func disable() -> String? {
+        UserDefaults.standard.set(true, forKey: hiddenKey)
+        DisplayAutostart.launchctl(["bootout", "\(domain)/\(label)"])
+        do { if isEnabled { try FileManager.default.removeItem(at: plistURL) } }
+        catch { return "could not remove \(plistURL.path): \(error.localizedDescription)" }
+        return nil
+    }
+
+    static func enableUnlessHidden() -> String? {
+        UserDefaults.standard.bool(forKey: hiddenKey) ? nil : enable()
+    }
 }

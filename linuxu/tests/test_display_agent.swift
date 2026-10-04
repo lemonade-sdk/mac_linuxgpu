@@ -182,3 +182,53 @@ check(presentRects((0..<300).map { CGRect(x: $0, y: 0, width: 1, height: 1) }, w
       .elementsEqual([(0, 0, 640, 480)], by: ==))
 
 print("PASS display agent: report/modes decoding, EDID identity and primaries, virtual-display plans, refusals, add/update/remove, frame replies and damage")
+
+// ---- the display control model: per-monitor persistence, status, lines ----
+do {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlg-display-control-\(getpid())")
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let prefsURL = dir.appendingPathComponent("displays.json")
+    // No file: every monitor is on.
+    var prefs = DisplayPrefs.load(from: prefsURL)
+    check(prefs.isOn("DEL-40DD-1096046924"))
+    prefs.set("DEL-40DD-1096046924", on: false)
+    prefs.set("DEL-40DD-1096046924", on: false)
+    try! prefs.save(to: prefsURL)
+    // Reloaded (a reboot, a replug): the choice holds, once.
+    var reloaded = DisplayPrefs.load(from: prefsURL)
+    check(reloaded == prefs && reloaded.off == ["DEL-40DD-1096046924"] && !reloaded.isOn("DEL-40DD-1096046924"))
+    check(reloaded.isOn("SAM-0F12-77"), "other monitors stay on")
+    // Keyed by identity, not connector: the same monitor on another
+    // connector stays off; another monitor on its old connector is on.
+    let connected = [(connector: "DP-2", key: "DEL-40DD-1096046924"), (connector: "DP-4", key: "SAM-0F12-77")]
+    check(connectorsToMirror(connected: connected, prefs: reloaded) == ["DP-4"])
+    reloaded.set("DEL-40DD-1096046924", on: true)
+    check(connectorsToMirror(connected: connected, prefs: reloaded) == ["DP-2", "DP-4"])
+    // A damaged file reads as defaults rather than failing the daemon.
+    try! Data("not json".utf8).write(to: prefsURL)
+    check(DisplayPrefs.load(from: prefsURL) == DisplayPrefs())
+
+    // The key from an EDID: vendor, product, serial.
+    let key = monitorKey(edid: edid(serial: 1096046924))
+    check(key == "LNX-0001-1096046924", key ?? "nil")
+    check(monitorKey(edid: edid(name: "", serial: 0, serialText: "SN12345")) == "LNX-0001-SN12345")
+    check(monitorKey(edid: Data(count: 128)) == nil && monitorKey(edid: nil) == nil)
+
+    // Status: written by the daemon, read by the menu bar.
+    let statusURL = dir.appendingPathComponent("display-status.json")
+    var status = DisplayStatus(daemon: 42, driverAttached: true, monitors: [
+        .init(key: "DEL-40DD-1096046924", connector: "DP-4", name: "DELL UP2716D", on: true,
+              state: .mirroring, mode: "2560x1440 @ 59.950 Hz", error: nil)])
+    try! status.save(to: statusURL)
+    check(DisplayStatus.load(from: statusURL) == status && status.summary == .mirroring)
+    status.monitors.append(.init(key: "SAM-0F12-77", connector: "DP-2", name: "SAMSUNG", on: true,
+                                 state: .error, mode: nil, error: "OUTPUT: busy"))
+    check(status.summary == .error)
+    check(DisplayStatus().summary == .off)
+
+    // A mirroring process's lines.
+    check(parseAgentLine("display-agent: DP-4 lit at 2560x1440 @ 59.950 Hz") == .mirroring("2560x1440 @ 59.950 Hz"))
+    check(parseAgentLine("display-agent: FAILED: PRESENT: Linux errno 62") == .failed("PRESENT: Linux errno 62"))
+    check(parseAgentLine("display-agent: capture surface 1 imported as handle 2") == .other)
+}
+print("PASS display control: per-monitor choices persist by EDID identity, status round trip, agent lines")
