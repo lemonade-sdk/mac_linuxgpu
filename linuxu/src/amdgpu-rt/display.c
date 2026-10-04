@@ -1,6 +1,9 @@
 /* The in-driver display test (rt/display.h): a DRM client that shows a
  * static pattern through upstream drm_client, the atomic helpers and the
  * driver's own KMS (amdgpu_dm and Display Core on amdgpu). */
+#include <pthread.h>
+#include <time.h>
+
 #include <linux/errno.h>
 #include <linux/io.h>
 #include <linux/iosys-map.h>
@@ -108,7 +111,13 @@ struct display_output {
 	struct dma_fence_cb flip_cb;
 	struct output_frame pending_frame;
 	struct task_struct *worker;
-	wait_queue_head_t wake;
+	/* The worker sleeps on this until a kick (a frame, a flip, stop) or
+	 * its timeout; nothing polls. A plain condition variable: linuxu's
+	 * wait_event sleeps in 1 ms steps. */
+	pthread_mutex_t sleep_lock;
+	pthread_cond_t sleep_cond;
+	uint64_t kicks, kicks_seen;	/* kicks_seen: the worker's */
+	bool stop;
 	/* Under lock: the mailbox, the stats, the flip's signal. */
 	spinlock_t lock;
 	struct rt_surface *next;
@@ -1065,6 +1074,40 @@ static void damage_merge(struct output_damage *d, const struct output_damage *ad
 	}
 }
 
+static void output_kick(struct display_output *o)
+{
+	pthread_mutex_lock(&o->sleep_lock);
+	o->kicks++;
+	pthread_cond_broadcast(&o->sleep_cond);
+	pthread_mutex_unlock(&o->sleep_lock);
+}
+
+/* The worker: until a kick since the last sleep, stop, or @timeout_ms
+ * (0: none). */
+static void output_sleep(struct display_output *o, unsigned int timeout_ms)
+{
+	struct timespec deadline;
+
+	if (timeout_ms) {
+		clock_gettime(CLOCK_REALTIME, &deadline);
+		deadline.tv_sec += timeout_ms / 1000;
+		deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+		if (deadline.tv_nsec >= 1000000000L) {
+			deadline.tv_sec++;
+			deadline.tv_nsec -= 1000000000L;
+		}
+	}
+	pthread_mutex_lock(&o->sleep_lock);
+	while (o->kicks == o->kicks_seen && !o->stop) {
+		if (!timeout_ms)
+			pthread_cond_wait(&o->sleep_cond, &o->sleep_lock);
+		else if (pthread_cond_timedwait(&o->sleep_cond, &o->sleep_lock, &deadline))
+			break;
+	}
+	o->kicks_seen = o->kicks;
+	pthread_mutex_unlock(&o->sleep_lock);
+}
+
 static void output_flip_signaled(struct dma_fence *fence, struct dma_fence_cb *cb)
 {
 	struct display_output *o = container_of(cb, struct display_output, flip_cb);
@@ -1074,7 +1117,7 @@ static void output_flip_signaled(struct dma_fence *fence, struct dma_fence_cb *c
 	spin_lock_irqsave(&o->lock, flags);
 	o->flip_done = true;
 	spin_unlock_irqrestore(&o->lock, flags);
-	wake_up(&o->wake);
+	output_kick(o);
 }
 
 static void output_error(struct display_output *o, int error)
@@ -1279,7 +1322,7 @@ static bool output_has_work(struct display_output *o)
 	spin_lock_irqsave(&o->lock, flags);
 	work = o->next || o->flip_done;
 	spin_unlock_irqrestore(&o->lock, flags);
-	return work || kthread_should_stop();
+	return work || o->stop || kthread_should_stop();
 }
 
 static int output_worker(void *arg)
@@ -1297,10 +1340,8 @@ static int output_worker(void *arg)
 		/* Nothing outstanding: sleep until a frame or a flip arrives.
 		 * A pending flip is also checked after a bounded wait, the
 		 * backstop for a lost flip interrupt. */
-		if (o->pending_flip)
-			wait_event_timeout(o->wake, output_has_work(o), msecs_to_jiffies(OUTPUT_FLIP_TIMEOUT_MS));
-		else
-			wait_event(o->wake, output_has_work(o));
+		if (!output_has_work(o))
+			output_sleep(o, o->pending_flip ? OUTPUT_FLIP_TIMEOUT_MS : 0);
 		if (kthread_should_stop())
 			break;
 		spin_lock_irqsave(&o->lock, flags);
@@ -1339,13 +1380,17 @@ static int output_worker(void *arg)
 		rt_surface_release(left);
 	}
 	while (!kthread_should_stop())
-		wait_event_timeout(o->wake, kthread_should_stop(), msecs_to_jiffies(1000));
+		output_sleep(o, 1000);
 	return 0;
 }
 
 static void output_stop(struct display_output *o)
 {
 	if (o->worker) {
+		pthread_mutex_lock(&o->sleep_lock);
+		o->stop = true;
+		pthread_cond_broadcast(&o->sleep_cond);
+		pthread_mutex_unlock(&o->sleep_lock);
 		kthread_stop(o->worker);
 		o->worker = NULL;
 	}
@@ -1386,6 +1431,8 @@ static void output_free(struct display_output *o)
 		}
 		drm_client_buffer_delete(o->fb[i]);
 	}
+	pthread_cond_destroy(&o->sleep_cond);
+	pthread_mutex_destroy(&o->sleep_lock);
 	kfree(o);
 }
 
@@ -1430,7 +1477,8 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 	o->height = height;
 	o->front = o->pending = -1;
 	spin_lock_init(&o->lock);
-	init_waitqueue_head(&o->wake);
+	pthread_mutex_init(&o->sleep_lock, NULL);
+	pthread_cond_init(&o->sleep_cond, NULL);
 	o->stats.version = 2;
 	ret = drm_client_modeset_probe(&rt_display.client, 0, 0);
 	if (report)
@@ -1586,9 +1634,9 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 	if (stats)
 		*stats = o->stats;
 	spin_unlock_irqrestore(&o->lock, flags);
-	mutex_unlock(&rt_display_lock);
 	if (!surface)
-		wake_up(&o->wake);
+		output_kick(o);	/* under rt_display_lock: o cannot go meanwhile */
+	mutex_unlock(&rt_display_lock);
 	rt_surface_release(surface);
 	rt_surface_release(replaced);
 	return ret;
