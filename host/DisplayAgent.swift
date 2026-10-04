@@ -430,6 +430,19 @@ struct PresentMeasurement {
     var bucketCopyNs = [UInt64](repeating: 0, count: 4)
     var lastFlipped: UInt64 = 0
 
+    /// Damage ScreenCaptureKit reported and what was left once unchanged
+    /// tiles were dropped (bytes), frames left with none, hashing time.
+    var reportedBytes: UInt64 = 0, keptBytes: UInt64 = 0, unchangedFrames = 0, filterNs: UInt64 = 0, filterFrames = 0
+
+    mutating func filtered(reported: [DamageFilter.Rect], kept: [DamageFilter.Rect], ns: UInt64) {
+        func bytes(_ r: [DamageFilter.Rect]) -> UInt64 { r.reduce(0) { $0 + UInt64($1.w) * UInt64($1.h) * 4 } }
+        reportedBytes += bytes(reported)
+        keptBytes += bytes(kept)
+        unchangedFrames += kept.isEmpty ? 1 : 0
+        filterNs += ns
+        filterFrames += 1
+    }
+
     /// Waiting for the compositor to finish writing the captured buffer.
     var lockWaitNs: UInt64 = 0, lockWaitMaxNs: UInt64 = 0
 
@@ -469,6 +482,11 @@ struct PresentMeasurement {
                           Double(callWallMaxNs) / 1e3, Double(handlerCPUNs) / p / 1e3))
         out.append(String(format: "waiting for the compositor to finish the captured frame: %.1f us on average, %.1f us at most",
                           Double(lockWaitNs) / p / 1e3, Double(lockWaitMaxNs) / 1e3))
+        let ff = Double(max(filterFrames, 1))
+        out.append(String(format: "unchanged damage: %d of %d damaged frame(s) changed nothing; %.1f KB reported, %.1f KB kept per damaged frame (%.0f%% dropped); hashing %.1f us per frame",
+                          unchangedFrames, filterFrames, Double(reportedBytes) / ff / 1e3, Double(keptBytes) / ff / 1e3,
+                          reportedBytes > 0 ? 100 * (1 - Double(keptBytes) / Double(reportedBytes)) : 0,
+                          Double(filterNs) / ff / 1e3))
         out.append(String(format: "driver per flipped frame: %.1f KB copied in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
                           Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
                           Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
@@ -543,6 +561,119 @@ struct PresentedFrames<Item> {
         taken.removeAll()
         newest = nil
         replaced = 0
+    }
+}
+
+/// Damage that changes nothing on screen, dropped before PRESENT. Some
+/// windows are redrawn every frame with the same pixels (menu bar status
+/// items, a cursor drawn by the hardware rather than into the capture) and
+/// ScreenCaptureKit reports them as damage; copied and flipped, an idle
+/// display would cost a frame's work every refresh. Each row of the frame
+/// is cut into tiles of 64 pixels with a 64-bit hash of each; a dirty
+/// rectangle's tiles are hashed again and only those that differ from what
+/// the driver was last given are kept, in whole tiles (so a tile is never
+/// recorded as sent while part of it was not), runs of changed rows
+/// merged into one rectangle each.
+struct DamageFilter {
+    typealias Rect = (x: UInt32, y: UInt32, w: UInt32, h: UInt32)
+    static let tile = 64
+    let width: Int, height: Int, columns: Int
+    /// Per row, per tile: the hash of what the driver was given; 0 when
+    /// not known (hashes are odd).
+    private var hashes: [UInt64]
+    /// Scratch: a rectangle's new hashes, row by row.
+    private var fresh: [UInt64] = []
+
+    init(width: Int, height: Int) {
+        self.width = width
+        self.height = height
+        columns = (width + DamageFilter.tile - 1) / DamageFilter.tile
+        hashes = [UInt64](repeating: 0, count: columns * height)
+    }
+
+    /// Nothing known: the next damage is kept whole.
+    mutating func reset() {
+        for i in hashes.indices { hashes[i] = 0 }
+    }
+
+    /// The rectangles of @rects whose content changed, given the frame at
+    /// @base (BGRA, @pitch bytes per row, readable while this runs). More
+    /// than 255 become the whole frame.
+    mutating func filter(_ rects: [Rect], base: UnsafeRawPointer, pitch: Int) -> [Rect] {
+        var out: [Rect] = []
+        let t = DamageFilter.tile
+        for r in rects {
+            let x0 = Int(r.x), y0 = Int(r.y)
+            let x1 = min(x0 + Int(r.w), width), y1 = min(y0 + Int(r.h), height)
+            guard x0 < x1, y0 < y1 else { continue }
+            let c0 = x0 / t, c1 = (x1 - 1) / t, n = c1 - c0 + 1
+            fresh.removeAll(keepingCapacity: true)
+            for y in y0..<y1 {
+                let row = base + y * pitch
+                for c in c0...c1 {
+                    let px = c * t, count = min(t, width - px)
+                    fresh.append(DamageFilter.hash(row + px * 4, bytes: count * 4))
+                }
+            }
+            var runStart = -1, runMin = 0, runMax = 0
+            func close(_ end: Int) {
+                guard runStart >= 0 else { return }
+                let px = runMin * t
+                out.append((UInt32(px), UInt32(runStart), UInt32(min((runMax + 1) * t, width) - px),
+                            UInt32(end - runStart)))
+                runStart = -1
+            }
+            for y in y0..<y1 {
+                var lo = Int.max, hi = -1
+                for i in 0..<n {
+                    let h = fresh[(y - y0) * n + i], at = y * columns + c0 + i
+                    if hashes[at] != h {
+                        hashes[at] = h
+                        lo = min(lo, c0 + i)
+                        hi = c0 + i
+                    }
+                }
+                if hi < 0 {
+                    close(y)
+                } else if runStart < 0 {
+                    runStart = y; runMin = lo; runMax = hi
+                } else {
+                    runMin = min(runMin, lo); runMax = max(runMax, hi)
+                }
+            }
+            close(y1)
+        }
+        if out.count > 255 { return [(0, 0, UInt32(width), UInt32(height))] }
+        return out
+    }
+
+    @inline(__always) private static func mum(_ a: UInt64, _ b: UInt64) -> UInt64 {
+        let r = a.multipliedFullWidth(by: b)
+        return r.high ^ r.low
+    }
+
+    /// A 64-bit hash of @bytes (a multiple of 4) at @p, odd (0 is "not
+    /// known"): wyhash's multiply-fold over two lanes of 16 bytes.
+    static func hash(_ p: UnsafeRawPointer, bytes: Int) -> UInt64 {
+        let k0: UInt64 = 0xa0761d6478bd642f, k1: UInt64 = 0xe7037ed1a0b428db
+        let k2: UInt64 = 0x8ebc6af09c88c6e3, k3: UInt64 = 0x589965cc75374cc3
+        var a = k0 ^ UInt64(bytes), b = k1
+        var i = 0
+        while i + 32 <= bytes {
+            a = mum(p.loadUnaligned(fromByteOffset: i, as: UInt64.self) ^ k1,
+                    p.loadUnaligned(fromByteOffset: i + 8, as: UInt64.self) ^ a)
+            b = mum(p.loadUnaligned(fromByteOffset: i + 16, as: UInt64.self) ^ k2,
+                    p.loadUnaligned(fromByteOffset: i + 24, as: UInt64.self) ^ b)
+            i += 32
+        }
+        while i + 8 <= bytes {
+            a = mum(p.loadUnaligned(fromByteOffset: i, as: UInt64.self) ^ k3, a ^ k1)
+            i += 8
+        }
+        if i < bytes {
+            a = mum(UInt64(p.loadUnaligned(fromByteOffset: i, as: UInt32.self)) ^ k2, a ^ k3)
+        }
+        return mum(a ^ k3, b ^ k0 ^ UInt64(bytes)) | 1
     }
 }
 

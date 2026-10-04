@@ -334,6 +334,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     /// until the driver has flipped it (its copy is done; the flip waited
     /// for it) or replaced it with a newer frame (never copied).
     var held = PresentedFrames<CMSampleBuffer>()
+    /// What the driver was given, by tile: damage that changes nothing is dropped.
+    var filter: DamageFilter?
     var measurement = PresentMeasurement()
     var last: PresentStats?
     var failure: String?
@@ -517,10 +519,18 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             return
         }
         defer { IOSurfaceUnlock(surface, .readOnly, nil) }
+        if filter?.width != mode.width || filter?.height != mode.height {
+            filter = DamageFilter(width: mode.width, height: mode.height)
+        }
+        let filterWall = uptimeNs()
+        let kept = filter!.filter(rects, base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
+                                  pitch: IOSurfaceGetBytesPerRow(surface))
+        measurement.filtered(reported: rects, kept: kept, ns: uptimeNs() - filterWall)
+        if kept.isEmpty { return }
         // The frame's composition time on the virtual display.
         let captureNs = (info[.displayTime] as? UInt64).map(machToNs) ?? 0
         let callCPU = threadCPUNs(), callWall = uptimeNs()
-        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: rects, captureNs: captureNs)
+        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: kept, captureNs: captureNs)
         let callWallNs = uptimeNs() - callWall, callCPUNs = threadCPUNs() - callCPU
         guard kr == kIOReturnSuccess, status == 0, let stats else {
             failure = kr == kIOReturnSuccess ?

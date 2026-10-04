@@ -166,15 +166,18 @@ var m = PresentMeasurement()
 m.frames = 4; m.idleFrames = 1
 m.present(callCPUNs: 20_000, callWallNs: 40_000, handlerCPUNs: 60_000)
 m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000, lockWaitNs: 1_200_000)
+m.filtered(reported: [(0, 0, 100, 10)], kept: [(0, 0, 50, 10)], ns: 30_000)
+m.filtered(reported: [(0, 0, 100, 10)], kept: [], ns: 10_000)
 m.observe(ps); m.observe(ps)
 let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_400, lastCopy: 2_000_000, latency: 100_000_000)!
 m.observe(big)
 check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
 let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
-check(measured.count == 8 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+check(measured.count == 9 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
       measured[2].contains("600.0 us on average, 1200.0 us at most") &&
-      measured[3].contains("8294.4 KB copied") && measured[5].contains("10.00 ms on average") &&
-      measured[7].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
+      measured[3].contains("1 of 2 damaged frame(s) changed nothing; 4.0 KB reported, 1.0 KB kept per damaged frame (75% dropped); hashing 20.0 us") &&
+      measured[4].contains("8294.4 KB copied") && measured[6].contains("10.00 ms on average") &&
+      measured[8].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)
@@ -264,3 +267,74 @@ do {
     check(frames.retire(flipped: 61) == ["G"])
 }
 print("PASS presented frames: a buffer is held until its frame was replaced or flipped")
+
+// Damage that changed nothing is dropped; what changed is kept in whole tiles.
+do {
+    let w = 300, h = 200, pitch = 1280   // 5 tiles a row, the last 44 pixels
+    var px = [UInt32](repeating: 0x00336699, count: pitch / 4 * h)
+    var f = DamageFilter(width: w, height: h)
+    func run(_ rects: [DamageFilter.Rect]) -> [DamageFilter.Rect] {
+        px.withUnsafeBytes { f.filter(rects, base: $0.baseAddress!, pitch: pitch) }
+    }
+    func same(_ a: [DamageFilter.Rect], _ b: [DamageFilter.Rect]) -> Bool { a.elementsEqual(b, by: ==) }
+    // Nothing known yet: the whole rectangle, out to whole tiles.
+    let first = run([(100, 40, 100, 30)])
+    check(same(first, [(64, 40, 192, 30)]), "\(first)")
+    // The same pixels again: nothing.
+    check(run([(100, 40, 100, 30)]).isEmpty)
+    // The rest of the frame, once, so later checks see only what they change.
+    check(same(run([(0, 0, 300, 200)]), [(0, 0, 300, 200)]), "every row had a tile not known")
+    // One pixel: its tile on its row.
+    px[50 * pitch / 4 + 130] = 0x00ff0000
+    check(same(run([(100, 40, 100, 30)]), [(128, 50, 64, 1)]))
+    // Two rows apart: two rectangles; adjacent rows merge with the union of their tiles.
+    px[42 * pitch / 4 + 70] = 1; px[60 * pitch / 4 + 200] = 2; px[61 * pitch / 4 + 130] = 3
+    let two = run([(64, 40, 192, 30)])
+    check(same(two, [(64, 42, 64, 1), (128, 60, 128, 2)]), "\(two)")
+    // The partial tile at the right edge.
+    px[10 * pitch / 4 + 299] = 4
+    check(same(run([(290, 0, 10, 20)]), [(256, 10, 44, 1)]))
+    // Overlapping rectangles: a tile is reported once.
+    px[100 * pitch / 4 + 10] = 5
+    check(same(run([(0, 90, 50, 20), (0, 95, 60, 10)]), [(0, 100, 64, 1)]))
+    // Rectangles outside the frame are clipped; empty ones dropped.
+    check(run([(400, 0, 10, 10), (0, 250, 10, 10), (0, 0, 0, 5)]).isEmpty)
+    // After a reset everything is new again.
+    f.reset()
+    check(same(run([(0, 0, 300, 200)]), [(0, 0, 300, 200)]))
+    // Every other row changed: a rectangle each. Then more than 255: the frame.
+    for y in stride(from: 0, to: 200, by: 2) { px[y * pitch / 4] &+= 1; px[y * pitch / 4 + 299] &+= 1 }
+    let many = (0..<200).map { (UInt32(0), UInt32($0), UInt32(300), UInt32(1)) }
+    let r = run(many)
+    check(r.count == 100 && r.enumerated().allSatisfy { $0.element == (0, UInt32($0.offset * 2), 300, 1) }, "\(r.count)")
+    for y in 0..<200 { px[y * pitch / 4 + 70] &+= 1; px[y * pitch / 4 + 200] &+= 1 }
+    let split = run((0..<200).flatMap { [(UInt32(64), UInt32($0), UInt32(64), UInt32(1)), (UInt32(192), UInt32($0), UInt32(64), UInt32(1))] })
+    check(split.count == 1 && split[0] == (0, 0, 300, 200), "\(split.count)")
+    // Every single-bit change in a tile changes its hash.
+    var seg = [UInt8](repeating: 0x5a, count: 256)
+    let h0 = seg.withUnsafeBytes { DamageFilter.hash($0.baseAddress!, bytes: 256) }
+    check(h0 & 1 == 1)
+    for byte in 0..<256 {
+        for bit in 0..<8 {
+            seg[byte] ^= UInt8(1 << bit)
+            check(seg.withUnsafeBytes { DamageFilter.hash($0.baseAddress!, bytes: 256) } != h0, "byte \(byte) bit \(bit)")
+            seg[byte] ^= UInt8(1 << bit)
+        }
+    }
+    check(seg.withUnsafeBytes { DamageFilter.hash($0.baseAddress!, bytes: 252) } != h0, "length counts")
+    // What hashing a whole 2560x1440 frame costs (reported, not checked).
+    let bw = 2560, bh = 1440
+    var big = [UInt32](repeating: 0, count: bw * bh)
+    for i in big.indices { big[i] = UInt32(truncatingIfNeeded: i &* 2654435761) }
+    var bf = DamageFilter(width: bw, height: bh)
+    let start = DispatchTime.now().uptimeNanoseconds
+    var kept = 0
+    for k in 0..<10 {
+        big[k] &+= 1
+        kept += big.withUnsafeBytes { bf.filter([(0, 0, UInt32(bw), UInt32(bh))], base: $0.baseAddress!, pitch: bw * 4) }.count
+    }
+    let ns = Double(DispatchTime.now().uptimeNanoseconds - start) / 10
+    print(String(format: "damage filter: a whole 2560x1440 frame in %.2f ms (%.1f GB/s)", ns / 1e6, Double(bw * bh * 4) / ns))
+    check(kept == 10)
+}
+print("PASS damage filter: unchanged tiles dropped, changed ones kept whole, edges and overlaps")
