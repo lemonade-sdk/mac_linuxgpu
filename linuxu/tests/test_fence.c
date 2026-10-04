@@ -54,10 +54,7 @@ static long long now_ms(void)
 	return (long long)((ticks * tb.numer) / (tb.denom * 1000000ULL));
 }
 
-/* HZ base of the shim's jiffies (jiffies.h: CONFIG_HZ=100) */
-#ifndef CONFIG_HZ
-#define CONFIG_HZ 100
-#endif
+#include <linux/jiffies.h>	/* CONFIG_HZ, the shim's jiffy base */
 
 /* minimal fence ops */
 static const char *test_driver_name(struct dma_fence *f) { (void)f; return "test"; }

@@ -65,6 +65,11 @@ for source in "${sources[@]}"; do
   case "$source" in
     third_party/linux/lib/kfifo.c) extra=(-include linux/kernel.h -include linux/bug.h) ;;
     third_party/linux/lib/sort.c) extra=(-include linux/compiler.h -include linux/preempt.h) ;;
+    # create_signal_event takes the user address of the event's slot even
+    # on a dGPU, whose event page no user mapping backs (user_address is
+    # NULL until an mmap libhsakmt only makes on APUs): NULL plus an
+    # offset, never dereferenced. The kernel builds it without UBSan.
+    third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_events.c) extra=(-fno-sanitize=pointer-overflow) ;;
   esac
   clang "${cflags[@]}" "${extra[@]}" -c "$source" -o "$object" &
   pids+=($!)

@@ -8,10 +8,9 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <rt/task.h>
+#include <rt/park.h>
 
-#ifndef CONFIG_HZ
-#define CONFIG_HZ 100
-#endif
+#include <linux/jiffies.h>	/* CONFIG_HZ */
 #ifndef ERESTARTSYS
 #define ERESTARTSYS 512
 #endif
@@ -195,23 +194,114 @@ static signed long fence_remaining(uint64_t start, signed long timeout)
 	return elapsed >= (uint64_t)timeout ? 0 : timeout - (signed long)elapsed;
 }
 
+/* Fence waits park until a fence's callback fires (dma_fence_signal runs
+ * it from the signalling path, the GPU's interrupt for hardware fences) or
+ * the timeout, bounded by the backstop (rt/park.h). */
+struct fence_park {
+	unsigned int fired;
+};
+struct fence_park_cb {
+	struct dma_fence_cb base;
+	struct fence_park *park;
+};
+
+static void fence_park_fired(struct dma_fence *fence, struct dma_fence_cb *cb)
+{
+	struct fence_park *park = container_of(cb, struct fence_park_cb, base)->park;
+
+	(void)fence;
+	__atomic_store_n(&park->fired, 1, __ATOMIC_SEQ_CST);
+	linuxu_unpark(park);
+}
+
+static bool fence_park_still(const void *p)
+{
+	return !__atomic_load_n(&((const struct fence_park *)p)->fired, __ATOMIC_SEQ_CST);
+}
+
+static signed long fences_wait(struct dma_fence **fences, uint32_t count, bool intr,
+			       signed long timeout, uint32_t *idx, const void *caller)
+{
+	struct fence_park park = { 0 };
+	struct fence_park_cb one, *cbs = count == 1 ? &one : NULL;
+	bool *armed, armed_one = false;
+	uint64_t start = fence_now_ns(), backstop = linuxu_park_backstop_first();
+	bool backstopped = false;
+	signed long ret = 0;
+
+	if (count > 1) {
+		cbs = kcalloc(count, sizeof(*cbs) + sizeof(*armed), GFP_KERNEL);
+		if (!cbs)
+			return -ENOMEM;
+		armed = (bool *)(cbs + count);
+	} else {
+		armed = &armed_one;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		cbs[i].park = &park;
+		armed[i] = !dma_fence_add_callback(fences[i], &cbs[i].base, fence_park_fired);
+	}
+	for (;;) {
+		const unsigned int fired = __atomic_load_n(&park.fired, __ATOMIC_SEQ_CST);
+		long remaining = fence_remaining(start, timeout);
+		bool done = false, interrupted = false;
+		uint64_t now, until;
+
+		for (uint32_t i = 0; i < count && !done; i++) {
+			if (dma_fence_is_signaled(fences[i])) {
+				if (idx) *idx = i;
+				done = true;
+			} else if (intr && (__atomic_load_n(&fences[i]->wait_interrupted, __ATOMIC_ACQUIRE) ||
+					    fence_signal_pending())) {
+				interrupted = true;
+			}
+		}
+		if (done) {
+			if (backstopped && !fired)
+				linuxu_wait_missed(NULL, caller);
+			ret = remaining ? remaining : 1;
+			break;
+		}
+		if (interrupted) {
+			ret = -ERESTARTSYS;
+			break;
+		}
+		if (!remaining) {
+			ret = 0;
+			break;
+		}
+		now = fence_now_ns();
+		until = now + backstop;
+		if (timeout != LONG_MAX) {
+			const uint64_t deadline = start + (uint64_t)timeout * (1000000000ull / CONFIG_HZ);
+
+			if (deadline < until)
+				until = deadline;
+		}
+		if (linuxu_park(&park, fence_park_still, &park, until) == LINUXU_PARK_WOKEN) {
+			backstopped = false;
+			backstop = linuxu_park_backstop_first();
+		} else {
+			backstopped = true;
+			backstop = linuxu_park_backstop_next(backstop);
+		}
+	}
+	/* After removal no callback of ours runs: park may go. */
+	for (uint32_t i = 0; i < count; i++)
+		if (armed[i])
+			dma_fence_remove_callback(fences[i], &cbs[i].base);
+	if (count > 1)
+		kfree(cbs);
+	return ret;
+}
+
 signed long dma_fence_default_wait(struct dma_fence *fence, bool intr, signed long timeout)
 {
 	if (timeout < 0) return -EINVAL;
 	if (!fence || dma_fence_is_signaled(fence)) return timeout ? timeout : 1;
 	if (!timeout) return 0;
-	uint64_t start = fence_now_ns();
 	dma_fence_enable_sw_signaling(fence);
-	for (;;) {
-		long remaining = fence_remaining(start, timeout);
-		if (dma_fence_is_signaled(fence)) return remaining ? remaining : 1;
-		if (intr && (__atomic_load_n(&fence->wait_interrupted, __ATOMIC_ACQUIRE) ||
-			     fence_signal_pending()))
-			return -ERESTARTSYS;
-		if (!remaining) return 0;
-		struct timespec pause = {0, 1000000};
-		nanosleep(&pause, NULL);
-	}
+	return fences_wait(&fence, 1, intr, timeout, NULL, __builtin_return_address(0));
 }
 
 signed long dma_fence_wait_timeout(struct dma_fence *fence, bool intr, signed long timeout)
@@ -220,7 +310,10 @@ signed long dma_fence_wait_timeout(struct dma_fence *fence, bool intr, signed lo
 	if (!fence) return timeout ? timeout : 1;
 	if (fence->ops && fence->ops->wait && fence->ops->wait != dma_fence_default_wait)
 		return fence->ops->wait(fence, intr, timeout);
-	return dma_fence_default_wait(fence, intr, timeout);
+	if (dma_fence_is_signaled(fence)) return timeout ? timeout : 1;
+	if (!timeout) return 0;
+	dma_fence_enable_sw_signaling(fence);
+	return fences_wait(&fence, 1, intr, timeout, NULL, __builtin_return_address(0));
 }
 
 signed long dma_fence_wait(struct dma_fence *fence, bool intr)
@@ -233,26 +326,19 @@ signed long dma_fence_wait_any_timeout(struct dma_fence **fences, uint32_t count
 				       bool intr, signed long timeout, uint32_t *idx)
 {
 	if (!fences || !count || timeout < 0) return -EINVAL;
-	uint64_t start = fence_now_ns();
 	for (uint32_t i = 0; i < count; i++) {
 		if (!fences[i]) return -EINVAL;
 		if (timeout) dma_fence_enable_sw_signaling(fences[i]);
 	}
-	for (;;) {
-		long remaining = fence_remaining(start, timeout);
-		for (uint32_t i = 0; i < count; i++) {
+	if (!timeout) {
+		for (uint32_t i = 0; i < count; i++)
 			if (dma_fence_is_signaled(fences[i])) {
 				if (idx) *idx = i;
-				return remaining ? remaining : 1;
+				return 1;
 			}
-			if (intr && (__atomic_load_n(&fences[i]->wait_interrupted, __ATOMIC_ACQUIRE) ||
-				     fence_signal_pending()))
-				return -ERESTARTSYS;
-		}
-		if (!remaining) return 0;
-		struct timespec pause = {0, 1000000};
-		nanosleep(&pause, NULL);
+		return 0;
 	}
+	return fences_wait(fences, count, intr, timeout, idx, __builtin_return_address(0));
 }
 
 int dma_fence_get_status(struct dma_fence *fence)

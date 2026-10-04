@@ -61,12 +61,12 @@ int main(void)
 	usleep(50 * 1000);
 	EXPECT(ran == 1);
 
-	/* 2. delayed work: deadline is 50ms at the shared HZ=100. */
+	/* 2. delayed work: deadline is 50ms at the shared HZ. */
 	INIT_DELAYED_WORK(&dwork, delayed_fn);
 	start_ms = now_ms();
 	schedule_delayed_work(&dwork, msecs_to_jiffies(50));
 	usleep(200 * 1000);
-	/* Absolute jiffies are quantized at 10ms; a deadline may land
+	/* Absolute jiffies are quantized to a jiffy; a deadline may land
 	 * just under the requested wall-clock duration. */
 	EXPECT(delayed_ms >= 40);
 	EXPECT(delayed_ms < 150);

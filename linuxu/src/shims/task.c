@@ -1,11 +1,15 @@
 /* Minimal per-thread Linux task identity for in-process KMD operations. */
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <rt/task.h>
+#include <rt/park.h>
 #include <linux/list.h>
 #include <linux/percpu.h>
 #include <linux/pid.h>
@@ -283,7 +287,190 @@ void linuxu_task_wake(struct task_struct *task)
 {
 	if (!task) return;
 	__atomic_store_n(&task->state, 0, __ATOMIC_RELEASE);
-	__atomic_add_fetch(&task->wake_sequence, 1, __ATOMIC_RELEASE);
+	__atomic_add_fetch(&task->wake_sequence, 1, __ATOMIC_SEQ_CST);
+	linuxu_unpark(task);
+}
+
+/* ---- park / unpark (rt/park.h) ---- */
+
+#define PARK_BUCKETS 128
+struct park_bucket {
+	pthread_mutex_t lock;
+	pthread_cond_t cond;
+	unsigned int waiters;
+};
+static struct park_bucket park_buckets[PARK_BUCKETS] = {
+	[0 ... PARK_BUCKETS - 1] = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 },
+};
+static struct linuxu_park_stats park_counts;
+static uint64_t park_backstop_first_ns = LINUXU_PARK_BACKSTOP_FIRST_NS;
+static uint64_t park_backstop_max_ns = LINUXU_PARK_BACKSTOP_MAX_NS;
+
+static struct park_bucket *park_bucket_of(const void *key)
+{
+	uint64_t k = (uint64_t)(uintptr_t)key;
+
+	k ^= k >> 17;
+	k *= 0x9e3779b97f4a7c15ULL;
+	return &park_buckets[(k >> 40) % PARK_BUCKETS];
+}
+
+uint64_t linuxu_park_now_ns(void)
+{
+	struct timespec now;
+
+	clock_gettime(CLOCK_UPTIME_RAW, &now);
+	return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
+}
+
+int linuxu_park(const void *key, bool (*still)(const void *arg), const void *arg,
+		uint64_t deadline_ns)
+{
+	struct park_bucket *b = park_bucket_of(key);
+	bool slept = false;
+	int r;
+
+	pthread_mutex_lock(&b->lock);
+	__atomic_add_fetch(&b->waiters, 1, __ATOMIC_SEQ_CST);
+	/* Pairs with the fence in linuxu_unpark: either the waker sees this
+	 * waiter, or this check sees the waker's change. */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	__atomic_add_fetch(&park_counts.parks, 1, __ATOMIC_RELAXED);
+	for (;;) {
+		if (slept)
+			__atomic_add_fetch(&park_counts.wakeups, 1, __ATOMIC_RELAXED);
+		if (!still(arg)) {
+			r = LINUXU_PARK_WOKEN;
+			break;
+		}
+		if (deadline_ns) {
+			const uint64_t now = linuxu_park_now_ns();
+			struct timespec rel;
+
+			if (now >= deadline_ns) {
+				r = LINUXU_PARK_TIMEOUT;
+				break;
+			}
+			rel.tv_sec = (time_t)((deadline_ns - now) / 1000000000ULL);
+			rel.tv_nsec = (long)((deadline_ns - now) % 1000000000ULL);
+			pthread_cond_timedwait_relative_np(&b->cond, &b->lock, &rel);
+		} else {
+			pthread_cond_wait(&b->cond, &b->lock);
+		}
+		slept = true;
+	}
+	__atomic_sub_fetch(&b->waiters, 1, __ATOMIC_SEQ_CST);
+	pthread_mutex_unlock(&b->lock);
+	__atomic_add_fetch(r == LINUXU_PARK_WOKEN ? &park_counts.woken : &park_counts.timeouts, 1,
+			   __ATOMIC_RELAXED);
+	return r;
+}
+
+void linuxu_unpark(const void *key)
+{
+	struct park_bucket *b = park_bucket_of(key);
+
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (!__atomic_load_n(&b->waiters, __ATOMIC_SEQ_CST))
+		return;
+	pthread_mutex_lock(&b->lock);
+	pthread_cond_broadcast(&b->cond);
+	pthread_mutex_unlock(&b->lock);
+}
+
+struct park_task_arg {
+	struct task_struct *task;
+	unsigned long seq;
+};
+
+static bool park_task_still(const void *p)
+{
+	const struct park_task_arg *a = p;
+
+	return __atomic_load_n(&a->task->wake_sequence, __ATOMIC_SEQ_CST) == a->seq;
+}
+
+int linuxu_park_task(struct task_struct *task, unsigned long seq, uint64_t deadline_ns)
+{
+	struct park_task_arg a = { task, seq };
+
+	return linuxu_park(task, park_task_still, &a, deadline_ns);
+}
+
+void linuxu_park_set_backstop(uint64_t first_ns, uint64_t max_ns)
+{
+	if (!first_ns || max_ns < first_ns)
+		return;
+	__atomic_store_n(&park_backstop_first_ns, first_ns, __ATOMIC_RELAXED);
+	__atomic_store_n(&park_backstop_max_ns, max_ns, __ATOMIC_RELAXED);
+}
+
+uint64_t linuxu_park_backstop_first(void)
+{
+	return __atomic_load_n(&park_backstop_first_ns, __ATOMIC_RELAXED);
+}
+
+uint64_t linuxu_park_backstop_max(void)
+{
+	return __atomic_load_n(&park_backstop_max_ns, __ATOMIC_RELAXED);
+}
+
+/* Where the missed-wake report goes: stderr here; printk.c, linked into
+ * the driver and most tests, overrides this with a printk. */
+__attribute__((weak)) void linuxu_wait_report(const char *message)
+{
+#ifdef LINUXU_DEXT_DK
+	(void)message;	/* the driver links printk.c, which overrides this */
+#else
+	fputs(message, stderr);
+#endif
+}
+
+void linuxu_wait_missed(struct linuxu_wait_site *site, const void *caller)
+{
+	static pthread_mutex_t logged_lock = PTHREAD_MUTEX_INITIALIZER;
+	static const void *logged[64];
+	bool first = false;
+
+	__atomic_add_fetch(&park_counts.missed, 1, __ATOMIC_RELAXED);
+	if (site) {
+		first = !__atomic_exchange_n(&site->logged, 1, __ATOMIC_RELAXED);
+	} else {
+		unsigned int i;
+
+		pthread_mutex_lock(&logged_lock);
+		for (i = 0; i < 64 && logged[i] && logged[i] != caller; i++)
+			;
+		if (i < 64 && !logged[i]) {
+			logged[i] = caller;
+			first = true;
+		}
+		pthread_mutex_unlock(&logged_lock);
+	}
+	if (!first)
+		return;
+	{
+		char message[256];
+
+		if (site)
+			snprintf(message, sizeof(message), "linuxu: wait at %s:%d: its condition came "
+				 "true without a wake (found by the backstop)\n", site->file, site->line);
+		else
+			snprintf(message, sizeof(message), "linuxu: wait called from %p: its condition "
+				 "came true without a wake (found by the backstop)\n", caller);
+		linuxu_wait_report(message);
+	}
+}
+
+void linuxu_park_stats(struct linuxu_park_stats *out)
+{
+	if (!out)
+		return;
+	out->parks = __atomic_load_n(&park_counts.parks, __ATOMIC_RELAXED);
+	out->woken = __atomic_load_n(&park_counts.woken, __ATOMIC_RELAXED);
+	out->timeouts = __atomic_load_n(&park_counts.timeouts, __ATOMIC_RELAXED);
+	out->wakeups = __atomic_load_n(&park_counts.wakeups, __ATOMIC_RELAXED);
+	out->missed = __atomic_load_n(&park_counts.missed, __ATOMIC_RELAXED);
 }
 int send_sig(int sig, struct task_struct *task, int privileged)
 {

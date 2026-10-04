@@ -45,7 +45,7 @@ UNSUPPORTED = 0xe00002c7
 # Names follow dext/sources/session_state.h.
 SESSION_FLAGS = ["closing", "quarantined", "stopping", "pci_open", "modules_running",
                  "final_cleanup", "releasable", "restart_required", "raw_bar_mapped",
-                 "runtime_device", "isolation_attempted", "device_removed"]
+                 "runtime_device", "isolation_attempted", "device_removed", "retiring"]
 QUARANTINE_CAUSES = ["none", "raw BAR mapping lifetime uncertain", "DMA shutdown reservation failed",
                      "GPU completion uncertain (compute stop)", "interrupt cancellation failed",
                      "endpoint isolation failed", "DMA backing retained at fini", "definite PCI fault",

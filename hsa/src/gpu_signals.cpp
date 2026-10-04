@@ -7,6 +7,8 @@
 #include <map>
 #include <system_error>
 #include <cstdio>
+#include <string>
+#include <thread>
 
 namespace mac_hsa::detail {
 namespace {
@@ -156,9 +158,28 @@ std::map<Connection *,std::weak_ptr<GPUSignalContext>> contexts;
 struct SignalSlot {
     std::shared_ptr<GPUSignalContext> context;
     unsigned index;
+    bool hasEvent=false;
+    uint32_t event=0;
     SignalSlot(std::shared_ptr<GPUSignalContext> c,unsigned i):context(std::move(c)),index(i) {}
-    ~SignalSlot() {std::lock_guard lock(context->slotsMutex);context->signals[index].reset();context->used[index]=false;}
+    ~SignalSlot() {
+        if (hasEvent) {
+            // The command processor must not write the mailbox of a slot
+            // that goes back to the pool.
+            auto *abi=static_cast<SignalABI *>(context->arena.host)+index;
+            abi->eventMailbox=0;abi->eventID=0;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            (void)context->connection->destroySignalEvent(event);
+        }
+        std::lock_guard lock(context->slotsMutex);context->signals[index].reset();context->used[index]=false;
+    }
 };
+// Why signals of a connection carry no event, said once per process.
+void reportNoInterruptSignals(const std::string &why) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true))
+        std::fprintf(stderr,"mac_hsa: interrupt signals unavailable (%s): blocked waits on GPU signals "
+                     "poll every %llu us\n",why.c_str(),(unsigned long long)(blockedSignalPollNs()/1000));
+}
 }
 hsa_status_t reclaimGPUSignalService(const std::shared_ptr<Connection> &connection,std::shared_ptr<void> *lease) {
     std::shared_ptr<GPUSignalContext> context;
@@ -221,6 +242,19 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connectio
     catch (...) {std::lock_guard rollback(context->slotsMutex);context->used[slot]=false;throw;}
     auto *abi=static_cast<SignalABI *>(context->arena.host)+slot;
     *abi={};abi->kind=1;abi->value=initial;
+    {
+        // An interrupt signal, as ROCr makes by default: the completion of
+        // a packet naming it raises the event a blocked wait sleeps on.
+        SignalEvent event;std::string why;
+        const auto status=context->connection->createSignalEvent(event,&why);
+        if (status==HSA_STATUS_SUCCESS) {
+            backing->hasEvent=true;backing->event=event.id;
+            abi->eventMailbox=event.mailbox;abi->eventID=event.trigger;
+            signal->hasEvent=true;signal->eventID=event.id;
+        } else {
+            reportNoInterruptSignals(why.empty() ? "status "+std::to_string(int(status)) : why);
+        }
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     signal->gpuAtomic=[context,slot](unsigned op,int64_t value,int64_t compare,int64_t &old) {
         return context->execute(slot,op,value,compare,old);
@@ -236,3 +270,65 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connectio
     return HSA_STATUS_SUCCESS;
 }
 }
+
+namespace mac_hsa {
+void notifySignal(Signal &signal) {
+    // Through the mutex: a host-signal waiter is either before its check
+    // (and sees the new value) or asleep (and is notified).
+    { std::lock_guard lock(signal.waitMutex); }
+    signal.changed.notify_all();
+    if (!signal.hasEvent) return;
+    // Pairs with the sleeper's increment before its last check.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!signal.eventSleepers.load(std::memory_order_seq_cst)) return;
+    if (auto connection=signal.gpuConnection.lock()) (void)connection->setSignalEvent(signal.eventID);
+}
+
+void sleepOnSignals(Signal *const *signals, uint32_t count, uint64_t maxNs,
+                    const std::function<bool()> &satisfied) {
+    constexpr uint32_t kMaxEvents=64;
+    const uint64_t slice=std::min(maxNs,signalWaitBackstopNs());
+    std::shared_ptr<Connection> connection;
+    uint32_t ids[kMaxEvents];
+    bool events=count && count<=kMaxEvents && slice>=1000000;
+    for (uint32_t i=0;events && i<count;++i) {
+        auto c=signals[i]->hasEvent ? signals[i]->gpuConnection.lock() : nullptr;
+        if (!c || (connection && c!=connection)) events=false;
+        else {connection=std::move(c);ids[i]=signals[i]->eventID;}
+    }
+    if (events) {
+        // In the driver until the completion interrupt, a host-side set, or
+        // the backstop: nothing polls.
+        for (uint32_t i=0;i<count;++i) signals[i]->eventSleepers.fetch_add(1,std::memory_order_seq_cst);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        hsa_status_t status=HSA_STATUS_SUCCESS;
+        if (!satisfied()) {
+            EventWaitResult result;
+            status=connection->waitSignalEvents(ids,count,uint32_t(slice/1000000),result);
+        }
+        for (uint32_t i=0;i<count;++i) signals[i]->eventSleepers.fetch_sub(1,std::memory_order_seq_cst);
+        if (status==HSA_STATUS_SUCCESS) return;
+        for (uint32_t i=0;i<count;++i)
+            if (!signals[i]->alive.load()) return;	// destroyed under the wait: its event went
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true))
+            std::fprintf(stderr,"mac_hsa: an interrupt wait failed (status %d); that wait polls\n",int(status));
+        std::this_thread::sleep_for(std::chrono::nanoseconds(std::min(maxNs,blockedSignalPollNs())));
+        return;
+    }
+    if (count==1 && !signals[0]->gpuAtomic && !signals[0]->sharedABI) {
+        // A host signal: every store notifies its condition variable (a
+        // silent store need not; the backstop finds it).
+        std::unique_lock lock(signals[0]->waitMutex);
+        if (!satisfied()) signals[0]->changed.wait_for(lock,std::chrono::nanoseconds(slice));
+        return;
+    }
+    // A GPU signal without an event, or a wait over mixed signals: poll.
+    if (count==1) {
+        std::unique_lock lock(signals[0]->waitMutex);
+        signals[0]->changed.wait_for(lock,std::chrono::nanoseconds(std::min(maxNs,blockedSignalPollNs())));
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::nanoseconds(std::min(maxNs,blockedSignalPollNs())));
+}
+} // namespace mac_hsa

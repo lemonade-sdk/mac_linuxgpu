@@ -83,6 +83,16 @@ int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive);
 int dext_kfd_queue_destroy(struct dext_kfd_queue *q);
 unsigned int dext_kfd_queue_count(struct dext_kfd_client *c);
 
+/* Signal events of the client's KFD process and waits on them
+ * (rt_kfd_event_create, rt_kfd_wait_begin/run). */
+struct rt_kfd_wait;
+int dext_kfd_event_create(struct dext_kfd_client *c, uint32_t *id, uint32_t *trigger,
+                          uint64_t *mailbox_va);
+int dext_kfd_event_destroy(struct dext_kfd_client *c, uint32_t id);
+int dext_kfd_event_set(struct dext_kfd_client *c, uint32_t id);
+int dext_kfd_wait_begin(struct dext_kfd_client *c, const uint32_t *ids, uint32_t count,
+                        int all, uint32_t timeout_ms, struct rt_kfd_wait **out);
+
 /* Bounded launches, out[] as dext_aql_dispatch_bounded/dispatch_code. The
  * queue is destroyed through KFD before returning, so only a failed
  * destroy leaves the launch uncertain. */

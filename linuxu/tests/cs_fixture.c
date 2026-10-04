@@ -88,6 +88,8 @@ enum {
 static struct pci_dev *pdev;
 static struct amdgpu_device *adev;
 uint64_t cs_fixture_visible_vram;
+unsigned int cs_fixture_sdma_instances;
+void (*cs_fixture_display)(struct amdgpu_device *adev);
 static uint8_t *vram;		/* the VRAM behind the aperture */
 static uint64_t *doorbells;
 static struct amdgpu_irq_src fence_irq;
@@ -252,7 +254,7 @@ static void hub_set_pd(struct engine *e, uint32_t vmid, uint64_t pd)
 	hub_pd[e->ring->vm_hub][vmid] = pd;
 	pthread_mutex_unlock(&hub_lock);
 }
-static struct engine compute_engine, sdma_engine;
+static struct engine compute_engine, sdma_engine, sdma1_engine;
 
 static uint8_t *gpu_to_host(struct engine *e, uint32_t vmid, uint64_t addr)
 {
@@ -270,7 +272,9 @@ static uint8_t *gpu_to_host(struct engine *e, uint32_t vmid, uint64_t addr)
 
 static struct engine *engine_of(struct amdgpu_ring *ring)
 {
-	return ring == &adev->gfx.compute_ring[0] ? &compute_engine : &sdma_engine;
+	if (ring == &adev->gfx.compute_ring[0])
+		return &compute_engine;
+	return ring == &adev->sdma.instance[1].ring ? &sdma1_engine : &sdma_engine;
 }
 
 static uint64_t fx_get_rptr(struct amdgpu_ring *ring)
@@ -1047,6 +1051,11 @@ struct pci_dev *cs_fixture_init(void)
 	/* Host test DMA addresses are user pointers: no narrower mask (as
 	 * rt_device_alloc does for the host backend). */
 
+	/* A display (cs_fixture.h): modesetting and dumb buffers. */
+	if (cs_fixture_display) {
+		fx_driver.driver_features |= DRIVER_MODESET | DRIVER_ATOMIC;
+		fx_driver.dumb_create = amdgpu_mode_dumb_create;
+	}
 	adev = devm_drm_dev_alloc(&pdev->dev, &fx_driver, typeof(*adev), ddev);
 	if (IS_ERR(adev))
 		FX_ABORT("devm_drm_dev_alloc = %ld", PTR_ERR(adev));
@@ -1187,11 +1196,14 @@ struct pci_dev *cs_fixture_init(void)
 	fence_irq.funcs = &fx_irq_funcs;
 	fence_irq.enabled_types = kcalloc(1, sizeof(atomic_t), GFP_KERNEL);
 	adev->gfx.num_compute_rings = 1;
-	adev->sdma.num_instances = 1;
+	adev->sdma.num_instances = cs_fixture_sdma_instances == 2 ? 2 : 1;
 	ring_setup(&adev->gfx.compute_ring[0], &fx_compute_funcs, "comp_1.0.0",
 		   AMDGPU_GFXHUB(0), &compute_engine);
 	ring_setup(&adev->sdma.instance[0].ring, &fx_sdma_funcs, "sdma0", AMDGPU_GFXHUB(0),
 		   &sdma_engine);
+	if (adev->sdma.num_instances == 2)
+		ring_setup(&adev->sdma.instance[1].ring, &fx_sdma_funcs, "sdma1", AMDGPU_GFXHUB(0),
+			   &sdma1_engine);
 	adev->mman.buffer_funcs = &fx_buffer_funcs;
 	adev->mman.buffer_funcs_ring = &adev->sdma.instance[0].ring;
 	adev->vm_manager.vm_pte_funcs = &fx_pte_funcs;
@@ -1204,6 +1216,10 @@ struct pci_dev *cs_fixture_init(void)
 	if (!getenv("CS_FIXTURE_NO_DMA_HOLD"))	/* the negative control */
 		rt_dma_hold_attach(adev);
 
+	/* The display IP's init runs before registration, as in
+	 * amdgpu_device_ip_init. */
+	if (cs_fixture_display)
+		cs_fixture_display(adev);
 	r = drm_dev_register(adev_to_drm(adev), 0);
 	if (r)
 		FX_ABORT("drm_dev_register = %d", r);
@@ -1212,9 +1228,11 @@ struct pci_dev *cs_fixture_init(void)
 
 void cs_fixture_stop(void)
 {
-	struct engine *engines[] = { &compute_engine, &sdma_engine };
+	struct engine *engines[] = { &compute_engine, &sdma_engine, &sdma1_engine };
 
-	for (unsigned int i = 0; i < 2; ++i) {
+	for (unsigned int i = 0; i < 3; ++i) {
+		if (!engines[i]->ring)
+			continue;
 		pthread_mutex_lock(&engines[i]->lock);
 		engines[i]->stop = true;
 		pthread_cond_signal(&engines[i]->kick);
@@ -1228,6 +1246,12 @@ void cs_fixture_stats(struct cs_fixture_stats *out)
 	pthread_mutex_lock(&stats_lock);
 	*out = stats;
 	pthread_mutex_unlock(&stats_lock);
+}
+
+uint8_t *cs_fixture_vram_host(uint64_t mc)
+{
+	return mc >= adev->gmc.vram_start && mc <= adev->gmc.vram_end ?
+		vram + (mc - adev->gmc.vram_start) : NULL;
 }
 
 struct amdgpu_device *cs_fixture_adev(void)

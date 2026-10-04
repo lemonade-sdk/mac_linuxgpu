@@ -69,9 +69,24 @@ uint32_t waitSignals(bool all, uint32_t count, hsa_signal_t *handles,
             const auto elapsed = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count());
             if (elapsed >= timeout) return UINT32_MAX;
-            if (hint == HSA_WAIT_STATE_ACTIVE) std::this_thread::yield();
-            else std::this_thread::sleep_for(std::chrono::nanoseconds(std::min<uint64_t>(
-                mac_hsa::blockedSignalPollNs(), timeout - elapsed)));
+            if (hint == HSA_WAIT_STATE_ACTIVE) { std::this_thread::yield(); continue; }
+            // Asleep on the signals still pending: their events in the
+            // driver when every one has one (sleepOnSignals).
+            std::vector<mac_hsa::Signal *> pending;
+            pending.reserve(count);
+            for (uint32_t i = 0; i < count; ++i)
+                if (waiting[i] && !(all && satisfied[i])) pending.push_back(waiting[i].get());
+            mac_hsa::sleepOnSignals(pending.data(), uint32_t(pending.size()), timeout - elapsed, [&] {
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (!waiting[i] || (all && satisfied[i])) continue;
+                    if (!waiting[i]->alive.load()) return true;
+                    const bool met = mac_hsa::signalCondition(
+                        waiting[i]->value().load(std::memory_order_relaxed), conditions[i], values[i]);
+                    if (met && !all) return true;
+                    if (!met && all) return false;
+                }
+                return all;
+            });
         }
     } catch (const std::bad_alloc &) { return UINT32_MAX; }
 }
@@ -490,7 +505,7 @@ hsa_status_t hsa_signal_destroy(hsa_signal_t handle) {
         const auto entry=signals.find(handle.handle);
         if (entry==signals.end()) return HSA_STATUS_ERROR_INVALID_SIGNAL;
         retired=std::move(entry->second);signals.erase(entry);
-        retired->alive=false;retired->changed.notify_all();
+        retired->alive=false;mac_hsa::notifySignal(*retired);
     }
     return HSA_STATUS_SUCCESS;
 }
@@ -518,7 +533,7 @@ void hsa_signal_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
     if (!signal) return;
     if (signal->storeHook) signal->storeHook(value);
     else signal->value().store(value, std::memory_order_relaxed);
-    signal->changed.notify_all();
+    mac_hsa::notifySignal(*signal);
 }
 void hsa_signal_silent_store_relaxed(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
@@ -531,7 +546,7 @@ void hsa_signal_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
     if (!signal) return;
     if (signal->storeHook) signal->storeHook(value);
     else signal->value().store(value, std::memory_order_release);
-    signal->changed.notify_all();
+    mac_hsa::notifySignal(*signal);
 }
 void hsa_signal_silent_store_screlease(hsa_signal_t handle, hsa_signal_value_t value) {
     const auto signal = findSignal(handle);
@@ -546,21 +561,21 @@ void hsa_signal_##name##_##suffix(hsa_signal_t handle, hsa_signal_value_t value)
     const auto signal = findSignal(handle); \
     if (!signal) return; \
     signal->value().op(value, order); \
-    signal->changed.notify_all(); \
+    mac_hsa::notifySignal(*signal); \
 }
 #define SIGNAL_VALUE_RMW(suffix, order, failure) \
 hsa_signal_value_t hsa_signal_exchange_##suffix(hsa_signal_t handle, hsa_signal_value_t value) { \
     const auto signal = findSignal(handle); \
     if (!signal) return 0; \
     const auto old = signal->value().exchange(value, order); \
-    signal->changed.notify_all(); return old; \
+    mac_hsa::notifySignal(*signal); return old; \
 } \
 hsa_signal_value_t hsa_signal_cas_##suffix(hsa_signal_t handle, hsa_signal_value_t expected, \
                                          hsa_signal_value_t desired) { \
     const auto signal = findSignal(handle); \
     if (!signal) return 0; \
     signal->value().compare_exchange_strong(expected, desired, order, failure); \
-    signal->changed.notify_all(); return expected; \
+    mac_hsa::notifySignal(*signal); return expected; \
 }
 #define SIGNAL_ATOMICS(suffix, order, failure) \
 SIGNAL_RMW(add, fetch_add, suffix, order) \

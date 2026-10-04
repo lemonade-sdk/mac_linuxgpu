@@ -53,6 +53,7 @@
 #include "dc.h"
 #include "dcn/dcn_4_1_0_offset.h"
 #include "dcn/dcn_4_1_0_sh_mask.h"
+#include "dcn401_fixture.h"
 #include <rt/bootstrap.h>
 #include <drm/drm_drv.h>
 #include "amdgpu_ttm.h"
@@ -63,6 +64,7 @@
 #include <drm/drm_file.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/display.h>
+#include <rt/identity.h>
 #include <rt/surface.h>
 #include <rt/removal.h>
 #include <rt/sysfs.h>
@@ -80,197 +82,8 @@ extern int amdgpu_sync_init(void);
 /* drm_crtc_internal.h: what a write to debugfs edid_override runs. */
 extern int drm_edid_override_set(struct drm_connector *connector, const void *edid, size_t size);
 
-#define VBIOS_BYTES	(64 * 1024)
-#define MMIO_BYTES	(64ULL << 20)
-
-static uint8_t vbios[VBIOS_BYTES];
-static uint32_t dce_base[6];
-static size_t vbios_used = 0x400;
-
-static uint16_t vb_alloc(size_t bytes)
-{
-	size_t at = (vbios_used + 3) & ~(size_t)3;
-
-	assert(at + bytes < VBIOS_BYTES);
-	vbios_used = at + bytes;
-	return (uint16_t)at;
-}
-
-static void vb_header(uint16_t at, uint16_t size, uint8_t frev, uint8_t crev)
-{
-	struct atom_common_table_header *h = (void *)&vbios[at];
-
-	h->structuresize = size;
-	h->format_revision = frev;
-	h->content_revision = crev;
-}
-
-/* One connector path: connector object, its first (internal) encoder, the
- * device tag, and a record list with a DDC line and an HPD pin. */
-struct fixture_path {
-	uint16_t connector;
-	uint16_t encoder;
-	uint16_t device_tag;
-	uint8_t i2c_id;
-	uint8_t hpd_pin;
-};
-
-static const struct fixture_path paths[] = {
-	{ (GRAPH_OBJECT_TYPE_CONNECTOR << 12) | (GRAPH_OBJECT_ENUM_ID1 << 8) | CONNECTOR_OBJECT_ID_DISPLAYPORT,
-	  (GRAPH_OBJECT_TYPE_ENCODER << 12) | (GRAPH_OBJECT_ENUM_ID1 << 8) | ENCODER_OBJECT_ID_INTERNAL_UNIPHY,
-	  ATOM_DISPLAY_DFP1_SUPPORT, 0x91, 1 },
-	{ (GRAPH_OBJECT_TYPE_CONNECTOR << 12) | (GRAPH_OBJECT_ENUM_ID2 << 8) | CONNECTOR_OBJECT_ID_DISPLAYPORT,
-	  (GRAPH_OBJECT_TYPE_ENCODER << 12) | (GRAPH_OBJECT_ENUM_ID2 << 8) | ENCODER_OBJECT_ID_INTERNAL_UNIPHY,
-	  ATOM_DISPLAY_DFP2_SUPPORT, 0x92, 2 },
-	{ (GRAPH_OBJECT_TYPE_CONNECTOR << 12) | (GRAPH_OBJECT_ENUM_ID3 << 8) | CONNECTOR_OBJECT_ID_DISPLAYPORT,
-	  (GRAPH_OBJECT_TYPE_ENCODER << 12) | (GRAPH_OBJECT_ENUM_ID1 << 8) | ENCODER_OBJECT_ID_INTERNAL_UNIPHY1,
-	  ATOM_DISPLAY_DFP3_SUPPORT, 0x93, 3 },
-	{ (GRAPH_OBJECT_TYPE_CONNECTOR << 12) | (GRAPH_OBJECT_ENUM_ID1 << 8) | CONNECTOR_OBJECT_ID_HDMI_TYPE_A,
-	  (GRAPH_OBJECT_TYPE_ENCODER << 12) | (GRAPH_OBJECT_ENUM_ID2 << 8) | ENCODER_OBJECT_ID_INTERNAL_UNIPHY1,
-	  ATOM_DISPLAY_DFP4_SUPPORT, 0x94, 4 },
-};
-#define NPATHS (sizeof(paths) / sizeof(paths[0]))
-
-static void build_vbios(void)
-{
-	struct atom_rom_header_v2_2 *rom;
-	struct atom_master_data_table_v2_1 *mdt;
-	struct display_object_info_table_v1_5 *obj;
-	struct atom_gpio_pin_lut_v2_1 *lut;
-	uint16_t rom_at, cmd_at, mdt_at, obj_at, lut_at;
-	size_t obj_bytes, lut_bytes;
-
-	vbios[0] = 0x55;
-	vbios[1] = 0xaa;
-	vbios[2] = VBIOS_BYTES / 512;			/* image size, 512 B units */
-	memcpy(&vbios[0x30], " 761295520", 10);		/* ATOM_ATI_MAGIC */
-	/* Identification strings (part number, name, date, version). */
-	vbios[OFFSET_TO_GET_ATOMBIOS_NUMBER_OF_STRINGS] = 1;
-	*(uint16_t *)&vbios[OFFSET_TO_GET_ATOMBIOS_STRING_START] = 0x200;
-	memcpy(&vbios[0x200], "LINUXU-DCN401-FIXTURE\0\r\nlinuxu fixture VBIOS", 45);
-	memcpy(&vbios[0x260], "ATOMBIOSBK-AMD VER000.000.000.000.000000", 41);
-	memcpy(&vbios[OFFSET_TO_VBIOS_DATE], "10/02/26 12:00", 14);
-
-	rom_at = vb_alloc(sizeof(*rom));
-	*(uint16_t *)&vbios[0x48] = rom_at;		/* ATOM_ROM_TABLE_PTR */
-	rom = (void *)&vbios[rom_at];
-	vb_header(rom_at, sizeof(*rom), 2, 2);
-	memcpy(rom->atom_bios_string, "ATOM", 4);
-
-	cmd_at = vb_alloc(sizeof(struct atom_common_table_header) +
-			  sizeof(struct atom_master_list_of_command_functions_v2_1));
-	vb_header(cmd_at, sizeof(struct atom_common_table_header) +
-		  sizeof(struct atom_master_list_of_command_functions_v2_1), 2, 1);
-	rom->masterhwfunction_offset = cmd_at;
-
-	mdt_at = vb_alloc(sizeof(*mdt));
-	vb_header(mdt_at, sizeof(*mdt), 2, 1);
-	rom->masterdatatable_offset = mdt_at;
-	mdt = (void *)&vbios[mdt_at];
-
-	/* Display paths, each followed by its record list. */
-	obj_bytes = sizeof(*obj) + NPATHS * sizeof(struct atom_display_object_path_v3);
-	obj_at = vb_alloc(obj_bytes);
-	vb_header(obj_at, obj_bytes, 1, 5);
-	obj = (void *)&vbios[obj_at];
-	obj->number_of_path = NPATHS;
-	for (size_t i = 0; i < NPATHS; i++) {
-		struct atom_display_object_path_v3 *p = &obj->display_path[i];
-		uint16_t rec_at = vb_alloc(sizeof(struct atom_i2c_record) +
-					   sizeof(struct atom_hpd_int_record) + 1);
-		struct atom_i2c_record *i2c = (void *)&vbios[rec_at];
-		struct atom_hpd_int_record *hpd = (void *)(i2c + 1);
-
-		obj->supporteddevices |= paths[i].device_tag;
-		p->display_objid = paths[i].connector;
-		p->encoderobjid = paths[i].encoder;
-		p->device_tag = paths[i].device_tag;
-		/* Record offsets are relative to the object info table. */
-		p->disp_recordoffset = rec_at - obj_at;
-		i2c->record_header.record_type = ATOM_I2C_RECORD_TYPE;
-		i2c->record_header.record_size = sizeof(*i2c);
-		i2c->i2c_id = paths[i].i2c_id;
-		hpd->record_header.record_type = ATOM_HPD_INT_RECORD_TYPE;
-		hpd->record_header.record_size = sizeof(*hpd);
-		hpd->pin_id = paths[i].hpd_pin;
-		hpd->plugin_pin_state = 1;
-		*((uint8_t *)(hpd + 1)) = ATOM_RECORD_END_TYPE;
-	}
-	mdt->listOfdatatables.displayobjectinfo = obj_at;
-
-	/* GPIO pins for the DDC lines and HPD pins named by the records. */
-	lut_bytes = sizeof(*lut) + 2 * NPATHS * sizeof(struct atom_gpio_pin_assignment);
-	lut_at = vb_alloc(lut_bytes);
-	vb_header(lut_at, lut_bytes, 2, 1);
-	lut = (void *)&vbios[lut_at];
-	/* DDC lines DDC1..4 and HPD pins HPD1..4, at the DCN 4.0.1 GPIO
-	 * registers (segment 2) the GPIO translation expects. */
-	for (size_t i = 0; i < NPATHS; i++) {
-		static const uint32_t ddc[] = { regDC_GPIO_DDC1_A, regDC_GPIO_DDC2_A,
-						regDC_GPIO_DDC3_A, regDC_GPIO_DDC4_A };
-		static const uint8_t hpd_shift[] = {
-			DC_GPIO_HPD_A__DC_GPIO_HPD1_A__SHIFT, DC_GPIO_HPD_A__DC_GPIO_HPD2_A__SHIFT,
-			DC_GPIO_HPD_A__DC_GPIO_HPD3_A__SHIFT, DC_GPIO_HPD_A__DC_GPIO_HPD4_A__SHIFT };
-
-		lut->gpio_pin[2 * i].gpio_id = paths[i].i2c_id;
-		lut->gpio_pin[2 * i].data_a_reg_index = dce_base[regDC_GPIO_DDC1_A_BASE_IDX] + ddc[i];
-		lut->gpio_pin[2 * i + 1].gpio_id = paths[i].hpd_pin;
-		lut->gpio_pin[2 * i + 1].data_a_reg_index = dce_base[regDC_GPIO_HPD_A_BASE_IDX] + regDC_GPIO_HPD_A;
-		lut->gpio_pin[2 * i + 1].gpio_bitshift = hpd_shift[i];
-	}
-	mdt->listOfdatatables.gpio_pin_lut = lut_at;
-
-	/* Firmware info v3.4, display controller info v4.5 (100 MHz DCE and
-	 * DP PHY reference, 50 MHz I2C engine reference) and SMU info v4.0,
-	 * the table versions a DCN 4.x board carries. */
-	{
-		uint16_t fw_at = vb_alloc(sizeof(struct atom_firmware_info_v3_4));
-		uint16_t dce_at = vb_alloc(sizeof(struct atom_display_controller_info_v4_5));
-		uint16_t smu_at = vb_alloc(sizeof(struct atom_smu_info_v4_0));
-		struct atom_firmware_info_v3_4 *fw = (void *)&vbios[fw_at];
-		struct atom_display_controller_info_v4_5 *dce = (void *)&vbios[dce_at];
-
-		vb_header(fw_at, sizeof(*fw), 3, 4);
-		fw->bootup_sclk_in10khz = 50000;
-		fw->bootup_mclk_in10khz = 100000;
-		vb_header(dce_at, sizeof(*dce), 4, 5);
-		dce->dce_refclk_10khz = 10000;
-		dce->dpphy_refclk_10khz = 10000;
-		dce->i2c_engine_refclk_10khz = 5000;
-		vb_header(smu_at, sizeof(struct atom_smu_info_v4_0), 4, 0);
-		mdt->listOfdatatables.firmwareinfo = fw_at;
-		mdt->listOfdatatables.dce_info = dce_at;
-		mdt->listOfdatatables.smu_info = smu_at;
-	}
-}
-
-/* Fixture IP base addresses (dword offsets) for DCE, NBIO and CLK, the
- * values IP discovery would supply. They only place the registers inside
- * the fixture register file. */
-static uint32_t dce_base[6] = { 0x00000012, 0x000000C0, 0x000034C0, 0x00009000, 0x00380000, 0 };
-static uint32_t nbio_base[] = { 0x00000000, 0x00000014, 0x00000D20, 0x00010400, 0x00390000, 0 };
-static uint32_t clk_base[] = { 0x00016C00, 0x00016E00, 0x00017000, 0x00017200, 0x0001B000, 0x0001B200 };
-
 static struct amdgpu_device *adev;
 
-/* Register file: every register reads back what was last written. */
-static uint32_t *fixture_regs;
-static unsigned long fixture_reg_reads, fixture_reg_writes;
-
-static u32 fixture_rreg(struct amdgpu_device *a, u32 byte_offset)
-{
-	(void)a;
-	__atomic_add_fetch(&fixture_reg_reads, 1, __ATOMIC_RELAXED);
-	return byte_offset < MMIO_BYTES ? fixture_regs[byte_offset / 4] : 0;
-}
-
-static void fixture_wreg(struct amdgpu_device *a, u32 byte_offset, u32 v)
-{
-	(void)a;
-	__atomic_add_fetch(&fixture_reg_writes, 1, __ATOMIC_RELAXED);
-	if (byte_offset < MMIO_BYTES)
-		fixture_regs[byte_offset / 4] = v;
-}
 /* The PCI function, whose device is the DRM device's parent (adev->dev),
  * as amdgpu_pci_probe sets it up. */
 static struct pci_dev fixture_pdev;
@@ -449,103 +262,21 @@ static void fixture_init(void)
 	adev->family = AMDGPU_FAMILY_GC_12_0_0;
 	adev->external_rev_id = 0x50;
 	adev->ip_versions[GC_HWIP][0] = IP_VERSION(12, 0, 1);
-	adev->ip_versions[DCE_HWIP][0] = IP_VERSION(4, 0, 1);
 	adev->ip_versions[MMHUB_HWIP][0] = IP_VERSION(4, 1, 0);
-	adev->reg_offset[DCE_HWIP][0] = dce_base;
-	adev->reg_offset[NBIO_HWIP][0] = nbio_base;
-	adev->reg_offset[CLK_HWIP][0] = clk_base;
 	adev->firmware.load_type = AMDGPU_FW_LOAD_PSP;
 	amdgpu_set_init_level(adev, AMDGPU_INIT_LEVEL_DEFAULT);
 
-	/* No direct MMIO aperture: every register access takes amdgpu's
-	 * indirect path (adev->reg.pcie), which the fixture register file
-	 * implements. */
-	fixture_regs = calloc(1, MMIO_BYTES);
-	assert(fixture_regs);
-	adev->rmmio_size = 0;
-	spin_lock_init(&adev->mmio_idx_lock);
-	spin_lock_init(&adev->reg.pcie.lock);
-	adev->reg.pcie.rreg = fixture_rreg;
-	adev->reg.pcie.wreg = fixture_wreg;
-
-	/* Fuse: this DCN has its DMCUB microcontroller (CC_DC_PIPE_DIS). */
-	WREG32(dce_base[regCC_DC_PIPE_DIS_BASE_IDX] + regCC_DC_PIPE_DIS,
-	       CC_DC_PIPE_DIS__DC_DMCUB_ENABLE_MASK);
-	assert(RREG32(dce_base[regCC_DC_PIPE_DIS_BASE_IDX] + regCC_DC_PIPE_DIS) ==
-	       CC_DC_PIPE_DIS__DC_DMCUB_ENABLE_MASK);
+	/* DCN 4.0.1: bases, the register file, the DMCUB fuse. */
+	dcn401_fixture_attach(adev);
 	fixture_ttm_init();
 	/* The IH block's sw_init: the device interrupt and its sources. */
 	printf("dm-offline: amdgpu_irq_init -> %d\n", amdgpu_irq_init(adev));
 
-	build_vbios();
-	adev->bios = vbios;
-	adev->bios_size = VBIOS_BYTES;
-	adev->is_atom_fw = true;
-	assert(amdgpu_atombios_init(adev) == 0);
+	dcn401_fixture_vbios(adev);
 }
 
 
-/* ---- the display test ----
- *
- * Synthetic EDIDs (EDID 1.4, 1920x1080@60 preferred, CEA-861 timing at
- * 148.5 MHz): one with a CTA-861 extension carrying an HDMI vendor block
- * for the HDMI connector, and its base block alone for a DisplayPort
- * connector. They describe no real monitor. */
-static uint8_t fixture_edid[256];
-static uint8_t fixture_edid_dp[128];
-
-static void edid_checksum(uint8_t *block)
-{
-	uint8_t sum = 0;
-
-	for (int i = 0; i < 127; i++)
-		sum += block[i];
-	block[127] = (uint8_t)(0x100 - sum);
-}
-
-static void build_edid(void)
-{
-	static const uint8_t header[8] = { 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };
-	static const uint8_t dtd_1080p[18] = { 0x02, 0x3a, 0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58,
-					       0x2c, 0x45, 0x00, 0x58, 0x54, 0x21, 0x00, 0x00, 0x1e };
-	static const uint8_t chroma[10] = { 0xee, 0x91, 0xa3, 0x54, 0x4c, 0x99, 0x26, 0x0f, 0x50, 0x54 };
-	static const uint8_t range[18] = { 0x00, 0x00, 0x00, 0xfd, 0x00, 0x38, 0x4c, 0x1e, 0x53, 0x11,
-					   0x00, 0x0a, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20 };
-	uint8_t *b = fixture_edid, *x = fixture_edid + 128;
-
-	memcpy(b, header, 8);
-	b[8] = 0x31; b[9] = 0xd8;		/* "LNX" */
-	b[10] = 0x01;				/* product 1 */
-	b[16] = 1; b[17] = 2026 - 1990;		/* week, year */
-	b[18] = 1; b[19] = 4;			/* EDID 1.4 */
-	b[20] = 0xa2;				/* digital, 8 bpc, HDMI-a */
-	b[21] = 60; b[22] = 34;			/* cm */
-	b[23] = 120;				/* gamma 2.2 */
-	b[24] = 0x02;				/* preferred timing is native */
-	memcpy(&b[25], chroma, 10);
-	b[35] = 0x20;				/* 640x480@60 */
-	for (int i = 38; i < 54; i++)
-		b[i] = 0x01;			/* no standard timings */
-	memcpy(&b[54], dtd_1080p, 18);
-	memcpy(&b[72], "\0\0\0\xfc\0LINUXU TEST\n ", 18);
-	memcpy(&b[90], range, 18);
-	b[108 + 3] = 0x10;			/* dummy descriptor */
-	b[126] = 1;				/* one extension */
-	edid_checksum(b);
-
-	x[0] = 0x02; x[1] = 0x03;		/* CTA-861 revision 3 */
-	x[4] = 0x42; x[5] = 0x90; x[6] = 0x01;	/* video: VIC 16 (native), VIC 1 */
-	x[7] = 0x65; x[8] = 0x03; x[9] = 0x0c; x[10] = 0x00; x[11] = 0x10; x[12] = 0x00; /* HDMI VSDB, 1.0.0.0 */
-	x[2] = 13;				/* no DTDs: they would start here */
-	x[3] = 0x00;
-	edid_checksum(x);
-
-	memcpy(fixture_edid_dp, fixture_edid, 128);
-	fixture_edid_dp[20] = 0xa5;		/* digital, 8 bpc, DisplayPort */
-	fixture_edid_dp[126] = 0;		/* no extension */
-	memcpy(&fixture_edid_dp[72], "\0\0\0\xfc\0LINUXU DP\n   ", 18);
-	edid_checksum(fixture_edid_dp);
-}
+/* ---- the display test ---- */
 
 static struct drm_connector *connector_named(const char *name)
 {
@@ -589,8 +320,8 @@ static const struct rt_display_connector *report_connector(const struct rt_displ
 static int otg_with_timing(uint32_t htotal, uint32_t vtotal)
 {
 	for (int i = 0; i < 4; i++) {
-		uint32_t h = RREG32(dce_base[regOTG0_OTG_H_TOTAL_BASE_IDX] + regOTG0_OTG_H_TOTAL + i * OTG_STRIDE);
-		uint32_t v = RREG32(dce_base[regOTG0_OTG_V_TOTAL_BASE_IDX] + regOTG0_OTG_V_TOTAL + i * OTG_STRIDE);
+		uint32_t h = RREG32(dcn401_dce_base[regOTG0_OTG_H_TOTAL_BASE_IDX] + regOTG0_OTG_H_TOTAL + i * OTG_STRIDE);
+		uint32_t v = RREG32(dcn401_dce_base[regOTG0_OTG_V_TOTAL_BASE_IDX] + regOTG0_OTG_V_TOTAL + i * OTG_STRIDE);
 
 		if ((h & 0x7fff) == htotal - 1 && (v & 0xffff) == vtotal - 1)
 			return i;
@@ -601,7 +332,7 @@ static int otg_with_timing(uint32_t htotal, uint32_t vtotal)
 static int hubp_scanning(uint64_t address)
 {
 	for (int i = 0; i < 4; i++)
-		if (RREG32(dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_BASE_IDX] +
+		if (RREG32(dcn401_dce_base[regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS_BASE_IDX] +
 			   regHUBPREQ0_DCSURF_PRIMARY_SURFACE_ADDRESS + i * HUBP_STRIDE) ==
 		    lower_32_bits(address))
 			return i;
@@ -631,11 +362,11 @@ static void display_test(void)
 	 * sink from it), since no fixture DDC or AUX channel answers. DP-1 and
 	 * DP-3 stay empty. */
 	assert(hdmi && dp);
-	build_edid();
+	dcn401_fixture_build_edid();
 	hdmi->force = DRM_FORCE_ON;
-	assert(drm_edid_override_set(hdmi, fixture_edid, sizeof(fixture_edid)) == 0);
+	assert(drm_edid_override_set(hdmi, dcn401_fixture_edid, sizeof(dcn401_fixture_edid)) == 0);
 	dp->force = DRM_FORCE_ON;
-	assert(drm_edid_override_set(dp, fixture_edid_dp, sizeof(fixture_edid_dp)) == 0);
+	assert(drm_edid_override_set(dp, dcn401_fixture_edid_dp, sizeof(dcn401_fixture_edid_dp)) == 0);
 
 	/* amdgpu_pci_probe registers the device after IP init: minors, then
 	 * planes, CRTCs, encoders and connectors with their sysfs devices. */
@@ -661,11 +392,11 @@ static void display_test(void)
 		       report.connector[i].preferred_height, report.connector[i].preferred_refresh);
 	c = report_connector(&report, "HDMI-A-1");
 	assert(c && c->status == connector_status_connected && c->modes > 0 &&
-	       c->edid_bytes == sizeof(fixture_edid) && !c->lit);
+	       c->edid_bytes == sizeof(dcn401_fixture_edid) && !c->lit);
 	assert(c->preferred_width == 1920 && c->preferred_height == 1080 && c->preferred_refresh == 60);
 	c = report_connector(&report, "DP-2");
 	assert(c && c->status == connector_status_connected && c->modes > 0 &&
-	       c->edid_bytes == sizeof(fixture_edid_dp) && c->preferred_width == 1920 &&
+	       c->edid_bytes == sizeof(dcn401_fixture_edid_dp) && c->preferred_width == 1920 &&
 	       c->preferred_height == 1080 && c->preferred_refresh == 60);
 	c = report_connector(&report, "DP-1");
 	assert(c && c->status == connector_status_disconnected && !c->modes && !c->edid_bytes);
@@ -702,6 +433,58 @@ static void display_test(void)
 		assert(rt_display_modes(&fixture_pdev, "DP-9", &modes) == -ENOENT);
 	}
 
+	/* The monitor on a connector, as the dext publishes it for our tools:
+	 * the EDID's monitor name descriptor and the physical size, from what
+	 * the probe left (no detection). */
+	{
+		struct rt_display_monitor monitor;
+
+		assert(rt_display_monitor(&fixture_pdev, "HDMI-A-1", &monitor) == 0);
+		printf("dm-offline: HDMI-A-1 monitor \"%s\", %ux%u mm\n", monitor.name,
+		       monitor.width_mm, monitor.height_mm);
+		assert(monitor.status == connector_status_connected &&
+		       !strcmp(monitor.name, "LINUXU TEST") && monitor.width_mm == 600 &&
+		       monitor.height_mm == 340);
+		assert(rt_display_monitor(&fixture_pdev, "card0-DP-2", &monitor) == 0 &&
+		       !strcmp(monitor.name, "LINUXU DP"));
+		assert(rt_display_monitor(&fixture_pdev, "DP-1", &monitor) == 0 &&
+		       monitor.status == connector_status_disconnected && !monitor.name[0] &&
+		       !monitor.width_mm);
+		assert(rt_display_monitor(&fixture_pdev, "DP-9", &monitor) == -ENOENT);
+		assert(rt_display_monitor(&fixture_pdev, "", &monitor) == -EINVAL);
+		assert(rt_display_monitor(&fixture_pdev, "DP-2", NULL) == -EINVAL);
+	}
+
+	/* The board as the driver knows it (rt/identity.h): copies of the
+	 * device's own fields. This fixture runs no KFD, so it has no ISA
+	 * target. */
+	{
+		struct rt_device_identity id;
+		struct atom_context *atom = adev->mode_info.atom_context;
+		static struct pci_dev unbound;
+
+		assert(rt_device_identity(&fixture_pdev, &id) == 0);
+		printf("dm-offline: identity %04x:%04x rev %02x, GC %u.%u.%u, VRAM %llu MB %s, "
+		       "VBIOS \"%s\" \"%s\"\n", id.vendor, id.device, id.revision,
+		       id.gc_version >> 24, (id.gc_version >> 16) & 0xff, (id.gc_version >> 8) & 0xff,
+		       (unsigned long long)(id.vram_bytes >> 20), id.vram_type_name, id.vbios_pn,
+		       id.vbios_version);
+		assert(id.version == RT_IDENTITY_VERSION && id.vendor == 0x1002 &&
+		       id.device == 0x7551 && id.revision == 0xc0);
+		assert(id.gc_version == IP_VERSION(12, 0, 1) && !id.gfx_target_version &&
+		       !id.gfx_target[0]);
+		assert(id.vram_bytes == adev->gmc.real_vram_size && id.vram_bytes &&
+		       id.visible_vram_bytes == adev->gmc.visible_vram_size &&
+		       id.vram_type == adev->gmc.vram_type &&
+		       id.compute_units == adev->gfx.cu_info.number);
+		assert(atom && !strncmp(id.vbios_pn, (const char *)atom->vbios_pn, strlen(id.vbios_pn)) &&
+		       !strncmp(id.vbios_version, (const char *)atom->vbios_ver_str,
+				strlen(id.vbios_version)));
+		assert(!id.product_name[0]);
+		assert(rt_device_identity(&unbound, &id) == -ENODEV && id.device == 0);
+		assert(rt_device_identity(&fixture_pdev, NULL) == -EINVAL);
+	}
+
 	/* drm_sysfs connector files, read as a Linux tool reads them. */
 	assert(sysfs_text("drm/card0/card0-HDMI-A-1/status", text, sizeof(text)) > 0);
 	assert(!strcmp(text, "connected\n"));
@@ -716,7 +499,7 @@ static void display_test(void)
 					   text, sizeof(text), 0, &length);
 
 		printf("dm-offline: sysfs drm/card0/card0-HDMI-A-1/edid -> %ld bytes\n", n);
-		assert(n == sizeof(fixture_edid) && !memcmp(text, fixture_edid, sizeof(fixture_edid)));
+		assert(n == sizeof(dcn401_fixture_edid) && !memcmp(text, dcn401_fixture_edid, sizeof(dcn401_fixture_edid)));
 		n = linuxu_sysfs_read(&fixture_dev.kobj, "drm/card0/card0-DP-1/edid",
 				      text, sizeof(text), 0, &length);
 		assert(n == 0);
@@ -731,13 +514,13 @@ static void display_test(void)
 
 	/* The pattern on HDMI-A-1: dumb buffer in VRAM, pattern written
 	 * through the CPU view of VRAM, atomic commit through amdgpu_dm/DC. */
-	writes = fixture_reg_writes;
+	writes = dcn401_reg_writes;
 	r = rt_display_show(&fixture_pdev, "HDMI-A-1", RT_DISPLAY_PATTERN_BARS, &report);
 	printf("dm-offline: display show HDMI-A-1 -> %d (probe %d, commit %d), fb %ux%u pitch %u at 0x%llx, "
 	       "fill %llu us, commit %llu ms, %lu register writes\n", r, report.probe_status,
 	       report.commit_status, report.fb_width, report.fb_height, report.fb_pitch,
 	       (unsigned long long)report.fb_gpu_addr, (unsigned long long)report.fill_ns / 1000,
-	       (unsigned long long)report.commit_ns / 1000000, fixture_reg_writes - writes);
+	       (unsigned long long)report.commit_ns / 1000000, dcn401_reg_writes - writes);
 	assert(r == 0 && report.showing && rt_display_showing());
 	assert(report.pattern == RT_DISPLAY_PATTERN_BARS);
 	assert(report.fb_width == 1920 && report.fb_height == 1080 && report.fb_pitch >= 1920 * 4);
@@ -770,7 +553,7 @@ static void display_test(void)
 	assert(sysfs_text("drm/card0/card0-HDMI-A-1/enabled", text, sizeof(text)) > 0);
 	assert(!strcmp(text, "disabled\n"));
 	{
-		uint32_t control = RREG32(dce_base[regOTG0_OTG_CONTROL_BASE_IDX] + regOTG0_OTG_CONTROL +
+		uint32_t control = RREG32(dcn401_dce_base[regOTG0_OTG_CONTROL_BASE_IDX] + regOTG0_OTG_CONTROL +
 					  otg * OTG_STRIDE);
 
 		printf("dm-offline: OTG%d control 0x%08x after off\n", otg, control);
@@ -819,37 +602,25 @@ static void display_test(void)
 	printf("dm-offline: display output 1920x1080@59.000 -> %d\n", r);
 	assert(r == -EINVAL && !report.showing && !rt_display_showing());
 	assert(rt_display_output(&fixture_pdev, "DP-1", 1920, 1080, 60000, &report) == -ENOENT);
+	/* The output pipeline copies with SDMA, which this fixture has none
+	 * of: refused after the mode was found (test-display-pipeline runs
+	 * it on a fixture with both). */
 	r = rt_display_output(&fixture_pdev, "HDMI-A-1", 1920, 1080, 60000, &report);
-	printf("dm-offline: display output 1920x1080@60.000 -> %d (commit %d)\n", r, report.commit_status);
-	assert(r == 0 && report.showing && report.pattern == RT_DISPLAY_PATTERN_OUTPUT);
-	c = report_connector(&report, "HDMI-A-1");
-	assert(c && c->lit && c->lit_width == 1920 && c->lit_height == 1080);
-	{
-		const struct rt_surface_rect rect = { 0, 0, 16, 16 };
-		struct rt_display_present_stats ps;
-
-		assert(rt_display_present(&fixture_pdev, NULL, &rect, 1, &ps) == -EINVAL);
-		assert(ps.version == 1 && !ps.frames);
-	}
-	assert(rt_display_off(&fixture_pdev, &report) == 0 && !report.showing && !rt_display_showing());
-	{
-		const struct rt_surface_rect rect = { 0, 0, 16, 16 };
-
-		/* No output: refused before the surface is looked at. */
-		assert(rt_display_present(&fixture_pdev, (struct rt_surface *)&rect, &rect, 1, NULL) == -ENOENT);
-	}
+	printf("dm-offline: display output without SDMA -> %d\n", r);
+	assert(r == -ENODEV && !report.showing && !rt_display_showing());
+	assert(rt_display_present(&fixture_pdev, NULL, NULL, 0, 0, NULL) == -EINVAL);
 
 	/* The GPU leaves the bus while the pattern is on screen: nothing more
 	 * is driven, and turning it off commits nothing. */
 	r = rt_display_show(&fixture_pdev, "HDMI-A-1", RT_DISPLAY_PATTERN_BARS, &report);
 	assert(r == 0 && report.showing);
-	writes = fixture_reg_writes;
+	writes = dcn401_reg_writes;
 	assert(rt_removal_begin(&fixture_pdev) == 0);
 	assert(rt_display_probe(&fixture_pdev, &report) == -ENODEV);
 	assert(rt_display_show(&fixture_pdev, NULL, RT_DISPLAY_PATTERN_WHITE, &report) == -ENODEV);
 	r = rt_display_off(&fixture_pdev, &report);
 	printf("dm-offline: display off after removal -> %d, %lu register writes\n", r,
-	       fixture_reg_writes - writes);
+	       dcn401_reg_writes - writes);
 	assert(r == 0 && !rt_display_showing());
 	rt_removal_end();
 
@@ -915,8 +686,8 @@ int main(void)
 	assert(adev->dm.dc->ctx->dce_version == DCN_VERSION_4_01);
 	printf("dm-offline: %s, %u link(s) (%zu VBIOS connectors + virtual)\n",
 	       dce_version_to_string(adev->dm.dc->ctx->dce_version),
-	       adev->dm.dc->link_count, NPATHS);
-	assert(adev->dm.dc->link_count == NPATHS + 1);
+	       adev->dm.dc->link_count, DCN401_FIXTURE_PATHS);
+	assert(adev->dm.dc->link_count == DCN401_FIXTURE_PATHS + 1);
 
 	/* The DMUB service took the firmware into its framebuffer and reset
 	 * the controller; nothing executes it here, so the auto-load wait and
@@ -943,7 +714,7 @@ int main(void)
 	assert(adev_to_drm(adev)->mode_config.num_crtc == adev->mode_info.num_crtc);
 	printf("dm-offline: %d CRTC(s), %u register reads, %u writes\n",
 	       adev_to_drm(adev)->mode_config.num_crtc,
-	       (unsigned)fixture_reg_reads, (unsigned)fixture_reg_writes);
+	       (unsigned)dcn401_reg_reads, (unsigned)dcn401_reg_writes);
 
 	display_test();
 

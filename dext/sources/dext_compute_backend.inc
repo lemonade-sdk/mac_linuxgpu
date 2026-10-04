@@ -1140,6 +1140,57 @@ int dext_compute_aql_queue_create(uint64_t ring_handle,
     return 0;
 }
 
+/* Signal events (selector 86). */
+int dext_compute_event(uint32_t op, uint32_t id, uint64_t out[3])
+{
+    if (!out) return -EINVAL_L;
+    out[0] = out[1] = out[2] = 0;
+    if (!production_ready()) return -ENOTREADY_L;
+    struct dext_kfd_client *c = selected_kfd();
+    if (!c) return -ENOTREADY_L;
+    int r;
+    switch (op) {
+    case DEXT_COMPUTE_EVENT_CREATE: {
+        uint32_t event = 0, trigger = 0;
+        uint64_t mailbox = 0;
+        r = dext_kfd_event_create(c, &event, &trigger, &mailbox);
+        if (!r) {
+            out[0] = event;
+            out[1] = trigger;
+            out[2] = mailbox;
+        }
+        break;
+    }
+    case DEXT_COMPUTE_EVENT_DESTROY:
+        r = dext_kfd_event_destroy(c, id);
+        break;
+    case DEXT_COMPUTE_EVENT_SET:
+        r = dext_kfd_event_set(c, id);
+        break;
+    default:
+        return -EINVAL_L;
+    }
+    if (r == -ENOENT) return -ENOENT_L;
+    if (r == -ENOSPC) return -ENOMEM_L;	/* KFD_SIGNAL_EVENT_LIMIT reached */
+    return r ? kfd_error(c, r) : 0;
+}
+
+/* Selector 87: registered here, on the owner's queue; run off it. */
+int dext_compute_event_wait_begin(const uint32_t *ids, uint32_t count, int all,
+                                  uint32_t timeout_ms, struct rt_kfd_wait **out)
+{
+    if (!out) return -EINVAL_L;
+    *out = NULL;
+    if (!production_ready()) return -ENOTREADY_L;
+    struct dext_kfd_client *c = selected_kfd();
+    if (!c) return -ENOTREADY_L;
+    const int r = dext_kfd_wait_begin(c, ids, count, all, timeout_ms, out);
+    if (r == -ENOENT) return -ENOENT_L;
+    if (r == -EINVAL) return -EINVAL_L;
+    if (r == -EBUSY) return -EBUSY_L;
+    return r ? -ENOTREADY_L : 0;
+}
+
 int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
                                 uint64_t *out_status)
 {

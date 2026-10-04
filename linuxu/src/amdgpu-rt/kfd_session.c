@@ -45,6 +45,11 @@
  * and below TASK_SIZE_MAX, so no GPU VA and no client mapping overlaps. */
 #define RT_KFD_ARENA_VA		(1ULL << 47)
 #define RT_KFD_DOORBELL_VA	(RT_KFD_ARENA_VA + (1ULL << 40))
+/* Each running wait's argument block: its own VA (rt_process_ioctl maps
+ * the block there for the call), between the arena and the doorbells. */
+#define RT_KFD_WAIT_VA		(RT_KFD_ARENA_VA + (1ULL << 39))
+#define RT_KFD_WAIT_STRIDE	(1ULL << 20)
+#define RT_KFD_EVENT_PAGE_BYTES	((uint64_t)KFD_SIGNAL_EVENT_LIMIT * 8)
 /* GART-mapped staging for SDMA transfers to and from VRAM. */
 #define RT_KFD_STAGING_BYTES	(1ULL << 20)
 #define RT_KFD_LARGE_PAGE	(2ULL << 20)
@@ -131,6 +136,21 @@ struct rt_kfd_session {
 	/* The first teardown step that could not confirm the GPU let go. */
 	enum rt_kfd_step fail_step;
 	int fail_error;
+	/* Signal events (rt_kfd_event_create) and the waits on them. */
+	struct rt_kfd_bo *event_page;
+	unsigned long event_ids[KFD_SIGNAL_EVENT_LIMIT / BITS_PER_LONG];
+	unsigned int events;
+	uint64_t wait_slots;		/* bit per running wait's VA */
+	unsigned int waits;
+	pthread_cond_t waits_done;
+	bool closing;
+};
+
+struct rt_kfd_wait {
+	struct rt_kfd_session *s;
+	unsigned int slot;
+	uint32_t count, all, timeout_ms;
+	uint32_t ids[RT_KFD_WAIT_EVENTS_MAX];
 };
 
 /* ---- VA allocation ---- */
@@ -437,6 +457,7 @@ static void session_free(struct rt_kfd_session *s)
 	dma_fence_put(s->pending_copy);
 	va_clear(&s->window);
 	va_clear(&s->private_range);
+	pthread_cond_destroy(&s->waits_done);
 	pthread_mutex_destroy(&s->lock);
 	kfree(s);
 }
@@ -462,6 +483,7 @@ int rt_kfd_session_open(struct amdgpu_device *adev, struct rt_compute_ctx *ctx,
 	s->ctx = ctx;
 	s->kfd_fd = s->drm_fd = -1;
 	pthread_mutex_init(&s->lock, NULL);
+	pthread_cond_init(&s->waits_done, NULL);
 	r = rt_compute_bo_alloc(ctx, RT_KFD_STAGING_BYTES, PAGE_SIZE, RT_COMPUTE_GTT,
 				&s->staging);
 	if (!r)
@@ -1782,6 +1804,239 @@ int rt_kfd_session_settle(struct rt_kfd_session *s, unsigned int wait_ms)
 	return r;
 }
 
+/* ---- signal events and interrupt-driven waits ---- */
+
+static long event_destroy_locked(struct rt_kfd_session *s, uint32_t id)
+{
+	struct kfd_ioctl_destroy_event_args args = { .event_id = id };
+	long r = session_ioctl(s, AMDKFD_IOC_DESTROY_EVENT, &args, sizeof(args));
+
+	if (!r) {
+		clear_bit(id, s->event_ids);
+		s->events--;
+	}
+	return r;
+}
+
+/* Close's first step. Caller holds s->lock and is inside the process. */
+static void end_waits_locked(struct rt_kfd_session *s)
+{
+	s->closing = true;
+	for (uint32_t id = 0; id < KFD_SIGNAL_EVENT_LIMIT && s->events; ++id)
+		if (test_bit(id, s->event_ids) && event_destroy_locked(s, id)) {
+			/* KFD keeps an event it will not destroy; the process
+			 * exit frees it. */
+			clear_bit(id, s->event_ids);
+			s->events--;
+		}
+	while (s->waits)
+		pthread_cond_wait(&s->waits_done, &s->lock);
+}
+
+int rt_kfd_event_create(struct rt_kfd_session *s, struct rt_kfd_event *out)
+{
+	struct kfd_ioctl_create_event_args args = {0};
+	struct linuxu_process_saved saved;
+	long r;
+
+	if (!s || !out)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	pthread_mutex_lock(&s->lock);
+	if (s->uncertain || s->closing) {
+		pthread_mutex_unlock(&s->lock);
+		return -EBUSY;
+	}
+	r = session_enter(s, &saved);
+	if (r) {
+		pthread_mutex_unlock(&s->lock);
+		return (int)r;
+	}
+	if (!s->event_page)
+		r = bo_alloc_locked(s, RT_KFD_EVENT_PAGE_BYTES, PAGE_SIZE, RT_KFD_GTT,
+				    RT_KFD_PLACE_PRIVATE, &s->event_page);
+	if (!r) {
+		/* hsaKmtCreateEvent: the event page goes with the first
+		 * signal event; KFD maps it and fills it with
+		 * UNSIGNALED_EVENT_SLOT. */
+		args.event_type = KFD_IOC_EVENT_SIGNAL;
+		args.auto_reset = 1;
+		args.node_id = 0;
+		args.event_page_offset = s->process->signal_page ? 0 : s->event_page->handle;
+		r = session_ioctl(s, AMDKFD_IOC_CREATE_EVENT, &args, sizeof(args));
+	}
+	if (!r && (args.event_id >= KFD_SIGNAL_EVENT_LIMIT ||
+		   args.event_slot_index >= KFD_SIGNAL_EVENT_LIMIT)) {
+		(void)event_destroy_locked(s, args.event_id);
+		r = -ERANGE;
+	} else if (!r) {
+		set_bit(args.event_id, s->event_ids);
+		s->events++;
+		out->id = args.event_id;
+		out->trigger = args.event_trigger_data;
+		out->mailbox_va = s->event_page->va + (uint64_t)args.event_slot_index * 8;
+	}
+	linuxu_process_leave(&saved);
+	pthread_mutex_unlock(&s->lock);
+	return (int)r;
+}
+
+static int event_call(struct rt_kfd_session *s, uint32_t id, bool destroy)
+{
+	struct linuxu_process_saved saved;
+	long r;
+
+	if (!s || id >= KFD_SIGNAL_EVENT_LIMIT)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	if (!test_bit(id, s->event_ids)) {
+		pthread_mutex_unlock(&s->lock);
+		return -ENOENT;
+	}
+	r = session_enter(s, &saved);
+	if (!r) {
+		if (destroy) {
+			r = event_destroy_locked(s, id);
+		} else {
+			struct kfd_ioctl_set_event_args args = { .event_id = id };
+
+			r = session_ioctl(s, AMDKFD_IOC_SET_EVENT, &args, sizeof(args));
+		}
+		linuxu_process_leave(&saved);
+	}
+	pthread_mutex_unlock(&s->lock);
+	return (int)r;
+}
+
+int rt_kfd_event_destroy(struct rt_kfd_session *s, uint32_t id)
+{
+	return event_call(s, id, true);
+}
+
+int rt_kfd_event_set(struct rt_kfd_session *s, uint32_t id)
+{
+	return event_call(s, id, false);
+}
+
+unsigned int rt_kfd_event_count(struct rt_kfd_session *s)
+{
+	unsigned int n;
+
+	if (!s)
+		return 0;
+	pthread_mutex_lock(&s->lock);
+	n = s->events;
+	pthread_mutex_unlock(&s->lock);
+	return n;
+}
+
+int rt_kfd_wait_begin(struct rt_kfd_session *s, const uint32_t *ids, uint32_t count,
+		      int all, uint32_t timeout_ms, struct rt_kfd_wait **out)
+{
+	struct rt_kfd_wait *w;
+	int r = 0;
+
+	if (!out)
+		return -EINVAL;
+	*out = NULL;
+	if (!s || !ids || !count || count > RT_KFD_WAIT_EVENTS_MAX)
+		return -EINVAL;
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return -ENOMEM;
+	pthread_mutex_lock(&s->lock);
+	if (s->closing)
+		r = -ESHUTDOWN;
+	else if (s->uncertain)
+		r = -EBUSY;
+	else if (s->wait_slots == UINT64_MAX)
+		r = -EBUSY;
+	for (uint32_t i = 0; !r && i < count; ++i)
+		if (ids[i] >= KFD_SIGNAL_EVENT_LIMIT || !test_bit(ids[i], s->event_ids))
+			r = -ENOENT;
+	if (!r) {
+		w->slot = (unsigned int)__builtin_ctzll(~s->wait_slots);
+		s->wait_slots |= 1ULL << w->slot;
+		s->waits++;
+	}
+	pthread_mutex_unlock(&s->lock);
+	if (r) {
+		kfree(w);
+		return r;
+	}
+	w->s = s;
+	w->count = count;
+	w->all = all ? 1 : 0;
+	w->timeout_ms = timeout_ms > RT_KFD_WAIT_MAX_MS ? RT_KFD_WAIT_MAX_MS : timeout_ms;
+	memcpy(w->ids, ids, count * sizeof(*ids));
+	*out = w;
+	return 0;
+}
+
+static void wait_end(struct rt_kfd_wait *w)
+{
+	struct rt_kfd_session *s = w->s;
+
+	pthread_mutex_lock(&s->lock);
+	s->wait_slots &= ~(1ULL << w->slot);
+	if (!--s->waits)
+		pthread_cond_broadcast(&s->waits_done);
+	pthread_mutex_unlock(&s->lock);
+	kfree(w);
+}
+
+void rt_kfd_wait_cancel(struct rt_kfd_wait *w)
+{
+	if (w)
+		wait_end(w);
+}
+
+int rt_kfd_wait_run(struct rt_kfd_wait *w, uint32_t *result)
+{
+	struct {
+		struct kfd_ioctl_wait_events_args args;
+		struct kfd_event_data events[RT_KFD_WAIT_EVENTS_MAX];
+	} *call;
+	struct linuxu_process_saved saved;
+	struct rt_kfd_session *s;
+	size_t bytes;
+	long r;
+
+	if (!w)
+		return -EINVAL;
+	s = w->s;
+	if (result)
+		*result = KFD_IOC_WAIT_RESULT_FAIL;
+	call = kzalloc(sizeof(*call), GFP_KERNEL);
+	r = call ? 0 : -ENOMEM;
+	if (!r) {
+		const uint64_t va = RT_KFD_WAIT_VA + w->slot * RT_KFD_WAIT_STRIDE;
+
+		bytes = offsetof(typeof(*call), events) + w->count * sizeof(call->events[0]);
+		call->args.events_ptr = va + offsetof(typeof(*call), events);
+		call->args.num_events = w->count;
+		call->args.wait_for_all = w->all;
+		call->args.timeout = w->timeout_ms;
+		for (uint32_t i = 0; i < w->count; ++i)
+			call->events[i].event_id = w->ids[i];
+		r = session_enter(s, &saved);
+		if (!r) {
+			/* Unlocked: the KFD process serializes its own event
+			 * state (p->event_mutex), and this sleep must not hold
+			 * up the session's other calls. */
+			r = READ_ONCE(s->closing) ? -ESHUTDOWN :
+				rt_process_ioctl(s->kfd_fd, AMDKFD_IOC_WAIT_EVENTS, va, call, bytes);
+			linuxu_process_leave(&saved);
+		}
+		if (!r && result)
+			*result = call->args.wait_result;
+		kfree(call);
+	}
+	wait_end(w);
+	return (int)r;
+}
+
+
 int rt_kfd_session_close(struct rt_kfd_session *s)
 {
 	struct linuxu_process_saved saved;
@@ -1795,6 +2050,9 @@ int rt_kfd_session_close(struct rt_kfd_session *s)
 		pthread_mutex_unlock(&s->lock);
 		return r;
 	}
+	/* Waits end first: destroying the events wakes each with FAIL, and
+	 * none may still be inside the process when it exits. */
+	end_waits_locked(s);
 	/* What a previous call left uncertain first: a copy that outlived its
 	 * timeout gets one more bounded wait. */
 	settle_copy_locked(s, RT_KFD_SETTLE_MS);

@@ -18,6 +18,7 @@ struct mutex {
 	atomic_long_t   owner;
 	raw_spinlock_t  wait_lock;
 	struct mutex_waiter *first_waiter;
+	unsigned int    linuxu_waiters;	/* parked in mutex_lock (rt/park.h) */
 };
 
 /* ---- initializers ---- */

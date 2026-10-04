@@ -1,4 +1,4 @@
-/* Host test for embedded mutex/completion state and HZ=100 deadlines.
+/* Host test for embedded mutex/completion state and jiffy deadlines.
  * Build: clang -w -std=gnu11 -D__KERNEL__ -ffunction-sections
  *   -fdata-sections -Ilinuxu/headers linuxu/tests/test_mutex_completion.c
  *   linuxu/src/sync.c -Wl,-dead_strip -lpthread -o /tmp/test_mutex_completion
@@ -91,13 +91,17 @@ int main(void)
 
 	init_completion(&c);
 	start = now_ns();
-	assert(wait_for_completion_timeout(&c, 2) == 0);
+	assert(wait_for_completion_timeout(&c, msecs_to_jiffies(20)) == 0);
 	elapsed = now_ns() - start;
-	assert(elapsed >= 18000000ULL && elapsed < 300000000ULL);
-	assert(HZ == 100);
+	assert(elapsed >= 19000000ULL && elapsed < 300000000ULL);
+	assert(HZ == 1000);
 	assert(pthread_create(&workers[0], NULL, finish_after_delay, &c) == 0);
-	remaining = wait_for_completion_timeout(&c, 10);
-	assert(remaining >= 1 && remaining <= 10);
+	start = now_ns();
+	remaining = wait_for_completion_timeout(&c, msecs_to_jiffies(100));
+	elapsed = now_ns() - start;
+	assert(remaining >= 1 && remaining <= msecs_to_jiffies(100));
+	/* complete() 5 ms in woke it: no backstop or poll step on top. */
+	assert(elapsed < 9000000ULL);
 	assert(pthread_join(workers[0], NULL) == 0);
 	assert(!completion_done(&c));
 

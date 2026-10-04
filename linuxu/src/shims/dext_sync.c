@@ -44,7 +44,16 @@ struct dext_cond {
 	uint64_t generation;
 	unsigned int waiters;
 	bool inline_locked;
+	void *sleepers;	/* dext_cond_block's list, kept by its queue */
 };
+
+/* Blocking waits (dext/sources/dext_threads.mm): sleep on a reentrant
+ * IODispatchQueue until woken. ENOTSUP when no queue exists; the wait then
+ * polls (IOSleep), which dext_cond_polled counts. */
+extern int dext_cond_block(void **sleepers, bool (*still)(void *),
+			   void (*release)(void *), void *arg, uint64_t deadline_ns);
+extern int dext_cond_wake(void **sleepers, bool all);
+unsigned long dext_cond_polled;
 _Static_assert(sizeof(struct dext_cond) <= sizeof(((pthread_cond_t *)0)->__opaque),
 	       "pthread condition must hold fallback state");
 _Static_assert(offsetof(pthread_cond_t, __opaque) % _Alignof(struct dext_cond) == 0,
@@ -364,6 +373,7 @@ static struct dext_cond *new_cond(void)
 	state->generation = 0;
 	state->waiters = 0;
 	state->inline_locked = false;
+	state->sleepers = NULL;
 	return state;
 }
 
@@ -374,6 +384,7 @@ static struct dext_cond *inline_cond(pthread_cond_t *c)
 	state->generation = 0;
 	state->waiters = 0;
 	state->inline_locked = false;
+	state->sleepers = NULL;
 	return state;
 }
 
@@ -482,7 +493,33 @@ static int notify_cond(pthread_cond_t *c)
 	 * callers must recheck their predicate while holding their mutex. */
 	state->generation++;
 	cond_unlock(state);
+	(void)dext_cond_wake(&state->sleepers, true);
 	return 0;
+}
+
+struct cond_blocked {
+	struct dext_cond *state;
+	pthread_mutex_t *mutex;
+	uint64_t observed;
+	int unlock_error;
+};
+
+static bool cond_unsignalled(void *p)
+{
+	struct cond_blocked *b = p;
+	bool same;
+
+	cond_lock(b->state);
+	same = b->state->generation == b->observed;
+	cond_unlock(b->state);
+	return same;
+}
+
+static void cond_release_mutex(void *p)
+{
+	struct cond_blocked *b = p;
+
+	b->unlock_error = pthread_mutex_unlock(b->mutex);
 }
 
 int pthread_cond_signal(pthread_cond_t *c) { return notify_cond(c); }
@@ -507,7 +544,7 @@ static int wait_cond(pthread_cond_t *c, pthread_mutex_t *m,
 		else
 			duration = (uint64_t)relative->tv_sec * 1000000000ULL +
 				   (uint64_t)relative->tv_nsec;
-		now = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+		now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 		deadline = duration > UINT64_MAX - now ? UINT64_MAX : now + duration;
 	}
 	error = cond_for(c, &state);
@@ -519,6 +556,27 @@ static int wait_cond(pthread_cond_t *c, pthread_mutex_t *m,
 	observed = state->generation;
 	state->waiters++;
 	cond_unlock(state);
+	{
+		/* Asleep on the queue until a signal or the deadline. */
+		struct cond_blocked b = { state, m, observed, 0 };
+		int blocked = dext_cond_block(&state->sleepers, cond_unsignalled,
+					      cond_release_mutex, &b,
+					      relative ? deadline : 0);
+
+		if (blocked != ENOTSUP) {
+			cond_lock(state);
+			state->waiters--;
+			cond_unlock(state);
+			if (b.unlock_error)
+				return b.unlock_error;
+			if (blocked == EIO)
+				IOSleep(1);	/* the queue refused the sleep: do not spin */
+			error = pthread_mutex_lock(m);
+			if (error)
+				return error;
+			return blocked == ETIMEDOUT ? ETIMEDOUT : 0;
+		}
+	}
 	error = pthread_mutex_unlock(m);
 	if (error) {
 		cond_lock(state);
@@ -526,6 +584,7 @@ static int wait_cond(pthread_cond_t *c, pthread_mutex_t *m,
 		cond_unlock(state);
 		return error;
 	}
+	__atomic_add_fetch(&dext_cond_polled, 1, __ATOMIC_RELAXED);
 	for (;;) {
 		cond_lock(state);
 		if (state->generation != observed) {
@@ -533,7 +592,7 @@ static int wait_cond(pthread_cond_t *c, pthread_mutex_t *m,
 			cond_unlock(state);
 			break;
 		}
-		if (relative && clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW) >= deadline) {
+		if (relative && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) {
 			state->waiters--;
 			cond_unlock(state);
 			result = ETIMEDOUT;

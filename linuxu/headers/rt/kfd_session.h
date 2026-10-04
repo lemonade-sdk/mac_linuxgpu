@@ -204,6 +204,51 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 unsigned int rt_kfd_session_queue_count(struct rt_kfd_session *s);
 
+/* Signal events: what an interrupt-driven wait sleeps on, as ROCr's
+ * interrupt signals use them through libhsakmt.
+ *
+ * rt_kfd_event_create is CREATE_EVENT (KFD_IOC_EVENT_SIGNAL, auto reset).
+ * The first one hands KFD the session's event page, a GTT BO in the
+ * session's private range that KFD maps for itself (kfd_event_page_set),
+ * as libhsakmt does on a dGPU. An amd_signal_t whose event_mailbox_ptr is
+ * @mailbox_va and whose event_id is @trigger makes the command processor
+ * write the mailbox and raise an interrupt when it completes the AQL packet
+ * that names the signal; KFD's interrupt handler then signals the event
+ * (kfd_signal_event_interrupt) and wakes whoever waits on it. Up to
+ * KFD_SIGNAL_EVENT_LIMIT events per session.
+ *
+ * A wait is WAIT_EVENTS, run on the caller's thread inside the process but
+ * outside the session lock, so many waits and every other call proceed
+ * together: rt_kfd_wait_begin registers it (the session cannot close under
+ * it), rt_kfd_wait_run sleeps until one event (or every event, @all)
+ * fires or @timeout_ms passes, then frees it. Nothing polls: the waiting
+ * thread runs again only for the interrupt or the timeout. Closing the
+ * session destroys its events, which ends every wait (result FAIL), and
+ * waits for them before the process exits. */
+#define RT_KFD_WAIT_EVENTS_MAX	64u	/* events one wait names */
+#define RT_KFD_WAITS_MAX	64u	/* waits at once per session */
+#define RT_KFD_WAIT_MAX_MS	1000u	/* longer timeouts are shortened */
+struct rt_kfd_event {
+	uint32_t id;		/* what WAIT_EVENTS, SET_EVENT, DESTROY_EVENT name */
+	uint32_t trigger;	/* amd_signal_t.event_id */
+	uint64_t mailbox_va;	/* amd_signal_t.event_mailbox_ptr */
+};
+int rt_kfd_event_create(struct rt_kfd_session *s, struct rt_kfd_event *out);
+int rt_kfd_event_destroy(struct rt_kfd_session *s, uint32_t id);
+/* SET_EVENT: a host-side change of a signal wakes its waiters. */
+int rt_kfd_event_set(struct rt_kfd_session *s, uint32_t id);
+unsigned int rt_kfd_event_count(struct rt_kfd_session *s);
+
+struct rt_kfd_wait;
+/* -EBUSY for RT_KFD_WAITS_MAX waits already, -ESHUTDOWN while closing. */
+int rt_kfd_wait_begin(struct rt_kfd_session *s, const uint32_t *ids, uint32_t count,
+		      int all, uint32_t timeout_ms, struct rt_kfd_wait **out);
+/* 0 with *result KFD_IOC_WAIT_RESULT_COMPLETE (0), _TIMEOUT (1) or _FAIL
+ * (2, an event was destroyed), or a negative errno. */
+int rt_kfd_wait_run(struct rt_kfd_wait *w, uint32_t *result);
+/* Free a wait that will not run. */
+void rt_kfd_wait_cancel(struct rt_kfd_wait *w);
+
 #ifdef __cplusplus
 }
 #endif

@@ -510,3 +510,10 @@ void backlight_device_unregister(struct backlight_device *bd)
 {
 	kfree(bd);
 }
+
+/* rt/park.h: a wait whose condition came true without a wake, in the
+ * kernel log (overrides task.c's stderr default). */
+void linuxu_wait_report(const char *message)
+{
+	printk(KERN_WARNING "%s", message);
+}

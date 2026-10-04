@@ -23,6 +23,7 @@
 		A0000000000000000000000A /* MacLinuxGPUHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000A /* MacLinuxGPUHostApp.swift */; };
 		A00000000000000000000040 /* DisplayAgent.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000040 /* DisplayAgent.swift */; };
 		A00000000000000000000041 /* DisplayAgentRuntime.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000041 /* DisplayAgentRuntime.swift */; };
+		A00000000000000000000043 /* DeviceInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000043 /* DeviceInfo.swift */; };
 		A00000000000000000000020 /* fw_mailbox_service.c in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000020 /* fw_mailbox_service.c */; };
 		A00000000000000000000021 /* fw_mailbox_iokit.c in Sources */ = {isa = PBXBuildFile; fileRef = B00000000000000000000021 /* fw_mailbox_iokit.c */; };
 		A0000000000000000000000C /* com.geramyloveless.MacAMDGPUHost.MacAMDGPU.dext in Embed System Extensions */ = {isa = PBXBuildFile; fileRef = B0000000000000000000000C /* com.geramyloveless.MacAMDGPUHost.MacAMDGPU.dext */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -69,6 +70,7 @@
 		B0000000000000000000000A /* MacLinuxGPUHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacLinuxGPUHostApp.swift; sourceTree = "<group>"; };
 		B00000000000000000000040 /* DisplayAgent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayAgent.swift; sourceTree = "<group>"; };
 		B00000000000000000000041 /* DisplayAgentRuntime.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayAgentRuntime.swift; sourceTree = "<group>"; };
+		B00000000000000000000043 /* DeviceInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceInfo.swift; sourceTree = "<group>"; };
 		B00000000000000000000042 /* CGVirtualDisplayPrivate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = CGVirtualDisplayPrivate.h; sourceTree = "<group>"; };
 		B00000000000000000000020 /* fw_mailbox_service.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fw_mailbox_service.c; sourceTree = "<group>"; };
 		B00000000000000000000021 /* fw_mailbox_iokit.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fw_mailbox_iokit.c; sourceTree = "<group>"; };
@@ -123,6 +125,7 @@
 				B0000000000000000000000A /* MacLinuxGPUHostApp.swift */,
 				B00000000000000000000040 /* DisplayAgent.swift */,
 				B00000000000000000000041 /* DisplayAgentRuntime.swift */,
+				B00000000000000000000043 /* DeviceInfo.swift */,
 				B00000000000000000000042 /* CGVirtualDisplayPrivate.h */,
 				B00000000000000000000020 /* fw_mailbox_service.c */,
 				B00000000000000000000021 /* fw_mailbox_iokit.c */,
@@ -311,6 +314,7 @@
 				A0000000000000000000000A /* MacLinuxGPUHostApp.swift in Sources */,
 				A00000000000000000000040 /* DisplayAgent.swift in Sources */,
 				A00000000000000000000041 /* DisplayAgentRuntime.swift in Sources */,
+				A00000000000000000000043 /* DeviceInfo.swift in Sources */,
 				A00000000000000000000020 /* fw_mailbox_service.c in Sources */,
 				A00000000000000000000021 /* fw_mailbox_iokit.c in Sources */,
 			);
@@ -455,13 +459,13 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 233;
+				CURRENT_PROJECT_VERSION = 235;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = YBQ9BU6Q6F;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_OPTIMIZATION_LEVEL = 0;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 0.1.129;
+				MARKETING_VERSION = 0.1.131;
 				ONLY_ACTIVE_ARCH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
@@ -480,12 +484,12 @@
 				CLANG_ENABLE_OBJC_ARC = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 233;
+				CURRENT_PROJECT_VERSION = 235;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = YBQ9BU6Q6F;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				MACOSX_DEPLOYMENT_TARGET = 26.2;
-				MARKETING_VERSION = 0.1.129;
+				MARKETING_VERSION = 0.1.131;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = macosx;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";

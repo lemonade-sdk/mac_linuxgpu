@@ -384,23 +384,96 @@ struct SurfaceVerifyResult {
 }
 
 /// struct rt_display_present_stats, version 1.
-struct PresentStats {
-    static let bytes = 56
-    let rects, jobs: UInt32
-    let full: Bool
-    let bytesCopied, copyNs, flipNs: UInt64
-    let copyStatus, flipStatus: Int32
-    let frames: UInt64
+/// struct rt_display_present_stats, version 2 (linuxu/headers/rt/display.h):
+/// the output worker's counters since OUTPUT. PRESENT returns them as they
+/// stand when it queues a frame (the frame itself is copied and flipped
+/// later); PRESENT with no rectangle only reads them.
+struct PresentStats: Equatable {
+    static let bytes = 120
+    let engines: UInt32
+    let received, flipped, replaced, copyJobs, bytesCopied: UInt64
+    let copySubmitNs, copyGPUNs, latencyNs, latencyMaxNs: UInt64
+    let lastBytes, lastCopyGPUNs, lastLatencyNs: UInt64
+    let error: Int32
+    let fullFrames: UInt32
 
     init?(_ data: Data) {
         guard data.count >= PresentStats.bytes else { return nil }
         let b = [UInt8](data)
         func u64(_ at: Int) -> UInt64 { UInt64(le32(b, at)) | UInt64(le32(b, at + 4)) << 32 }
-        guard le32(b, 0) == 1 else { return nil }
-        rects = le32(b, 4); jobs = le32(b, 8); full = le32(b, 12) != 0
-        bytesCopied = u64(16); copyNs = u64(24); flipNs = u64(32)
-        copyStatus = Int32(bitPattern: le32(b, 40)); flipStatus = Int32(bitPattern: le32(b, 44))
-        frames = u64(48)
+        guard le32(b, 0) == 2 else { return nil }
+        engines = le32(b, 4)
+        received = u64(8); flipped = u64(16); replaced = u64(24); copyJobs = u64(32); bytesCopied = u64(40)
+        copySubmitNs = u64(48); copyGPUNs = u64(56); latencyNs = u64(64); latencyMaxNs = u64(72)
+        lastBytes = u64(80); lastCopyGPUNs = u64(88); lastLatencyNs = u64(96)
+        error = Int32(bitPattern: le32(b, 104)); fullFrames = le32(b, 108)
+    }
+}
+
+/// What one mirroring run measured: the agent's side per presented frame
+/// (the PRESENT call's CPU and wall time, the whole frame handler's CPU)
+/// and the driver's per flipped frame (copy time against the bytes copied),
+/// summarized against the driver's counters at the start and the end of the
+/// measured window.
+struct PresentMeasurement {
+    /// Copy time by damage size: under 64 KiB, under 1 MiB, under 4 MiB, more.
+    static let bucketLimits: [UInt64] = [64 << 10, 1 << 20, 4 << 20, .max]
+    static let bucketNames = ["<64K", "64K-1M", "1M-4M", ">=4M"]
+    var frames = 0, idleFrames = 0, presented = 0
+    var callCPUNs: UInt64 = 0, callWallNs: UInt64 = 0, callWallMaxNs: UInt64 = 0, handlerCPUNs: UInt64 = 0
+    var bucketFrames = [Int](repeating: 0, count: 4)
+    var bucketBytes = [UInt64](repeating: 0, count: 4)
+    var bucketCopyNs = [UInt64](repeating: 0, count: 4)
+    var lastFlipped: UInt64 = 0
+
+    mutating func present(callCPUNs: UInt64, callWallNs: UInt64, handlerCPUNs: UInt64) {
+        presented += 1
+        self.callCPUNs += callCPUNs
+        self.callWallNs += callWallNs
+        callWallMaxNs = max(callWallMaxNs, callWallNs)
+        self.handlerCPUNs += handlerCPUNs
+    }
+
+    /// The driver's last flipped frame, once per flip seen.
+    mutating func observe(_ stats: PresentStats) {
+        guard stats.flipped != lastFlipped else { return }
+        lastFlipped = stats.flipped
+        guard stats.lastBytes > 0 else { return }
+        let i = PresentMeasurement.bucketLimits.firstIndex { stats.lastBytes < $0 } ?? 3
+        bucketFrames[i] += 1
+        bucketBytes[i] += stats.lastBytes
+        bucketCopyNs[i] += stats.lastCopyGPUNs
+    }
+
+    /// The report: @start and @end are the driver's counters around the
+    /// window of @seconds; @refreshHz the mode's rate.
+    func lines(start: PresentStats, end: PresentStats, seconds: Double, refreshHz: Double) -> [String] {
+        let flipped = end.flipped - start.flipped, received = end.received - start.received
+        let replaced = end.replaced - start.replaced, bytes = end.bytesCopied - start.bytesCopied
+        let f = Double(max(flipped, 1)), p = Double(max(presented, 1))
+        var out: [String] = []
+        out.append(String(format: "frames: %d captured (%d without damage), %d presented, %llu received by the driver, %llu flipped, %llu replaced before a flip; %.1f flips/s at %.3f Hz",
+                          frames, idleFrames, presented, received, flipped, replaced,
+                          Double(flipped) / max(seconds, 0.001), refreshHz))
+        out.append(String(format: "agent per presented frame: PRESENT %.1f us CPU, %.1f us wall (max %.1f); whole frame handler %.1f us CPU",
+                          Double(callCPUNs) / p / 1e3, Double(callWallNs) / p / 1e3,
+                          Double(callWallMaxNs) / 1e3, Double(handlerCPUNs) / p / 1e3))
+        out.append(String(format: "driver per flipped frame: %.1f KB copied in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
+                          Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
+                          Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
+                          Double(end.copyGPUNs - start.copyGPUNs) / f / 1e6))
+        out.append(String(format: "capture to scanout: %.2f ms on average, %.2f ms at most (since OUTPUT); %.2f frame(s) at %.3f Hz",
+                          Double(end.latencyNs - start.latencyNs) / f / 1e6, Double(end.latencyMaxNs) / 1e6,
+                          Double(end.latencyNs - start.latencyNs) / f / 1e9 * refreshHz, refreshHz))
+        for i in 0..<4 where bucketFrames[i] > 0 {
+            let mb = Double(bucketBytes[i]) / 1048576
+            out.append(String(format: "copy %@: %d frame(s), %.1f KB each, %.3f ms each, %.2f ms per MiB",
+                              PresentMeasurement.bucketNames[i], bucketFrames[i],
+                              Double(bucketBytes[i]) / Double(bucketFrames[i]) / 1e3,
+                              Double(bucketCopyNs[i]) / Double(bucketFrames[i]) / 1e6,
+                              mb > 0 ? Double(bucketCopyNs[i]) / 1e6 / mb : 0))
+        }
+        return out
     }
 }
 

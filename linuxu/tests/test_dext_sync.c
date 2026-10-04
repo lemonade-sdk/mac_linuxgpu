@@ -70,6 +70,65 @@ void *IOMalloc(size_t length)
 void IOFree(void *address, size_t length) { (void)length; free(address); }
 void IOSleep(uint64_t ms) { usleep((useconds_t)(ms * 1000)); }
 
+/* The reentrant IODispatchQueue (dext_threads.mm): a host mutex is the
+ * queue, a sleeper waits on its own record until woken or its deadline. */
+struct mock_sleeper { struct mock_sleeper *next; bool woken; };
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
+static bool queue_missing;
+static atomic_int queue_sleeps;
+extern unsigned long dext_cond_polled;
+int dext_cond_block(void **sleepers, bool (*still)(void *), void (*release)(void *), void *arg,
+		    uint64_t deadline_ns)
+{
+	struct mock_sleeper self = { NULL, false };
+	int result = 0;
+
+	if (queue_missing)
+		return ENOTSUP;
+	pthread_mutex_lock(&queue_lock);
+	self.next = *sleepers;
+	*sleepers = &self;
+	release(arg);
+	while (!self.woken && still(arg)) {
+		atomic_fetch_add(&queue_sleeps, 1);
+		if (deadline_ns) {
+			const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+			struct timespec rel;
+
+			if (now >= deadline_ns) { result = ETIMEDOUT; break; }
+			rel.tv_sec = (time_t)((deadline_ns - now) / 1000000000ULL);
+			rel.tv_nsec = (long)((deadline_ns - now) % 1000000000ULL);
+			pthread_cond_timedwait_relative_np(&queue_cond, &queue_lock, &rel);
+		} else {
+			pthread_cond_wait(&queue_cond, &queue_lock);
+		}
+	}
+	if (!self.woken)
+		for (struct mock_sleeper **link = (struct mock_sleeper **)sleepers; *link;
+		     link = &(*link)->next)
+			if (*link == &self) { *link = self.next; break; }
+	pthread_mutex_unlock(&queue_lock);
+	return result;
+}
+int dext_cond_wake(void **sleepers, bool all)
+{
+	if (queue_missing)
+		return ENOTSUP;
+	pthread_mutex_lock(&queue_lock);
+	while (*sleepers) {
+		struct mock_sleeper *sleeper = *sleepers;
+
+		*sleepers = sleeper->next;
+		sleeper->woken = true;
+		if (!all)
+			break;
+	}
+	pthread_cond_broadcast(&queue_cond);
+	pthread_mutex_unlock(&queue_lock);
+	return 0;
+}
+
 static pthread_mutex_t counter_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
 static atomic_int once_count;
@@ -239,6 +298,8 @@ int main(void)
 	test_rwlock();
 	test_shared_readers();
 	test_condition();
+	/* Waits slept on the queue: none polled. */
+	assert(dext_cond_polled == 0 && atomic_load(&queue_sleeps) > 0);
 	/* Repeat the real wait/signal/broadcast/timeout test using embedded
 	 * condition state after its first IOMalloc fails. */
 	ready_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
@@ -247,6 +308,16 @@ int main(void)
 	atomic_store(&waiting, 0);
 	iomalloc_fail_after = 1;
 	test_condition();
+	assert(dext_cond_polled == 0);
+	/* Without the queue (it could not be created), waits poll, counted. */
+	queue_missing = true;
+	ready_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
+	ready_cond = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+	ready = 0;
+	atomic_store(&waiting, 0);
+	test_condition();
+	assert(dext_cond_polled > 0);
+	queue_missing = false;
 	pthread_cond_t explicit_cond;
 	linuxu_test_iolock_fail_after = 1;
 	assert(DK(pthread_cond_init)(&explicit_cond, NULL) == 0);

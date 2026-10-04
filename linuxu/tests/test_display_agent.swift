@@ -140,11 +140,40 @@ put32(&verify, 24, 4096); put32(&verify, 56, 0xdead); put32(&verify, 60, 0xbeef)
 guard let v = SurfaceVerifyResult(Data(verify)) else { check(false); exit(1) }
 check(v.dwords == 4096 && v.gpuMismatches == 3 && v.cpuChecked && v.firstGPUMismatch == 4096 &&
       v.gpuValue == 0xdead && v.expectedValue == 0xbeef)
-var present = [UInt8](repeating: 0, count: PresentStats.bytes)
-put32(&present, 0, 1); put32(&present, 4, 2); put32(&present, 8, 1); put32(&present, 12, 1)
-put32(&present, 16, 7680); put32(&present, 40, UInt32(bitPattern: -62)); put32(&present, 48, 9)
-guard let ps = PresentStats(Data(present)) else { check(false); exit(1) }
-check(ps.rects == 2 && ps.jobs == 1 && ps.full && ps.bytesCopied == 7680 && ps.copyStatus == -62 && ps.frames == 9)
+func put64(_ b: inout [UInt8], _ at: Int, _ v: UInt64) {
+    put32(&b, at, UInt32(truncatingIfNeeded: v)); put32(&b, at + 4, UInt32(truncatingIfNeeded: v >> 32))
+}
+func presentStats(flipped: UInt64, bytes: UInt64, lastBytes: UInt64, lastCopy: UInt64, latency: UInt64) -> PresentStats? {
+    var b = [UInt8](repeating: 0, count: PresentStats.bytes)
+    put32(&b, 0, 2); put32(&b, 4, 2)
+    put64(&b, 8, flipped + 1); put64(&b, 16, flipped); put64(&b, 24, 1); put64(&b, 32, flipped * 2)
+    put64(&b, 40, bytes); put64(&b, 48, flipped * 30_000); put64(&b, 56, flipped * 500_000)
+    put64(&b, 64, latency); put64(&b, 72, 20_000_000)
+    put64(&b, 80, lastBytes); put64(&b, 88, lastCopy); put64(&b, 96, 9_000_000)
+    put32(&b, 104, UInt32(bitPattern: -19)); put32(&b, 108, 3)
+    return PresentStats(Data(b))
+}
+guard let ps = presentStats(flipped: 9, bytes: 7680, lastBytes: 4096, lastCopy: 70_000, latency: 90_000_000)
+else { check(false); exit(1) }
+check(ps.engines == 2 && ps.received == 10 && ps.flipped == 9 && ps.replaced == 1 && ps.copyJobs == 18 &&
+      ps.bytesCopied == 7680 && ps.copyGPUNs == 4_500_000 && ps.latencyMaxNs == 20_000_000 &&
+      ps.lastBytes == 4096 && ps.lastCopyGPUNs == 70_000 && ps.lastLatencyNs == 9_000_000 &&
+      ps.error == -19 && ps.fullFrames == 3)
+var v1 = [UInt8](repeating: 0, count: PresentStats.bytes); put32(&v1, 0, 1)
+check(PresentStats(Data(v1)) == nil && PresentStats(Data(count: 56)) == nil, "version 1 and short replies refused")
+// The measurement: one flip counted once, copy time by damage size.
+var m = PresentMeasurement()
+m.frames = 4; m.idleFrames = 1
+m.present(callCPUNs: 20_000, callWallNs: 40_000, handlerCPUNs: 60_000)
+m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000)
+m.observe(ps); m.observe(ps)
+let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_400, lastCopy: 2_000_000, latency: 100_000_000)!
+m.observe(big)
+check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
+let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
+check(measured.count == 6 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+      measured[2].contains("8294.4 KB copied") && measured[3].contains("10.00 ms on average") &&
+      measured[5].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)

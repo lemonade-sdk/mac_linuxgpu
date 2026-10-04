@@ -139,60 +139,86 @@ extern long schedule_timeout_uninterruptible(long timeout);
 extern void  schedule(void);
 extern int   schedule_tail(void);
 
-/* DriverKit has no Linux task signals. Poll conditions between bounded
- * sleeps; a timeout is measured once, and lock variants return with the
- * caller's lock held. Wakeup producers publish state before notifying. */
+/* wait_event and its variants, as in Linux: the waiter queues itself on
+ * the wake queue, tests the condition, and sleeps (parked on its task,
+ * rt/park.h) until a wake_up on the queue, a signal, or the timeout. Each
+ * sleep is bounded by the backstop; a backstop that finds the condition
+ * true reports the wait site once (a producer that changed the condition
+ * without waking the queue). Lock variants drop and retake the caller's
+ * lock around the sleep. */
 #include <linux/delay.h>
-#define ___wait_event(wq_head, condition, unused) \
+#include <rt/park.h>
+struct task_struct;
+struct linuxu_waiter {
+	struct wait_queue_head *wq;
+	struct wait_queue_entry entry;
+	struct task_struct *task;
+	struct linuxu_wait_site *site;
+	unsigned long seq;
+	uint64_t deadline_ns;	/* 0: none */
+	uint64_t backstop_ns;
+	int state;
+	bool timed, wq_locked, backstopped, expired;
+};
+extern void linuxu_waiter_init(struct linuxu_waiter *w, struct wait_queue_head *wq, int state,
+			       long timeout, bool timed, bool wq_locked,
+			       struct linuxu_wait_site *site);
+extern void linuxu_waiter_prepare(struct linuxu_waiter *w);
+extern void linuxu_waiter_satisfied(struct linuxu_waiter *w);
+extern int linuxu_waiter_sleep(struct linuxu_waiter *w);	/* 1: the timeout passed */
+extern long linuxu_waiter_left(struct linuxu_waiter *w);
+extern void linuxu_waiter_finish(struct linuxu_waiter *w);
+
+#define __linuxu_wait_event(wq_head, condition, state_, timeout_, timed_, wq_locked_, \
+			    unlock_, relock_) \
 ({ \
-    (void)(&(wq_head)); \
-    while (!(condition)) \
-        msleep(1); \
-    0; \
+    static struct linuxu_wait_site __lw_site = { __FILE__, __LINE__, 0 }; \
+    struct linuxu_waiter __lw; \
+    long __lw_ret; \
+    linuxu_waiter_init(&__lw, &(wq_head), (state_), (long)(timeout_), (timed_), \
+                       (wq_locked_), &__lw_site); \
+    for (;;) { \
+        int __lw_expired; \
+        linuxu_waiter_prepare(&__lw); \
+        if (condition) { \
+            linuxu_waiter_satisfied(&__lw); \
+            __lw_ret = (timed_) ? linuxu_waiter_left(&__lw) : 0; \
+            break; \
+        } \
+        if ((state_) != TASK_UNINTERRUPTIBLE && \
+            linuxu_wait_signal_pending((state_) == TASK_KILLABLE)) { \
+            __lw_ret = -ERESTARTSYS; \
+            break; \
+        } \
+        unlock_; \
+        __lw_expired = linuxu_waiter_sleep(&__lw); \
+        relock_; \
+        if (__lw_expired) { \
+            __lw_ret = (condition) ? 1 : 0; \
+            break; \
+        } \
+    } \
+    linuxu_waiter_finish(&__lw); \
+    __lw_ret; \
 })
+
+#define ___wait_event(wq_head, condition, unused) \
+    ((void)__linuxu_wait_event(wq_head, condition, TASK_UNINTERRUPTIBLE, 0, false, false, , ), 0)
 #define wait_event(wq_head, condition) \
     ___wait_event(wq_head, condition, 0)
 #define __linuxu_wait_event_interruptible(wq_head, condition, fatal_only) \
-({ \
-    int __result = 0; (void)(&(wq_head)); \
-    while (!(condition)) { \
-        if (linuxu_wait_signal_pending(fatal_only)) { __result = -ERESTARTSYS; break; } \
-        msleep(1); \
-    } \
-    __result; \
-})
+    ((int)__linuxu_wait_event(wq_head, condition, \
+        (fatal_only) ? TASK_KILLABLE : TASK_INTERRUPTIBLE, 0, false, false, , ))
 #define wait_event_interruptible(wq_head, condition) \
     __linuxu_wait_event_interruptible(wq_head, condition, false)
 #define wait_event_killable(wq_head, condition) \
     __linuxu_wait_event_interruptible(wq_head, condition, true)
 
 #define wait_event_timeout(wq_head, condition, timeout) \
-({ \
-    long __left = (timeout); \
-    unsigned long __end = jiffies + (__left > 0 ? __left : 0); \
-    (void)(&(wq_head)); \
-    for (;;) { \
-        unsigned long __now = jiffies; \
-        __left = time_before(__now, __end) ? (long)(__end - __now) : 0; \
-        if (condition) { \
-            if (__left <= 0) __left = 1; \
-            break; \
-        } \
-        if (__left <= 0) { \
-            __left = 0; \
-            break; \
-        } \
-        msleep(1); \
-    } \
-    __left; \
-})
+    __linuxu_wait_event(wq_head, condition, TASK_UNINTERRUPTIBLE, timeout, true, false, , )
 #define __linuxu_wait_event_interruptible_timeout(wq_head, condition, timeout, fatal_only) \
-({ \
-    long __result = wait_event_timeout(wq_head, \
-        (condition) || linuxu_wait_signal_pending(fatal_only), timeout); \
-    if (!(condition) && linuxu_wait_signal_pending(fatal_only)) __result = -ERESTARTSYS; \
-    __result; \
-})
+    __linuxu_wait_event(wq_head, condition, (fatal_only) ? TASK_KILLABLE : TASK_INTERRUPTIBLE, \
+                        timeout, true, false, , )
 #define wait_event_interruptible_timeout(wq_head, condition, timeout) \
     __linuxu_wait_event_interruptible_timeout(wq_head, condition, timeout, false)
 #define wait_event_killable_timeout(wq_head, condition, timeout) \
@@ -201,26 +227,15 @@ extern int   schedule_tail(void);
     wait_event_interruptible_timeout(wq_head, condition, timeout)
 
 #define wait_event_lock_irq(wq_head, condition, lock) \
-({ \
-    (void)(&(wq_head)); \
-    while (!(condition)) { \
-        spin_unlock_irq(&(lock)); \
-        msleep(1); \
-        spin_lock_irq(&(lock)); \
-    } \
-    0; \
-})
+    ((void)__linuxu_wait_event(wq_head, condition, TASK_UNINTERRUPTIBLE, 0, false, false, \
+                               spin_unlock_irq(&(lock)), spin_lock_irq(&(lock))), 0)
 #define wait_event_interruptible_lock_irq(wq_head, condition, lock) \
-({ \
-    int __result = 0; (void)(&(wq_head)); \
-    while (!(condition)) { \
-        if (linuxu_wait_signal_pending(false)) { __result = -ERESTARTSYS; break; } \
-        spin_unlock_irq(&(lock)); msleep(1); spin_lock_irq(&(lock)); \
-    } \
-    __result; \
-})
+    ((int)__linuxu_wait_event(wq_head, condition, TASK_INTERRUPTIBLE, 0, false, false, \
+                              spin_unlock_irq(&(lock)), spin_lock_irq(&(lock))))
+/* The caller holds the wake queue's own lock. */
 #define wait_event_interruptible_locked(wq_head, condition) \
-    wait_event_interruptible_lock_irq(wq_head, condition, (wq_head).lock)
+    ((int)__linuxu_wait_event(wq_head, condition, TASK_INTERRUPTIBLE, 0, false, true, \
+                              spin_unlock(&(wq_head).lock), spin_lock(&(wq_head).lock)))
 extern unsigned int wake_up_all_locked(struct wait_queue_head *wq_head);
 #define wake_up_interruptible_sync_poll(wq_head, mode, nr) \
 	wake_up_interruptible_poll(wq_head, mode)

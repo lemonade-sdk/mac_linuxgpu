@@ -23,6 +23,14 @@ struct cs_fixture_stats {
 	unsigned long skipped;			/* packets skipped (state, caches) */
 };
 
+/* Before cs_fixture_init: two SDMA instances (each its own engine), and a
+ * display: the driver gets modesetting and dumb buffers, mode config is
+ * initialized and this function runs the display IP's init (after TTM,
+ * GART, VM and the rings, before drm_dev_register). */
+struct amdgpu_device;
+extern unsigned int cs_fixture_sdma_instances;
+extern void (*cs_fixture_display)(struct amdgpu_device *adev);
+
 /* Bring up the linked DRM/amdgpu modules and the fixture device, and
  * register its DRM device (render node minor 128). Aborts on failure. */
 struct pci_dev *cs_fixture_init(void);
@@ -37,6 +45,8 @@ void cs_fixture_hold_sdma(int hold);
 extern uint64_t cs_fixture_visible_vram;
 struct amdgpu_device;
 struct amdgpu_device *cs_fixture_adev(void);
+/* The host memory behind VRAM MC address @mc, or NULL. */
+uint8_t *cs_fixture_vram_host(uint64_t mc);
 /* TTM moves VRAM <-> GTT through the upstream code on this device
  * (ttm_evict_check.c). */
 void ttm_evict_check(void);

@@ -13,7 +13,7 @@
 #include <linux/atomic.h>
 
 #ifndef HZ
-#define HZ 100
+#define HZ 1000	/* as linux/jiffies.h, which may include this first */
 #endif
 
 #define DEFAULT_RATELIMIT_INTERVAL	(5 * HZ)

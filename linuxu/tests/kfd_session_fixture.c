@@ -68,6 +68,8 @@ static pthread_mutex_t cp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t cp_thread;
 static volatile bool cp_running;
 unsigned int cp_dispatches;
+static volatile bool cp_drop_interrupts;
+static unsigned int cp_interrupts, cp_interrupts_dropped;
 static void cp_add(uint32_t doorbell, uint64_t wptr, uint32_t pasid)
 {
 	pthread_mutex_lock(&cp_lock);
@@ -268,6 +270,7 @@ struct fake_bo {
 	struct ttm_resource res;
 	struct kgd_mem mem;
 	struct page **pages;
+	unsigned int order;	/* > 0: pages are one contiguous allocation */
 	uint64_t gpu_offset;	/* kernel (VMID0) address, 0 if none */
 	void *cpu;		/* kernel CPU mapping for kernel BOs */
 	struct amdgpu_vm *vm;	/* the VM the BO is mapped in */
@@ -301,8 +304,11 @@ static void untrack(struct fake_bo *f)
 static void bo_destroy(struct fake_bo *f)
 {
 	if (f->pages) {
-		for (uint32_t i = 0; i < f->tt.num_pages; ++i)
-			__free_pages(f->pages[i], 0);
+		if (f->order)
+			__free_pages(f->pages[0], f->order);
+		else
+			for (uint32_t i = 0; i < f->tt.num_pages; ++i)
+				__free_pages(f->pages[i], 0);
 		free(f->pages);
 	}
 	dma_resv_fini(&f->bo.tbo.base._resv);
@@ -355,9 +361,22 @@ static struct fake_bo *bo_create(uint64_t size, uint32_t domain)
 			f->tt.num_pages = size / PAGE_SIZE;
 			f->pages = calloc(f->tt.num_pages, sizeof(*f->pages));
 			assert(f->pages);
-			for (uint32_t i = 0; i < f->tt.num_pages; ++i) {
-				f->pages[i] = alloc_pages(GFP_KERNEL | __GFP_ZERO, 0);
-				assert(f->pages[i]);
+			/* Small multi-page BOs (KFD's event page) are one
+			 * allocation, so KFD's kernel mapping is contiguous. */
+			if (f->tt.num_pages > 1 && f->tt.num_pages <= 4 &&
+			    !(f->tt.num_pages & (f->tt.num_pages - 1))) {
+				struct page *first;
+
+				f->order = (unsigned int)__builtin_ctz(f->tt.num_pages);
+				first = alloc_pages(GFP_KERNEL | __GFP_ZERO, f->order);
+				assert(first);
+				for (uint32_t i = 0; i < f->tt.num_pages; ++i)
+					f->pages[i] = first + i;
+			} else {
+				for (uint32_t i = 0; i < f->tt.num_pages; ++i) {
+					f->pages[i] = alloc_pages(GFP_KERNEL | __GFP_ZERO, 0);
+					assert(f->pages[i]);
+				}
 			}
 			f->tt.pages = f->pages;
 			f->tt.page_flags = TTM_TT_FLAG_PRIV_POPULATED;
@@ -622,8 +641,9 @@ int amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel(struct kgd_mem *mem, void **kptr, u
 {
 	struct fake_bo *f = container_of(mem, struct fake_bo, mem);
 
-	/* KFD maps its own one-page BOs (CWSR TBA/TMA). */
-	assert(f->pages && f->tt.num_pages == 1);
+	/* KFD maps its own one-page BOs (CWSR TBA/TMA) and the event page
+	 * the runtime hands it (CREATE_EVENT). */
+	assert(f->pages && (f->tt.num_pages == 1 || f->order));
 	*kptr = page_address(f->pages[0]);
 	if (size)
 		*size = f->bo.tbo.base.size;
@@ -1263,14 +1283,37 @@ static void cp_service(struct cp_queue *q)
 			uint64_t signal = *(uint64_t *)(packet + FIXTURE_AQL_COMPLETION);
 			int64_t *value = signal ? fixture_va_to_host(q->pasid, signal + 8, 8) : NULL;
 
-			if (value)
+			if (value) {
+				uint64_t *abi = fixture_va_to_host(q->pasid, signal, 32);
+				uint64_t *mailbox = abi && abi[2] ?
+					fixture_va_to_host(q->pasid, abi[2], 8) : NULL;
+
 				__atomic_fetch_sub(value, 1, __ATOMIC_RELEASE);
+				/* An interrupt signal: as the CP, write the event
+				 * id to the mailbox and raise the end-of-pipe
+				 * interrupt KFD turns into the event. */
+				if (mailbox) {
+					uint32_t id = (uint32_t)abi[3];
+
+					__atomic_store_n(mailbox, id, __ATOMIC_RELEASE);
+					if (cp_drop_interrupts)
+						cp_interrupts_dropped++;
+					else {
+						cp_interrupts++;
+						kfd_signal_event_interrupt(q->pasid, id, 32, true);
+					}
+				}
+			}
 			cp_dispatches++;
 		}
 		__atomic_store_n((uint16_t *)packet, FIXTURE_AQL_PACKET_INVALID, __ATOMIC_RELEASE);
 		__atomic_store_n(read, id + 1, __ATOMIC_RELEASE);
 	}
 }
+void fixture_cp_drop_interrupts(bool drop) { cp_drop_interrupts = drop; }
+unsigned int fixture_cp_interrupts(void) { return cp_interrupts; }
+unsigned int fixture_cp_interrupts_dropped(void) { return cp_interrupts_dropped; }
+
 static void *cp_main(void *arg)
 {
 	(void)arg;

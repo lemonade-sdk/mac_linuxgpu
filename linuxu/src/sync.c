@@ -18,6 +18,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <rt/task.h>
+#include <rt/park.h>
 #include <rt/fatal.h>
 
 /* ------------------------------------------------------------------ *
@@ -238,29 +239,67 @@ bool mutex_is_locked(struct mutex *lock)
 	return lock && raw_spin_is_locked(&lock->wait_lock);
 }
 
+/* Contended: park on the mutex until an unlock (rt/park.h), with the
+ * backstop for an unlock that did not wake. @mode 0 uninterruptible, 1
+ * interruptible, 2 killable. */
+static bool mutex_still_locked(const void *p)
+{
+	return raw_spin_is_locked(&((const struct mutex *)p)->wait_lock);
+}
+
+static int mutex_wait(struct mutex *lock, int mode, const void *caller)
+{
+	uint64_t backstop = linuxu_park_backstop_first();
+	bool backstopped = false;
+	int r = 0;
+
+	for (;;) {
+		__atomic_add_fetch(&lock->linuxu_waiters, 1, __ATOMIC_SEQ_CST);
+		if (raw_spin_trylock(&lock->wait_lock)) {
+			if (backstopped)
+				linuxu_wait_missed(NULL, caller);
+			break;
+		}
+		if (mode && linuxu_wait_signal_pending(mode == 2)) {
+			r = -EINTR;
+			break;
+		}
+		if (linuxu_park(lock, mutex_still_locked, lock,
+				linuxu_park_now_ns() + backstop) == LINUXU_PARK_WOKEN) {
+			backstopped = false;
+			backstop = linuxu_park_backstop_first();
+		} else {
+			backstopped = true;
+			backstop = linuxu_park_backstop_next(backstop);
+		}
+		__atomic_sub_fetch(&lock->linuxu_waiters, 1, __ATOMIC_SEQ_CST);
+	}
+	__atomic_sub_fetch(&lock->linuxu_waiters, 1, __ATOMIC_SEQ_CST);
+	if (!r)
+		atomic_long_set(&lock->owner, (long)(uintptr_t)pthread_self());
+	return r;
+}
+
 void mutex_lock(struct mutex *lock)
 {
-	while (!raw_spin_trylock(&lock->wait_lock))
-		msleep(1);
-	atomic_long_set(&lock->owner, (long)(uintptr_t)pthread_self());
+	if (raw_spin_trylock(&lock->wait_lock))
+		atomic_long_set(&lock->owner, (long)(uintptr_t)pthread_self());
+	else
+		(void)mutex_wait(lock, 0, __builtin_return_address(0));
 }
 
 int mutex_lock_interruptible(struct mutex *lock)
 {
-	while (!mutex_trylock(lock)) {
-		if (linuxu_wait_signal_pending(false)) return -EINTR;
-		msleep(1);
-	}
-	return 0;
+	if (mutex_trylock(lock))
+		return 0;
+	return mutex_wait(lock, 1, __builtin_return_address(0));
 }
 
 int mutex_lock_killable(struct mutex *lock)
 {
-	while (!mutex_trylock(lock)) {
-		if (linuxu_wait_signal_pending(true)) return -EINTR;
-		msleep(1);
-	}
-	return 0;
+	if (mutex_trylock(lock))
+		return 0;
+	return mutex_wait(lock, 2, __builtin_return_address(0));
 }
 
 void mutex_lock_io(struct mutex *lock) { mutex_lock(lock); }
@@ -287,6 +326,10 @@ void mutex_unlock(struct mutex *lock)
 {
 	atomic_long_set(&lock->owner, 0);
 	raw_spin_unlock(&lock->wait_lock);
+	/* Pairs with mutex_wait's increment before its trylock. */
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&lock->linuxu_waiters, __ATOMIC_SEQ_CST))
+		linuxu_unpark(lock);
 }
 
 int mutex_trylock(struct mutex *lock)
@@ -330,6 +373,7 @@ void complete(struct completion *x)
 	if (x->done < UINT_MAX)
 		x->done++;
 	raw_spin_unlock(&x->lock);
+	linuxu_unpark(x);
 }
 
 void complete_all(struct completion *x)
@@ -337,6 +381,7 @@ void complete_all(struct completion *x)
 	raw_spin_lock(&x->lock);
 	x->done = UINT_MAX;
 	raw_spin_unlock(&x->lock);
+	linuxu_unpark(x);
 }
 
 void complete_done(struct completion *x)
@@ -361,11 +406,20 @@ static uint64_t completion_now_ns(void)
 	return (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec;
 }
 
-static long comp_wait(struct completion *x,
+static bool completion_still(const void *p)
+{
+	return !__atomic_load_n(&((const struct completion *)p)->done, __ATOMIC_SEQ_CST);
+}
+
+/* Parks on the completion (complete() unparks it), with the backstop for a
+ * completion signalled without a wake and for a signal to an interruptible
+ * waiter (signals wake tasks, not completions). */
+static long comp_wait(const void *caller, struct completion *x,
 			       unsigned long timeout_jiffies, bool timed, int interruptible)
 {
 	const uint64_t tick_ns = 1000000000ULL / HZ;
-	uint64_t deadline = 0;
+	uint64_t deadline = 0, backstop = linuxu_park_backstop_first();
+	bool backstopped = false;
 
 	if (timed) {
 		uint64_t now = completion_now_ns();
@@ -373,7 +427,7 @@ static long comp_wait(struct completion *x,
 			UINT64_MAX : now + (uint64_t)timeout_jiffies * tick_ns;
 	}
 	for (;;) {
-		uint64_t now, remaining;
+		uint64_t now, remaining, until;
 		unsigned int done;
 
 		raw_spin_lock(&x->lock);
@@ -382,6 +436,8 @@ static long comp_wait(struct completion *x,
 			x->done = done - 1;
 		raw_spin_unlock(&x->lock);
 		if (done) {
+			if (backstopped)
+				linuxu_wait_missed(NULL, caller);
 			if (!timed)
 				return 1;
 			now = completion_now_ns();
@@ -389,49 +445,59 @@ static long comp_wait(struct completion *x,
 			/* Linux reports at least one jiffy on a successful wait. */
 			return remaining ? (unsigned long)((remaining - 1) / tick_ns + 1) : 1;
 		}
-		if (timed && completion_now_ns() >= deadline)
+		now = completion_now_ns();
+		if (timed && now >= deadline)
 			return 0;
 		if (interruptible && linuxu_wait_signal_pending(interruptible == 2))
 			return -ERESTARTSYS;
-		msleep(1);
+		until = now + backstop;
+		if (timed && deadline < until)
+			until = deadline;
+		if (linuxu_park(x, completion_still, x, until) == LINUXU_PARK_WOKEN) {
+			backstopped = false;
+			backstop = linuxu_park_backstop_first();
+		} else if (until != deadline) {
+			backstopped = true;
+			backstop = linuxu_park_backstop_next(backstop);
+		}
 	}
 }
 
 
 int wait_for_completion(struct completion *x)
 {
-	comp_wait(x, 0, false, 0);
+	comp_wait(__builtin_return_address(0), x, 0, false, 0);
 	return 0;
 }
 
 unsigned long wait_for_completion_timeout(struct completion *x,
 					  unsigned long timeout)
 {
-	return comp_wait(x, timeout, true, 0);
+	return comp_wait(__builtin_return_address(0), x, timeout, true, 0);
 }
 
 int wait_for_completion_killable(struct completion *x)
 {
-	long ret = comp_wait(x, 0, false, 2);
+	long ret = comp_wait(__builtin_return_address(0), x, 0, false, 2);
 	return ret < 0 ? (int)ret : 0;
 }
 
 long wait_for_completion_killable_timeout(struct completion *x,
 						    unsigned long timeout)
 {
-	return comp_wait(x, timeout, true, 2);
+	return comp_wait(__builtin_return_address(0), x, timeout, true, 2);
 }
 
 int wait_for_completion_interruptible(struct completion *x)
 {
-	long ret = comp_wait(x, 0, false, 1);
+	long ret = comp_wait(__builtin_return_address(0), x, 0, false, 1);
 	return ret < 0 ? (int)ret : 0;
 }
 
 long wait_for_completion_interruptible_timeout(struct completion *x,
 							unsigned long timeout)
 {
-	return comp_wait(x, timeout, true, 1);
+	return comp_wait(__builtin_return_address(0), x, timeout, true, 1);
 }
 
 /*
@@ -443,14 +509,14 @@ bool wait_for_completion_interruptible_wake_function(struct completion *x,
 						     wake_function_t wake_function)
 {
 	(void)wake_function;
-	return comp_wait(x, 0, false, 1) > 0;
+	return comp_wait(__builtin_return_address(0), x, 0, false, 1) > 0;
 }
 
 bool wait_for_completion_wake_function(struct completion *x,
 				       wake_function_t wake_function)
 {
 	(void)wake_function;
-	comp_wait(x, 0, false, 0);
+	comp_wait(__builtin_return_address(0), x, 0, false, 0);
 	return true;
 }
 
@@ -564,6 +630,111 @@ void finish_wait(struct wait_queue_head *wq_head,
 	spin_unlock(&wq_head->lock);
 }
 
+/* ---- wait_event (linux/wait.h): park on the task, the wake queue wakes it ---- */
+
+void linuxu_waiter_init(struct linuxu_waiter *w, struct wait_queue_head *wq, int state,
+			long timeout, bool timed, bool wq_locked, struct linuxu_wait_site *site)
+{
+	const uint64_t tick_ns = 1000000000ULL / HZ;
+
+	memset(w, 0, sizeof(*w));
+	w->wq = wq;
+	w->task = current;
+	w->site = site;
+	w->state = state;
+	w->timed = timed;
+	w->wq_locked = wq_locked;
+	w->backstop_ns = linuxu_park_backstop_first();
+	init_waitqueue_entry(&w->entry, w->task);
+	w->entry.func = autoremove_wake_function;
+	if (timed && timeout < MAX_SCHEDULE_TIMEOUT) {
+		const uint64_t now = linuxu_park_now_ns();
+		const uint64_t left = timeout > 0 ? (uint64_t)timeout : 0;
+
+		w->deadline_ns = left > (UINT64_MAX - now) / tick_ns ? UINT64_MAX :
+			now + left * tick_ns;
+		w->expired = !left;
+	}
+	/* A wake queue nobody initialized (zeroed memory): Linux code always
+	 * initializes one; a shim may not have. */
+	if (!wq->head.next) {
+		if (!wq_locked)
+			spin_lock(&wq->lock);
+		if (!wq->head.next)
+			INIT_LIST_HEAD(&wq->head);
+		if (!wq_locked)
+			spin_unlock(&wq->lock);
+	}
+}
+
+void linuxu_waiter_prepare(struct linuxu_waiter *w)
+{
+	if (!w->wq_locked)
+		spin_lock(&w->wq->lock);
+	if (list_empty(&w->entry.entry))
+		__add_wait_queue(w->wq, &w->entry);
+	__set_current_state(w->state);
+	if (!w->wq_locked)
+		spin_unlock(&w->wq->lock);
+	/* Before the caller tests its condition: a wake after this moves the
+	 * sequence, so the sleep below returns at once. */
+	w->seq = __atomic_load_n(&w->task->wake_sequence, __ATOMIC_SEQ_CST);
+}
+
+void linuxu_waiter_satisfied(struct linuxu_waiter *w)
+{
+	if (w->backstopped)
+		linuxu_wait_missed(w->site, NULL);
+}
+
+int linuxu_waiter_sleep(struct linuxu_waiter *w)
+{
+	uint64_t now, until;
+
+	if (w->expired)
+		return 1;
+	now = linuxu_park_now_ns();
+	if (w->deadline_ns && now >= w->deadline_ns)
+		return 1;
+	until = now + w->backstop_ns;
+	if (w->deadline_ns && w->deadline_ns < until)
+		until = w->deadline_ns;
+	if (linuxu_park_task(w->task, w->seq, until) == LINUXU_PARK_WOKEN) {
+		w->backstopped = false;
+		w->backstop_ns = linuxu_park_backstop_first();
+		return 0;
+	}
+	if (w->deadline_ns && linuxu_park_now_ns() >= w->deadline_ns)
+		return 1;
+	w->backstopped = true;
+	w->backstop_ns = linuxu_park_backstop_next(w->backstop_ns);
+	return 0;
+}
+
+long linuxu_waiter_left(struct linuxu_waiter *w)
+{
+	const uint64_t tick_ns = 1000000000ULL / HZ;
+	uint64_t now;
+
+	if (!w->deadline_ns && !w->expired)
+		return MAX_SCHEDULE_TIMEOUT;
+	now = linuxu_park_now_ns();
+	if (w->expired || now >= w->deadline_ns)
+		return 1;	/* Linux: at least one jiffy when the condition held */
+	return (long)((w->deadline_ns - now + tick_ns - 1) / tick_ns);
+}
+
+void linuxu_waiter_finish(struct linuxu_waiter *w)
+{
+	__set_current_state(TASK_RUNNING);
+	if (!w->wq_locked)
+		spin_lock(&w->wq->lock);
+	if (!list_empty(&w->entry.entry))
+		list_del_init(&w->entry.entry);
+	if (!w->wq_locked)
+		spin_unlock(&w->wq->lock);
+}
+
 bool linuxu_wait_signal_pending(bool fatal_only)
 {
 	return fatal_only ? linuxu_task_fatal_signal_pending(current) : signal_pending(current);
@@ -655,27 +826,54 @@ unsigned int wake_up_all_locked(struct wait_queue_head *queue)
 
 
 
-/* Waiters re-check their condition after each poll tick. Return the remaining
- * Linux jiffies so upstream loops do not mistake one short sleep for expiry. */
+/* Sleep until the task is woken (linuxu_task_wake: wake queues,
+ * wake_up_process, signals) or the timeout, parked (rt/park.h). Returns
+ * the remaining Linux jiffies. A wait longer than the backstop maximum
+ * returns early with time left, a spurious wake as Linux allows: callers
+ * re-check their condition and sleep again. */
 long schedule_timeout(long timeout)
 {
-	unsigned long start, elapsed;
+	const uint64_t tick_ns = 1000000000ULL / HZ;
 	struct task_struct *task = current;
+	uint64_t now, deadline = 0;
+	bool first = true;
+
 	if (timeout <= 0)
 		return 0;
-	start = jiffies;
+	now = linuxu_park_now_ns();
+	if (timeout != MAX_SCHEDULE_TIMEOUT)
+		deadline = (uint64_t)timeout > (UINT64_MAX - now) / tick_ns ?
+			UINT64_MAX : now + (uint64_t)timeout * tick_ns;
 	for (;;) {
-		long state = __atomic_load_n(&task->state, __ATOMIC_ACQUIRE);
-		if (state == TASK_RUNNING) { msleep(1); break; }
+		const unsigned long seq = __atomic_load_n(&task->wake_sequence, __ATOMIC_SEQ_CST);
+		const long state = __atomic_load_n(&task->state, __ATOMIC_ACQUIRE);
+		uint64_t until;
+
+		if (state == TASK_RUNNING) {
+			/* Called without a sleeping state: a polling caller.
+			 * Give up the CPU briefly rather than spin. */
+			if (first)
+				msleep(1);
+			break;
+		}
+		first = false;
 		if ((state == TASK_INTERRUPTIBLE && signal_pending(task)) ||
-		    (state == TASK_KILLABLE && linuxu_task_fatal_signal_pending(task))) break;
-		if (timeout != MAX_SCHEDULE_TIMEOUT && jiffies - start >= (unsigned long)timeout) break;
-		msleep(1);
+		    (state == TASK_KILLABLE && linuxu_task_fatal_signal_pending(task)))
+			break;
+		now = linuxu_park_now_ns();
+		if (deadline && now >= deadline)
+			break;
+		until = now + linuxu_park_backstop_max();
+		if (deadline && deadline < until)
+			until = deadline;
+		if (linuxu_park_task(task, seq, until) == LINUXU_PARK_TIMEOUT && until != deadline)
+			break;	/* the backstop: a spurious wake */
 	}
 	__atomic_store_n(&task->state, TASK_RUNNING, __ATOMIC_RELEASE);
-	if (timeout == MAX_SCHEDULE_TIMEOUT) return timeout;
-	elapsed = jiffies - start;
-	return elapsed >= (unsigned long)timeout ? 0 : timeout - (long)elapsed;
+	if (timeout == MAX_SCHEDULE_TIMEOUT)
+		return timeout;
+	now = linuxu_park_now_ns();
+	return now >= deadline ? 0 : (long)((deadline - now + tick_ns - 1) / tick_ns);
 }
 
 long schedule_timeout_interruptible(long timeout)

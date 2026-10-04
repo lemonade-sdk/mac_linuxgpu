@@ -27,6 +27,7 @@ struct surface_buffer {
 };
 
 struct rt_surface {
+	int refs;		/* the import's, plus each hold (rt_surface_hold) */
 	struct drm_gem_object *obj;
 	uint64_t gpu_address;
 	uint64_t size;
@@ -198,6 +199,7 @@ int rt_surface_import(struct pci_dev *pdev, const struct rt_surface_segment *seg
 	surface->height = height;
 	surface->pitch = pitch;
 	surface->provider_context = provider->context;
+	surface->refs = 1;
 	/* Success: the provider is released with the dma-buf. */
 	buffer->armed = true;
 	*out = surface;
@@ -218,11 +220,17 @@ uncharge:
 	return r;
 }
 
+void rt_surface_hold(struct rt_surface *surface)
+{
+	if (surface)
+		__atomic_add_fetch(&surface->refs, 1, __ATOMIC_RELAXED);
+}
+
 void rt_surface_release(struct rt_surface *surface)
 {
 	struct amdgpu_bo *bo;
 
-	if (!surface)
+	if (!surface || __atomic_sub_fetch(&surface->refs, 1, __ATOMIC_ACQ_REL))
 		return;
 	bo = gem_to_amdgpu_bo(surface->obj);
 	if (!amdgpu_bo_reserve(bo, true)) {
@@ -255,6 +263,8 @@ uint64_t rt_surface_gpu_address(const struct rt_surface *surface)
 
 struct copy_batch {
 	struct amdgpu_device *adev;
+	struct drm_sched_entity *entity;	/* NULL: the TTM buffer-function entity */
+	struct amdgpu_ring *ring;		/* the entity's ring (for IB padding) */
 	struct amdgpu_job *job;
 	uint32_t packets;
 	struct dma_fence *last;
@@ -263,7 +273,7 @@ struct copy_batch {
 
 static int batch_submit(struct copy_batch *b)
 {
-	struct amdgpu_ring *ring = b->adev->mman.buffer_funcs_ring;
+	struct amdgpu_ring *ring = b->ring ? b->ring : b->adev->mman.buffer_funcs_ring;
 	struct dma_fence *fence;
 
 	if (!b->job)
@@ -287,7 +297,8 @@ static int batch_copy(struct copy_batch *b, uint64_t src, uint64_t dst, uint64_t
 		uint32_t chunk = bytes > funcs->copy_max_bytes ? funcs->copy_max_bytes : (uint32_t)bytes;
 
 		if (!b->job) {
-			r = amdgpu_job_alloc_with_ib(b->adev, &b->adev->mman.default_entity.base,
+			r = amdgpu_job_alloc_with_ib(b->adev, b->entity ? b->entity :
+						     &b->adev->mman.default_entity.base,
 						     AMDGPU_FENCE_OWNER_UNDEFINED,
 						     ALIGN(COPY_PACKETS_PER_JOB * funcs->copy_num_dw, 8) * 4,
 						     AMDGPU_IB_POOL_DELAYED, &b->job,
@@ -566,6 +577,20 @@ struct rt_surface *rt_surface_get(uint64_t owner, uint32_t handle)
 	return found;
 }
 
+struct rt_surface *rt_surface_get_hold(uint64_t owner, uint32_t handle)
+{
+	struct rt_surface *found = NULL;
+
+	mutex_lock(&surface_table_lock);
+	for (uint32_t i = 0; handle && i < RT_SURFACE_IMPORTS_MAX; i++)
+		if (surface_table[i].surface && surface_table[i].owner == owner &&
+		    surface_table[i].handle == handle)
+			found = surface_table[i].surface;
+	rt_surface_hold(found);
+	mutex_unlock(&surface_table_lock);
+	return found;
+}
+
 void *rt_surface_provider_context(const struct rt_surface *surface)
 {
 	return surface ? surface->provider_context : NULL;
@@ -620,4 +645,156 @@ unsigned int rt_surface_count(void)
 		n += surface_table[i].surface != NULL;
 	mutex_unlock(&surface_table_lock);
 	return n;
+}
+
+/* ---- asynchronous copies on engines the caller owns ---- */
+
+int rt_surface_engines_init(struct amdgpu_device *adev, struct rt_surface_engines *e)
+{
+	memset(e, 0, sizeof(*e));
+	for (int i = 0; i < adev->sdma.num_instances && e->count < RT_SURFACE_ENGINES_MAX; i++) {
+		struct amdgpu_ring *ring = &adev->sdma.instance[i].ring;
+		struct drm_gpu_scheduler *sched = &ring->sched;
+		struct drm_sched_entity *entity;
+
+		if (!ring->sched.ready || !adev->mman.buffer_funcs)
+			continue;
+		entity = kzalloc(sizeof(*entity), GFP_KERNEL);
+		if (!entity)
+			break;
+		if (drm_sched_entity_init(entity, DRM_SCHED_PRIORITY_NORMAL, &sched, 1, NULL)) {
+			kfree(entity);
+			continue;
+		}
+		e->entity[e->count] = entity;
+		e->ring[e->count] = ring;
+		e->count++;
+	}
+	return e->count ? 0 : -ENODEV;
+}
+
+void rt_surface_engines_fini(struct rt_surface_engines *e)
+{
+	for (unsigned int i = 0; i < e->count; i++) {
+		drm_sched_entity_destroy(e->entity[i]);
+		kfree(e->entity[i]);
+	}
+	memset(e, 0, sizeof(*e));
+}
+
+/* Rows of one rectangle as copy ranges: whole rows with equal pitches in
+ * bands of up to 64 rows, else one range per row. */
+#define COPY_BAND_ROWS	64u
+
+static uint64_t rect_bytes(const struct rt_surface *src, uint32_t dst_pitch,
+			   const struct rt_surface_rect *r, uint32_t *x, uint32_t *y,
+			   uint32_t *w, uint32_t *h)
+{
+	if (r->x >= src->width || r->y >= src->height || !r->width || !r->height)
+		return 0;
+	*x = r->x;
+	*y = r->y;
+	*w = min_t(u32, r->width, src->width - r->x);
+	*h = min_t(u32, r->height, src->height - r->y);
+	(void)dst_pitch;
+	return (uint64_t)*w * 4 * *h;
+}
+
+int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
+			   uint32_t dst_pitch, const struct rt_surface_rect *rects, uint32_t count,
+			   struct rt_surface_engines *engines,
+			   struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
+			   struct rt_surface_copy_stats *stats)
+{
+	struct copy_batch batch[RT_SURFACE_ENGINES_MAX] = { 0 };
+	struct rt_surface_copy_stats local[RT_SURFACE_ENGINES_MAX] = { 0 };
+	struct amdgpu_device *adev;
+	struct amdgpu_bo *dst_bo, *src_bo;
+	uint64_t total = 0, half;
+	unsigned int use, e = 0;
+	u64 start = ktime_get_ns();
+	int r = 0;
+
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
+		fences[i] = NULL;
+	if (stats)
+		memset(stats, 0, sizeof(*stats));
+	if (!src || !dst || !rects || !count || !engines || !engines->count ||
+	    dst_pitch < (uint64_t)src->width * 4 || dst->size < (uint64_t)dst_pitch * src->height)
+		return -EINVAL;
+	dst_bo = gem_to_amdgpu_bo(dst);
+	src_bo = gem_to_amdgpu_bo(src->obj);
+	adev = amdgpu_ttm_adev(dst_bo->tbo.bdev);
+	if (rt_removal_active(adev))
+		return -ENODEV;
+	for (uint32_t i = 0; i < count; i++) {
+		uint32_t x, y, w, h;
+
+		total += rect_bytes(src, dst_pitch, &rects[i], &x, &y, &w, &h);
+	}
+	if (!total)
+		return 0;
+	/* Large damage goes to both engines, about half each. */
+	use = total >= (1u << 20) ? engines->count : 1;
+	half = (total + use - 1) / use;
+	for (unsigned int i = 0; i < use; i++) {
+		batch[i].adev = adev;
+		batch[i].entity = engines->entity[i];
+		batch[i].ring = engines->ring[i];
+		batch[i].stats = &local[i];
+	}
+	for (uint32_t i = 0; !r && i < count; i++) {
+		uint32_t x, y, w, h;
+
+		if (!rect_bytes(src, dst_pitch, &rects[i], &x, &y, &w, &h))
+			continue;
+		if (stats)
+			stats->rows += h;
+		for (uint32_t row = y; !r && row < y + h;) {
+			uint32_t rows = 1;
+			uint64_t bytes = (uint64_t)w * 4;
+
+			if (!x && w == src->width && src->pitch == dst_pitch) {
+				rows = min_t(u32, COPY_BAND_ROWS, y + h - row);
+				bytes = (uint64_t)(rows - 1) * src->pitch + (uint64_t)w * 4;
+			}
+			if (e + 1 < use && local[e].bytes >= half)
+				e++;
+			r = batch_copy(&batch[e], src->gpu_address + (u64)row * src->pitch + (u64)x * 4,
+				       dst_address + (u64)row * dst_pitch + (u64)x * 4, bytes);
+			row += rows;
+		}
+	}
+	for (unsigned int i = 0; i < use; i++) {
+		if (r && batch[i].job) {
+			amdgpu_job_free(batch[i].job);
+			batch[i].job = NULL;
+		} else if (!r) {
+			batch_submit(&batch[i]);
+		}
+		if (batch[i].last) {
+			/* Neither buffer moves or goes before the copy finished, and
+			 * a commit of @dst waits for it (an implicit in-fence). */
+			if (!amdgpu_bo_reserve(src_bo, true)) {
+				amdgpu_bo_fence(src_bo, batch[i].last, true);
+				amdgpu_bo_unreserve(src_bo);
+			} else {
+				dma_fence_wait(batch[i].last, false);
+			}
+			if (!amdgpu_bo_reserve(dst_bo, true)) {
+				amdgpu_bo_fence(dst_bo, batch[i].last, false);
+				amdgpu_bo_unreserve(dst_bo);
+			} else {
+				dma_fence_wait(batch[i].last, false);
+			}
+			fences[i] = batch[i].last;
+		}
+		if (stats) {
+			stats->jobs += local[i].jobs;
+			stats->bytes += local[i].bytes;
+		}
+	}
+	if (stats)
+		stats->ns = ktime_get_ns() - start;
+	return r;
 }

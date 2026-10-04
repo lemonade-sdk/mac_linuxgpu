@@ -62,8 +62,9 @@ int rt_surface_import(struct pci_dev *pdev, const struct rt_surface_segment *seg
 		      uint32_t pitch, const struct rt_surface_provider *provider,
 		      struct rt_surface **out);
 
-/* Drop the surface: unpin, drop the BO. The provider's release follows
- * once the BO is destroyed (possibly later, on a TTM worker). */
+/* Drop a reference; the last one unpins and drops the BO. The provider's
+ * release follows once the BO is destroyed (possibly later, on a TTM
+ * worker). */
 void rt_surface_release(struct rt_surface *surface);
 
 /* The surface's geometry. */
@@ -127,6 +128,12 @@ uint32_t rt_surface_add(uint64_t owner, struct rt_surface *surface);
 struct rt_surface *rt_surface_get(uint64_t owner, uint32_t handle);
 /* The provider context the surface was imported with. */
 void *rt_surface_provider_context(const struct rt_surface *surface);
+/* The surface of @owner's @handle with a hold the caller drops with
+ * rt_surface_release(), or NULL. */
+struct rt_surface *rt_surface_get_hold(uint64_t owner, uint32_t handle);
+/* Another reference; rt_surface_release() drops one, the last releases. */
+void rt_surface_hold(struct rt_surface *surface);
+
 /* Remove and release: one handle (0 or -ENOENT), all of an owner's, or all
  * (both return how many). */
 int rt_surface_remove(uint64_t owner, uint32_t handle);
@@ -136,6 +143,33 @@ unsigned int rt_surface_count(void);
 
 #ifdef __KERNEL__
 struct drm_gem_object;
+struct drm_sched_entity;
+struct amdgpu_ring;
+struct amdgpu_device;
+struct dma_fence;
+
+/* SDMA engines a caller owns for asynchronous copies: one scheduler
+ * entity per ready SDMA ring, at most two. */
+#define RT_SURFACE_ENGINES_MAX	2u
+struct rt_surface_engines {
+	unsigned int count;
+	struct drm_sched_entity *entity[RT_SURFACE_ENGINES_MAX];
+	struct amdgpu_ring *ring[RT_SURFACE_ENGINES_MAX];
+};
+int rt_surface_engines_init(struct amdgpu_device *adev, struct rt_surface_engines *engines);
+void rt_surface_engines_fini(struct rt_surface_engines *engines);
+
+/* Submit the copies of @count rectangles into @dst (an amdgpu BO the
+ * caller keeps pinned in VRAM at @dst_address) and return without waiting.
+ * Damage of 1 MiB or more is split between the engines. Each engine's last
+ * fence is added to both buffers (a commit of @dst waits for it) and
+ * returned in @fences (NULL for an engine left unused; the caller puts
+ * them). Returns 0 or the failing step's errno (nothing submitted then). */
+int rt_surface_copy_submit(struct rt_surface *src, struct drm_gem_object *dst, uint64_t dst_address,
+			   uint32_t dst_pitch, const struct rt_surface_rect *rects, uint32_t count,
+			   struct rt_surface_engines *engines,
+			   struct dma_fence *fences[RT_SURFACE_ENGINES_MAX],
+			   struct rt_surface_copy_stats *stats);
 
 /* Copy @count rectangles of @src into @dst (an amdgpu BO, linear, @dst_pitch
  * bytes per row, at least the surface's size) at the same coordinates, on

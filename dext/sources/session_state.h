@@ -40,6 +40,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_RUNTIME_DEVICE      = 1u << 9,
 	MLG_SESSION_FLAG_ISOLATION_ATTEMPTED = 1u << 10,
 	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
+	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
 };
 
 /* Which close/probe step quarantined the session. */
@@ -98,7 +99,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * power-request selectors, the two Linux read paths below,
  * which run upstream callbacks while the driver runs and never claim PCI,
  * join the session or touch queues, the self-contained submission
- * self-test (DrmSelfTest) and the display test (Display). Linux-file clients are type 2
+ * self-test (DrmSelfTest), the display test (Display) and the entitlement-checked
+ * Retire an installer sends before a driver upgrade. Linux-file clients are type 2
  * (MLG_USER_CLIENT_LINUX_FILE, linuxu/headers/rt/lx_abi.h). */
 #define MLG_USER_CLIENT_SESSION  0u
 #define MLG_USER_CLIENT_OBSERVER 1u
@@ -114,6 +116,94 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 /* 83 is MLG_SELECTOR_POWER (power_state.h). 96-103 are the Linux-file selectors
  * (linuxu/headers/rt/lx_abi.h). */
 #define MLG_SELECTOR_DISPLAY             84u
+#define MLG_SELECTOR_RETIRE              85u
+#define MLG_SELECTOR_EVENT               86u
+#define MLG_SELECTOR_EVENT_WAIT          87u
+
+/* Interrupt-driven waits on KFD signal events (a session client on the KFD
+ * path; rt/kfd_session.h has the semantics).
+ *
+ * EVENT       in:  [0] op, [1] event id (DESTROY, SET)
+ *             out: [0] 0 or -errno (Linux values), and for CREATE
+ *                  [1] event id, [2] trigger (amd_signal_t.event_id),
+ *                  [3] mailbox VA (amd_signal_t.event_mailbox_ptr)
+ *             -ENODEV: no KFD process backs this client (legacy path).
+ * EVENT_WAIT  called with IOConnectCallAsync*. in: [0] token (echoed),
+ *             [1] event count, [2] 1 = all of them, [3] timeout in ms
+ *             (at most MLG_EVENT_WAIT_MAX_MS); struct in: the event ids
+ *             (uint32_t each, at most MLG_EVENT_WAIT_IDS)
+ *             out: [0] 0, or -errno when the wait did not start (then
+ *             nothing completes; -EAGAIN: every waiting thread is busy)
+ *             completion: async data [0] token, [1] 0 or -errno, [2] the
+ *             KFD wait result (0 complete, 1 timeout, 2 failed).
+ * The wait sleeps on a driver thread until KFD's interrupt handler signals
+ * an event it names, or the timeout: the client's thread sleeps in its
+ * own receive until the completion arrives. Nothing polls. */
+#define MLG_EVENT_OP_CREATE     0u
+#define MLG_EVENT_OP_DESTROY    1u
+#define MLG_EVENT_OP_SET        2u
+#define MLG_EVENT_WORDS         4u
+#define MLG_EVENT_WAIT_IDS      64u
+#define MLG_EVENT_WAIT_MAX_MS   1000u
+#define MLG_EVENT_WAIT_WORDS    3u
+
+/* Retire: hand the GPU to a replacement driver (a system extension upgrade).
+ *
+ * macOS does not stop a running driver extension when an activation request
+ * replaces it: the old version stays "terminating for upgrade via delegate"
+ * and the new one attaches only after every instance of the old one is gone.
+ * Retire is how the installer makes an instance go, without killing it:
+ *
+ *   QUIESCE    admit no new session, close an open one through the normal
+ *              close (upstream removal, interrupt drain, endpoint reset,
+ *              provider close). The instance stays attached and idle.
+ *   TERMINATE  QUIESCE, then ask IOKit to terminate this driver instance
+ *              (IOService::Terminate) once nothing of the session is left:
+ *              its clients and the driver are stopped and the process exits.
+ *              Send it only once macOS accepted the replacement; otherwise
+ *              the GPU stays without a driver until it is attached again.
+ *   RESUME     undo QUIESCE (a replacement that failed or was deferred).
+ *
+ * Nothing is forced into quarantine: a client holding a raw BAR mapping
+ * refuses the close (RAW_BAR), and so do other session clients unless
+ * MLG_RETIRE_FORCE is given (their next call fails NotAttached or NotOpen,
+ * as after any close). A quarantined session is released when it is
+ * provably quiescent; otherwise it stays (QUARANTINED, out[2] the blocker):
+ * restart the Mac, never kill the driver. Requires the session-release
+ * entitlement; observers may call it.
+ *   scalar in:  [0] MLG_RETIRE_OP_*, [1] MLG_RETIRE_FORCE or 0,
+ *               [2] MLG_RETIRE_CONFIRM
+ *   scalar out: [0] IOReturn: Success (IDLE, TERMINATING, STOPPING,
+ *               RESUMED), NotReady (CLOSING; QUARANTINED with a blocker that
+ *               can clear), Busy (CLIENTS, RAW_BAR), Error (QUARANTINED for
+ *               good, or Terminate failed)
+ *               [1] MLG_RETIRE_*
+ *               [2] CLIENTS: the other session clients; QUARANTINED: the
+ *               MLG_RELEASE_* blocker; else 0
+ * Repeat the call to follow a close; session state flag RETIRING shows it. */
+#define MLG_RETIRE_OP_QUIESCE   0u
+#define MLG_RETIRE_OP_TERMINATE 1u
+#define MLG_RETIRE_OP_RESUME    2u
+#define MLG_RETIRE_FORCE        1u
+#define MLG_RETIRE_CONFIRM      0x52455452ULL /* "RETR" */
+#define MLG_RETIRE_WORDS        3u
+
+enum mlg_retire_state {
+	MLG_RETIRE_IDLE        = 0, /* no session; new sessions refused */
+	MLG_RETIRE_TERMINATING = 1, /* termination requested: stops, then the process exits */
+	MLG_RETIRE_CLOSING     = 2, /* the session is closing; what was asked follows it */
+	MLG_RETIRE_CLIENTS     = 3, /* other session clients attached (no MLG_RETIRE_FORCE) */
+	MLG_RETIRE_RAW_BAR     = 4, /* a client maps a BAR: a close now would quarantine */
+	MLG_RETIRE_QUARANTINED = 5, /* quarantined and not releasable now */
+	MLG_RETIRE_STOPPING    = 6, /* IOKit is already stopping this instance */
+	MLG_RETIRE_RESUMED     = 7, /* RESUME: sessions admitted again */
+};
+
+static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_count)
+{
+	return input && input_count == 3 && input[0] <= MLG_RETIRE_OP_RESUME &&
+	       !(input[1] & ~(uint64_t)MLG_RETIRE_FORCE) && input[2] == MLG_RETIRE_CONFIRM;
+}
 
 /* SysfsRead: the amdgpu device's sysfs directory, read as Linux sysfs reads
  * it (the attribute's show(), or a bin_attribute's read()), or listed.
@@ -202,11 +292,14 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  *           struct out: struct rt_surface_verify_result
  *   RELEASE [1] handle
  *   OUTPUT  [1] refresh in mHz; struct in: struct mlg_display_output; the
- *           connector at that mode with two framebuffers (rt_display_output)
+ *           connector at that mode with three framebuffers and a worker
+ *           that copies and flips (rt_display_output)
  *           struct out: struct rt_display_report
- *   PRESENT [1] handle; struct in: struct mlg_display_present; the dirty
- *           rectangles copied and flipped (rt_display_present)
- *           struct out: struct rt_display_present_stats */
+ *   PRESENT [1] handle; struct in: struct mlg_display_present; queues the
+ *           frame (its dirty rectangles and capture time) for the worker
+ *           and returns without waiting for the copy or the flip
+ *           (rt_display_present); no rectangle only reads the statistics
+ *           struct out: struct rt_display_present_stats (version 2) */
 #define MLG_DISPLAY_OP_IMPORT   5u
 #define MLG_DISPLAY_OP_VERIFY   6u
 #define MLG_DISPLAY_OP_RELEASE  7u
@@ -226,6 +319,7 @@ struct mlg_display_rect {
 struct mlg_display_present {
 	uint32_t count;
 	uint32_t reserved;
+	uint64_t capture_ns; /* when the frame was captured, mach_absolute_time in ns */
 	struct mlg_display_rect rect[]; /* count, at most MLG_DISPLAY_PRESENT_RECTS_MAX */
 };
 #define MLG_DISPLAY_PATTERN_BARS     0u
@@ -297,6 +391,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_RUNTIME_BUILD:
 	case MLG_SELECTOR_RELEASE_QUARANTINE:
 		return true;
+	case MLG_SELECTOR_RETIRE: /* entitlement-checked in the handler */
+		return mlg_retire_args_valid(input, input_count);
 	case MLG_SELECTOR_QUERY_INFO:
 		if (!input || !input_count)
 			return false;

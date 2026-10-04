@@ -402,7 +402,7 @@ test: all test-ttm-device-pool test-page-alloc-dk test-dext-alloc test-dext-time
 	if [ "$(TEST_SRCS)" = "$(TEST_SRCS)" ] && [ -f "linuxu/tests/test_workqueue_barrier.c" ]; then \
 		b=$(BUILD)/tests/test_workqueue_barrier; \
 		echo "-- linuxu/tests/test_workqueue_barrier.c"; \
-		if $(CC) $(HOSTCFLAGS) $(INCPATHS) linuxu/tests/test_workqueue_barrier.c build/linuxu/work.o build/linuxu/shims/printk.o build/linuxu/timer.o build/linuxu/delay.o build/linuxu/sync.o build/linuxu/rwsem.o build/linuxu/mm/page.o build/linuxu/kmem/kmemalloc.o build/linuxu/kmem/kmemcheck.o build/linuxu/atomic_long.o -Wl,-dead_strip -lpthread -o $$b 2>$(BUILD)/tests/err.test_workqueue_barrier.log; then \
+		if $(CC) $(HOSTCFLAGS) $(INCPATHS) linuxu/tests/test_workqueue_barrier.c build/linuxu/work.o build/linuxu/shims/printk.o build/linuxu/shims/task.o build/linuxu/timer.o build/linuxu/delay.o build/linuxu/sync.o build/linuxu/rwsem.o build/linuxu/mm/page.o build/linuxu/kmem/kmemalloc.o build/linuxu/kmem/kmemcheck.o build/linuxu/atomic_long.o -Wl,-dead_strip -lpthread -o $$b 2>$(BUILD)/tests/err.test_workqueue_barrier.log; then \
 			if $$b; then echo "   PASS linuxu/tests/test_workqueue_barrier.c"; pass=$$((pass+1)); \
 			else echo "   FAIL linuxu/tests/test_workqueue_barrier.c (runtime)"; fail=$$((fail+1)); fi; \
 		else \
@@ -1216,6 +1216,12 @@ test-surface-import:
 test: test-surface-import
 .PHONY: test-surface-import
 
+test-display-pipeline:
+	bash scripts/test-display-pipeline.sh
+
+test: test-display-pipeline
+.PHONY: test-display-pipeline
+
 # The display agent's model (host/DisplayAgent.swift): decoding, the
 # virtual-display plan for a monitor, and the changes a probe makes.
 test-display-agent:
@@ -1223,3 +1229,17 @@ test-display-agent:
 
 test: test-display-agent
 .PHONY: test-display-agent
+
+# What the dext publishes on its IOService for System Information and our
+# tools (dext/sources/device_properties.h), with DriverKit container
+# substitutes.
+test-device-properties:
+	bash scripts/test-device-properties.sh
+
+# The host's view of the GPU and its monitors from those properties
+# (host/DeviceInfo.swift).
+test-device-info:
+	bash scripts/test-device-info.sh
+
+test: test-device-properties test-device-info
+.PHONY: test-device-properties test-device-info
