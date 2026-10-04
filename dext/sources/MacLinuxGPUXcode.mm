@@ -1772,8 +1772,14 @@ IMPL(MacLinuxGPU, Stop)
     // An unplug terminates the provider: see whether the device is gone
     // before anything else touches it.
     const bool alreadyClosing = s_sessionClosing;
-    if (device_removed("provider stop") && alreadyClosing && s_dmaQuarantined)
+    if (device_removed("provider stop") && alreadyClosing && s_dmaQuarantined) {
         release_removed(this);
+        // Released (and the provider with it, complete_session_close): the
+        // session is over. Closing again would find a new, empty session,
+        // keep the DMA backing the removal left and quarantine it, and the
+        // instance would never exit for a replug.
+        if (!s_sessionClosing) return kIOReturnSuccess;
+    }
     close_session(this);
     // A quarantine that is already provably quiescent must not stall system
     // extension deactivation or upgrade; otherwise FinishSession retries.

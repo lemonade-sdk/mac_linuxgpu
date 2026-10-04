@@ -694,12 +694,24 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
         queue.drain();
     }
     if (quarantined) {
-        // Retained until the provider stops and finds the device gone,
-        // which releases it (what MacLinuxGPU::Stop does).
+        // Retained until the provider stops and finds the device gone. The
+        // real Stop releases the session and the provider, and closes
+        // nothing again: the old instance must go so a replug attaches a
+        // fresh one (a second close would re-quarantine and keep it alive).
         assert(s_dmaQuarantined && !clientStops);
         devicePresent = false;
-        assert(device_removed("provider stop"));
-        release_removed(&driver);
+        const auto closes = [] {
+            const auto text = retainedLog();
+            size_t n = 0;
+            for (size_t at = text.find("session close begin"); at != std::string::npos;
+                 at = text.find("session close begin", at + 1)) ++n;
+            return n;
+        };
+        const size_t before = closes();
+        assert(driver.Stop(&provider) == kIOReturnSuccess);
+        assert(driverStops == 1 && !s_stopProvider && closes() == before);
+        assert(!s_dmaQuarantined && !s_sessionClosing);
+        s_stopping = false;	/* the replug's instance is a fresh process */
     }
     assert(!s_dmaQuarantined && !s_sessionClosing && !s_quarantineRetained && !s_deviceRemoved);
     assert(clientStops == 1 && client.superStops == 1);
