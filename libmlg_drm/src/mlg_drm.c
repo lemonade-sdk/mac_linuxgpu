@@ -257,10 +257,13 @@ int mlg_close(int fd)
 
 	if (!get_transport(&t))
 		return fail(MLG_LX_EBADF);
+	/* Forget the number first: once the driver closes it, an open on
+	 * another thread can be given the same number before this returns.
+	 * As in Linux, the descriptor is gone even when the close fails. */
+	forget(fd);
 	r = t.close(t.ctx, fd);
 	if (r < 0)
 		return fail(-r);
-	forget(fd);
 	return 0;
 }
 

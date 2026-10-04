@@ -44,13 +44,22 @@ static struct {
 	int mmaps, munmaps;
 	uint64_t mmap_length, munmap_length;
 	uint8_t page[16384];
-} rec;
+	int reuse_fd;			/* when >= 0, the next open's number */
+	const char *open_in_close;	/* another thread's open, while a close runs */
+	int opened_in_close;
+} rec = { .reuse_fd = -1 };
 
 static int r_open(void *ctx, uint32_t dev, uint32_t flags)
 {
 	(void)ctx;
 	rec.open_dev = dev;
 	rec.open_flags = flags;
+	if (rec.reuse_fd >= 0) {
+		const int fd = rec.reuse_fd;
+
+		rec.reuse_fd = -1;
+		return fd;
+	}
 	return rec.next_fd++;
 }
 
@@ -58,6 +67,15 @@ static int r_close(void *ctx, int fd)
 {
 	(void)ctx;
 	rec.closed = fd;
+	if (rec.open_in_close) {
+		/* The driver has let go of @fd: an open on another thread may
+		 * get its number before this close returns. */
+		const char *path = rec.open_in_close;
+
+		rec.open_in_close = NULL;
+		rec.reuse_fd = fd;
+		rec.opened_in_close = mlg_open(path, O_RDWR);
+	}
 	return fd >= 0 && fd < rec.next_fd ? 0 : -MLG_LX_EBADF;
 }
 
@@ -352,7 +370,15 @@ int main(void)
 
 	CHECK(mlg_close(kfd) == 0 && rec.closed == kfd);
 	CHECK(mlg_ioctl(kfd, AMDKFD_IOC_GET_VERSION, &apn) == -1 && errno == EBADF);
+	/* A close does not forget a descriptor number that a concurrent open
+	 * was given in the meantime. */
+	rec.open_in_close = "/dev/dri/renderD128";
+	CHECK(mlg_close(fd) == 0 && rec.opened_in_close == fd);
+	rec.result = 0;
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close){ .handle = 1 }) == 0);
 	CHECK(mlg_close(fd) == 0);
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close){ .handle = 1 }) == -1 &&
+	      errno == EBADF);
 	/* ... else what AMDGPU_INFO_DEV_INFO reports, on a render node it
 	 * opens and closes. */
 	struct mlg_transport plain = recording;

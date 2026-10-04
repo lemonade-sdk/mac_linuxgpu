@@ -11,7 +11,12 @@ the device; GTT mappings, cached or write-combined, are normal memory.
   counts on one.
 - radv_amdgpu_winsys_bo_create: a VRAM buffer that is not NO_CPU_ACCESS is
   placed in GTT instead, whatever the caller asked (command buffers,
-  descriptor pools, shader arenas, upload buffers).
+  descriptor pools, upload buffers).
+- radv_CreateDevice: without CPU-visible VRAM, shader code is uploaded by
+  SDMA into NO_CPU_ACCESS arenas in VRAM (the dmashaders path), rather than
+  living in GTT where every instruction fetch that misses the caches
+  crosses the PCIe link. On the R9700 that is 39% more decode speed in
+  llama.cpp.
 
 Other platforms are unchanged.
 
@@ -54,3 +59,20 @@ index c47d421..fdb697a 100644
     /*
      * Override the max submits on video queues.
      * If you submit multiple session contexts in the same IB sequence the
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+index bd422f5..40002fa 100644
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -1598,7 +1598,11 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
+    }
+    device->private_sdma_queue = VK_NULL_HANDLE;
+ 
+-   device->shader_use_invisible_vram = (instance->perftest_flags & RADV_PERFTEST_DMA_SHADERS) &&
++   /* Without CPU-visible VRAM (Apple silicon: radv_amdgpu_winsys_query_info), shader code
++    * reaches VRAM only through DMA; a CPU-mapped arena would sit in GTT and every
++    * instruction fetch that misses the caches would cross the PCIe link. */
++   const bool no_visible_vram = pdev->info.has_dedicated_vram && !pdev->info.vram_vis_size_kb;
++   device->shader_use_invisible_vram = ((instance->perftest_flags & RADV_PERFTEST_DMA_SHADERS) || no_visible_vram) &&
+                                        /* SDMA buffer copy is only implemented for GFX7+. */
+                                        pdev->info.gfx_level >= GFX7;
+    result = radv_init_shader_upload_queue(device);
