@@ -346,10 +346,16 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     var filter: DamageFilter?
     enum DamageMode { case raw, filtered, scroll }
     var damageMode = DamageMode.scroll
-    /// CGVirtualDisplaySettings.refreshDeadline (0: not set) and a capture
-    /// with no minimum frame interval, as Sidecar does (--refresh-deadline,
-    /// --frame-interval zero).
-    var refreshDeadline = 0.0, frameIntervalZero = false
+    /// CGVirtualDisplaySettings.refreshDeadline (0: not set; --refresh-deadline)
+    /// and the capture's minimum frame interval: none by default, so the
+    /// stream wakes right after each composition rather than on a grid of
+    /// its own (typing on build 239 with the keep-alive: change to flip
+    /// p50 30 -> 21 ms, p90 40 -> 30 ms, max 47 -> 35 ms; --frame-interval
+    /// refresh for one refresh). Sidecar's capture sets no minimum frame
+    /// time either; its refreshDeadline 0.004 measured no better here.
+    var refreshDeadline = 0.0, frameIntervalZero = true
+    /// The type workload's timeline, when it runs.
+    var typeProbe: TypeProbe?
     var measurement = PresentMeasurement()
     var last: PresentStats?
     var failure: String?
@@ -374,7 +380,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         descriptor.greenPrimary = CGPoint(x: plan.greenPrimary.x, y: plan.greenPrimary.y)
         descriptor.bluePrimary = CGPoint(x: plan.bluePrimary.x, y: plan.bluePrimary.y)
         descriptor.whitePoint = CGPoint(x: plan.whitePoint.x, y: plan.whitePoint.y)
-        descriptor.queue = DispatchQueue(label: "MacLinuxGPU.display-agent.virtual-display")
+        descriptor.queue = DispatchQueue(label: "MacLinuxGPU.display-agent.virtual-display", qos: .userInteractive)
         descriptor.terminationHandler = { _, _ in print("display-agent: macOS ended the virtual display") }
         guard let display = CGVirtualDisplay(descriptor: descriptor) else {
             failure = "CGVirtualDisplay could not be created"
@@ -487,6 +493,26 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
     }
 
+    /// The type workload: poll the driver (1 ms) until the frame flipped,
+    /// then record PRESENT to flip and change to flip from its vblank time.
+    private func followFlip(_ probe: TypeProbe, target: UInt64, captureNs: UInt64, returned: UInt64,
+                            changes: [UInt64], attempts: Int) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(1)) { [self] in
+            guard !stopped, failure == nil, let handle = handles.values.first,
+                  let stats = observer.displayStats(handle: handle) else { return }
+            if stats.flipped >= target {
+                // Its own vblank time when it is the last flipped frame; else when seen.
+                let flipNs = stats.flipped == target && stats.lastLatencyNs > 0 && captureNs > 0 ?
+                    captureNs + stats.lastLatencyNs : uptimeNs()
+                if flipNs > returned { probe.flipped.add(flipNs - returned) }
+                for change in changes where flipNs > change { probe.total.add(flipNs - change) }
+            } else if attempts < 1000 {
+                followFlip(probe, target: target, captureNs: captureNs, returned: returned, changes: changes,
+                           attempts: attempts + 1)
+            }
+        }
+    }
+
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         queue.async { self.failure = self.failure ?? "ScreenCaptureKit stopped: \(error)" }
     }
@@ -541,6 +567,16 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             return
         }
         defer { IOSurfaceUnlock(surface, .readOnly, nil) }
+        // The type workload: which change, if any, this frame first shows.
+        var typeChanges: [(seq: Int, ns: UInt64)] = []
+        if let probe = typeProbe, probe.points.count == 4,
+           probe.points.allSatisfy({ $0.x >= 0 && $0.y >= 0 && $0.x < mode.width && $0.y < mode.height }) {
+            let base = IOSurfaceGetBaseAddress(surface), pitch = IOSurfaceGetBytesPerRow(surface)
+            let brightness = probe.points.map {
+                Int((base + $0.y * pitch).load(fromByteOffset: $0.x * 4 + 1, as: UInt8.self))   // BGRA: green
+            }
+            typeChanges = probe.firstShown(index: typeMarkIndex(brightness: brightness), now: handlerWall)
+        }
         if filter?.width != mode.width || filter?.height != mode.height {
             filter = DamageFilter(width: mode.width, height: mode.height)
             filter!.detectScroll = damageMode == .scroll
@@ -564,6 +600,16 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             return
         }
         last = stats
+        if !typeChanges.isEmpty, let probe = typeProbe {
+            let returned = uptimeNs()
+            for change in typeChanges where captureNs > change.ns { probe.composed.add(captureNs - change.ns) }
+            // The display time can be the frame's target vblank, after the handler runs.
+            probe.delivered.add(handlerWall > captureNs ? handlerWall - captureNs : 0)
+            probe.presented.add(returned - handlerWall)
+            // Taken frames so far, this one included: it flips at that count.
+            followFlip(probe, target: stats.received - stats.replaced, captureNs: captureNs, returned: returned,
+                       changes: typeChanges.map { $0.ns }, attempts: 0)
+        }
         measurement.observe(stats)
         _ = held.presented(sample, received: stats.received, replaced: stats.replaced, flipped: stats.flipped)
         measurement.present(callCPUNs: callCPUNs, callWallNs: callWallNs, handlerCPUNs: threadCPUNs() - handlerStart,
@@ -578,6 +624,127 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
 ///          (the damage of full-screen video)
 ///   scroll a 1600x1100 window scrolls a text document 6 points every
 ///          refresh under a header that stays
+///   type   a glyph-sized mark in a small window changes 5 to 15 times a
+///          second at random; each change is followed to its flip
+/// Keeps the WindowServer updating the virtual display every refresh.
+/// A virtual display has no vsync of its own: once nothing on it changes,
+/// the WindowServer lets its update cycle idle, and the next change (a
+/// typed character) waits up to ~200 ms to be composited and captured
+/// (measured on build 239 with a probe in another process: p90 157 ms,
+/// max 203 ms on the virtual display; p90 22 ms on the built-in one).
+/// A 2x2 point window in a corner changes its opacity every refresh
+/// between two values that composite to the same pixels: the WindowServer
+/// composes the display each refresh (p90 26 ms, max 33 ms), and the agent
+/// drops the frames it captures as unchanged, so nothing is copied or
+/// flipped for it.
+final class DisplayKeepAlive {
+    private var window: NSWindow?
+    private var timer: Timer?
+    private var layer: CALayer?
+    private var on = false
+
+    /// @displayID's bottom right corner, every 1/@refreshHz s.
+    func start(displayID: CGDirectDisplayID, refreshHz: Double) {
+        let bounds = CGDisplayBounds(displayID), main = CGDisplayBounds(CGMainDisplayID())
+        guard bounds.width > 0 else { return }
+        let frame = NSRect(x: bounds.maxX - 2, y: main.height - bounds.maxY, width: 2, height: 2)
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.level = .screenSaver
+        window.ignoresMouseEvents = true
+        window.hasShadow = false
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        view.wantsLayer = true
+        let layer = CALayer()
+        layer.frame = view.bounds
+        view.layer?.addSublayer(layer)
+        window.contentView = view
+        window.setFrame(frame, display: true)
+        window.orderFrontRegardless()
+        self.window = window
+        self.layer = layer
+        let timer = Timer(timeInterval: 1 / max(refreshHz, 1), repeats: true) { [weak self] _ in self?.tick() }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func tick() {
+        on.toggle()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        // 0.001 and 0.002 of white over anything round to the same 8-bit pixel.
+        layer?.backgroundColor = CGColor(gray: 1, alpha: on ? 0.001 : 0.002)
+        CATransaction.commit()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        window?.orderOut(nil)
+        window = nil
+        layer = nil
+    }
+}
+
+/// The type workload's timeline: each change of the mark (a glyph-sized
+/// square) with when the app flushed it to the WindowServer, matched to the
+/// first captured frame that shows it (by the mark's grey), then followed
+/// to PRESENT and to its flip. Stages: change to the frame's composition
+/// (its display time), composition to the frame handler, handler to
+/// PRESENT returning, PRESENT to the flip (the driver's vblank time).
+final class TypeProbe {
+    private let lock = NSLock()
+    private var changes: [(seq: Int, ns: UInt64)] = []
+    private var seen = Set<Int>()
+    /// The marks' centres in the capture (pixels, top-left origin).
+    var points: [(x: Int, y: Int)] = []
+    var composed = LatencySeries(), delivered = LatencySeries(), presented = LatencySeries()
+    var flipped = LatencySeries(), total = LatencySeries()
+    var changeCount: Int { lock.lock(); defer { lock.unlock() }; return changes.count }
+    var seenCount: Int { lock.lock(); defer { lock.unlock() }; return seen.count }
+
+    func changed(_ seq: Int, at ns: UInt64) {
+        lock.lock(); changes.append((seq, ns)); lock.unlock()
+    }
+
+    /// The changes a frame showing grey index @index at @now shows first:
+    /// the newest change with that index not seen yet, made before @now,
+    /// and every earlier change no frame showed (overtaken: this frame is
+    /// the first to show the screen past them). Empty when nothing new.
+    func firstShown(index: Int, now: UInt64) -> [(seq: Int, ns: UInt64)] {
+        lock.lock(); defer { lock.unlock() }
+        guard let c = changes.last(where: { $0.seq % 16 == index && $0.ns <= now }), !seen.contains(c.seq)
+        else { return [] }
+        let shown = changes.filter { $0.seq <= c.seq && !seen.contains($0.seq) }
+        for older in shown { seen.insert(older.seq) }
+        overtaken += shown.count - 1
+        return shown
+    }
+    private(set) var overtaken = 0
+
+    /// Times are reset with the measured window.
+    func reset() {
+        lock.lock(); defer { lock.unlock() }
+        changes.removeAll(); seen.removeAll(); overtaken = 0
+        composed = LatencySeries(); delivered = LatencySeries(); presented = LatencySeries()
+        flipped = LatencySeries(); total = LatencySeries()
+    }
+
+    var lines: [String] {
+        let shown = seenCount, made = changeCount
+        return ["typing: \(made) change(s), \(shown) shown (\(overtaken) only by a later change's frame)",
+                "  change to composition: " + composed.summary,
+                "  composition to frame handler: " + delivered.summary,
+                "  frame handler to PRESENT returned: " + presented.summary,
+                "  PRESENT to flip: " + flipped.summary,
+                "  change to flip: " + total.summary]
+    }
+}
+
 private final class Workload {
     let kind: String
     var window: NSWindow?
@@ -585,14 +752,40 @@ private final class Workload {
     var tick = 0
     var position = CGPoint(x: 0, y: 0), velocity = CGPoint(x: 9, y: 6)
     var scrollView: NSScrollView?
+    /// type: the mark, the probe, the changes made.
+    var typeMarks: [CALayer] = []
+    var typeProbe: TypeProbe?
+    var typeSeq = 0
 
     init(kind: String) { self.kind = kind }
+
+    /// type: the next change in 66 to 200 ms (5 to 15 a second, like typing).
+    private func typeNext() {
+        let delay = Double.random(in: 0.066...0.2)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in self?.typeChange() }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func typeChange() {
+        guard typeMarks.count == 4, let typeProbe, window != nil else { return }
+        typeSeq += 1
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, mark) in typeMarks.enumerated() {
+            mark.backgroundColor = CGColor(gray: typeMarkBit(typeSeq, i) ? 1 : 0, alpha: 1)
+        }
+        CATransaction.commit()
+        CATransaction.flush()   // to the WindowServer now, as an app's change after a key press
+        typeProbe.changed(typeSeq, at: clock_gettime_nsec_np(CLOCK_UPTIME_RAW))
+        typeNext()
+    }
 
     /// nil when started; otherwise why not.
     func start(displayID: CGDirectDisplayID, refreshHz: Double) -> String? {
         if kind == "still" { return nil }
-        guard ["move", "full", "scroll"].contains(kind) else {
-            return "unknown workload \(kind) (still, move, full or scroll)"
+        guard ["move", "full", "scroll", "type"].contains(kind) else {
+            return "unknown workload \(kind) (still, move, full, scroll or type)"
         }
         // The app is already a background agent (runDisplayAgent).
         // CoreGraphics' global space has its origin at the top left of the
@@ -601,6 +794,7 @@ private final class Workload {
         guard bounds.width > 0 else { return "the virtual display has no bounds" }
         let screen = NSRect(x: bounds.minX, y: main.height - bounds.maxY, width: bounds.width, height: bounds.height)
         let frame = kind == "full" ? screen :
+            kind == "type" ? NSRect(x: screen.minX + 300, y: screen.minY + 300, width: 320, height: 60) :
             kind == "scroll" ? NSRect(x: screen.minX + 200, y: screen.minY + 100, width: min(1600, screen.width - 400),
                                       height: min(1100, screen.height - 200)) :
             NSRect(x: screen.minX, y: screen.minY, width: 480, height: 320)
@@ -608,7 +802,25 @@ private final class Workload {
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.ignoresMouseEvents = true
-        if kind == "scroll" {
+        if kind == "type", let probe = typeProbe {
+            // A text-field-sized window; the mark is a glyph-sized square in it.
+            let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+            view.wantsLayer = true
+            view.layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
+            typeMarks = (0..<4).map { i in
+                let mark = CALayer()
+                mark.frame = CGRect(x: 20 + 20 * i, y: 20, width: 12, height: 18)
+                mark.backgroundColor = CGColor(gray: 0, alpha: 1)
+                view.layer?.addSublayer(mark)
+                return mark
+            }
+            window.contentView = view
+            // Capture pixels, top-left origin: each mark's centre (26 + 20 i, 29)
+            // up from the window's bottom left.
+            probe.points = (0..<4).map { i in
+                (Int(frame.minX - screen.minX) + 26 + 20 * i, Int(screen.maxY - (frame.minY + 29)))
+            }
+        } else if kind == "scroll" {
             // A text document in a scroll view: a header bar that stays, lines that move.
             let content = NSView(frame: NSRect(origin: .zero, size: frame.size))
             let header = NSTextField(labelWithString: "MacLinuxGPU scroll workload")
@@ -638,6 +850,10 @@ private final class Workload {
         window.setFrame(frame, display: true)
         window.orderFrontRegardless()
         self.window = window
+        if kind == "type" {
+            typeNext()
+            return nil
+        }
         let interval = 1 / max(refreshHz, 1)
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.step(screen: screen) }
         RunLoop.main.add(timer, forMode: .common)
@@ -722,8 +938,19 @@ private func agentLog(_ text: String) {
     fflush(stdout)
 }
 
+/// Held while a monitor is mirrored: the agent is a background process the
+/// system would App Nap (timers coalesced, low QoS), and the virtual display
+/// it owns is only as prompt as it is.
+private var agentLatencyActivity: NSObjectProtocol?
+
 func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     if options.contains("--daemon") { return runDisplayAgentDaemon(options) }
+    // The keep-alive's timer and the frame handler run on time: no App Nap
+    // timer coalescing for a process that mirrors a display.
+    if agentLatencyActivity == nil {
+        agentLatencyActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical], reason: "mirroring a monitor as a macOS display")
+    }
     let seconds = Double(option(options, "--seconds") ?? "") ?? 0
     agentHandleSignals()
     guard CGPreflightScreenCaptureAccess() else {
@@ -787,8 +1014,8 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
         return .ended(1)
     }
     if !daemon {
-        // For measuring: Sidecar's settings (CGVirtualDisplaySettings'
-        // refreshDeadline; the capture's minimum frame interval).
+        // Tuning: CGVirtualDisplaySettings' refreshDeadline (unset by
+        // default) and the capture's minimum frame interval (none by default).
         if let text = option(options, "--refresh-deadline") {
             guard let seconds = Double(text), seconds >= 0, seconds < 1 else {
                 print("display-agent: --refresh-deadline \(text): seconds from 0 to 1")
@@ -796,7 +1023,7 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
             }
             mirror.refreshDeadline = seconds
         }
-        switch option(options, "--frame-interval") ?? "refresh" {
+        switch option(options, "--frame-interval") ?? "zero" {
         case "refresh": mirror.frameIntervalZero = false
         case "zero": mirror.frameIntervalZero = true
         case let other:
@@ -804,7 +1031,15 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
             return .ended(1)
         }
     }
+    let keepAlive = DisplayKeepAlive()
+    // --keep-alive off, for measuring: the WindowServer idles the display.
+    let keepAliveOn = daemon || option(options, "--keep-alive") != "off"
     let workload = Workload(kind: daemon ? "still" : option(options, "--workload") ?? "still")
+    if workload.kind == "type" {
+        let probe = TypeProbe()
+        workload.typeProbe = probe
+        mirror.typeProbe = probe
+    }
     let warmup = daemon ? Double.infinity : Double(option(options, "--warmup") ?? "") ?? 2
     let dextPID = daemon ? nil : driverProcessID(options)
     var outputOn = false
@@ -828,6 +1063,11 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
         for line in measured.lines(start: started.stats, end: end, seconds: seconds, refreshHz: mode.refreshRate) {
             print("display-agent:   " + line)
         }
+        if let probe = mirror.typeProbe {
+            mirror.queue.sync {}   // flips being followed land first
+            Thread.sleep(forTimeInterval: 0.1)
+            mirror.queue.sync { probe.lines.forEach { print("display-agent:   " + $0) } }
+        }
         let flips = Double(max(end.flipped - started.stats.flipped, 1))
         if let a0 = started.agent, let a1 = ProcessUsage.current() {
             let (cpu, wakeups) = a1.rates(since: a0)
@@ -846,6 +1086,7 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
     }
 
     func teardown() -> Int32 {
+        keepAlive.stop()
         workload.stop()
         if outputOn { report() }
         mirror.stopCapture()
@@ -873,6 +1114,7 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
     outputOn = true
     guard mirror.startCapture(mode) else { return .ended(teardown()) }
     agentBecomeBackground()
+    if keepAliveOn { keepAlive.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) }
     if let error = workload.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) {
         mirror.failure = "workload: \(error)"
         return .ended(teardown())
@@ -894,6 +1136,7 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
            let handle = mirror.queue.sync(execute: { mirror.handles.values.first }) {
             if let stats = observer.displayStats(handle: handle) {
                 mirror.queue.sync { mirror.measurement = PresentMeasurement(); mirror.measurement.lastFlipped = stats.flipped }
+                mirror.typeProbe?.reset()
                 started = (stats, ProcessUsage.current(), dextPID.flatMap { ProcessUsage.sampled(pid: $0) }, uptimeNs())
             } else {
                 print("display-agent: the driver's statistics could not be read; mirroring continues unmeasured")

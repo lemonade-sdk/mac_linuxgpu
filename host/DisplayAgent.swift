@@ -918,3 +918,31 @@ enum DisplayControl {
     static let prefsChanged = "com.geramyloveless.maclinuxgpu.display-prefs"
     static let statusChanged = "com.geramyloveless.maclinuxgpu.display-status"
 }
+
+/// Durations of one stage of a latency (ns), summarized as percentiles.
+struct LatencySeries {
+    private(set) var values: [UInt64] = []
+    mutating func add(_ ns: UInt64) { values.append(ns) }
+    var count: Int { values.count }
+    /// The value at @fraction (0...1) of the sorted series, nearest rank.
+    func percentile(_ fraction: Double) -> UInt64 {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let rank = Int((fraction * Double(sorted.count)).rounded(.up)) - 1
+        return sorted[min(max(rank, 0), sorted.count - 1)]
+    }
+    /// "p50 a ms, p90 b ms, max c ms (n)".
+    var summary: String {
+        String(format: "p50 %.2f ms, p90 %.2f ms, max %.2f ms (%d)", Double(percentile(0.5)) / 1e6,
+               Double(percentile(0.9)) / 1e6, Double(values.max() ?? 0) / 1e6, values.count)
+    }
+}
+
+/// The type workload's marks: four glyph-sized squares, square i white
+/// when bit i of the change number is set, else black (black and white
+/// survive the display's colour conversion, grey levels do not). The four
+/// captured pixels' brightness gives seq % 16 back.
+func typeMarkBit(_ seq: Int, _ bit: Int) -> Bool { (seq >> bit) & 1 == 1 }
+func typeMarkIndex(brightness: [Int]) -> Int {
+    brightness.prefix(4).enumerated().reduce(0) { $0 | ($1.element >= 128 ? 1 << $1.offset : 0) }
+}

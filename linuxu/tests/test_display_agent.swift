@@ -457,3 +457,18 @@ do {
     }
 }
 print("PASS scroll detection: moves for shifted rows, header and edits as damage, edges, unknown rows")
+
+// Latency percentiles and the type workload's marks.
+do {
+    var s = LatencySeries()
+    check(s.percentile(0.5) == 0 && s.summary.hasSuffix("(0)"))
+    for v in [5, 1, 4, 2, 3, 100, 6, 7, 8, 9] { s.add(UInt64(v) * 1_000_000) }
+    check(s.percentile(0.5) == 5_000_000 && s.percentile(0.9) == 9_000_000 && s.percentile(1) == 100_000_000)
+    check(s.summary == "p50 5.00 ms, p90 9.00 ms, max 100.00 ms (10)", s.summary)
+    for seq in 0..<64 {
+        // White and black as a colour conversion might leave them.
+        let pixels = (0..<4).map { typeMarkBit(seq, $0) ? 231 : 19 }
+        check(typeMarkIndex(brightness: pixels) == seq % 16, "\(seq)")
+    }
+}
+print("PASS latency series and type marks")
