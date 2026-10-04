@@ -60,6 +60,8 @@ for source in "${sources[@]}"; do
   object="$test_dir/$(echo "$source" | tr '/' '_').o"
   extra=()
   case "$source" in
+    # kmemcheck tracks the heap (the leak check below): debug build.
+    linuxu/src/kmem/kmemalloc.c|linuxu/src/kmem/kmemcheck.c) extra=(-DDEBUG=1) ;;
     third_party/linux/lib/kfifo.c) extra=(-include linux/kernel.h -include linux/bug.h) ;;
     third_party/linux/lib/sort.c) extra=(-include linux/compiler.h -include linux/preempt.h) ;;
     */kfd_device.c) extra=(-Dkfd_gtt_sa_allocate=upstream_kfd_gtt_sa_allocate

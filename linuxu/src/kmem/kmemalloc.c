@@ -1,10 +1,13 @@
-/* linuxu shim: kmemalloc — kmalloc/kfree family over libc malloc with
- * kmemcheck canaries (REAL).
+/* linuxu shim: kmemalloc — kmalloc/kfree family over libc malloc, with
+ * kmemcheck canaries and tracking in debug builds (DEBUG) only.
  * Kernel arg order preserved (e.g. memcmp(dest, src, n)); kzalloc zeroes;
  * __GFP_ZERO is honored; node affinity is unused in this single process.
  *
- * Every nonzero allocation carries a leading struct kmemcheck_hdr + canaries;
- * see kmemcheck.c for the layout. */
+ * Every nonzero allocation carries a leading header: the payload's size
+ * (ksize) and the allocation to free (the payload is aligned inside it).
+ * Debug builds add kmemcheck's fields and canaries around the payload (see
+ * kmemcheck.c for the layout) and track every object, which costs a lock
+ * per kmalloc and kfree; release builds have neither. */
 #include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -17,6 +20,7 @@
 #include <linux/gfp.h>
 #include <linux/string.h>
 
+#if DEBUG
 /* shared with kmemcheck.c (same directory, same translation unit set) */
 struct kmemcheck_hdr {
 	uintptr_t user_ptr;
@@ -30,6 +34,23 @@ struct kmemcheck_hdr {
 extern int kmemcheck_track(struct kmemcheck_hdr *hdr, size_t user_size);
 extern int kmemcheck_untrack(struct kmemcheck_hdr *hdr);
 extern int kmemcheck_scan(void);
+#define KM_CANARY sizeof(uint64_t)	/* a canary word on each side */
+#else
+struct kmemcheck_hdr {
+	uintptr_t user_ptr;
+	size_t    size;
+	size_t    alloc_size;
+	void     *allocation;
+};
+#define KM_CANARY 0
+#endif
+
+/* The header of the payload at @user_ptr. */
+static struct kmemcheck_hdr *km_hdr(const void *user_ptr)
+{
+	return (struct kmemcheck_hdr *)((uintptr_t)user_ptr - KM_CANARY -
+					sizeof(struct kmemcheck_hdr));
+}
 
 #define KM_ALIGN 8u
 static size_t km_align(size_t s)
@@ -40,7 +61,7 @@ static size_t km_align(size_t s)
 /* total bytes to malloc for a payload of user_size */
 static size_t km_total(size_t user_size, size_t alignment)
 {
-	const size_t overhead = sizeof(struct kmemcheck_hdr) + 2 * sizeof(uint64_t);
+	const size_t overhead = sizeof(struct kmemcheck_hdr) + 2 * KM_CANARY;
 	if (!alignment || (alignment & (alignment - 1)) ||
 	    alignment - 1 > SIZE_MAX - overhead ||
 	    user_size > SIZE_MAX - overhead - (alignment - 1))
@@ -59,13 +80,17 @@ static void *km_alloc_aligned(size_t user_size, size_t alignment)
 
 	if (!raw)
 		return NULL;
-	user = ((uintptr_t)raw + sizeof(*hdr) + sizeof(uint64_t) + alignment - 1) &
+	user = ((uintptr_t)raw + sizeof(*hdr) + KM_CANARY + alignment - 1) &
 		~(uintptr_t)(alignment - 1);
-	hdr = (struct kmemcheck_hdr *)(user - sizeof(uint64_t) - sizeof(*hdr));
+	hdr = km_hdr((void *)user);
 	hdr->user_ptr = user;
 	hdr->alloc_size = total;
 	hdr->allocation = raw;
+#if DEBUG
 	kmemcheck_track(hdr, user_size);
+#else
+	hdr->size = user_size;
+#endif
 	return (void *)hdr->user_ptr;
 }
 
@@ -80,10 +105,10 @@ static void km_dealloc(void *user_ptr)
 
 	if (ZERO_OR_NULL_PTR(user_ptr))
 		return;
-	hdr = (struct kmemcheck_hdr *)
-		((unsigned char *)user_ptr - sizeof(uint64_t) -
-		 sizeof(struct kmemcheck_hdr));
+	hdr = km_hdr(user_ptr);
+#if DEBUG
 	kmemcheck_untrack(hdr);
+#endif
 	free(hdr->allocation);
 }
 
@@ -159,18 +184,26 @@ void kvfree_sensitive(const void *addr, size_t len)
 	kvfree(addr);
 }
 
-/* kmemcheck: the slab allocator (kmalloc/kfree) is kmemcheck-instrumented
- * (canary words + per-size checksum around every object), so the check
- * is always live. */
+/* kmemcheck: in debug builds the slab allocator (kmalloc/kfree) is
+ * kmemcheck-instrumented (canary words + per-size checksum around every
+ * object); release builds track nothing, and the checks find nothing. */
 int kmemcheck_enabled(void)
 {
+#if DEBUG
 	return 1;
+#else
+	return 0;
+#endif
 }
 
 /* Scan all live allocations; returns number of corrupted objects. */
 int kmemcheck_verify_all(void)
 {
+#if DEBUG
 	return kmemcheck_scan();
+#else
+	return 0;
+#endif
 }
 
 /* ---- flexible-array ("obj") single-arg runtimes ----
@@ -417,9 +450,7 @@ size_t ksize(const void *p)
 
 	if (ZERO_OR_NULL_PTR(p))
 		return 0;
-	hdr = (struct kmemcheck_hdr *)
-		((unsigned char *)p - sizeof(uint64_t) -
-		 sizeof(struct kmemcheck_hdr));
+	hdr = km_hdr(p);
 	return hdr->size;
 }
 

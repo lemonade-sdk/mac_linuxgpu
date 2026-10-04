@@ -3,7 +3,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
-flags=(-w -std=gnu11 -g -O1 -fsanitize=address,undefined
+flags=(-w -std=gnu11 -g -O1 -DDEBUG=1 -fsanitize=address,undefined
   -fno-sanitize-recover=all -ffunction-sections -fdata-sections
   -Ilinuxu/headers -Ilinuxu/tests)
 heap=(-Dmalloc=dext_test_malloc -Dcalloc=dext_test_calloc

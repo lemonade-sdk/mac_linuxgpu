@@ -1,8 +1,9 @@
-/* linuxu shim: kmemcheck — heap canary verification for kmalloc/kfree;
- * strategy (offline test regime): REAL.
+/* linuxu shim: kmemcheck — heap canary verification for kmalloc/kfree, in
+ * debug builds (DEBUG); a release build has none of it (kmemalloc.c).
  * Every kmalloc object is allocated with a leading/trailing canary word and
  * a per-size checksum so the P0 kmemcheck goal (corrupt a byte -> detect)
  * is real.  kmemcheck_verify scans all live allocations. */
+#if DEBUG
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -186,3 +187,9 @@ size_t kmemcheck_live_bytes(void)
 	pthread_mutex_unlock(&kmemcheck_lock);
 	return total;
 }
+#else
+#include <stddef.h>
+/* Release builds track nothing: no object is live to the checker. */
+size_t kmemcheck_live_bytes(void);
+size_t kmemcheck_live_bytes(void) { return 0; }
+#endif /* DEBUG */
