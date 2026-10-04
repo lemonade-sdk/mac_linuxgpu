@@ -488,12 +488,20 @@ static int notify_cond(pthread_cond_t *c)
 	int error = cond_for(c, &state);
 	if (error)
 		return error;
+	unsigned int waiters;
+
 	cond_lock(state);
 	/* All waiters may observe this generation. Extra wakes are permitted;
 	 * callers must recheck their predicate while holding their mutex. */
 	state->generation++;
+	waiters = state->waiters;
 	cond_unlock(state);
-	(void)dext_cond_wake(&state->sleepers, true);
+	/* A waiter counts itself and reads the generation in one cond_lock
+	 * section: one that comes after this saw the new generation and does
+	 * not sleep. With none, the wake (a hop onto the sleep queue) is
+	 * skipped; signals with nobody waiting are the common case. */
+	if (waiters)
+		(void)dext_cond_wake(&state->sleepers, true);
 	return 0;
 }
 
