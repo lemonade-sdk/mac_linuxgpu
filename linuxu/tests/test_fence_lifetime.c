@@ -64,7 +64,7 @@ static void waits(void)
 	assert(dma_fence_wait_timeout(fences[0], false, -1) == -EINVAL);
 	pthread_t thread; assert(!pthread_create(&thread, NULL, signal_later, fences[1]));
 	uint32_t index = 99;
-	long result = dma_fence_wait_any_timeout(fences, 2, false, 20, &index);
+	long result = dma_fence_wait_any_timeout(fences, 2, false, msecs_to_jiffies(2000), &index);
 	assert(result > 0 && index == 1);
 	pthread_join(thread, NULL);
 	assert(!dma_fence_is_signaled(fences[0]));
