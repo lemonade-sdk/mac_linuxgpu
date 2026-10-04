@@ -1,6 +1,12 @@
 /* Exercises the real LINUXU_DEXT bridge with mocked DriverKit RPC boundaries. */
 #include "driverkit_dma_mocks.h"
+/* A hold attempted inside an operation on the same thread waits this long
+ * for it before refusing (production: 2 s). */
+#define DEXT_DMA_HOLD_DRAIN_MS 50
 #include "../../dext/sources/iokit_bridge.mm"
+#include <atomic>
+#include <thread>
+#include <chrono>
 #include <rt/dext_dma.h>
 
 static uint64_t log_tail() {
@@ -657,6 +663,48 @@ static void import_lifetime() {
     mock_import_segments = 1;
 }
 
+/* A session closing while another thread is still unmapping (a Linux-file
+ * client's release work after its process exited): the shutdown hold waits
+ * for that operation instead of failing (which quarantined the session). */
+static std::atomic<bool> inflight_entered, inflight_release;
+static void hold_waits_for_inflight_operation() {
+    start();
+    void *cpu = allocate();
+    mock_complete_hook = [] {
+        inflight_entered = true;
+        while (!inflight_release) std::this_thread::yield();
+    };
+    std::thread unmapper([cpu] { assert(dext_dma_free_coherent(cpu, 16384) == 0); });
+    while (!inflight_entered) std::this_thread::yield();
+    /* Released 20 ms into the hold's wait, within its 50 ms. */
+    std::thread releaser([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        inflight_release = true;
+    });
+    const auto start_time = std::chrono::steady_clock::now();
+    assert(dext_dma_begin_shutdown(65536) == 0);
+    assert(std::chrono::steady_clock::now() - start_time >= std::chrono::milliseconds(15));
+    unmapper.join(); releaser.join();
+    mock_complete_hook = nullptr;
+    assert(dext_dma_begin_shutdown_reset() == 0 && dext_dma_end_shutdown_reset(1) == 0);
+    clean();
+    /* One that never finishes within the wait is still refused. */
+    start();
+    cpu = allocate();
+    inflight_entered = inflight_release = false;
+    mock_complete_hook = [] {
+        inflight_entered = true;
+        while (!inflight_release) std::this_thread::yield();
+    };
+    std::thread stuck([cpu] { assert(dext_dma_free_coherent(cpu, 16384) == 0); });
+    while (!inflight_entered) std::this_thread::yield();
+    assert(dext_dma_begin_shutdown(65536) != 0);
+    inflight_release = true;
+    stuck.join();
+    mock_complete_hook = nullptr;
+    clean();
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "shutdown-reset-failed")) shutdown_failure(false);
@@ -672,6 +720,7 @@ int main(int argc, char **argv) {
         reset_admission(); shutdown_retention(); probe_lifetime(); normal_and_rpc_failures(); stopping_during_allocation(); vmap_unwind(); cpu_pages_and_aliases();
         ranges_descriptor();
         address_widths(); platform_probe();
+        hold_waits_for_inflight_operation();
     }
     puts("production DriverKit DMA bridge offline failure checks passed");
 }

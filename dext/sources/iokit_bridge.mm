@@ -742,9 +742,29 @@ extern "C" void dext_dma_end_reset(void)
 /* Called on the serialized owner queue before stopping compute or upstream.
  * Software may relinquish ownership, but DART keeps every backing pinned
  * until upstream workers/IRQs are drained and FLR has isolated the endpoint. */
+#ifndef DEXT_DMA_HOLD_DRAIN_MS
+#define DEXT_DMA_HOLD_DRAIN_MS 2000
+#endif
 static int dext_dma_begin_hold(uint64_t dma_budget, bool probe)
 {
 	dext_dma_acquire();
+	/* An operation in flight on another thread is not a reason to give up:
+	 * a session closes while work queued by the processes that just exited
+	 * (a Linux-file client's KFD release, TTM's delayed frees) is still
+	 * unmapping. Each operation is short; wait for none to be in flight,
+	 * bounded, before deciding. Operations that begin after the hold are
+	 * covered by it. */
+	if (g_dma_operations && dma_budget && g_dma_pci && !g_dma_stopping &&
+	    !g_dma_resetting && !g_dma_holding_frees && !g_dma_cleanup_failed) {
+		const uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) +
+			(uint64_t)DEXT_DMA_HOLD_DRAIN_MS * 1000000ULL;
+		while (g_dma_operations && !g_dma_resetting &&
+		       clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < deadline) {
+			dext_dma_release();
+			IOSleep(1);
+			dext_dma_acquire();
+		}
+	}
 	if (!probe && g_dma_probe_hold && !g_dma_quarantined &&
 	    !g_dma_probe_committing && !g_dma_resetting && !g_dma_operations &&
 	    !g_dma_cleanup_failed) {
