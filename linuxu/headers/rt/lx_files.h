@@ -91,6 +91,8 @@ int rt_lx_result(struct rt_lx_client *c, uint64_t token, void *rbuf,
 		 size_t cap, size_t *reply_bytes, int64_t *result);
 /* Async calls running or kept. */
 unsigned int rt_lx_async_outstanding(struct rt_lx_client *c);
+/* The client's async workers (they stay, at most MLG_LX_MAX_ASYNC). */
+unsigned int rt_lx_async_workers(struct rt_lx_client *c);
 
 /* What backs a mapping. */
 #define RT_LX_RANGE_CPU	1u	/* addr: dext virtual address */

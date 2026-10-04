@@ -22,7 +22,7 @@
  *   reply    user client: reply handed to IOKit, return
  *   total    user client: entry to return
  * An LX_IOCTL_ASYNC request (a wait) has no args or reply hops; its
- * "spawn" hop is the time from the request to its worker starting. */
+ * "spawn" hop is the time from the request to a worker taking it. */
 #ifndef LINUXU_RT_LX_TIMING_H
 #define LINUXU_RT_LX_TIMING_H
 

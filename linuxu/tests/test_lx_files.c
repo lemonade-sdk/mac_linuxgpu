@@ -565,6 +565,17 @@ int main(void)
 		}
 		CHECK(s->w[MLG_LX_MAX_ASYNC].first_signaled == 99);
 		CHECK(rt_lx_async_outstanding(a) == 0);
+		/* One worker per call that overlapped; they stay for later
+		 * calls, which start no more. */
+		CHECK(rt_lx_async_workers(a) == MLG_LX_MAX_ASYNC);
+		for (unsigned i = 0; i < 4 * MLG_LX_MAX_ASYNC; ++i) {
+			struct async_call one = { 0 };
+
+			CHECK(!start_async(a, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &s->w[0], &one));
+			wait_done(&one);
+			CHECK(one.result == 0);
+		}
+		CHECK(rt_lx_async_workers(a) == MLG_LX_MAX_ASYNC && rt_lx_async_outstanding(a) == 0);
 		free(calls);
 		free(s);
 		__atomic_store_n(&signaled, 0, __ATOMIC_SEQ_CST);
