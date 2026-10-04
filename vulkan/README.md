@@ -85,13 +85,14 @@ to two points of a timeline syncobj and exports the later one).
 pinned, declared in `patches/manifest.json` as an optional upstream (marked
 `update = none` in `.gitmodules`, so a plain recursive clone does not fetch
 it). The sparse set is what a RADV-only Meson build reads (about 60 MB).
-Three patches:
+Four patches:
 
 | Patch | Files | What |
 | --- | --- | --- |
 | `patches/mesa/radv-macos-build.patch` | `meson.build`, `src/amd/addrlib/meson.build`, `src/amd/common/meson.build`, `src/amd/vulkan/meson.build` | Find libdrm through pkg-config on Darwin when RADV is built; select addrlib's portable type definitions (`HAVE_TSERVER`) instead of the Apple kernel driver's private header; link RADV with `-undefined dynamic_lookup` as KosmicKrisp does (Mach-O cannot leave the entrypoint tables' weak layer symbols undefined). |
 | `patches/mesa/drm-file-ops.patch` | `src/util/os_drm.h`, `src/amd/vulkan/radv_device.c`, `src/amd/vulkan/radv_physical_device.c`, `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c` | `drm_ioctl` uses `drmIoctl` when libdrm defines `LIBDRM_FILE_OPS`; new `os_drm_open/stat/mmap/munmap` wrappers; RADV's six call sites use them. Without `LIBDRM_FILE_OPS` nothing changes. |
 | `patches/mesa/radv-apple-silicon-vram.patch` | `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c`, `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c` | On Apple silicon, report no CPU-visible VRAM and place every buffer that is not `NO_CPU_ACCESS` in GTT (see [VRAM and the CPU on Apple silicon](#vram-and-the-cpu-on-apple-silicon)). |
+| `patches/mesa/radv-macos-display-wsi.patch` | `src/amd/vulkan/radv_instance.c`, `src/amd/vulkan/radv_wsi.h`, `src/vulkan/wsi/meson.build`, `src/vulkan/wsi/wsi_common_metal.c`, `src/vulkan/wsi/wsi_common_metal_layer.h`, `src/vulkan/wsi/wsi_common_metal_layer.m` | `VK_EXT_metal_surface` and swapchains, presented by the GPU's own display engine (see [Presenting: the GPU's display engine](#presenting-the-gpus-display-engine)). |
 
 `scripts/verify-upstream.py` (`make verify-source`) checks the Mesa pin,
 sparse set and that the working tree is the pin plus exactly these patches,
@@ -153,9 +154,10 @@ share/vulkan/icd.d/radeon_icd.json
 ```
 
 The tree is relocatable (`@loader_path` rpath, ICD path relative to the
-JSON). Meson options: `-Dvulkan-drivers=amd -Dplatforms= -Dllvm=disabled`,
+JSON). Meson options: `-Dvulkan-drivers=amd -Dplatforms=macos -Dllvm=disabled`,
 no GL, no video, no zstd or SPIRV-Tools, so nothing from Homebrew is linked.
-Only headless WSI is built; there is no display or window-system surface yet.
+WSI: headless surfaces, and Metal surfaces that the GPU's display engine
+presents (below).
 
 To use it from any Vulkan program, point the loader at it alone (this also
 keeps MoltenVK out of the picture):
@@ -252,13 +254,39 @@ and mapping, every descriptor's lifetime), `RADV_DEBUG=info,startup`,
 `MESA_VK_ABORT_ON_ERROR=1` for a backtrace at the first error, and the
 driver log. Do not kill the driver process (README, "Known limitations").
 
+## Presenting: the GPU's display engine
+
+RADV presents `VK_EXT_metal_surface` surfaces (what SDL, GLFW and MoltenVK
+users create) with the GPU's own display engine, on the monitor the
+driver's display output drives (docs/macos-displays.md, section 4). The
+swapchain's images stay in VRAM and become framebuffers of the GPU's
+primary node; each present goes into the output's next commit, so no
+frame crosses Thunderbolt and neither the Apple GPU nor WindowServer sees
+it.
+
+- `MLG_WSI_OUTPUT=<connector>` (`DP-1`, or `auto` for whatever the output
+  drives) turns it on. Without it the surface reports no presentation
+  support: nothing is presented any other way.
+- Where the frame goes: on the primary plane, in place of the mirrored
+  desktop, when the layer's window fills its screen or is not on the
+  monitor's screen; on an overlay plane at the window's rectangle when it
+  is a window on that screen. `MLG_WSI_MODE=fullscreen` or `windowed`
+  decides instead of the window. At swapchain creation the window is moved
+  to the monitor's screen (the macOS display whose identity is the
+  monitor's EDID, `drmMlgConnectorDisplay`).
+- FIFO only: every frame is shown, one per vblank; the next present waits
+  for the previous frame to reach the screen.
+- Failures print `mlg-wsi:` and the step and errno on stderr, and lose the
+  surface.
+- `make test-radv-scanout` runs it offline on the fixture's display
+  output.
+
 ## Remaining gaps
 
-- **WSI and display.** Only headless WSI. Presenting needs a macOS surface:
-  either RADV's Metal-layer WSI (Mesa builds `wsi_common_metal` for
-  KosmicKrisp) blitting from a linear image, or dma-buf/IOSurface sharing.
-  There is no display engine in the dext (compute only), so this is the
-  next step for Quake3e.
+- **Presenting elsewhere.** Only the display engine path: a window on
+  another display is not composited by macOS with the GPU's frames (the
+  frames go full screen on the monitor instead), and VK_KHR_display and
+  leases are not built.
 - **sync_file poll.** A sync_file descriptor is a socket that never becomes
   readable: `poll` on it times out instead of reporting the fence. Mesa's
   own waits use `sync_wait` (implemented through syncobjs) and syncobj

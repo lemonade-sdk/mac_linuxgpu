@@ -17,6 +17,8 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_device.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_mode_config.h>
+#include <drm/drm_plane.h>
+#include <drm/drm_framebuffer.h>
 #include <rt/display.h>
 #include <rt/lx_files.h>
 #include <rt/surface.h>
@@ -133,6 +135,55 @@ unsigned int scanout_fx_pipes_showing(uint32_t value)
 			mask |= 1u << i;
 	}
 	return mask;
+}
+
+/* The CRTC that drives HDMI-A-1. */
+static struct drm_crtc *output_crtc(void)
+{
+	struct drm_connector_list_iter iter;
+	struct drm_connector *connector;
+	struct drm_crtc *crtc = NULL;
+
+	drm_connector_list_iter_begin(adev_to_drm(adev), &iter);
+	drm_for_each_connector_iter(connector, &iter)
+		if (!strcmp(connector->name, "HDMI-A-1") && connector->state)
+			crtc = connector->state->crtc;
+	drm_connector_list_iter_end(&iter);
+	return crtc;
+}
+
+int scanout_fx_primary_fb(uint32_t *width, uint32_t *height, uint64_t *modifier)
+{
+	struct drm_crtc *crtc = output_crtc();
+	const struct drm_plane_state *ps = crtc ? crtc->primary->state : NULL;
+
+	if (!ps || !ps->fb)
+		return 0;
+	*width = ps->fb->width;
+	*height = ps->fb->height;
+	*modifier = ps->fb->modifier;
+	return 1;
+}
+
+int scanout_fx_overlay(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h)
+{
+	struct drm_crtc *crtc = output_crtc();
+	struct drm_plane *plane;
+
+	if (!crtc)
+		return 0;
+	drm_for_each_plane(plane, adev_to_drm(adev)) {
+		const struct drm_plane_state *ps = plane->state;
+
+		if (plane->type != DRM_PLANE_TYPE_OVERLAY || !ps || ps->crtc != crtc || !ps->fb)
+			continue;
+		*x = ps->crtc_x;
+		*y = ps->crtc_y;
+		*w = ps->crtc_w;
+		*h = ps->crtc_h;
+		return 1;
+	}
+	return 0;
 }
 
 int scanout_fx_has_master(void)

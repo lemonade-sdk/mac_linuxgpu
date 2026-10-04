@@ -27,6 +27,12 @@ void scanout_fx_hold_vblank(int hold);
 uint32_t scanout_fx_pipe_pixel(unsigned int pipe, uint64_t offset);
 /* A bit per enabled pipe whose surface starts with @value. */
 unsigned int scanout_fx_pipes_showing(uint32_t value);
+/* The framebuffer on the output CRTC's primary plane: 1 with its size and
+ * modifier, 0 when there is none. */
+int scanout_fx_primary_fb(uint32_t *width, uint32_t *height, uint64_t *modifier);
+/* An overlay plane on the output's CRTC: 1 with its rectangle, 0 when
+ * none is. */
+int scanout_fx_overlay(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h);
 /* Whether the DRM device has a master. */
 int scanout_fx_has_master(void);
 /* A whole desktop frame of @value, presented as a display agent does. */

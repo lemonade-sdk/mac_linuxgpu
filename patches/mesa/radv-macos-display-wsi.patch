@@ -1,0 +1,1390 @@
+radv: present Metal surfaces through the GPU's display engine on mac_linuxgpu
+
+On mac_linuxgpu the GPU drives its own monitor: the driver runs a display
+output that mirrors the macOS desktop to it and is the only one that
+commits to it, and its libdrm (libdrm-mlg) lets a client put framebuffers
+of the GPU's primary node on that output's planes (drmMlgScanout). RADV's
+images then go straight to scanout, with no copy and without the Apple
+GPU or the macOS compositor, whatever window the application presents
+from.
+
+- RADV advertises VK_EXT_metal_surface, and the surface and swapchain
+  extensions, on the macOS platform.
+- wsi_common_metal.c: a driver that is neither software nor Metal (RADV)
+  presents its Metal surfaces through the display engine when libdrm
+  defines LIBDRM_MLG_SCANOUT. Other drivers are unchanged.
+- That presentation (the end of wsi_common_metal.c): MLG_WSI_OUTPUT names the output's connector (or
+  "auto"); without it the surface reports no presentation support. The
+  swapchain attaches to the output, makes its images framebuffers of the
+  primary node with modifiers both of the output's planes scan out, and
+  checks the first one with the driver. Each present goes on the primary
+  plane when the window fills its screen or is not on the monitor's
+  screen, else on an overlay plane at the window's rectangle
+  (MLG_WSI_MODE=fullscreen or windowed decides instead). FIFO: every frame
+  is shown, the next one handed over once the previous reached the screen;
+  a per-image syncobj signals at the vblank that shows it, which acquire
+  and VK_KHR_present_wait wait on. The last swapchain of the process gives
+  the screen back to the desktop. Failures name the step and the errno on
+  stderr and lose the surface.
+- wsi_common_metal_layer.m: the layer's window and screen, read on the
+  main thread; the window is moved to the monitor's screen at swapchain
+  creation.
+- meson: the frameworks the Metal WSI uses (AppKit now too) linked into
+  whatever links the WSI.
+
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index e6407ac..6e2dd01 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -248,6 +248,9 @@ static const struct vk_instance_extension_table radv_instance_extensions_support
+ #ifndef VK_USE_PLATFORM_WIN32_KHR
+    .EXT_headless_surface = true,
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++   .EXT_metal_surface = true,
++#endif
+ };
+ 
+ static enum radeon_ctx_pstate
+diff --git a/src/amd/vulkan/radv_wsi.h b/src/amd/vulkan/radv_wsi.h
+index 2ab3107..a1eab08 100644
+--- a/src/amd/vulkan/radv_wsi.h
++++ b/src/amd/vulkan/radv_wsi.h
+@@ -14,7 +14,7 @@
+ #include "radv_physical_device.h"
+ 
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||   \
+-   defined(VK_USE_PLATFORM_DISPLAY_KHR)
++   defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(VK_USE_PLATFORM_METAL_EXT)
+ #define RADV_USE_WSI_PLATFORM
+ #endif
+ 
+diff --git a/src/vulkan/wsi/meson.build b/src/vulkan/wsi/meson.build
+index 80925d1..df9f1f2 100644
+--- a/src/vulkan/wsi/meson.build
++++ b/src/vulkan/wsi/meson.build
+@@ -36,6 +36,10 @@ endif
+ 
+ if with_platform_macos
+   files_vulkan_wsi += files('wsi_common_metal.c', 'wsi_common_metal_layer.m')
++  # The frameworks those use (AppKit for a layer's window), for whatever
++  # links the WSI in.
++  platform_deps += dependency('appleframeworks',
++                              modules : ['QuartzCore', 'Metal', 'AppKit', 'CoreGraphics'])
+ endif
+ 
+ if system_has_kms_drm and not with_platform_android
+@@ -88,7 +92,7 @@ else
+     # our weak function overloads may not resolve properly.
+     link_whole : libvulkan_wsi,
+     dependencies : [
+-      idep_vulkan_wsi_headers, dep_libudev
++      idep_vulkan_wsi_headers, dep_libudev, platform_deps
+     ]
+   )
+ endif
+diff --git a/src/vulkan/wsi/wsi_common_metal.c b/src/vulkan/wsi/wsi_common_metal.c
+index 4fae988..78536bf 100644
+--- a/src/vulkan/wsi/wsi_common_metal.c
++++ b/src/vulkan/wsi/wsi_common_metal.c
+@@ -15,6 +15,43 @@
+ #include "wsi_common_private.h"
+ #include "wsi_common_metal_layer.h"
+ 
++#ifdef HAVE_LIBDRM
++#include <xf86drm.h>
++#endif
++#ifdef LIBDRM_MLG_SCANOUT
++/* A DRM driver on mac_linuxgpu presents through the GPU's display engine
++ * (the end of this file); Metal drivers and software drivers present here. */
++static bool wsi_mlg_device(const struct wsi_device *wsi_device);
++static VkResult wsi_mlg_surface_get_support(VkIcdSurfaceBase *surface,
++                                            struct wsi_device *wsi_device,
++                                            uint32_t queueFamilyIndex, VkBool32 *pSupported);
++static VkResult wsi_mlg_surface_get_capabilities(VkIcdSurfaceBase *surface,
++                                                 struct wsi_device *wsi_device,
++                                                 VkSurfaceCapabilities2KHR *caps);
++static VkResult wsi_mlg_surface_get_formats(VkIcdSurfaceBase *surface,
++                                            struct wsi_device *wsi_device,
++                                            uint32_t *pSurfaceFormatCount,
++                                            VkSurfaceFormatKHR *pSurfaceFormats);
++static VkResult wsi_mlg_surface_get_formats2(VkIcdSurfaceBase *surface,
++                                             struct wsi_device *wsi_device,
++                                             const void *info_next,
++                                             uint32_t *pSurfaceFormatCount,
++                                             VkSurfaceFormat2KHR *pSurfaceFormats);
++static VkResult wsi_mlg_surface_get_present_modes(VkIcdSurfaceBase *surface,
++                                                  struct wsi_device *wsi_device,
++                                                  uint32_t *pPresentModeCount,
++                                                  VkPresentModeKHR *pPresentModes);
++static VkResult wsi_mlg_surface_create_swapchain(VkIcdSurfaceBase *surface, VkDevice device,
++                                                 struct wsi_device *wsi_device,
++                                                 const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                                 const VkAllocationCallbacks *pAllocator,
++                                                 struct wsi_swapchain **swapchain_out);
++#define MLG_ROUTE(wsi_device, call) \
++   do { if (wsi_mlg_device(wsi_device)) return call; } while (0)
++#else
++#define MLG_ROUTE(wsi_device, call) do { } while (0)
++#endif
++
+ #include "vulkan/vulkan_core.h"
+ 
+ #include <assert.h>
+@@ -34,6 +71,8 @@ wsi_metal_surface_get_support(VkIcdSurfaceBase *surface,
+                                  uint32_t queueFamilyIndex,
+                                  VkBool32* pSupported)
+ {
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_get_support(surface, wsi_device, queueFamilyIndex,
++                                                     pSupported));
+    *pSupported = true;
+    return VK_SUCCESS;
+ }
+@@ -48,6 +87,7 @@ wsi_metal_surface_get_capabilities(VkIcdSurfaceBase *surface,
+                                  struct wsi_device *wsi_device,
+                                  VkSurfaceCapabilities2KHR* caps)
+ {
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_get_capabilities(surface, wsi_device, caps));
+    VkIcdSurfaceMetal *metal_surface = (VkIcdSurfaceMetal *)surface;
+    assert(metal_surface->pLayer);
+ 
+@@ -216,6 +256,8 @@ wsi_metal_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+                                  uint32_t* pSurfaceFormatCount,
+                                  VkSurfaceFormatKHR* pSurfaceFormats)
+ {
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_get_formats(icd_surface, wsi_device, pSurfaceFormatCount,
++                                                     pSurfaceFormats));
+    VK_FROM_HANDLE(vk_physical_device, pdev, wsi_device->pdevice);
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
+@@ -245,6 +287,8 @@ wsi_metal_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
+                                   uint32_t* pSurfaceFormatCount,
+                                   VkSurfaceFormat2KHR* pSurfaceFormats)
+ {
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_get_formats2(icd_surface, wsi_device, info_next,
++                                                      pSurfaceFormatCount, pSurfaceFormats));
+    VK_FROM_HANDLE(vk_physical_device, pdev, wsi_device->pdevice);
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
+@@ -274,6 +318,8 @@ wsi_metal_surface_get_present_modes(VkIcdSurfaceBase *surface,
+                                        uint32_t* pPresentModeCount,
+                                        VkPresentModeKHR* pPresentModes)
+ {
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_get_present_modes(surface, wsi_device, pPresentModeCount,
++                                                           pPresentModes));
+    if (pPresentModes == NULL) {
+       *pPresentModeCount = ARRAY_SIZE(present_modes);
+       return VK_SUCCESS;
+@@ -697,6 +743,9 @@ wsi_metal_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ {
+    VkIcdSurfaceMetal *metal_surface = (VkIcdSurfaceMetal *)icd_surface;
+    assert(metal_surface->pLayer);
++   MLG_ROUTE(wsi_device, wsi_mlg_surface_create_swapchain(icd_surface, device, wsi_device,
++                                                          pCreateInfo, pAllocator,
++                                                          swapchain_out));
+ 
+    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+ 
+@@ -929,3 +978,923 @@ wsi_metal_configure_image(const struct wsi_swapchain *chain,
+ 
+    return VK_SUCCESS;
+ }
++
++/* ---- mac_linuxgpu ---- */
++
++/* Metal surfaces of a DRM driver on mac_linuxgpu, presented by the GPU's
++ * own display engine (wsi_common_mlg.h).
++ *
++ * The driver mirrors the macOS desktop to a monitor on the GPU (its display
++ * output) and is the only one that commits to it. A swapchain here attaches
++ * to that output (MLG_WSI_OUTPUT names its connector, or "auto") and hands
++ * it each presented image, a framebuffer of the GPU's primary node, through
++ * drmMlgScanout:
++ *
++ *  - the primary plane, in place of the desktop, when the layer's window
++ *    fills its screen, or when the window is not on the monitor's screen
++ *    (the monitor then shows the game whatever macOS does with the window);
++ *  - an overlay plane over the desktop at the window's rectangle when the
++ *    window is a window on the monitor's screen.
++ *
++ * MLG_WSI_MODE=fullscreen or windowed chooses instead of the window. No
++ * pixel is copied: the images are tiled, compressed where the display
++ * engine reads compression, and stay in the GPU's memory. The rendering
++ * waits are the images' implicit fences, which the driver's commit waits
++ * for; each present's syncobj signals at the vblank that shows it.
++ *
++ * Presenting without MLG_WSI_OUTPUT is not supported: the surface reports
++ * no presentation support and creating a swapchain fails. Every failure is
++ * reported on stderr with the step that failed and the driver's errno, and
++ * nothing is presented any other way. */
++#ifdef LIBDRM_MLG_SCANOUT
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <xf86drmMode.h>
++
++#include "drm-uapi/drm_fourcc.h"
++#include "util/macros.h"
++#include "util/simple_mtx.h"
++#include "util/u_atomic.h"
++#include "c11/threads.h"
++
++#define MLG_FLIP_TIMEOUT_MS 2000
++
++static void
++mlg_error(const char *fmt, ...) PRINTFLIKE(1, 2);
++
++static void
++mlg_error(const char *fmt, ...)
++{
++   va_list ap;
++
++   va_start(ap, fmt);
++   fputs("mlg-wsi: ", stderr);
++   vfprintf(stderr, fmt, ap);
++   fputc('\n', stderr);
++   va_end(ap);
++}
++
++static const char *
++mlg_output_env(void)
++{
++   const char *output = getenv("MLG_WSI_OUTPUT");
++
++   return output && output[0] ? output : NULL;
++}
++
++static bool
++wsi_mlg_device(const struct wsi_device *wsi_device)
++{
++   return !wsi_device->sw && !wsi_device->metal.bind_drawable_to_vkimage;
++}
++
++/* ---- the attachment, one per process ---- */
++
++static simple_mtx_t attach_lock = SIMPLE_MTX_INITIALIZER;
++static unsigned attach_count;
++
++static int64_t
++deadline_ns(uint64_t from_now_ns)
++{
++   struct timespec ts;
++
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   uint64_t now = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec;
++   return from_now_ns > (uint64_t)INT64_MAX - now ? INT64_MAX : (int64_t)(now + from_now_ns);
++}
++
++static struct mlg_lx_scanout
++mlg_request(uint32_t op)
++{
++   return (struct mlg_lx_scanout){ .version = MLG_LX_SCANOUT_VERSION, .op = op };
++}
++
++/* ---- surface queries ---- */
++
++static VkResult
++wsi_mlg_surface_get_support(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
++                            uint32_t queueFamilyIndex, VkBool32 *pSupported)
++{
++   static int warned;
++
++   *pSupported = mlg_output_env() != NULL;
++   if (!*pSupported && !p_atomic_xchg(&warned, 1))
++      mlg_error("presenting needs MLG_WSI_OUTPUT: the connector of the GPU's display output "
++                "(\"DP-1\"), or \"auto\" (see mlg-run)");
++   return VK_SUCCESS;
++}
++
++static const VkFormat mlg_formats[] = {
++   VK_FORMAT_B8G8R8A8_UNORM,
++   VK_FORMAT_B8G8R8A8_SRGB,
++};
++
++static VkResult
++wsi_mlg_surface_get_capabilities(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
++                                 VkSurfaceCapabilities2KHR *caps)
++{
++   VkIcdSurfaceMetal *metal_surface = (VkIcdSurfaceMetal *)surface;
++   VkSurfaceCapabilitiesKHR *c = &caps->surfaceCapabilities;
++
++   wsi_metal_layer_size(metal_surface->pLayer, &c->currentExtent.width,
++                        &c->currentExtent.height);
++   if (!c->currentExtent.width || !c->currentExtent.height)
++      c->currentExtent.width = c->currentExtent.height = UINT32_MAX;
++   /* One on screen, one waiting for its vblank, one being drawn. */
++   c->minImageCount = 3;
++   c->maxImageCount = 8;
++   c->minImageExtent = (VkExtent2D){ 1, 1 };
++   c->maxImageExtent = (VkExtent2D){ wsi_device->maxImageDimension2D,
++                                     wsi_device->maxImageDimension2D };
++   c->supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++   c->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
++   c->maxImageArrayLayers = 1;
++   c->supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
++
++   VkImageUsageFlags usage = wsi_caps_get_image_usage();
++   VkImageUsageFlags2CreateInfoKHR *usage2 =
++      vk_find_struct(caps->pNext, IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR);
++   if (usage2)
++      usage2->usage = usage;
++   else
++      c->supportedUsageFlags = usage;
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_mlg_surface_get_formats(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
++                            uint32_t *pSurfaceFormatCount, VkSurfaceFormatKHR *pSurfaceFormats)
++{
++   VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
++
++   for (unsigned i = 0; i < ARRAY_SIZE(mlg_formats); i++) {
++      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, f) {
++         f->format = mlg_formats[i];
++         f->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++   }
++   return vk_outarray_status(&out);
++}
++
++static VkResult
++wsi_mlg_surface_get_formats2(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
++                             const void *info_next, uint32_t *pSurfaceFormatCount,
++                             VkSurfaceFormat2KHR *pSurfaceFormats)
++{
++   VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out, pSurfaceFormats, pSurfaceFormatCount);
++
++   for (unsigned i = 0; i < ARRAY_SIZE(mlg_formats); i++) {
++      vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, f) {
++         f->surfaceFormat.format = mlg_formats[i];
++         f->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++   }
++   return vk_outarray_status(&out);
++}
++
++static VkResult
++wsi_mlg_surface_get_present_modes(VkIcdSurfaceBase *surface, struct wsi_device *wsi_device,
++                                  uint32_t *pPresentModeCount, VkPresentModeKHR *pPresentModes)
++{
++   /* Every frame is shown, one per vblank. */
++   if (!pPresentModes) {
++      *pPresentModeCount = 1;
++      return VK_SUCCESS;
++   }
++   if (*pPresentModeCount < 1)
++      return VK_INCOMPLETE;
++   pPresentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
++   *pPresentModeCount = 1;
++   return VK_SUCCESS;
++}
++
++/* ---- the swapchain ---- */
++
++enum mlg_image_state {
++   MLG_IMAGE_IDLE,
++   MLG_IMAGE_DRAWING,
++   MLG_IMAGE_QUEUED,   /* handed to the output, its vblank not seen yet */
++   MLG_IMAGE_SHOWN,    /* on screen */
++};
++
++struct wsi_mlg_image {
++   struct wsi_image base;
++   uint32_t handle;    /* the buffer in the primary file */
++   uint32_t fb_id;
++   uint32_t syncobj;   /* signals at the vblank that shows the image */
++   enum mlg_image_state state;
++   uint64_t serial;    /* order of presents */
++   uint64_t present_id;
++};
++
++enum mlg_mode {
++   MLG_MODE_AUTO,
++   MLG_MODE_FULLSCREEN,
++   MLG_MODE_WINDOWED,
++};
++
++struct wsi_mlg_swapchain {
++   struct wsi_swapchain base;
++   VkIcdSurfaceMetal *surface;
++   VkExtent2D extent;
++   int card;                           /* the primary node */
++   struct mlg_lx_scanout_state output; /* at attach */
++   uint32_t display_id;                /* the macOS display of the monitor, 0: none */
++   enum mlg_mode mode;
++   struct wsi_mlg_window_cache *window;
++   mtx_t lock;
++   VkResult status;
++   uint64_t serial;
++   uint64_t shown_present_id;          /* the newest present id on screen */
++   /* What the last present did, to report changes. */
++   uint32_t last_layer;
++   int32_t last_x, last_y;
++   uint32_t last_w, last_h;
++   bool warned_away;
++   struct wsi_mlg_image images[0];
++};
++VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_mlg_swapchain, base.base, VkSwapchainKHR,
++                               VK_OBJECT_TYPE_SWAPCHAIN_KHR)
++
++static const char *
++layer_name(uint32_t layer)
++{
++   return layer == MLG_LX_LAYER_PRIMARY ? "the primary plane" : "an overlay plane";
++}
++
++/* The primary node of the GPU this device is. */
++static int
++mlg_open_primary(const struct wsi_device *wsi_device)
++{
++   drmDevicePtr devices[8];
++   int count = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
++   int fd = -1;
++
++   for (int i = 0; i < count; i++) {
++      drmDevicePtr d = devices[i];
++      const VkPhysicalDevicePCIBusInfoPropertiesEXT *bus = &wsi_device->pci_bus_info;
++
++      if (fd >= 0 || d->bustype != DRM_BUS_PCI || !(d->available_nodes & (1 << DRM_NODE_PRIMARY)))
++         continue;
++      if (d->businfo.pci->domain != bus->pciDomain || d->businfo.pci->bus != bus->pciBus ||
++          d->businfo.pci->dev != bus->pciDevice || d->businfo.pci->func != bus->pciFunction)
++         continue;
++      fd = drmFileOpen(d->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
++      if (fd < 0)
++         mlg_error("opening %s failed: %s", d->nodes[DRM_NODE_PRIMARY], strerror(errno));
++   }
++   if (count > 0)
++      drmFreeDevices(devices, count);
++   if (fd < 0 && count >= 0)
++      mlg_error("no primary node for the GPU at %04x:%02x:%02x.%x",
++                wsi_device->pci_bus_info.pciDomain, wsi_device->pci_bus_info.pciBus,
++                wsi_device->pci_bus_info.pciDevice, wsi_device->pci_bus_info.pciFunction);
++   return fd;
++}
++
++/* The XRGB8888 modifiers of plane @plane_id's IN_FORMATS, appended to @mods
++ * (an array of @cap), or only those already in it when @intersect. */
++static uint32_t
++mlg_plane_modifiers(int card, uint32_t plane_id, uint64_t *mods, uint32_t count, uint32_t cap,
++                    bool intersect)
++{
++   drmModeObjectPropertiesPtr props = drmModeObjectGetProperties(card, plane_id,
++                                                                 DRM_MODE_OBJECT_PLANE);
++   uint64_t blob_id = 0;
++
++   if (!props)
++      return intersect ? 0 : count;
++   for (uint32_t i = 0; i < props->count_props && !blob_id; i++) {
++      drmModePropertyPtr p = drmModeGetProperty(card, props->props[i]);
++      if (p && !strcmp(p->name, "IN_FORMATS"))
++         blob_id = props->prop_values[i];
++      drmModeFreeProperty(p);
++   }
++   drmModeFreeObjectProperties(props);
++   drmModePropertyBlobPtr blob = blob_id ? drmModeGetPropertyBlob(card, (uint32_t)blob_id) : NULL;
++   if (!blob)
++      return intersect ? 0 : count;
++
++   uint64_t found[64];
++   uint32_t nfound = 0;
++   drmModeFormatModifierIterator it = { 0 };
++   while (drmModeFormatModifierBlobIterNext(blob, &it))
++      if (it.fmt == DRM_FORMAT_XRGB8888 && nfound < ARRAY_SIZE(found))
++         found[nfound++] = it.mod;
++   drmModeFreePropertyBlob(blob);
++
++   if (!intersect) {
++      for (uint32_t i = 0; i < nfound && count < cap; i++)
++         mods[count++] = found[i];
++      return count;
++   }
++   uint32_t kept = 0;
++   for (uint32_t i = 0; i < count; i++)
++      for (uint32_t j = 0; j < nfound; j++)
++         if (mods[i] == found[j]) {
++            mods[kept++] = mods[i];
++            break;
++         }
++   return kept;
++}
++
++/* Where the next present goes: the layer and the destination on the CRTC. */
++static void
++mlg_placement(struct wsi_mlg_swapchain *chain, uint32_t *layer, int32_t *x, int32_t *y,
++              uint32_t *w, uint32_t *h)
++{
++   struct wsi_mlg_window win;
++   const uint32_t mw = chain->output.width, mh = chain->output.height;
++
++   wsi_mlg_window_get(chain->window, &win);
++   const bool on_monitor = win.has_window && chain->display_id &&
++                           win.display_id == chain->display_id;
++
++   if (chain->mode == MLG_MODE_FULLSCREEN ||
++       (chain->mode == MLG_MODE_AUTO && (!on_monitor || win.fullscreen))) {
++      if (chain->mode == MLG_MODE_AUTO && !on_monitor && win.has_window && chain->display_id &&
++          !chain->warned_away) {
++         mlg_error("the window left %s's screen; the frames stay full screen on %s",
++                   chain->output.connector, chain->output.connector);
++         chain->warned_away = true;
++      }
++      *layer = MLG_LX_LAYER_PRIMARY;
++      *x = *y = 0;
++      *w = mw;
++      *h = mh;
++      return;
++   }
++   *layer = MLG_LX_LAYER_OVERLAY;
++   if (on_monitor && win.screen_width && win.screen_height) {
++      /* Screen pixels to CRTC pixels (the same with the virtual display's
++       * mode at 1x). */
++      *x = (int32_t)((int64_t)win.x * mw / win.screen_width);
++      *y = (int32_t)((int64_t)win.y * mh / win.screen_height);
++      *w = (uint32_t)((uint64_t)win.width * mw / win.screen_width);
++      *h = (uint32_t)((uint64_t)win.height * mh / win.screen_height);
++   } else {
++      /* A window elsewhere, or none: the image's size, centred. */
++      *w = MIN2(chain->extent.width, mw);
++      *h = MIN2(chain->extent.height, mh);
++      *x = (int32_t)(mw - *w) / 2;
++      *y = (int32_t)(mh - *h) / 2;
++   }
++   if (!*w || !*h) {
++      *w = MIN2(chain->extent.width, mw);
++      *h = MIN2(chain->extent.height, mh);
++   }
++}
++
++static int
++mlg_scanout_image(struct wsi_mlg_swapchain *chain, uint32_t op, struct wsi_mlg_image *image,
++                  uint32_t layer, int32_t x, int32_t y, uint32_t w, uint32_t h,
++                  struct mlg_lx_scanout_state *st)
++{
++   struct mlg_lx_scanout req = mlg_request(op);
++
++   req.fd = chain->card;
++   req.layer = layer;
++   req.fb_id = image->fb_id;
++   req.syncobj = image->syncobj;
++   req.src_w = chain->extent.width;
++   req.src_h = chain->extent.height;
++   req.dst_x = x;
++   req.dst_y = y;
++   req.dst_w = w;
++   req.dst_h = h;
++   return drmMlgScanout(&req, st);
++}
++
++static VkResult
++mlg_surface_lost(struct wsi_mlg_swapchain *chain)
++{
++   chain->status = VK_ERROR_SURFACE_LOST_KHR;
++   return chain->status;
++}
++
++/* Wait (until @deadline, absolute CLOCK_MONOTONIC) for @image's vblank.
++ * 0, -ETIME, or another -errno. */
++static int
++mlg_wait_flip(struct wsi_mlg_swapchain *chain, struct wsi_mlg_image *image, int64_t deadline)
++{
++   uint32_t sync = image->syncobj;
++   int r = drmSyncobjWait(chain->card, &sync, 1, deadline,
++                          DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL);
++   return r ? (r < 0 ? r : -errno) : 0;
++}
++
++/* @image reached the screen: the one before it leaves it. */
++static void
++mlg_shown(struct wsi_mlg_swapchain *chain, struct wsi_mlg_image *image)
++{
++   for (uint32_t i = 0; i < chain->base.image_count; i++) {
++      struct wsi_mlg_image *other = &chain->images[i];
++      if (other != image && other->state == MLG_IMAGE_SHOWN && other->serial < image->serial)
++         other->state = MLG_IMAGE_IDLE;
++   }
++   image->state = MLG_IMAGE_SHOWN;
++   if (image->present_id > chain->shown_present_id)
++      chain->shown_present_id = image->present_id;
++}
++
++static struct wsi_mlg_image *
++mlg_oldest_queued(struct wsi_mlg_swapchain *chain)
++{
++   struct wsi_mlg_image *oldest = NULL;
++
++   for (uint32_t i = 0; i < chain->base.image_count; i++) {
++      struct wsi_mlg_image *image = &chain->images[i];
++      if (image->state == MLG_IMAGE_QUEUED && (!oldest || image->serial < oldest->serial))
++         oldest = image;
++   }
++   return oldest;
++}
++
++/* Account every queued image whose vblank passed, oldest first. */
++static VkResult
++mlg_poll_flips(struct wsi_mlg_swapchain *chain)
++{
++   struct wsi_mlg_image *image;
++
++   while ((image = mlg_oldest_queued(chain))) {
++      int r = mlg_wait_flip(chain, image, 0);
++      if (r == -ETIME)
++         return VK_SUCCESS;
++      if (r) {
++         mlg_error("waiting for a frame's vblank on %s failed: %s", chain->output.connector,
++                   strerror(-r));
++         return mlg_surface_lost(chain);
++      }
++      mlg_shown(chain, image);
++   }
++   return VK_SUCCESS;
++}
++
++/* Wait for the oldest queued image's vblank until @deadline. */
++static VkResult
++mlg_wait_oldest(struct wsi_mlg_swapchain *chain, int64_t deadline, bool *timed_out)
++{
++   struct wsi_mlg_image *image = mlg_oldest_queued(chain);
++
++   *timed_out = false;
++   if (!image)
++      return VK_SUCCESS;
++   int r = mlg_wait_flip(chain, image, deadline);
++   if (r == -ETIME) {
++      *timed_out = true;
++      return VK_SUCCESS;
++   }
++   if (r) {
++      mlg_error("waiting for a frame's vblank on %s failed: %s", chain->output.connector,
++                strerror(-r));
++      return mlg_surface_lost(chain);
++   }
++   mlg_shown(chain, image);
++   return VK_SUCCESS;
++}
++
++static struct wsi_image *
++wsi_mlg_get_wsi_image(struct wsi_swapchain *wsi_chain, uint32_t image_index)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++   return &chain->images[image_index].base;
++}
++
++static VkResult
++wsi_mlg_acquire_next_image(struct wsi_swapchain *wsi_chain, const VkAcquireNextImageInfoKHR *info,
++                           uint32_t *image_index)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++   const int64_t deadline = info->timeout == UINT64_MAX ? INT64_MAX : deadline_ns(info->timeout);
++   VkResult result;
++
++   mtx_lock(&chain->lock);
++   for (;;) {
++      result = chain->status;
++      if (result == VK_SUCCESS)
++         result = mlg_poll_flips(chain);
++      if (result != VK_SUCCESS)
++         break;
++      for (uint32_t i = 0; i < chain->base.image_count; i++) {
++         if (chain->images[i].state == MLG_IMAGE_IDLE) {
++            chain->images[i].state = MLG_IMAGE_DRAWING;
++            *image_index = i;
++            mtx_unlock(&chain->lock);
++            return VK_SUCCESS;
++         }
++      }
++      bool timed_out;
++      if (!mlg_oldest_queued(chain)) {
++         /* Every image is drawn or on screen: none frees up by itself. */
++         result = info->timeout ? VK_TIMEOUT : VK_NOT_READY;
++         break;
++      }
++      result = mlg_wait_oldest(chain, deadline, &timed_out);
++      if (result != VK_SUCCESS)
++         break;
++      if (timed_out) {
++         result = info->timeout ? VK_TIMEOUT : VK_NOT_READY;
++         break;
++      }
++   }
++   mtx_unlock(&chain->lock);
++   return result;
++}
++
++static VkResult
++wsi_mlg_release_images(struct wsi_swapchain *wsi_chain, uint32_t count, const uint32_t *indices)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++
++   mtx_lock(&chain->lock);
++   for (uint32_t i = 0; i < count; i++) {
++      assert(indices[i] < chain->base.image_count);
++      chain->images[indices[i]].state = MLG_IMAGE_IDLE;
++   }
++   mtx_unlock(&chain->lock);
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_mlg_queue_present(struct wsi_swapchain *wsi_chain, uint32_t image_index, uint64_t present_id,
++                      const VkPresentRegionKHR *damage)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++   struct wsi_mlg_image *image = &chain->images[image_index];
++   struct mlg_lx_scanout_state st;
++   uint32_t layer, w, h;
++   int32_t x, y;
++   VkResult result;
++   int r;
++
++   mtx_lock(&chain->lock);
++   result = chain->status;
++   if (result != VK_SUCCESS)
++      goto out;
++   /* The output takes one frame ahead of the one waiting for its vblank:
++    * the frame before this one goes to the screen first (every frame is
++    * shown, at most one per vblank). */
++   while (mlg_oldest_queued(chain)) {
++      bool timed_out;
++      result = mlg_wait_oldest(chain, deadline_ns(MLG_FLIP_TIMEOUT_MS * 1000000ull), &timed_out);
++      if (result != VK_SUCCESS)
++         goto out;
++      if (timed_out) {
++         mlg_error("a frame on %s did not reach the screen in %u ms", chain->output.connector,
++                   MLG_FLIP_TIMEOUT_MS);
++         result = mlg_surface_lost(chain);
++         goto out;
++      }
++   }
++
++   mlg_placement(chain, &layer, &x, &y, &w, &h);
++   r = mlg_scanout_image(chain, MLG_LX_SCANOUT_PRESENT, image, layer, x, y, w, h, &st);
++   if (r) {
++      mlg_error("present on %s (%s, %dx%d at %d,%d) failed: %s%s%s", chain->output.connector,
++                layer_name(layer), w, h, x, y, strerror(-r),
++                st.error ? "; the display output stopped with " : "",
++                st.error ? strerror(-st.error) : "");
++      result = mlg_surface_lost(chain);
++      goto out;
++   }
++   if (layer != chain->last_layer || x != chain->last_x || y != chain->last_y ||
++       w != chain->last_w || h != chain->last_h) {
++      if (layer != chain->last_layer || getenv("MLG_WSI_DEBUG"))
++         fprintf(stderr, "mlg-wsi: %s: %ux%u frames on %s at %d,%d %ux%u\n",
++                 chain->output.connector, chain->extent.width, chain->extent.height,
++                 layer_name(layer), x, y, w, h);
++      chain->last_layer = layer;
++      chain->last_x = x;
++      chain->last_y = y;
++      chain->last_w = w;
++      chain->last_h = h;
++   }
++   image->state = MLG_IMAGE_QUEUED;
++   image->serial = ++chain->serial;
++   image->present_id = present_id;
++out:
++   mtx_unlock(&chain->lock);
++   return result;
++}
++
++static VkResult
++wsi_mlg_wait_for_present(struct wsi_swapchain *wsi_chain, uint64_t present_id, uint64_t timeout)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++   const int64_t deadline = timeout == UINT64_MAX ? INT64_MAX : deadline_ns(timeout);
++   VkResult result;
++
++   mtx_lock(&chain->lock);
++   for (;;) {
++      result = chain->status;
++      if (result == VK_SUCCESS)
++         result = mlg_poll_flips(chain);
++      if (result != VK_SUCCESS || chain->shown_present_id >= present_id)
++         break;
++      bool timed_out;
++      if (!mlg_oldest_queued(chain)) {
++         result = VK_TIMEOUT;   /* that present was never made */
++         break;
++      }
++      result = mlg_wait_oldest(chain, deadline, &timed_out);
++      if (result != VK_SUCCESS)
++         break;
++      if (timed_out) {
++         result = VK_TIMEOUT;
++         break;
++      }
++   }
++   mtx_unlock(&chain->lock);
++   return result;
++}
++
++static void
++mlg_image_finish(struct wsi_mlg_swapchain *chain, struct wsi_mlg_image *image)
++{
++   /* CLOSEFB, not RMFB: a framebuffer still on screen stays there until
++    * the output replaces it, rather than the plane being turned off. */
++   if (image->fb_id)
++      drmModeCloseFB(chain->card, image->fb_id);
++   if (image->handle)
++      drmCloseBufferHandle(chain->card, image->handle);
++   if (image->syncobj)
++      drmSyncobjDestroy(chain->card, image->syncobj);
++   wsi_destroy_image(&chain->base, &image->base);
++}
++
++static void
++mlg_detach(struct wsi_mlg_swapchain *chain)
++{
++   simple_mtx_lock(&attach_lock);
++   if (attach_count && !--attach_count) {
++      struct mlg_lx_scanout req = mlg_request(MLG_LX_SCANOUT_DETACH);
++      struct mlg_lx_scanout_state st;
++      int r = drmMlgScanout(&req, &st);
++      if (r)
++         mlg_error("giving %s back to the desktop failed: %s", chain->output.connector,
++                   strerror(-r));
++   }
++   simple_mtx_unlock(&attach_lock);
++}
++
++static VkResult
++wsi_mlg_swapchain_destroy(struct wsi_swapchain *wsi_chain, const VkAllocationCallbacks *pAllocator)
++{
++   struct wsi_mlg_swapchain *chain = (struct wsi_mlg_swapchain *)wsi_chain;
++
++   /* The desktop goes back on screen first (when this is the process's
++    * last swapchain), so no image of ours is scanned out as it goes. */
++   mlg_detach(chain);
++   for (uint32_t i = 0; i < chain->base.image_count; i++)
++      mlg_image_finish(chain, &chain->images[i]);
++   wsi_mlg_window_cache_destroy(chain->window);
++   close(chain->card);
++   mtx_destroy(&chain->lock);
++   wsi_swapchain_finish(&chain->base);
++   vk_free(pAllocator, chain);
++   return VK_SUCCESS;
++}
++
++static VkResult
++mlg_image_init(struct wsi_mlg_swapchain *chain, struct wsi_mlg_image *image)
++{
++   VkResult result = wsi_create_image(&chain->base, &chain->base.image_info, &image->base);
++   if (result != VK_SUCCESS)
++      return result;
++
++   uint32_t handles[4] = { 0 };
++   uint64_t modifiers[4] = { 0 };
++   int r = drmPrimeFDToHandle(chain->card, image->base.dma_buf_fd, &image->handle);
++   if (r) {
++      mlg_error("importing a swapchain image on the primary node failed: %s", strerror(errno));
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   for (int p = 0; p < image->base.num_planes; p++) {
++      handles[p] = image->handle;
++      modifiers[p] = image->base.drm_modifier;
++   }
++   r = drmModeAddFB2WithModifiers(chain->card, chain->extent.width, chain->extent.height,
++                                  DRM_FORMAT_XRGB8888, handles, image->base.row_pitches,
++                                  image->base.offsets,
++                                  image->base.drm_modifier != DRM_FORMAT_MOD_INVALID ? modifiers : NULL,
++                                  &image->fb_id,
++                                  image->base.drm_modifier != DRM_FORMAT_MOD_INVALID ?
++                                  DRM_MODE_FB_MODIFIERS : 0);
++   if (r) {
++      mlg_error("a %ux%u framebuffer with modifier 0x%llx failed: %s", chain->extent.width,
++                chain->extent.height, (unsigned long long)image->base.drm_modifier, strerror(-r));
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   if (drmSyncobjCreate(chain->card, 0, &image->syncobj)) {
++      mlg_error("a syncobj for a swapchain image failed: %s", strerror(errno));
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   image->state = MLG_IMAGE_IDLE;
++   return VK_SUCCESS;
++}
++
++static VkResult
++wsi_mlg_surface_create_swapchain(VkIcdSurfaceBase *icd_surface, VkDevice device,
++                                 struct wsi_device *wsi_device,
++                                 const VkSwapchainCreateInfoKHR *pCreateInfo,
++                                 const VkAllocationCallbacks *pAllocator,
++                                 struct wsi_swapchain **swapchain_out)
++{
++   VkIcdSurfaceMetal *surface = (VkIcdSurfaceMetal *)icd_surface;
++   const char *output = mlg_output_env();
++   const char *mode = getenv("MLG_WSI_MODE");
++   struct mlg_lx_scanout_state st;
++   struct mlg_lx_scanout req;
++   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
++   uint64_t mods[64];
++   uint32_t nmods = 0;
++   bool attached = false;
++   int r;
++
++   if (!output) {
++      mlg_error("presenting needs MLG_WSI_OUTPUT (see mlg-run)");
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++   if (pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_UNORM &&
++       pCreateInfo->imageFormat != VK_FORMAT_B8G8R8A8_SRGB) {
++      mlg_error("format %d is not a format the surface reported", pCreateInfo->imageFormat);
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
++
++   const unsigned num_images = MAX2(pCreateInfo->minImageCount, 3);
++   struct wsi_mlg_swapchain *chain =
++      vk_zalloc(pAllocator, sizeof(*chain) + num_images * sizeof(chain->images[0]), 8,
++                VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++   if (!chain)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   chain->card = -1;
++   chain->surface = surface;
++   chain->extent = pCreateInfo->imageExtent;
++   chain->mode = mode && !strcmp(mode, "fullscreen") ? MLG_MODE_FULLSCREEN :
++                 mode && !strcmp(mode, "windowed") ? MLG_MODE_WINDOWED : MLG_MODE_AUTO;
++   if (mode && chain->mode == MLG_MODE_AUTO && strcmp(mode, "auto")) {
++      mlg_error("MLG_WSI_MODE=%s: not fullscreen, windowed or auto", mode);
++      goto fail_free;
++   }
++   if (mtx_init(&chain->lock, mtx_plain) != thrd_success) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_free;
++   }
++
++   chain->card = mlg_open_primary(wsi_device);
++   if (chain->card < 0)
++      goto fail_lock;
++
++   /* Attach to the output on that connector. */
++   req = mlg_request(MLG_LX_SCANOUT_ATTACH);
++   if (strcmp(output, "auto"))
++      snprintf(req.connector, sizeof(req.connector), "%s", output);
++   simple_mtx_lock(&attach_lock);
++   r = drmMlgScanout(&req, &st);
++   if (!r)
++      attach_count++;
++   simple_mtx_unlock(&attach_lock);
++   if (r) {
++      if (r == -ENOENT && st.output)
++         mlg_error("MLG_WSI_OUTPUT=%s: the display output drives %s", output, st.connector);
++      else if (r == -ENOENT)
++         mlg_error("MLG_WSI_OUTPUT=%s: the driver has no display output; the display agent "
++                   "lights one (MacLinuxGPUHost display-agent)", output);
++      else if (r == -EBUSY)
++         mlg_error("MLG_WSI_OUTPUT=%s: another process shows its frames there", output);
++      else
++         mlg_error("attaching to the display output failed: %s", strerror(-r));
++      goto fail_card;
++   }
++   attached = true;
++   chain->output = st;
++
++   /* Modifiers both planes scan out, else the primary plane's. */
++   nmods = mlg_plane_modifiers(chain->card, st.primary_plane_id, mods, 0, ARRAY_SIZE(mods), false);
++   if (st.overlay_plane_id) {
++      uint64_t both[ARRAY_SIZE(mods)];
++      memcpy(both, mods, nmods * sizeof(mods[0]));
++      uint32_t nboth = mlg_plane_modifiers(chain->card, st.overlay_plane_id, both, nmods,
++                                           ARRAY_SIZE(both), true);
++      if (nboth) {
++         memcpy(mods, both, nboth * sizeof(mods[0]));
++         nmods = nboth;
++      }
++   }
++   if (!nmods) {
++      mlg_error("%s's primary plane lists no XRGB8888 modifier", st.connector);
++      goto fail_detach;
++   }
++
++   /* The monitor's macOS display, for the window's placement. */
++   r = drmMlgConnectorDisplay(chain->card, st.connector_id, &chain->display_id);
++   if (r == -ENOENT) {
++      fprintf(stderr, "mlg-wsi: no macOS display stands for %s; the frames go full screen there "
++              "and the window stays where it is\n", st.connector);
++      chain->display_id = 0;
++   } else if (r) {
++      mlg_error("finding the macOS display of %s failed: %s", st.connector, strerror(-r));
++      goto fail_detach;
++   }
++   chain->window = wsi_mlg_window_cache_create(surface->pLayer);
++   if (!chain->window) {
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      goto fail_detach;
++   }
++   if (chain->display_id) {
++      struct wsi_mlg_window win;
++      char why[160];
++
++      wsi_mlg_window_get(chain->window, &win);
++      if (win.has_window && win.display_id != chain->display_id) {
++         r = wsi_mlg_window_move(chain->window, chain->display_id, why, sizeof(why));
++         if (r) {
++            mlg_error("moving the window to %s's display failed: %s", st.connector, why);
++            goto fail_window;
++         }
++         fprintf(stderr, "mlg-wsi: moved the window to %s's display\n", st.connector);
++      }
++   }
++
++   const uint64_t *mod_list = mods;
++   struct wsi_drm_image_params image_params = {
++      .base.image_type = WSI_IMAGE_TYPE_DRM,
++      .same_gpu = true,
++      .num_modifier_lists = wsi_device->supports_modifiers ? 1 : 0,
++      .num_modifiers = &nmods,
++      .modifiers = &mod_list,
++   };
++   result = wsi_swapchain_init(wsi_device, &chain->base, device, pCreateInfo, &image_params.base,
++                               pAllocator);
++   if (result != VK_SUCCESS)
++      goto fail_window;
++
++   chain->base.destroy = wsi_mlg_swapchain_destroy;
++   chain->base.get_wsi_image = wsi_mlg_get_wsi_image;
++   chain->base.acquire_next_image = wsi_mlg_acquire_next_image;
++   chain->base.release_images = wsi_mlg_release_images;
++   chain->base.queue_present = wsi_mlg_queue_present;
++   chain->base.wait_for_present = wsi_mlg_wait_for_present;
++   chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
++   chain->base.image_count = num_images;
++   chain->status = VK_SUCCESS;
++
++   uint32_t created = 0;
++   for (; created < num_images; created++) {
++      result = mlg_image_init(chain, &chain->images[created]);
++      if (result != VK_SUCCESS) {
++         mlg_image_finish(chain, &chain->images[created]);
++         goto fail_images;
++      }
++   }
++
++   /* The driver's check of the first frame where it will go. */
++   {
++      uint32_t layer, w, h;
++      int32_t x, y;
++
++      mlg_placement(chain, &layer, &x, &y, &w, &h);
++      r = mlg_scanout_image(chain, MLG_LX_SCANOUT_TEST, &chain->images[0], layer, x, y, w, h, &st);
++      if (r) {
++         mlg_error("%s refuses a %ux%u image (modifier 0x%llx) on %s at %d,%d %ux%u: %s",
++                   chain->output.connector, chain->extent.width, chain->extent.height,
++                   (unsigned long long)chain->images[0].base.drm_modifier, layer_name(layer),
++                   x, y, w, h, strerror(-r));
++         result = VK_ERROR_INITIALIZATION_FAILED;
++         goto fail_images;
++      }
++   }
++   fprintf(stderr, "mlg-wsi: %u %ux%u images on %s (%ux%u, modifier 0x%llx)\n", num_images,
++           chain->extent.width, chain->extent.height, chain->output.connector,
++           chain->output.width, chain->output.height,
++           (unsigned long long)chain->images[0].base.drm_modifier);
++   *swapchain_out = &chain->base;
++   return VK_SUCCESS;
++
++fail_images:
++   while (created > 0)
++      mlg_image_finish(chain, &chain->images[--created]);
++   wsi_swapchain_finish(&chain->base);
++fail_window:
++   wsi_mlg_window_cache_destroy(chain->window);
++fail_detach:
++   if (attached)
++      mlg_detach(chain);
++fail_card:
++   close(chain->card);
++fail_lock:
++   mtx_destroy(&chain->lock);
++fail_free:
++   vk_free(pAllocator, chain);
++   return result;
++}
++
++#endif /* LIBDRM_MLG_SCANOUT */
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.h b/src/vulkan/wsi/wsi_common_metal_layer.h
+index e9473b1..d28927e 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.h
++++ b/src/vulkan/wsi/wsi_common_metal_layer.h
+@@ -52,4 +52,31 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+    CAMetalDrawable **drawable_ptr, void *buffer,
+    uint32_t width, uint32_t height, uint32_t row_pitch);
+ 
++/* ---- the layer's window (mac_linuxgpu; wsi_common_metal.c's display
++ * engine presents need it) ---- */
++
++/* Where a layer's window is, in pixels of its screen, origin top left. */
++struct wsi_mlg_window {
++   bool has_window;        /* the layer is in a window on a screen */
++   bool fullscreen;        /* the content covers the whole screen */
++   uint32_t display_id;    /* the screen's CGDirectDisplayID */
++   int32_t x, y;           /* the content rectangle */
++   uint32_t width, height;
++   uint32_t screen_width, screen_height;
++};
++
++struct wsi_mlg_window_cache;
++
++/* Follows the window of @layer. Reads it once on the main thread. */
++struct wsi_mlg_window_cache *wsi_mlg_window_cache_create(const CAMetalLayer *layer);
++void wsi_mlg_window_cache_destroy(struct wsi_mlg_window_cache *cache);
++/* The window now when called on the main thread; elsewhere the last state
++ * read there, with a new read queued on the main thread. */
++void wsi_mlg_window_get(struct wsi_mlg_window_cache *cache, struct wsi_mlg_window *out);
++/* Put the window on display @display_id, at the same place relative to its
++ * screen (clamped to it), keeping its size. On the main thread now,
++ * elsewhere queued there. 0, or -errno with a reason in @why. */
++int wsi_mlg_window_move(struct wsi_mlg_window_cache *cache, uint32_t display_id, char *why,
++                        size_t why_size);
++
+ #endif // WSI_COMMON_METAL_LAYER_H
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 67c3e7f..abaac80 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -8,6 +8,12 @@
+ 
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <Metal/Metal.h>
++#import <AppKit/AppKit.h>
++
++#include <errno.h>
++#include <math.h>
++#include <stdio.h>
++#include <string.h>
+ 
+ void
+ wsi_metal_layer_size(const CAMetalLayer *metal_layer,
+@@ -343,3 +349,225 @@ wsi_metal_layer_blit_and_present(struct wsi_metal_layer_blit_context *context,
+       *drawable_ptr = nil;
+    }
+ }
++
++/* ---- mac_linuxgpu: the window of a layer whose frames the GPU's display
++ * engine shows (wsi_common_metal.c): where its content is on which screen,
++ * and moving it to another screen. AppKit is read and changed on the main
++ * thread only; a swapchain used on another thread gets the state last read
++ * there. ---- */
++
++@interface WsiMlgWindowCache : NSObject {
++@public
++   CALayer *layer;          /* not retained: the application owns it for the surface's life */
++   struct wsi_mlg_window state;
++   bool refresh_queued;
++}
++@end
++
++@implementation WsiMlgWindowCache
++@end
++
++struct wsi_mlg_window_cache {
++   WsiMlgWindowCache *object;
++};
++
++static NSView *
++layer_view(CALayer *layer)
++{
++   for (CALayer *l = layer; l; l = l.superlayer) {
++      id delegate = l.delegate;
++      if ([delegate isKindOfClass:[NSView class]])
++         return (NSView *)delegate;
++   }
++   return nil;
++}
++
++static NSScreen *
++screen_with_id(uint32_t display_id)
++{
++   for (NSScreen *screen in [NSScreen screens]) {
++      NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
++      if (number && number.unsignedIntValue == display_id)
++         return screen;
++   }
++   return nil;
++}
++
++/* On the main thread. */
++static void
++window_read(CALayer *layer, struct wsi_mlg_window *out)
++{
++   memset(out, 0, sizeof(*out));
++   @autoreleasepool {
++      NSView *view = layer_view(layer);
++      NSWindow *window = view.window;
++      NSScreen *screen = window.screen;
++      if (!view || !window || !screen)
++         return;
++
++      NSNumber *number = screen.deviceDescription[@"NSScreenNumber"];
++      CGFloat scale = screen.backingScaleFactor;
++      NSRect content = [window convertRectToScreen:[view convertRect:view.bounds toView:nil]];
++      NSRect frame = screen.frame;
++
++      out->has_window = number != nil;
++      out->display_id = number.unsignedIntValue;
++      out->x = (int32_t)lround((content.origin.x - frame.origin.x) * scale);
++      out->y = (int32_t)lround((NSMaxY(frame) - NSMaxY(content)) * scale);
++      out->width = (uint32_t)lround(content.size.width * scale);
++      out->height = (uint32_t)lround(content.size.height * scale);
++      out->screen_width = (uint32_t)lround(frame.size.width * scale);
++      out->screen_height = (uint32_t)lround(frame.size.height * scale);
++      out->fullscreen = (window.styleMask & NSWindowStyleMaskFullScreen) ||
++                        (out->x <= 0 && out->y <= 0 &&
++                         out->x + (int64_t)out->width >= out->screen_width &&
++                         out->y + (int64_t)out->height >= out->screen_height);
++   }
++}
++
++static void
++cache_refresh(WsiMlgWindowCache *cache)
++{
++   struct wsi_mlg_window state;
++
++   window_read(cache->layer, &state);
++   @synchronized(cache) {
++      cache->state = state;
++      cache->refresh_queued = false;
++   }
++}
++
++struct wsi_mlg_window_cache *
++wsi_mlg_window_cache_create(const CAMetalLayer *metal_layer)
++{
++   struct wsi_mlg_window_cache *cache = calloc(1, sizeof(*cache));
++   if (!cache)
++      return NULL;
++   cache->object = [[WsiMlgWindowCache alloc] init];
++   cache->object->layer = (CALayer *)metal_layer;
++   WsiMlgWindowCache *object = cache->object;
++   if ([NSThread isMainThread])
++      cache_refresh(object);
++   else
++      dispatch_sync(dispatch_get_main_queue(), ^{ cache_refresh(object); });
++   return cache;
++}
++
++void
++wsi_mlg_window_cache_destroy(struct wsi_mlg_window_cache *cache)
++{
++   if (!cache)
++      return;
++   /* A queued refresh holds its own reference. */
++   @synchronized(cache->object) {
++      cache->object->layer = nil;
++   }
++   [cache->object release];
++   free(cache);
++}
++
++void
++wsi_mlg_window_get(struct wsi_mlg_window_cache *cache, struct wsi_mlg_window *out)
++{
++   WsiMlgWindowCache *object = cache->object;
++
++   if ([NSThread isMainThread]) {
++      cache_refresh(object);
++      *out = object->state;
++      return;
++   }
++   bool queue = false;
++   @synchronized(object) {
++      *out = object->state;
++      if (!object->refresh_queued && object->layer) {
++         object->refresh_queued = true;
++         queue = true;
++      }
++   }
++   if (queue) {
++      [object retain];
++      dispatch_async(dispatch_get_main_queue(), ^{
++         CALayer *layer;
++         @synchronized(object) {
++            layer = object->layer;
++         }
++         if (layer)
++            cache_refresh(object);
++         [object release];
++      });
++   }
++}
++
++/* On the main thread. */
++static int
++window_move(CALayer *layer, uint32_t display_id, char *why, size_t why_size)
++{
++   @autoreleasepool {
++      NSView *view = layer_view(layer);
++      NSWindow *window = view.window;
++      NSScreen *target = screen_with_id(display_id);
++
++      if (!window) {
++         snprintf(why, why_size, "the layer is in no window");
++         return -ENOENT;
++      }
++      if (!target) {
++         snprintf(why, why_size, "no screen is display %u", display_id);
++         return -ENODEV;
++      }
++      if (window.screen == target)
++         return 0;
++      if (window.styleMask & NSWindowStyleMaskFullScreen) {
++         snprintf(why, why_size, "the window is in native full screen on another display; "
++                  "leave full screen or start the application on that display");
++         return -EBUSY;
++      }
++
++      NSRect from = window.screen ? window.screen.frame : NSZeroRect;
++      NSRect to = target.frame;
++      NSRect frame = window.frame;
++      CGFloat dx = frame.origin.x - from.origin.x;
++      CGFloat dy = frame.origin.y - from.origin.y;
++      CGFloat w = MIN(frame.size.width, to.size.width);
++      CGFloat h = MIN(frame.size.height, to.size.height);
++      dx = MAX(0, MIN(dx, to.size.width - w));
++      dy = MAX(0, MIN(dy, to.size.height - h));
++      [window setFrame:NSMakeRect(to.origin.x + dx, to.origin.y + dy, w, h) display:YES];
++      if (window.screen != target) {
++         snprintf(why, why_size, "the window did not move to display %u", display_id);
++         return -EIO;
++      }
++      return 0;
++   }
++}
++
++int
++wsi_mlg_window_move(struct wsi_mlg_window_cache *cache, uint32_t display_id, char *why,
++                    size_t why_size)
++{
++   WsiMlgWindowCache *object = cache->object;
++   CALayer *layer = object->layer;
++
++   why[0] = 0;
++   if ([NSThread isMainThread]) {
++      int r = window_move(layer, display_id, why, why_size);
++      cache_refresh(object);
++      return r;
++   }
++   [object retain];
++   dispatch_async(dispatch_get_main_queue(), ^{
++      char reason[160];
++      CALayer *l;
++      @synchronized(object) {
++         l = object->layer;
++      }
++      if (l) {
++         if (window_move(l, display_id, reason, sizeof(reason)))
++            fprintf(stderr, "mlg-wsi: moving the window to display %u failed: %s\n",
++                    display_id, reason);
++         cache_refresh(object);
++      }
++      [object release];
++   });
++   return 0;
++}

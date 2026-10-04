@@ -142,6 +142,19 @@
           "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c"
         ],
         "reason": "Apple silicon maps PCIe BARs for the CPU as Device memory only, so memcpy into a CPU mapping of VRAM faults on unaligned stores (seen on the R9700: SIGBUS creating the device). On Apple silicon the winsys reports no CPU-visible VRAM and places any buffer that is not NO_CPU_ACCESS in GTT, whose mappings are normal memory."
+      },
+      {
+        "patch": "patches/mesa/radv-macos-display-wsi.patch",
+        "sha256": "b880a1694266954bacc6b4006b4b6c8199d821d463951258f42ab97d585433e9",
+        "files": [
+          "src/amd/vulkan/radv_instance.c",
+          "src/amd/vulkan/radv_wsi.h",
+          "src/vulkan/wsi/meson.build",
+          "src/vulkan/wsi/wsi_common_metal.c",
+          "src/vulkan/wsi/wsi_common_metal_layer.h",
+          "src/vulkan/wsi/wsi_common_metal_layer.m"
+        ],
+        "reason": "RADV presents Metal surfaces through the GPU's own display engine: VK_EXT_metal_surface on the macOS platform, and for a driver that is neither software nor Metal a swapchain whose images are framebuffers of the GPU's primary node shown on the driver's display output (libdrm-mlg's drmMlgScanout), on the primary plane or on an overlay plane at the window's rectangle, with no copy. MLG_WSI_OUTPUT names the output; without it the surface reports no presentation support. Other drivers are unchanged."
       }
     ]
   },

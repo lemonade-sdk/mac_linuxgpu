@@ -8,7 +8,9 @@
 #   2. Builds libdrm-mlg (make libdrm-mlg): libdrm and libdrm_amdgpu over
 #      libmlg_drm, with the pkg-config files Mesa looks for.
 #   3. Configures and builds RADV with Meson: the ACO compiler and no LLVM,
-#      no window-system platforms (headless WSI only), no GL, no video.
+#      the macOS platform (Metal surfaces, which RADV presents through the
+#      GPU's display engine: patches/mesa/radv-macos-display-wsi.patch), no
+#      GL, no video.
 #   4. Installs into build/radv/install:
 #        lib/libvulkan_radeon.dylib, lib/libdrm_mlg.dylib, lib/libmlg_drm.dylib
 #        share/vulkan/icd.d/radeon_icd.json   (library path relative to it)
@@ -77,7 +79,7 @@ echo "    libdrm $(pkg-config --modversion libdrm) from $(pkg-config --variable=
 step "Configuring RADV ($buildtype)"
 options=(
   --buildtype="$buildtype" --prefix="$PREFIX" --libdir=lib
-  -Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms= -Dllvm=disabled
+  -Dvulkan-drivers=amd -Dgallium-drivers= -Dplatforms=macos -Dllvm=disabled
   -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dglx=disabled -Degl=disabled
   -Dgbm=disabled -Dvulkan-layers= -Dtools= -Dvideo-codecs= -Dbuild-tests=false
   -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled -Dspirv-tools=disabled

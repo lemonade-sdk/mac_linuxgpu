@@ -1182,8 +1182,14 @@ test-radv-offline: lib
 test-llama-offline: lib
 	bash scripts/test-llama-offline.sh
 
-test: test-radv-offline test-llama-offline
-.PHONY: libdrm-mlg test-libdrm-mlg radv llama-vulkan test-radv-offline test-llama-offline
+# RADV's Metal surfaces on the fixture's display output (drmMlgScanout);
+# skips when RADV has not been built.
+test-radv-scanout: lib
+	bash scripts/test-radv-scanout.sh
+
+test: test-radv-offline test-llama-offline test-radv-scanout
+.PHONY: libdrm-mlg test-libdrm-mlg radv llama-vulkan test-radv-offline test-llama-offline \
+	test-radv-scanout
 
 # The hardware CS self-test runner (scripts/drm-selftest.py) against a fake
 # DrmSelfTest selector.
