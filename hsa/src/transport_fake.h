@@ -4,6 +4,9 @@
 #include "device_init.h"
 #include <map>
 #include <mutex>
+#include <condition_variable>
+#include <string>
+#include <array>
 #include <span>
 #include <vector>
 
@@ -51,6 +54,9 @@ struct FakeDeviceConfig {
     uint32_t maxClockMHz = 2400, xccCount = 1;
     TargetFeature sramecc = TargetFeature::Unsupported;
     std::string productName = "Fake AMDGPU";            // product-name tag; empty = declined
+    // Interrupt signals (selectors 86/87): a KFD session on a driver that
+    // serves them.
+    bool signalEvents = false;
 };
 
 class MAC_HSA_FAKE_EXPORT FakeConnection final : public Connection, public InitializationRPC {
@@ -99,6 +105,25 @@ public:
     // ---- Connection: device power (power.h) ----
     hsa_status_t powerState(PowerSnapshot &out) override;
     hsa_status_t requestPower(uint64_t op, PowerSnapshot &out) override;
+
+    // ---- Connection: interrupt signals (KFD signal events) ----
+    // Served when config().signalEvents (a KFD session on a driver with
+    // events); declined otherwise, as the real driver declines.
+    hsa_status_t createSignalEvent(SignalEvent &out, std::string *why) override;
+    hsa_status_t destroySignalEvent(uint32_t id) override;
+    hsa_status_t setSignalEvent(uint32_t id) override;
+    hsa_status_t waitSignalEvents(const uint32_t *ids, uint32_t count, uint32_t timeoutMs,
+                                  EventWaitResult &result) override;
+    // The command processor completing a packet that names @signal:
+    // decrement its value and, for an interrupt signal, write its mailbox
+    // and raise the interrupt, unless interrupts are being dropped.
+    void completeSignal(uint64_t signalHandle);
+    void dropInterrupts(bool drop);
+    struct EventStats {
+        uint64_t created = 0, live = 0, interrupts = 0, dropped = 0, sets = 0;
+        uint64_t waits = 0, firedWaits = 0, timedOutWaits = 0;
+    };
+    EventStats eventStats() const;
 
     // ---- InitializationRPC (used by device_init.cpp) ----
     hsa_status_t scalar(uint32_t selector, std::span<const uint64_t> input,
@@ -171,6 +196,15 @@ private:
     hsa_status_t powerRefusalLocked() const;
     void setPowerLocked(amdgpu::power::PowerState state, uint32_t flags);
     bool codeSyncKernelLocked(uint64_t kernelObject) const;
+    // Signal events: KFD's auto-reset events and its mailbox page.
+    struct Event { bool signaled = false; };
+    std::map<uint32_t, Event> events_;
+    std::array<uint64_t, 4096> eventPage_{};
+    uint32_t nextEvent_ = 1;
+    bool dropInterrupts_ = false;
+    EventStats eventStats_;
+    std::condition_variable eventChanged_;
+    void raiseEventLocked(uint32_t id);
 };
 
 // Replaces the shared fake with a device built from config. Call before

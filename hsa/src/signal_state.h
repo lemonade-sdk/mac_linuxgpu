@@ -42,6 +42,12 @@ struct Signal {
     std::function<bool(unsigned,int64_t,int64_t,int64_t &)> gpuAtomic;
     std::function<bool()> gpuHealthy;
     std::function<void(int64_t)> storeHook; // Runtime-owned queue doorbell.
+    // An interrupt signal: the KFD signal event in abi's event fields.
+    bool hasEvent = false;
+    uint32_t eventID = 0;
+    // Threads asleep in the driver on that event: a host-side change sets
+    // the event only while there are any (notifySignal).
+    std::atomic<uint32_t> eventSleepers{0};
     std::atomic<bool> alive{true};
     std::mutex waitMutex;
     std::condition_variable changed;
@@ -95,11 +101,24 @@ inline bool signalCondition(int64_t value, hsa_signal_condition_t condition, int
     default: return false;
     }
 }
+// A signal changed from the host: wake its waiters (the condition variable,
+// and the driver's event for an interrupt signal with a sleeper).
+void notifySignal(Signal &signal);
+// Sleep until something may have changed one of @signals, at most @maxNs.
+// @satisfied is re-read once the sleep is armed (a change after that wakes
+// the sleep); true skips it. gpu_signals.cpp.
+void sleepOnSignals(Signal *const *signals, uint32_t count, uint64_t maxNs,
+                    const std::function<bool()> &satisfied);
+
 inline int64_t waitSignal(const std::shared_ptr<Signal> &signal,
                          hsa_signal_condition_t condition, int64_t compare,
                          uint64_t timeout, hsa_wait_state_t hint, std::memory_order order) {
     if (!signal) return 0; // invalid-handle operations have undefined HSA behavior
     const auto start = std::chrono::steady_clock::now();
+    bool spun = false;
+    const auto done = [&] {
+        return signalCondition(signal->value().load(order), condition, compare) || !signal->alive.load();
+    };
     for (;;) {
         const auto value = signal->value().load(order);
         if (signalCondition(value, condition, compare) || !signal->alive.load() || !timeout)
@@ -107,14 +126,18 @@ inline int64_t waitSignal(const std::shared_ptr<Signal> &signal,
         const auto elapsed = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - start).count());
         if (elapsed >= timeout) return value;
-        if (hint == HSA_WAIT_STATE_ACTIVE) std::this_thread::yield();
-        else {
-            // Poll as well as notify: direct host atomic writes and silent stores
-            // do not notify this condition variable. Never hold the runtime lock.
-            const auto interval = std::min<uint64_t>(blockedSignalPollNs(), timeout - elapsed);
-            std::unique_lock lock(signal->waitMutex);
-            signal->changed.wait_for(lock, std::chrono::nanoseconds(interval));
+        if (hint == HSA_WAIT_STATE_ACTIVE) { std::this_thread::yield(); continue; }
+        if (!spun && signalWaitSpinNs()) {
+            // A short spin first, for completions expected within microseconds.
+            spun = true;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(
+                std::min<uint64_t>(signalWaitSpinNs(), timeout - elapsed));
+            while (!done() && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+            continue;
         }
+        // Never hold the runtime lock while asleep.
+        Signal *one = signal.get();
+        sleepOnSignals(&one, 1, timeout - elapsed, done);
     }
 }
 }

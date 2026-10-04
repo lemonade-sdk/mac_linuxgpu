@@ -23,6 +23,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 
 namespace mac_hsa {
@@ -639,7 +640,164 @@ public:
         return powerCall(amdgpu::power::kSelector, op, out);
     }
 
+    // Interrupt signals: KFD signal events of this client's KFD process
+    // (selectors 86 and 87, dext/sources/session_state.h). Without the
+    // session lock: event calls and waits run beside everything else.
+    hsa_status_t createSignalEvent(SignalEvent &out, std::string *why) override {
+        io_connect_t port;
+        {
+            std::lock_guard lock(sessionMutex);
+            const auto status = eventSupportLocked(why);
+            if (status != HSA_STATUS_SUCCESS) return status;
+            port = ownerPort;
+        }
+        uint64_t input[2] = {kEventCreate, 0}, output[kEventWords]{};
+        uint32_t raw = 0;
+        const auto status = call(port, kSelectorEvent, input, 2, output, kEventWords, &raw);
+        if (raw == uint32_t(kIOReturnUnsupported) || raw == uint32_t(kIOReturnBadArgument)) {
+            if (why) *why = "the driver does not serve signal events (selector 86)";
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        }
+        if (status != HSA_STATUS_SUCCESS) return status;
+        const auto error = int64_t(output[0]);
+        if (error < 0) {
+            if (why) *why = "the driver refused a signal event (errno " + std::to_string(-error) + ")";
+            return error == -12 ? HSA_STATUS_ERROR_OUT_OF_RESOURCES :
+                   error == -19 ? HSA_STATUS_ERROR_INVALID_ARGUMENT : HSA_STATUS_ERROR;
+        }
+        if (output[1] > UINT32_MAX || output[2] > UINT32_MAX || !output[3]) return HSA_STATUS_ERROR;
+        out = {uint32_t(output[1]), uint32_t(output[2]), output[3]};
+        return HSA_STATUS_SUCCESS;
+    }
+    hsa_status_t destroySignalEvent(uint32_t id) override { return eventCall(kEventDestroy, id); }
+    hsa_status_t setSignalEvent(uint32_t id) override { return eventCall(kEventSet, id); }
+    hsa_status_t waitSignalEvents(const uint32_t *ids, uint32_t count, uint32_t timeoutMs,
+                                  EventWaitResult &result) override {
+        if (!ids || !count || count > kEventWaitIDs || !timeoutMs) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        io_connect_t port;
+        {
+            std::lock_guard lock(sessionMutex);
+            port = ownerPort;
+        }
+        if (!port) return HSA_STATUS_ERROR;
+        auto &waiter = eventWaiter();
+        if (!waiter.port) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        timeoutMs = std::min(timeoutMs, kEventWaitMaxMs);
+        waiter.token = nextEventToken.fetch_add(1, std::memory_order_relaxed);
+        waiter.done = false;
+        io_user_reference_t reference[kIOAsyncCalloutCount]{};
+        reference[kIOAsyncCalloutFuncIndex] = io_user_reference_t(uintptr_t(&eventWaitCompleted));
+        reference[kIOAsyncCalloutRefconIndex] = io_user_reference_t(waiter.token);
+        uint64_t input[4] = {waiter.token, count, 0, timeoutMs}, output[1]{};
+        uint32_t outputs = 1;
+        const auto kr = IOConnectCallAsyncMethod(port, kSelectorEventWait,
+            IONotificationPortGetMachPort(waiter.port), reference, kIOAsyncCalloutCount,
+            input, 4, ids, count * sizeof(uint32_t), output, &outputs, nullptr, nullptr);
+        if (kr == kIOReturnNoDevice || kr == kIOReturnNotAttached || kr == MACH_SEND_INVALID_DEST)
+            return kDeviceLostStatus;
+        if (kr != KERN_SUCCESS || outputs < 1) return HSA_STATUS_ERROR;
+        if (int64_t(output[0]) < 0)	// not started: nothing will complete
+            return int64_t(output[0]) == -11 || int64_t(output[0]) == -16 ?
+                HSA_STATUS_ERROR_OUT_OF_RESOURCES : HSA_STATUS_ERROR;
+        // The driver completes the call by its own timeout; this deadline
+        // only notices a driver that went away.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs + 2000);
+        union {
+            mach_msg_header_t header;
+            uint8_t bytes[4096];
+        } message;
+        while (!waiter.done) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0) return HSA_STATUS_ERROR;
+            std::memset(&message.header, 0, sizeof(message.header));
+            const auto received = mach_msg(&message.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+                                           sizeof(message), IONotificationPortGetMachPort(waiter.port),
+                                           mach_msg_timeout_t(left), MACH_PORT_NULL);
+            if (received == MACH_RCV_TIMED_OUT) continue;
+            if (received != MACH_MSG_SUCCESS) return HSA_STATUS_ERROR;
+            IODispatchCalloutFromMessage(nullptr, &message.header, waiter.port);
+        }
+        if (waiter.status != kIOReturnSuccess || waiter.count < 3 || waiter.args[0] != input[0])
+            return HSA_STATUS_ERROR;
+        if (int64_t(waiter.args[1]) < 0) return HSA_STATUS_ERROR;	// -EIO: an event went away
+        if (waiter.args[2] == 0) { result = EventWaitResult::Fired; return HSA_STATUS_SUCCESS; }
+        if (waiter.args[2] == 1) { result = EventWaitResult::TimedOut; return HSA_STATUS_SUCCESS; }
+        return HSA_STATUS_ERROR;
+    }
+
 private:
+    // Selectors 86/87 (session_state.h).
+    static constexpr uint32_t kSelectorEvent = 86, kSelectorEventWait = 87;
+    static constexpr uint64_t kEventCreate = 0, kEventDestroy = 1, kEventSet = 2;
+    static constexpr uint32_t kEventWords = 4, kEventWaitIDs = 64, kEventWaitMaxMs = 1000;
+    int eventSupport = -1;	// -1 unknown, 0 no, 1 yes (under sessionMutex)
+    std::string eventDecline;
+    std::atomic<uint64_t> nextEventToken{1};
+    hsa_status_t eventSupportLocked(std::string *why) {
+        if (eventSupport < 0) {
+            eventSupport = 0;
+            if (!linuxShim) {
+                eventDecline = "the driver is not the Linux-shim driver";
+            } else if (ensureReady() != HSA_STATUS_SUCCESS) {
+                eventSupport = -1;
+                if (why) *why = "the device is not ready";
+                return HSA_STATUS_ERROR;
+            } else if (sessionMode != ComputeSessionMode::KFD) {
+                eventDecline = "the compute session is on the legacy path (no KFD process)";
+            } else {
+                std::array<uint64_t, 3> build{};
+                if (scalar(43, {}, build) != HSA_STATUS_SUCCESS) {
+                    eventDecline = "the driver build could not be read";
+                } else if (build[2] < kSignalEventDriverBuild) {
+                    eventDecline = "driver build " + std::to_string(build[2]) +
+                        " predates signal events (build " + std::to_string(kSignalEventDriverBuild) + ")";
+                } else {
+                    eventSupport = 1;
+                }
+            }
+        }
+        if (eventSupport == 1) return HSA_STATUS_SUCCESS;
+        if (why) *why = eventDecline;
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    hsa_status_t eventCall(uint64_t op, uint32_t id) {
+        io_connect_t port;
+        {
+            std::lock_guard lock(sessionMutex);
+            if (eventSupport != 1) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+            port = ownerPort;
+        }
+        uint64_t input[2] = {op, id}, output[kEventWords]{};
+        const auto status = call(port, kSelectorEvent, input, 2, output, kEventWords);
+        if (status != HSA_STATUS_SUCCESS) return status;
+        return int64_t(output[0]) < 0 ? HSA_STATUS_ERROR : HSA_STATUS_SUCCESS;
+    }
+    // One notification port per thread: a thread has one wait in flight.
+    // The completion's refcon is the call's token, so a completion that
+    // arrives after its call gave up matches nothing.
+    struct EventWaiter {
+        IONotificationPortRef port = nullptr;
+        uint64_t token = 0;
+        bool done = false;
+        IOReturn status = kIOReturnSuccess;
+        uint64_t args[3]{};
+        uint32_t count = 0;
+        EventWaiter() : port(IONotificationPortCreate(kIOMainPortDefault)) {}
+        ~EventWaiter() { if (port) IONotificationPortDestroy(port); }
+    };
+    static EventWaiter &eventWaiter() {
+        thread_local EventWaiter waiter;
+        return waiter;
+    }
+    static void eventWaitCompleted(void *refcon, IOReturn status, void **args, uint32_t count) {
+        auto &waiter = eventWaiter();
+        if (uint64_t(uintptr_t(refcon)) != waiter.token) return;	// a stale completion
+        waiter.status = status;
+        waiter.count = std::min<uint32_t>(count, 3);
+        for (uint32_t i = 0; i < waiter.count; ++i) waiter.args[i] = uint64_t(uintptr_t(args[i]));
+        waiter.done = true;
+    }
     hsa_status_t powerCall(uint32_t selector, uint64_t input, PowerSnapshot &out) {
         io_connect_t port;
         {

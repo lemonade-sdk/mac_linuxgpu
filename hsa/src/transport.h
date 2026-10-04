@@ -20,6 +20,9 @@ constexpr uint64_t kPersistentQueueDriverBuild=187;
 constexpr uint64_t kQueueResourceDriverBuild=190;
 // First driver build with KFD-backed compute sessions (QueryInfo tag 12).
 constexpr uint64_t kComputeSessionDriverBuild=192;
+// First driver build with KFD signal events and interrupt waits (selectors
+// 86 and 87, dext/sources/session_state.h).
+constexpr uint64_t kSignalEventDriverBuild=235;
 
 // Compute-session QueryInfo tag: which path the driver gave this client.
 // Legacy: VMID0 buffers and the driver's legacy HQDs (one queue per HQD).
@@ -199,6 +202,12 @@ inline void applyProductName(DeviceProperties &out, const uint64_t *words) {
 constexpr uint64_t kDeviceSpecDwords = 32;
 constexpr uint64_t kDeviceSpecDriverBuild = 197; // first driver build serving tag 8
 struct SharedBuffer { DeviceBuffer device; void *host = nullptr; uint32_t memoryType = 0; };
+// A KFD signal event: an amd_signal_t whose event_mailbox_ptr is mailbox and
+// whose event_id is trigger makes the command processor write the mailbox
+// and raise an interrupt when it completes a packet naming the signal; the
+// driver's interrupt handler signals event id.
+struct SignalEvent { uint32_t id = 0, trigger = 0; uint64_t mailbox = 0; };
+enum class EventWaitResult { Fired, TimedOut };
 struct BufferToken { uint64_t registryID = 0, token[2]{}, size = 0; };
 static_assert(sizeof(BufferToken) == 32);
 
@@ -253,6 +262,21 @@ public:
     // it. Callable whatever state the session is in; drivers that predate
     // the protocol decline with HSA_STATUS_ERROR_INVALID_ARGUMENT.
     virtual hsa_status_t powerState(PowerSnapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    // Interrupt signals. A connection without them (the legacy path, a
+    // driver that predates them) declines with
+    // HSA_STATUS_ERROR_INVALID_ARGUMENT and says why in @why.
+    virtual hsa_status_t createSignalEvent(SignalEvent &, std::string *why = nullptr) {
+        if (why) *why = "the transport has no signal events";
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    virtual hsa_status_t destroySignalEvent(uint32_t) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    // A host-side change of a signal: wake whoever sleeps on its event.
+    virtual hsa_status_t setSignalEvent(uint32_t) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    // Sleep until one of @ids fires or @timeoutMs (1 or more) passes. The
+    // calling thread sleeps in the kernel; nothing polls.
+    virtual hsa_status_t waitSignalEvents(const uint32_t *, uint32_t, uint32_t, EventWaitResult &) {
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
     virtual hsa_status_t requestPower(uint64_t, PowerSnapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
 };
 

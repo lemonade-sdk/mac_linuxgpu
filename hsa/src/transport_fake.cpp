@@ -293,6 +293,11 @@ void FakeConnection::processQueueLocked(Queue &queue) {
         if (packet->completion_signal.handle) {
             auto *signal = reinterpret_cast<SignalABI *>(packet->completion_signal.handle);
             std::atomic_ref<int64_t>(signal->value).fetch_sub(1, std::memory_order_release);
+            if (signal->eventMailbox) {
+                *reinterpret_cast<volatile uint64_t *>(signal->eventMailbox) = signal->eventID;
+                if (dropInterrupts_) ++eventStats_.dropped;
+                else { ++eventStats_.interrupts; raiseEventLocked(signal->eventID); }
+            }
         }
         header.store(HSA_PACKET_TYPE_INVALID, std::memory_order_release);
         read.store(id + 1, std::memory_order_release);
@@ -575,4 +580,94 @@ std::shared_ptr<FakeConnection> fakeConnection() {
     return g_fake;
 }
 
+} // namespace mac_hsa
+
+namespace mac_hsa {
+hsa_status_t FakeConnection::createSignalEvent(SignalEvent &out, std::string *why) {
+    std::lock_guard lock(mutex_);
+    if (!config_.signalEvents) {
+        if (why) *why = "the fake device serves no signal events";
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    if (events_.size() >= eventPage_.size() - 1) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    while (events_.count(nextEvent_) || !nextEvent_ || nextEvent_ >= eventPage_.size())
+        nextEvent_ = nextEvent_ + 1 >= eventPage_.size() ? 1 : nextEvent_ + 1;
+    const uint32_t id = nextEvent_++;
+    events_[id] = {};
+    eventPage_[id] = UINT64_MAX;
+    out = {id, id, uint64_t(reinterpret_cast<uintptr_t>(&eventPage_[id]))};
+    ++eventStats_.created;
+    return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t FakeConnection::destroySignalEvent(uint32_t id) {
+    std::lock_guard lock(mutex_);
+    if (!events_.erase(id)) return HSA_STATUS_ERROR;
+    eventChanged_.notify_all();
+    return HSA_STATUS_SUCCESS;
+}
+
+void FakeConnection::raiseEventLocked(uint32_t id) {
+    const auto it = events_.find(id);
+    if (it == events_.end()) return;
+    it->second.signaled = true;
+    eventChanged_.notify_all();
+}
+
+hsa_status_t FakeConnection::setSignalEvent(uint32_t id) {
+    std::lock_guard lock(mutex_);
+    if (!events_.count(id)) return HSA_STATUS_ERROR;
+    ++eventStats_.sets;
+    raiseEventLocked(id);
+    return HSA_STATUS_SUCCESS;
+}
+
+// As KFD's WAIT_EVENTS (any): an auto-reset event that fired before the
+// wait completes it at once and is consumed.
+hsa_status_t FakeConnection::waitSignalEvents(const uint32_t *ids, uint32_t count, uint32_t timeoutMs,
+                                              EventWaitResult &result) {
+    std::unique_lock lock(mutex_);
+    ++eventStats_.waits;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto it = events_.find(ids[i]);
+            if (it == events_.end()) return HSA_STATUS_ERROR;	// destroyed: KFD's -EIO
+            if (it->second.signaled) {
+                it->second.signaled = false;
+                ++eventStats_.firedWaits;
+                result = EventWaitResult::Fired;
+                return HSA_STATUS_SUCCESS;
+            }
+        }
+        if (eventChanged_.wait_until(lock, deadline) == std::cv_status::timeout) {
+            ++eventStats_.timedOutWaits;
+            result = EventWaitResult::TimedOut;
+            return HSA_STATUS_SUCCESS;
+        }
+    }
+}
+
+void FakeConnection::completeSignal(uint64_t signalHandle) {
+    std::lock_guard lock(mutex_);
+    auto *signal = reinterpret_cast<SignalABI *>(signalHandle);
+    std::atomic_ref<int64_t>(signal->value).fetch_sub(1, std::memory_order_release);
+    if (!signal->eventMailbox) return;
+    *reinterpret_cast<volatile uint64_t *>(signal->eventMailbox) = signal->eventID;
+    if (dropInterrupts_) { ++eventStats_.dropped; return; }
+    ++eventStats_.interrupts;
+    raiseEventLocked(signal->eventID);
+}
+
+void FakeConnection::dropInterrupts(bool drop) {
+    std::lock_guard lock(mutex_);
+    dropInterrupts_ = drop;
+}
+
+FakeConnection::EventStats FakeConnection::eventStats() const {
+    std::lock_guard lock(mutex_);
+    auto stats = eventStats_;
+    stats.live = events_.size();
+    return stats;
+}
 } // namespace mac_hsa

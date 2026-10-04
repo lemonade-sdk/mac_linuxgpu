@@ -7,21 +7,48 @@
 
 namespace mac_hsa {
 
-// Blocked waits still poll because GPU DMA stores do not notify a host
-// condition variable. Use a 32 us interval to limit completion wake latency.
-inline uint64_t blockedSignalPollNs(const char *setting) {
-    constexpr uint64_t fallback=32000;
-    if (!setting) return fallback;
+// How a blocked wait sleeps (signal_state.h, sleepOnSignals in
+// gpu_signals.cpp).
+//
+// A GPU signal that carries a KFD signal event (an interrupt signal) is
+// waited for in the driver: the thread sleeps until the command
+// processor's completion interrupt signals the event, a host-side change
+// sets it, or the backstop passes. The backstop
+// (MAC_HSA_WAIT_BACKSTOP_US, 100 us to 1 s, default 4 ms) re-reads the
+// value and re-arms the wait, so a lost interrupt costs at most one
+// backstop. A host signal sleeps on its condition variable (every store
+// notifies it) under the same backstop. A wait may first spin for
+// MAC_HSA_WAIT_SPIN_US (0 to 1000, default 0) before it sleeps.
+//
+// Only a GPU signal without an event (the legacy session path, a driver
+// before build 235; the runtime reports why once) and a wait over mixed
+// signals poll, every MAC_HSA_BLOCKED_POLL_US (10 to 1000, default 32).
+inline uint64_t microsecondsSetting(const char *setting, uint32_t fallback, uint32_t low, uint32_t high) {
+    if (!setting) return uint64_t(fallback) * 1000;
     const std::string_view text(setting);
-    uint32_t micros=0;
-    const auto parsed=std::from_chars(text.data(),text.data()+text.size(),micros);
-    if (parsed.ec!=std::errc{} || parsed.ptr!=text.data()+text.size() ||
-        micros<10 || micros>1000) return fallback;
-    return uint64_t(micros)*1000;
+    uint32_t micros = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), micros);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size() ||
+        micros < low || micros > high) return uint64_t(fallback) * 1000;
+    return uint64_t(micros) * 1000;
+}
+
+inline uint64_t blockedSignalPollNs(const char *setting) { return microsecondsSetting(setting, 32, 10, 1000); }
+inline uint64_t signalWaitBackstopNs(const char *setting) { return microsecondsSetting(setting, 4000, 100, 1000000); }
+inline uint64_t signalWaitSpinNs(const char *setting) {
+    return setting ? microsecondsSetting(setting, 0, 0, 1000) : 0;
 }
 
 inline uint64_t blockedSignalPollNs() {
-    static const uint64_t interval=blockedSignalPollNs(std::getenv("MAC_HSA_BLOCKED_POLL_US"));
+    static const uint64_t interval = blockedSignalPollNs(std::getenv("MAC_HSA_BLOCKED_POLL_US"));
+    return interval;
+}
+inline uint64_t signalWaitBackstopNs() {
+    static const uint64_t interval = signalWaitBackstopNs(std::getenv("MAC_HSA_WAIT_BACKSTOP_US"));
+    return interval;
+}
+inline uint64_t signalWaitSpinNs() {
+    static const uint64_t interval = signalWaitSpinNs(std::getenv("MAC_HSA_WAIT_SPIN_US"));
     return interval;
 }
 

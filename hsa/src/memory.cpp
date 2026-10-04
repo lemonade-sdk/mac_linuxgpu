@@ -578,7 +578,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
             if (!failed) failed = copyBytes(dst, src, size, destination, source) != HSA_STATUS_SUCCESS;
             if (failed) signal->value().store(-1, std::memory_order_release);
             else signal->value().fetch_sub(1, std::memory_order_release);
-            signal->changed.notify_all();
+            mac_hsa::notifySignal(*signal);
             jobPointer->done.store(true, std::memory_order_release);
         });
         copyJobs.push_back(std::move(job));
