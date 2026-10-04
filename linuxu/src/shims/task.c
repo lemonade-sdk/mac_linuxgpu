@@ -419,7 +419,11 @@ uint64_t linuxu_park_backstop_max(void)
  * the driver and most tests, overrides this with a printk. */
 __attribute__((weak)) void linuxu_wait_report(const char *message)
 {
+#ifdef LINUXU_DEXT_DK
+	(void)message;	/* the driver links printk.c, which overrides this */
+#else
 	fputs(message, stderr);
+#endif
 }
 
 void linuxu_wait_missed(struct linuxu_wait_site *site, const void *caller)
