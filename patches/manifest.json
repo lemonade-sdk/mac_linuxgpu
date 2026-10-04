@@ -162,7 +162,7 @@
     "patches": [
       {
         "patch": "patches/llama.cpp/sched-staged-inputs.patch",
-        "sha256": "29aefc57926d097399d77b1a2624ebc49890703ec7ac930dff2d4fc9b4542262",
+        "sha256": "e2c8aca86ce3395c905f2457441c1798259a4c5b51b982e8e886b285b7342307",
         "files": [
           "ggml/src/ggml-backend-impl.h",
           "ggml/src/ggml-backend-meta.cpp",
@@ -187,7 +187,7 @@
           "tests/CMakeLists.txt",
           "tests/test-backend-sched-inputs.cpp"
         ],
-        "reason": "Every request to the GPU is a round trip to the driver process (about 100 us for a trivial request on the R9700), so Vulkan's per-token synchronous work dominates decode. The scheduler wrote each graph input with a blocking set_tensor (a queue submission, a fence wait and a reset on a device without host-visible VRAM, as on Apple silicon), and ggml_vk_synchronize signalled its fence with an empty submission, which RADV turns into eight syncobj requests when it also waits for the transfer queue. Inputs are now staged in host memory and copied in the compute stream (a new optional backend function the scheduler uses for user inputs), the fence goes with the last compute submission, transfer-only work is waited for on the host, and small host copies stay in the compute stream. test-backend-sched-inputs covers input capture and ordering."
+        "reason": "Every request to the GPU is a round trip to the driver process (about 100 us for a trivial request on the R9700), so Vulkan's per-token synchronous work dominates decode. The scheduler wrote each graph input with a blocking set_tensor (a queue submission, a fence wait and a reset on a device without host-visible VRAM, as on Apple silicon), and ggml_vk_synchronize signalled its fence with an empty submission, which RADV turns into eight syncobj requests when it also waits for the transfer queue. Inputs are now staged in host memory and copied in the compute stream (a new optional backend function the scheduler uses for user inputs), the fence goes with the last compute submission, transfer-only work is waited for on the host, and a host copy uses the transfer queue only above a per-device size measured on first use (submission overhead times host-to-device bandwidth). test-backend-sched-inputs covers input capture and ordering."
       }
     ]
   }

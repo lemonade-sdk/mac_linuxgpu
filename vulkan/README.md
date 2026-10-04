@@ -110,9 +110,12 @@ once Mesa is checked out. `lib-dext` verifies only the Linux tree
   RADV turns into eight syncobj requests when it also waits for the transfer
   queue. Inputs are now staged in host memory and copied in the compute
   stream through a new optional backend function, the fence goes with the
-  last compute submission, and small host copies stay in the compute stream.
-  `test-backend-sched-inputs` checks that inputs are taken when the graph is
-  queued and ordered against the device's queued work.
+  last compute submission, and a host copy goes on the transfer queue only
+  above a size measured per device on first use: the extra submission's cost
+  times the host-to-device bandwidth (on the R9700 here about 150 us and
+  1.2 GB/s, so about 180 KB). `test-backend-sched-inputs` checks that inputs
+  are taken when the graph is queued, ordered against the device's queued
+  work, and that CPU results reach the device on both sides of that size.
 
 ## VRAM and the CPU on Apple silicon
 
