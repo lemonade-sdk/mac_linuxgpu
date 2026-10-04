@@ -376,16 +376,14 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         self.display = display
         // macOS brings the display online, then gives it a mode,
-        // asynchronously. The process sees it through CoreGraphics'
-        // reconfiguration notifications (agentWindowServerSetup), which
-        // arrive while the run loop turns.
+        // asynchronously.
         for _ in 0..<50 {
             var count: UInt32 = 0
             CGGetOnlineDisplayList(0, nil, &count)
             var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
             CGGetOnlineDisplayList(count, &ids, &count)
             if ids.contains(display.displayID) && currentMode() != nil { return true }
-            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+            Thread.sleep(forTimeInterval: 0.1)
         }
         failure = "the virtual display \(display.displayID) did not come online in a mode the monitor listed" +
             (CGDisplayCopyDisplayMode(display.displayID).map { " (macOS chose \($0.pixelWidth)x\($0.pixelHeight) @ \($0.refreshRate) Hz)" } ?? "")
@@ -600,18 +598,20 @@ private final class Workload {
 /// display for --seconds (default until Ctrl-C), then everything is undone:
 /// capture stopped, imports released, the monitor's previous configuration
 /// restored, the virtual display removed.
-/// The agent talks to the WindowServer (CGVirtualDisplay, ScreenCaptureKit)
-/// from the app's own executable: as a background agent that has finished
-/// launching (never in the Dock, never bouncing), and with a display
-/// reconfiguration callback registered. CoreGraphics caches the display
-/// configuration a process has seen; without the callback (and the run
-/// loop turning) a virtual display created after that has no modes in this
-/// process (CGDisplayCopyDisplayMode is nil), which a daemon that
-/// re-creates displays on hotplug would always hit.
-func agentWindowServerSetup() {
+/// The agent talks to the WindowServer from the app's own executable, so it
+/// becomes a background agent (never in the Dock, no bouncing icon), but
+/// only once its virtual display is up and captured: on macOS 26 a process
+/// that has finished launching as an NSApplication, or that registered a
+/// display reconfiguration callback, before it creates a virtual display
+/// never sees that display's modes (CGDisplayCopyDisplayMode stays nil;
+/// measured on build 236). A process creates one virtual display, so the
+/// daemon runs each mirroring in a child process (runDisplayAgentDaemon).
+private var agentIsBackground = false
+private func agentBecomeBackground() {
+    guard !agentIsBackground else { return }
+    agentIsBackground = true
     NSApplication.shared.setActivationPolicy(.accessory)
     NSApplication.shared.finishLaunching()
-    CGDisplayRegisterReconfigurationCallback({ _, _, _ in }, nil)
 }
 
 /// SIGINT/SIGTERM end the agent: the mirroring stops and everything is
@@ -640,7 +640,6 @@ private func agentLog(_ text: String) {
 func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     if options.contains("--daemon") { return runDisplayAgentDaemon(options) }
     let seconds = Double(option(options, "--seconds") ?? "") ?? 0
-    agentWindowServerSetup()
     agentHandleSignals()
     guard CGPreflightScreenCaptureAccess() else {
         _ = CGRequestScreenCaptureAccess()
@@ -652,10 +651,15 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     guard let (session, observer) = openClients(options) else { return 1 }
     defer { observer.closeUserClient(); session?.closeUserClient() }
     let deadline = seconds > 0 ? Date().addingTimeInterval(seconds) : Date.distantFuture
-    switch mirrorMonitor(observer: observer, options: options, daemon: false,
+    // --follow-hotplug (the daemon's child): end when the monitor leaves,
+    // exit 3 when none is connected, 0 when it left.
+    let follow = options.contains("--follow-hotplug")
+    if follow { setvbuf(stdout, nil, _IOLBF, 0) }	// the daemon's log, line by line
+    switch mirrorMonitor(observer: observer, options: options, daemon: follow,
                          shouldStop: { agentInterrupted || Date() >= deadline }) {
     case .ended(let code): return code
-    case .noMonitor, .monitorGone: return 1
+    case .noMonitor: return follow ? 3 : 1
+    case .monitorGone: return follow ? 0 : 1
     }
 }
 
@@ -754,6 +758,7 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
     guard mirror.startOutput(mode) else { return .ended(teardown()) }
     outputOn = true
     guard mirror.startCapture(mode) else { return .ended(teardown()) }
+    agentBecomeBackground()
     if let error = workload.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) {
         mirror.failure = "workload: \(error)"
         return .ended(teardown())
@@ -870,79 +875,82 @@ private final class DriverWatch {
 
 /// display-agent --create --daemon: the per-user LaunchAgent
 /// (DisplayAutostart) that makes the GPU's monitor a Mac display whenever
-/// the driver runs. It waits for the driver (IOKit matching), brings the
-/// GPU up if needed (its own session), mirrors the connected monitor, follows
-/// hotplug, tears down when the driver or the monitor leaves, and comes back
-/// when they return. SIGTERM (launchctl bootout) ends it cleanly. It never
-/// shows in the Dock.
+/// the driver runs. It waits for the driver (IOKit matching notifications,
+/// no polling) and then runs the mirroring in a child process,
+/// `display-agent --create --init --follow-hotplug`: the child brings the
+/// GPU up if needed, mirrors the connected monitor and exits when the
+/// monitor or the driver leaves; the daemon starts a new one when they come
+/// back. (A process sees the modes of one virtual display only: see
+/// agentBecomeBackground.) The daemon itself never talks to the WindowServer,
+/// so it never shows in the Dock. SIGTERM (launchctl bootout) stops the
+/// child and ends the daemon.
 func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
-    agentWindowServerSetup()
     agentHandleSignals()
     agentLog("display-agent: daemon started (pid \(getpid()))")
-    guard CGPreflightScreenCaptureAccess() else {
-        _ = CGRequestScreenCaptureAccess()
-        agentLog("display-agent: Screen Recording permission is needed: allow MacLinuxGPUHost in System Settings › Privacy & Security › Screen & System Audio Recording")
-        // launchd restarts the agent (not a successful exit) after its throttle.
-        return 1
-    }
     guard let watch = DriverWatch(bundleIdentifier: "com.geramyloveless.MacAMDGPUHost.MacAMDGPU") else {
         agentLog("display-agent: could not watch for the driver (IOKit notifications)")
         return 1
     }
-    var retryAfter: Date?
+    guard let executable = Bundle.main.executablePath else {
+        agentLog("display-agent: the app's executable path is unknown")
+        return 1
+    }
+    var connector: [String] = []
+    if let wanted = option(options, "--connector") { connector = ["--connector", wanted] }
+    var child: Process?
+    var childExited = false
     while !agentInterrupted {
         if !watch.present {
             agentLog("display-agent: waiting for the driver")
             while !agentInterrupted && !watch.present {
-                // Returns when a source fires: the match, or a signal.
                 _ = RunLoop.main.run(mode: .default, before: .distantFuture)
             }
             continue
         }
-        if let until = retryAfter {
-            retryAfter = nil
-            while !agentInterrupted && watch.present && Date() < until {
-                _ = RunLoop.main.run(mode: .default, before: until)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = ["display-agent", "--create", "--init", "--follow-hotplug",
+                             "--warmup", "1000000000"] + connector
+        childExited = false
+        process.terminationHandler = { _ in
+            DispatchQueue.main.async { childExited = true }
+        }
+        do {
+            try process.run()
+        } catch {
+            agentLog("display-agent: could not start the mirroring process: \(error)")
+            return 1
+        }
+        child = process
+        agentLog("display-agent: mirroring process \(process.processIdentifier) started")
+        // Until the child ends, or a signal or the driver leaving ends it.
+        while !childExited && !agentInterrupted && watch.present {
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(1))
+        }
+        if !childExited {
+            process.terminate()	// SIGTERM: it restores the monitor and removes its display
+            let deadline = Date().addingTimeInterval(10)
+            while !childExited && Date() < deadline {
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.2))
             }
-            continue
         }
-        // Our own session, so the GPU is up while a monitor is mirrored;
-        // compute clients join the same session alongside it.
-        guard let (session, observer) = openClients(["--init"]) else {
-            agentLog("display-agent: the GPU could not be brought up; retrying in 10 s")
-            retryAfter = Date().addingTimeInterval(10)
-            continue
+        child = nil
+        if !childExited { continue }
+        let status = process.terminationStatus
+        agentLog("display-agent: mirroring process ended (status \(status))")
+        if agentInterrupted { break }
+        let pause: TimeInterval
+        switch status {
+        case 0: pause = 2       // the monitor left: watch for it again
+        case 3: pause = 5       // no monitor connected yet
+        default: pause = 10     // an error: retry after a pause
         }
-        let end = mirrorMonitor(observer: observer, options: options, daemon: true,
-                                shouldStop: { agentInterrupted || !watch.present })
-        if case .noMonitor = end {
-            // Wait for a monitor: the driver's cached hotplug state, every
-            // 2 s (no GPU access). The session stays, so the GPU need not
-            // come up again for the monitor.
-            agentLog("display-agent: no monitor connected; waiting for one")
-            var connected = false
-            while !agentInterrupted && watch.present && !connected {
-                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
-                let (kr, _, status) = observer.display(.status)
-                if kr != kIOReturnSuccess { break }
-                connected = status?.connectors.contains { $0.connected } ?? false
-            }
-            observer.closeUserClient()
-            session?.closeUserClient()
-            continue
-        }
-        observer.closeUserClient()
-        session?.closeUserClient()
-        switch end {
-        case .ended(let code) where code != 0 && !agentInterrupted && watch.present:
-            agentLog("display-agent: mirroring ended with an error; retrying in 10 s")
-            retryAfter = Date().addingTimeInterval(10)
-        case .monitorGone:
-            agentLog("display-agent: the monitor left; waiting for it")
-        default:
-            break
+        let until = Date().addingTimeInterval(pause)
+        while !agentInterrupted && watch.present && Date() < until {
+            _ = RunLoop.main.run(mode: .default, before: until)
         }
     }
+    if let child, child.isRunning { child.terminate(); child.waitUntilExit() }
     agentLog("display-agent: daemon stopped")
     return 0
 }
