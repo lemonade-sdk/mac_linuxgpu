@@ -540,9 +540,7 @@ private final class Workload {
     func start(displayID: CGDirectDisplayID, refreshHz: Double) -> String? {
         if kind == "still" { return nil }
         guard kind == "move" || kind == "full" else { return "unknown workload \(kind) (still, move or full)" }
-        let app = NSApplication.shared
-        app.setActivationPolicy(.accessory)
-        app.finishLaunching()
+        // The app is already a background agent (runDisplayAgent).
         // CoreGraphics' global space has its origin at the top left of the
         // main display, AppKit's at the bottom left.
         let bounds = CGDisplayBounds(displayID), main = CGDisplayBounds(CGMainDisplayID())
