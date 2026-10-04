@@ -57,7 +57,8 @@ void removal_check(struct pci_dev *pdev);
  * followed, packets the software GPU does not model (register state,
  * cache and event packets, register writes) are skipped and counted, and
  * dispatches are counted but not run (the software GPU executes no
- * shaders). Off by default, so an unexpected packet aborts. */
+ * shaders); client SDMA IBs carry real SDMA packets (copy, write, fill,
+ * fence), which run. Off by default, so an unexpected packet aborts. */
 void cs_fixture_model_driver_streams(int on);
 /* The host memory behind @bytes at @offset of BAR @bar (BAR0: VRAM through
  * its aperture), or NULL: lx_loopback_set_bar_memory's callback. */

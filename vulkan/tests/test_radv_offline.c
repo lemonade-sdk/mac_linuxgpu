@@ -292,8 +292,17 @@ int main(int argc, char **argv)
 			   .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main" },
 		.layout = layout };
 	VkPipeline pipeline;
+	cs_fixture_stats(&before);
 	VK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, NULL, &pipeline));
+	cs_fixture_stats(&after);
+#if defined(__APPLE__) && defined(__aarch64__)
+	/* No CPU-visible VRAM: the shader reached VRAM by an SDMA copy. */
+	CHECK(after.copies > before.copies && after.sdma_ibs > before.sdma_ibs);
+	printf("compute pipeline compiled, uploaded to VRAM by SDMA (%lu copy)\n",
+	       after.copies - before.copies);
+#else
 	printf("compute pipeline compiled\n");
+#endif
 
 	VkDescriptorPoolSize dps = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
 	VkDescriptorPoolCreateInfo dpci = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,

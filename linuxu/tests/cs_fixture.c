@@ -17,8 +17,10 @@
  * The compute engine executes PM4 (INDIRECT_BUFFER, WRITE_DATA, DMA_DATA,
  * NOP, RELEASE_MEM in IBs and the ring's fence release); with
  * cs_fixture_model_driver_streams() it also follows chained IBs and skips
- * what it does not model, as a full driver's streams need. The SDMA
- * engine executes the fixture's own packet set
+ * what it does not model, as a full driver's streams need, and the SDMA
+ * engine runs a userspace driver's SDMA packets (copy, write, fill, fence)
+ * in client IBs. Otherwise the SDMA engine executes the fixture's own
+ * packet set
  * that its buffer functions and VM PTE functions emit (fill, copy, PTE
  * writes). A fence with an interrupt runs amdgpu_fence_process, as the
  * EOP/trap interrupt handlers do.
@@ -567,10 +569,101 @@ static uint64_t sdma_packet(struct engine *e, const uint32_t *dw, uint64_t avail
 	return n + 1;
 }
 
+/* -- SDMA: a userspace driver's packets (SDMA 5.2-7 layout, as Mesa emits
+ * them), in the IBs of client submissions when driver streams are modeled.
+ * The fixture's own packets stay in the kernel's IBs (VMID 0). -- */
+#define FX_SDMA7_OP_NOP		0u
+#define FX_SDMA7_OP_COPY	1u
+#define FX_SDMA7_OP_WRITE	2u
+#define FX_SDMA7_OP_FENCE	5u
+#define FX_SDMA7_OP_CONST_FILL	11u
+
+static uint64_t sdma7_packet(struct engine *e, const uint32_t *dw, uint64_t avail, uint32_t vmid)
+{
+	const uint32_t op = dw[0] & 0xff, sub = (dw[0] >> 8) & 0xff;
+	uint64_t n;
+
+#define NEED(words) do { n = (words); if (n > avail) \
+	FX_ABORT("SDMA packet 0x%08x past the end of its IB", dw[0]); } while (0)
+	switch (op) {
+	case FX_SDMA7_OP_NOP:
+		NEED(1 + ((dw[0] >> 16) & 0x3fff));
+		break;
+	case FX_SDMA7_OP_COPY: {
+		/* COPY_LINEAR: count - 1, parameters, source, destination. */
+		NEED(7);
+		if (sub != 0)
+			FX_ABORT("SDMA copy sub-opcode %u", sub);
+		const uint64_t bytes = (uint64_t)dw[1] + 1;
+		uint64_t src = ((uint64_t)dw[4] << 32) | dw[3], dst = ((uint64_t)dw[6] << 32) | dw[5];
+		uint8_t chunk[4096];
+
+		STAT(copies);
+		for (uint64_t off = 0; off < bytes;) {
+			uint64_t len = bytes - off < sizeof(chunk) ? bytes - off : sizeof(chunk);
+
+			if (!gpu_access(e, vmid, src + off, chunk, len, false) ||
+			    !gpu_access(e, vmid, dst + off, chunk, len, true))
+				break;
+			off += len;
+		}
+		break;
+	}
+	case FX_SDMA7_OP_WRITE: {
+		/* WRITE linear: destination, dwords - 1, the dwords. */
+		NEED(4);
+		const uint64_t words = (uint64_t)dw[3] + 1;
+
+		NEED(4 + words);
+		if (sub != 0)
+			FX_ABORT("SDMA write sub-opcode %u", sub);
+		gpu_access(e, vmid, ((uint64_t)dw[2] << 32) | dw[1], (void *)(uintptr_t)&dw[4],
+			   words * 4, true);
+		break;
+	}
+	case FX_SDMA7_OP_FENCE:
+		NEED(4);
+		gpu_access(e, vmid, ((uint64_t)dw[2] << 32) | dw[1], (void *)(uintptr_t)&dw[3], 4, true);
+		break;
+	case FX_SDMA7_OP_CONST_FILL: {
+		/* Destination, data, count - 1 in bytes; FILLSIZE 2 repeats the
+		 * dword, 0 its low byte. */
+		NEED(5);
+		const uint64_t dst = ((uint64_t)dw[2] << 32) | dw[1], bytes = (uint64_t)dw[4] + 1;
+		const uint32_t fillsize = dw[0] >> 30;
+		uint8_t pattern[256];
+
+		if (fillsize == 2) {
+			for (unsigned int i = 0; i < sizeof(pattern); i += 4)
+				memcpy(pattern + i, &dw[3], 4);
+		} else if (fillsize == 0) {
+			memset(pattern, dw[3] & 0xff, sizeof(pattern));
+		} else {
+			FX_ABORT("SDMA fill size %u", fillsize);
+		}
+		STAT(fills);
+		for (uint64_t off = 0; off < bytes; off += sizeof(pattern)) {
+			uint64_t len = bytes - off < sizeof(pattern) ? bytes - off : sizeof(pattern);
+
+			if (!gpu_access(e, vmid, dst + off, pattern, len, true))
+				break;
+		}
+		break;
+	}
+	default:
+		FX_ABORT("unexpected SDMA packet 0x%08x (opcode %u) in a client IB", dw[0], op);
+	}
+#undef NEED
+	return n;
+}
+
 static void sdma_run(struct engine *e, const uint32_t *dw, uint64_t count, uint32_t vmid, int depth)
 {
+	const bool client = driver_streams && depth && vmid;
+
 	for (uint64_t i = 0; i < count;)
-		i += sdma_packet(e, dw + i, count - i, vmid, depth);
+		i += client ? sdma7_packet(e, dw + i, count - i, vmid) :
+			      sdma_packet(e, dw + i, count - i, vmid, depth);
 }
 
 /* Execute the ring from rptr to wptr, a packet at a time. */
