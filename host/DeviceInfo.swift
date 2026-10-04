@@ -197,3 +197,71 @@ struct GPUDeviceInfo {
         return lines
     }
 }
+
+/// The PCI Express capability of a device, from its configuration space
+/// (the sysfs "config" file): what it can do and what it is set to. Linux
+/// sets Max Payload and Max Read Request (pcie_bus_configure_settings,
+/// pcie_set_readrq), and Extended and 10-bit tags (pci_configure_extended_tags,
+/// pci_configure_10bit_tags); a device left at its reset values moves data
+/// in smaller requests than it could.
+struct PCIeCapability: Equatable {
+    let offset: Int
+    let devCap, devCap2: UInt32
+    let devCtl, devSta, lnkSta, devCtl2: UInt16
+    let lnkCap: UInt32
+
+    /// Walks the capability list from 0x34 for capability 0x10; nil when the
+    /// space is too short, the list loops or there is no such capability.
+    init?(config: Data) {
+        let b = [UInt8](config)
+        func u16(_ at: Int) -> UInt16? { at + 2 <= b.count ? UInt16(b[at]) | UInt16(b[at + 1]) << 8 : nil }
+        func u32(_ at: Int) -> UInt32? {
+            guard let lo = u16(at), let hi = u16(at + 2) else { return nil }
+            return UInt32(lo) | UInt32(hi) << 16
+        }
+        guard b.count >= 64, b[6] & 0x10 != 0 else { return nil }   // Status: Capabilities List
+        var at = Int(b[0x34] & 0xfc), seen = 0
+        while at >= 0x40 && at + 2 <= b.count && seen < 48 {
+            if b[at] == 0x10 { break }
+            at = Int(b[at + 1] & 0xfc)
+            seen += 1
+        }
+        guard at >= 0x40, at + 2 <= b.count, b[at] == 0x10,
+              let devCap = u32(at + 4), let devCtl = u16(at + 8), let devSta = u16(at + 10),
+              let lnkCap = u32(at + 12), let lnkSta = u16(at + 18),
+              let devCap2 = u32(at + 36), let devCtl2 = u16(at + 40) else { return nil }
+        offset = at
+        self.devCap = devCap; self.devCtl = devCtl; self.devSta = devSta
+        self.lnkCap = lnkCap; self.lnkSta = lnkSta; self.devCap2 = devCap2; self.devCtl2 = devCtl2
+    }
+
+    var maxPayloadSupported: Int { 128 << Int(devCap & 7) }
+    var maxPayload: Int { 128 << Int((devCtl >> 5) & 7) }
+    var maxReadRequest: Int { 128 << Int((devCtl >> 12) & 7) }
+    var extendedTagSupported: Bool { devCap & (1 << 5) != 0 }
+    var extendedTagEnabled: Bool { devCtl & (1 << 8) != 0 }
+    var relaxedOrdering: Bool { devCtl & (1 << 4) != 0 }
+    var noSnoop: Bool { devCtl & (1 << 11) != 0 }
+    var tag10Completer: Bool { devCap2 & (1 << 16) != 0 }
+    var tag10Requester: Bool { devCap2 & (1 << 17) != 0 }
+    var tag10Enabled: Bool { devCtl2 & (1 << 12) != 0 }
+    var linkSpeed: Int { Int(lnkSta & 0xf) }
+    var linkWidth: Int { Int((lnkSta >> 4) & 0x3f) }
+    var maxLinkSpeed: Int { Int(lnkCap & 0xf) }
+    var maxLinkWidth: Int { Int((lnkCap >> 4) & 0x3f) }
+
+    var lines: [String] {
+        let speeds = ["?", "2.5", "5.0", "8.0", "16.0", "32.0", "64.0"]
+        func gt(_ s: Int) -> String { s < speeds.count ? speeds[s] + " GT/s" : "?" }
+        return [
+            String(format: "PCI Express capability at 0x%02x: DevCap 0x%08x DevCtl 0x%04x DevSta 0x%04x DevCap2 0x%08x DevCtl2 0x%04x",
+                   offset, devCap, devCtl, devSta, devCap2, devCtl2),
+            "  link: \(gt(linkSpeed)) x\(linkWidth) (the device can do \(gt(maxLinkSpeed)) x\(maxLinkWidth))",
+            "  max payload: \(maxPayload) bytes (supports \(maxPayloadSupported))",
+            "  max read request: \(maxReadRequest) bytes",
+            "  extended tags (8-bit): \(extendedTagEnabled ? "on" : "off") (\(extendedTagSupported ? "supported" : "not supported"))",
+            "  10-bit tags as requester: \(tag10Enabled ? "on" : "off") (requester \(tag10Requester ? "supported" : "not supported"), completer \(tag10Completer ? "supported" : "not supported"))",
+            "  relaxed ordering \(relaxedOrdering ? "on" : "off"), no snoop \(noSnoop ? "on" : "off")",
+        ]
+    }
+}

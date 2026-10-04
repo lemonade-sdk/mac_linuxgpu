@@ -97,7 +97,78 @@ static const struct attribute_group pcie_dev_attr_group = {
 	.is_visible = pcie_dev_attrs_are_visible,
 };
 
+/* drivers/pci/pci-sysfs.c pci_read_config: the "config" file, the device's
+ * configuration space as lspci and setpci read it: a byte, a word, then
+ * whole dwords, then a word and a byte, each little endian, through the
+ * driver's configuration reads. Read-only here (upstream also writes). */
+static ssize_t config_read(struct file *filp, struct kobject *kobj, const struct bin_attribute *bin_attr,
+			   char *buf, loff_t off, size_t count)
+{
+	struct pci_dev *dev = to_pci_dev(container_of(kobj, struct device, kobj));
+	unsigned int size = dev->cfg_size ? (unsigned int)dev->cfg_size : 256;
+	loff_t init_off = off;
+	u8 *data = (u8 *)buf;
+
+	(void)filp; (void)bin_attr;
+	if (off > size)
+		return 0;
+	if (off + count > size)
+		count = size - off;
+	size = (unsigned int)count;
+	if ((off & 1) && size) {
+		u8 val;
+
+		pci_read_config_byte(dev, (int)off, &val);
+		data[off - init_off] = val;
+		off++;
+		size--;
+	}
+	if ((off & 3) && size > 2) {
+		u16 val;
+
+		pci_read_config_word(dev, (int)off, &val);
+		data[off - init_off] = val & 0xff;
+		data[off - init_off + 1] = (val >> 8) & 0xff;
+		off += 2;
+		size -= 2;
+	}
+	while (size > 3) {
+		u32 val;
+
+		pci_read_config_dword(dev, (int)off, &val);
+		data[off - init_off] = val & 0xff;
+		data[off - init_off + 1] = (val >> 8) & 0xff;
+		data[off - init_off + 2] = (val >> 16) & 0xff;
+		data[off - init_off + 3] = (val >> 24) & 0xff;
+		off += 4;
+		size -= 4;
+	}
+	if (size >= 2) {
+		u16 val;
+
+		pci_read_config_word(dev, (int)off, &val);
+		data[off - init_off] = val & 0xff;
+		data[off - init_off + 1] = (val >> 8) & 0xff;
+		off += 2;
+		size -= 2;
+	}
+	if (size > 0) {
+		u8 val;
+
+		pci_read_config_byte(dev, (int)off, &val);
+		data[off - init_off] = val;
+	}
+	return (ssize_t)count;
+}
+static const struct bin_attribute bin_attr_config = {
+	.attr = { .name = "config", .mode = 0444 }, .size = 4096, .read = config_read,
+};
+static const struct bin_attribute *const pci_dev_config_attrs[] = { &bin_attr_config, NULL };
+static const struct attribute_group pci_dev_config_attr_group = {
+	.bin_attrs = pci_dev_config_attrs,
+};
+
 /* pci_bus_type.dev_groups upstream; the runtime PCI device carries them. */
 const struct attribute_group *pci_dev_groups[] = {
-	&pci_dev_group, &pcie_dev_attr_group, NULL,
+	&pci_dev_group, &pcie_dev_attr_group, &pci_dev_config_attr_group, NULL,
 };

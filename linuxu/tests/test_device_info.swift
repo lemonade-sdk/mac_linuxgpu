@@ -90,3 +90,35 @@ check(GPUDeviceInfo(properties: ["CFBundleIdentifier": "x"]) == nil)
 check(GPUDeviceInfo.memoryText(UInt64(16) << 30) == "16 GB" && GPUDeviceInfo.memoryText(UInt64(1536) << 20) == "1536 MB")
 
 print("PASS device-info: the GPU with the monitors on its outputs, from the dext's properties")
+
+// The PCI Express capability from a configuration space: the R9700's
+// capabilities (DevCap 0x10008fa1, DevCap2 0x730a9f) at reset-like settings.
+do {
+    var b = [UInt8](repeating: 0, count: 4096)
+    func put16(_ at: Int, _ v: UInt16) { b[at] = UInt8(v & 0xff); b[at + 1] = UInt8(v >> 8) }
+    func put32(_ at: Int, _ v: UInt32) { put16(at, UInt16(v & 0xffff)); put16(at + 2, UInt16(v >> 16)) }
+    b[6] = 0x10; b[0x34] = 0x48
+    b[0x48] = 0x01; b[0x49] = 0x64          // power management, next 0x64
+    b[0x64] = 0x10; b[0x65] = 0x00          // PCI Express
+    put32(0x64 + 4, 0x10008fa1)             // MPS 256 supported, extended tags supported
+    put16(0x64 + 8, 0x2010)                 // MRRS 512, MPS 128, relaxed ordering, extended tags off
+    put32(0x64 + 12, 0x00000105)            // link capable 32 GT/s x16
+    put16(0x64 + 18, 0x0044)                // link at 16 GT/s x4
+    put32(0x64 + 36, 0x00730a9f)            // 10-bit tags completer and requester
+    put16(0x64 + 40, 0x0000)
+    guard let cap = PCIeCapability(config: Data(b)) else { print("no capability"); exit(1) }
+    precondition(cap.offset == 0x64)
+    precondition(cap.maxPayloadSupported == 256 && cap.maxPayload == 128 && cap.maxReadRequest == 512)
+    precondition(cap.extendedTagSupported && !cap.extendedTagEnabled && cap.relaxedOrdering && !cap.noSnoop)
+    precondition(cap.tag10Requester && cap.tag10Completer && !cap.tag10Enabled)
+    precondition(cap.linkSpeed == 4 && cap.linkWidth == 4 && cap.maxLinkSpeed == 5 && cap.maxLinkWidth == 16)
+    precondition(cap.lines[1] == "  link: 16.0 GT/s x4 (the device can do 32.0 GT/s x16)", cap.lines[1])
+    precondition(cap.lines[2] == "  max payload: 128 bytes (supports 256)")
+    // No capabilities list, a list that loops, a short space: nil.
+    var none = b; none[6] = 0
+    precondition(PCIeCapability(config: Data(none)) == nil)
+    var loop = b; loop[0x49] = 0x48; loop[0x48] = 0x01
+    precondition(PCIeCapability(config: Data(loop)) == nil)
+    precondition(PCIeCapability(config: Data(b.prefix(0x64 + 20))) == nil)
+    print("PASS PCIe capability: list walk, payload, read request, tags, link, refusals")
+}

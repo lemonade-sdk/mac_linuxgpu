@@ -30,6 +30,19 @@ void linuxu_warn(const char *f, int l, const char *fmt, ...) { (void)f; (void)l;
 /* pci-sysfs link attributes read the PCIe capability; offline it is absent. */
 int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
 { (void)dev; (void)pos; *val = 0; return 0; }
+/* Configuration space: byte i holds i ^ 0x5a; reads of each width counted. */
+static unsigned int config_reads[5];
+int pci_read_config_byte(const struct pci_dev *dev, int where, u8 *val)
+{ (void)dev; config_reads[1]++; *val = (u8)(where ^ 0x5a); return 0; }
+int pci_read_config_word(const struct pci_dev *dev, int where, u16 *val)
+{ (void)dev; assert(!(where & 1)); config_reads[2]++; *val = (u16)((u8)(where ^ 0x5a) | (u8)((where + 1) ^ 0x5a) << 8); return 0; }
+int pci_read_config_dword(const struct pci_dev *dev, int where, u32 *val)
+{
+	(void)dev; assert(!(where & 3)); config_reads[4]++;
+	*val = 0;
+	for (int i = 0; i < 4; i++) *val |= (u32)(u8)((where + i) ^ 0x5a) << (8 * i);
+	return 0;
+}
 enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev) { (void)dev; return PCIE_SPEED_16_0GT; }
 enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev) { (void)dev; return PCIE_LNK_WIDTH_X16; }
 
@@ -283,6 +296,22 @@ static void pci_attributes(void)
 	/* No capability offline: link status reads as zero, like a down link. */
 	assert(rd(k, "current_link_speed", buf, sizeof(buf)) == 8 && !strcmp(buf, "Unknown\n"));
 	assert(rd(k, "current_link_width", buf, sizeof(buf)) == 2 && !strcmp(buf, "0\n"));
+	/* config: the configuration space, cfg_size bytes, aligned reads of
+	 * each width, as upstream's pci_read_config. */
+	{
+		static unsigned char space[4200];
+		pdev->cfg_size = 4096;
+		assert(linuxu_sysfs_read(k, "config", space, sizeof(space), 0, NULL) == 4096);
+		for (int i = 0; i < 4096; i++) assert(space[i] == (unsigned char)(i ^ 0x5a));
+		memset(config_reads, 0, sizeof(config_reads));
+		assert(linuxu_sysfs_read(k, "config", space, 9, 0x41, NULL) == 9);	/* 0x41..0x49 */
+		for (int i = 0; i < 9; i++) assert(space[i] == (unsigned char)((0x41 + i) ^ 0x5a));
+		assert(config_reads[1] == 1 && config_reads[2] == 2 && config_reads[4] == 1);	/* byte, word, dword, word */
+		assert(linuxu_sysfs_read(k, "config", space, 64, 4090, NULL) == 6);
+		assert(linuxu_sysfs_read(k, "config", space, 64, 4096, NULL) == 0);
+		pdev->cfg_size = 256;
+		assert(linuxu_sysfs_read(k, "config", space, sizeof(space), 0, NULL) == 256);
+	}
 	device_unregister(&pdev->dev);
 	free(pdev);
 	assert(!linuxu_sysfs_count(NULL));
@@ -293,6 +322,6 @@ int main(void)
 	paths_and_reads();
 	drain();
 	pci_attributes();
-	puts("PASS sysfs: path walk, groups, links, hwmon class directory, show/bin read, errnos, listing, removal drain, PCI attributes");
+	puts("PASS sysfs: path walk, groups, links, hwmon class directory, show/bin read, errnos, listing, removal drain, PCI attributes and configuration space");
 	return 0;
 }

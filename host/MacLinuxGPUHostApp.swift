@@ -2135,7 +2135,7 @@ struct AppMain {
         // Cached-state commands use an observer client, which works while a
         // session closes or stays quarantined and never joins a session.
         let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch",
-                                             "power-hold"]
+                                             "power-hold", "pcie"]
 
         if !host.openUserClient(observer: observerCommands.contains(args[1]),
                                 bundledOnly: args[1] == "ping-bundled") {
@@ -2146,6 +2146,20 @@ struct AppMain {
 
         let commandStatus: Int32
         switch args[1] {
+case "pcie":
+    // The GPU's PCI Express settings, from its configuration space as
+    // Linux shows it (the device's sysfs "config"); read only.
+    if let (status, config) = host.sysfsRead("config"), status == 0, let cap = PCIeCapability(config: config) {
+        cap.lines.forEach { print($0) }
+        commandStatus = 0
+    } else if let (status, config) = host.sysfsRead("config") {
+        print(status != 0 ? "ERROR: reading the configuration space: Linux errno \(-status)" :
+              "ERROR: no PCI Express capability in \(config.count) bytes of configuration space")
+        commandStatus = 1
+    } else {
+        print("ERROR: the driver did not answer the sysfs read (is the GPU initialized?)")
+        commandStatus = 1
+    }
 case "ping", "ping-bundled":
     commandStatus = host.ping() ? 0 : 1
 case "identity":
