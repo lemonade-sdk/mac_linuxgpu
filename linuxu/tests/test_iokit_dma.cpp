@@ -705,6 +705,33 @@ static void hold_waits_for_inflight_operation() {
     clean();
 }
 
+/* The VRAM aperture gate (rt/device_string.h) covers exactly the dext's
+ * BAR0 CPU mapping while it exists: once the device is gone, stores into it
+ * are refused and loads read all ones; a new mapping (a new device) opens
+ * it again, and memory outside it is never affected. */
+#include <rt/device_string.h>
+static void aperture_follows_bar0() {
+    start();
+    auto *bar = static_cast<uint8_t *>(dext_bar0_cpu_map(0, 4096)); assert(bar);
+    uint64_t word = 0x1122334455667788ULL, back = 0;
+    linuxu_device_memcpy(bar + 64, &word, 8);
+    assert(!memcmp(bar + 64, &word, 8));
+    linuxu_aperture_gone("test");
+    const uint64_t other = 0xaa;
+    linuxu_device_memcpy(bar + 64, &other, 8);           /* refused */
+    assert(!memcmp(bar + 64, &word, 8));
+    linuxu_device_memcpy(&back, bar + 64, 8);            /* reads all ones */
+    assert(back == UINT64_MAX);
+    uint64_t ram = 0;
+    linuxu_device_memcpy(&ram, &word, 8);                /* RAM is unaffected */
+    assert(ram == word);
+    assert(dext_bar0_cpu_unmap(bar) == 1);
+    bar = static_cast<uint8_t *>(dext_bar0_cpu_map(0, 4096)); assert(bar);
+    assert(!linuxu_aperture_is_gone());                  /* a new mapping */
+    assert(dext_bar0_cpu_unmap(bar) == 1);
+    clean();
+}
+
 int main(int argc, char **argv) {
     if (argc == 2) {
         if (!strcmp(argv[1], "shutdown-reset-failed")) shutdown_failure(false);
@@ -721,6 +748,7 @@ int main(int argc, char **argv) {
         ranges_descriptor();
         address_widths(); platform_probe();
         hold_waits_for_inflight_operation();
+        aperture_follows_bar0();
     }
     puts("production DriverKit DMA bridge offline failure checks passed");
 }

@@ -12,9 +12,12 @@ printf '#include "driverkit_dma_mocks.h"\n' > "$test_dir/include/PCIDriverKit/IO
 clang -w -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
   -ffunction-sections -fdata-sections -Ilinuxu/headers \
   -c linuxu/src/shims/printk.c -o "$test_dir/printk.o"
+clang -w -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+  -ffunction-sections -fdata-sections -Ilinuxu/headers \
+  -c linuxu/src/kmem/device_string.c -o "$test_dir/device_string.o"
 clang++ -x objective-c++ -std=c++17 -fno-exceptions -fno-objc-exceptions -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -DLINUXU_DEXT=1 \
   -I"$test_dir/include" -Ilinuxu/tests -idirafter linuxu/headers \
-  linuxu/tests/test_iokit_dma.cpp -x none "$test_dir/printk.o" \
+  linuxu/tests/test_iokit_dma.cpp -x none "$test_dir/printk.o" "$test_dir/device_string.o" \
   -Wl,-dead_strip -o "$test_dir/test_iokit_dma"
 "$test_dir/test_iokit_dma"
 "$test_dir/test_iokit_dma" failed-completion
