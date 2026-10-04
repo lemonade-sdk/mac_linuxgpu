@@ -14,6 +14,8 @@ import CoreGraphics
 import CoreMedia
 import CoreVideo
 import ScreenCaptureKit
+import AppKit
+import QuartzCore
 
 private let kIOReturnNotReadyValue = kern_return_t(bitPattern: 0xe00002d8)
 private let kIOReturnNotPermittedValue = kern_return_t(bitPattern: 0xe00002e2)
@@ -76,14 +78,18 @@ extension MacLinuxGPUHost {
         return (kr, Int64(bitPattern: status), DisplayReport(data))
     }
 
-    func displayPresent(handle: UInt32, rects: [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)])
-        -> (kern_return_t, Int64, PresentStats?) {
-        var request = Data(count: 8 + rects.count * 16)
+    /// PRESENT: queue a frame (its damage and capture time, mach ns) for the
+    /// driver's output worker; returns once queued. No rectangle and handle
+    /// 0 reads the worker's statistics only.
+    func displayPresent(handle: UInt32, rects: [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)],
+                        captureNs: UInt64) -> (kern_return_t, Int64, PresentStats?) {
+        var request = Data(count: 16 + rects.count * 16)
         request.withUnsafeMutableBytes { raw in
             raw.storeBytes(of: UInt32(rects.count).littleEndian, toByteOffset: 0, as: UInt32.self)
+            raw.storeBytes(of: captureNs.littleEndian, toByteOffset: 8, as: UInt64.self)
             for (i, r) in rects.enumerated() {
                 for (j, v) in [r.x, r.y, r.w, r.h].enumerated() {
-                    raw.storeBytes(of: v.littleEndian, toByteOffset: 8 + i * 16 + j * 4, as: UInt32.self)
+                    raw.storeBytes(of: v.littleEndian, toByteOffset: 16 + i * 16 + j * 4, as: UInt32.self)
                 }
             }
         }
@@ -93,6 +99,98 @@ extension MacLinuxGPUHost {
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), PresentStats(data))
     }
+
+    func displayStats() -> PresentStats? {
+        let (kr, status, stats) = displayPresent(handle: 0, rects: [], captureNs: 0)
+        return kr == kIOReturnSuccess && status == 0 ? stats : nil
+    }
+}
+
+// ----------------------------------------------------------------
+// MARK: - measurement helpers
+// ----------------------------------------------------------------
+
+private let machTimebase: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+/// mach_absolute_time units to ns: the clock the driver's ktime_get_ns()
+/// reads (CLOCK_UPTIME_RAW), so capture-to-flip latency needs no conversion.
+private func machToNs(_ t: UInt64) -> UInt64 {
+    t / UInt64(machTimebase.denom) * UInt64(machTimebase.numer) +
+        t % UInt64(machTimebase.denom) * UInt64(machTimebase.numer) / UInt64(machTimebase.denom)
+}
+
+private func threadCPUNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) }
+private func uptimeNs() -> UInt64 { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
+
+/// A process's CPU time and wakeups: this process from proc_pid_rusage
+/// (interrupt and package-idle wakeups); another user's (the driver's)
+/// through top(1), which may read them (idle wakeups only).
+struct ProcessUsage {
+    let cpuNs: UInt64
+    let wakeups: UInt64
+    let at: UInt64
+
+    static func current() -> ProcessUsage? {
+        var info = rusage_info_v4()
+        let r = withUnsafeMutablePointer(to: &info) { p in
+            p.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(getpid(), RUSAGE_INFO_V4, $0) }
+        }
+        var usage = rusage()
+        guard r == 0, getrusage(RUSAGE_SELF, &usage) == 0 else { return nil }
+        let cpu = UInt64(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1_000_000_000 +
+                  UInt64(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1000
+        return ProcessUsage(cpuNs: cpu, wakeups: info.ri_interrupt_wkups + info.ri_pkg_idle_wkups, at: uptimeNs())
+    }
+
+    static func sampled(pid: pid_t) -> ProcessUsage? {
+        let top = Process()
+        top.executableURL = URL(fileURLWithPath: "/usr/bin/top")
+        top.arguments = ["-l", "1", "-pid", String(pid), "-stats", "pid,idlew,time"]
+        let pipe = Pipe()
+        top.standardOutput = pipe
+        top.standardError = FileHandle.nullDevice
+        do { try top.run() } catch { return nil }
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        top.waitUntilExit()
+        guard let line = output.split(separator: "\n").last(where: { $0.hasPrefix(String(pid) + " ") }) else { return nil }
+        let fields = line.split(separator: " ")
+        guard fields.count >= 3, let wakeups = UInt64(fields[1].filter { $0 != "+" }) else { return nil }
+        // TIME: [hh:]mm:ss.cc
+        let parts = fields[2].filter { $0 != "+" }.split(separator: ":").map { Double($0) ?? 0 }
+        let seconds = parts.reduce(0) { $0 * 60 + $1 }
+        return ProcessUsage(cpuNs: UInt64(seconds * 1e9), wakeups: wakeups, at: uptimeNs())
+    }
+
+    /// CPU per second and wakeups per second from @start to self.
+    func rates(since start: ProcessUsage) -> (cpuPercent: Double, wakeupsPerSecond: Double) {
+        let seconds = Double(at - start.at) / 1e9
+        guard seconds > 0 else { return (0, 0) }
+        return (Double(cpuNs - start.cpuNs) / 1e9 / seconds * 100, Double(wakeups - start.wakeups) / seconds)
+    }
+}
+
+/// The driver's process: the one running this project's driver executable
+/// (its name, as the kernel keeps it, truncated to 16 bytes) as _driverkit.
+func driverProcessID(_ options: [String]) -> pid_t? {
+    if let given = option(options, "--dext-pid") { return pid_t(given) }
+    guard let driverkit = getpwnam("_driverkit")?.pointee.pw_uid else { return nil }
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
+    var size = 0
+    guard sysctl(&mib, 3, nil, &size, nil, 0) == 0 else { return nil }
+    var procs = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 8)
+    size = procs.count * MemoryLayout<kinfo_proc>.stride
+    guard sysctl(&mib, 3, &procs, &size, nil, 0) == 0 else { return nil }
+    let want = String("com.geramyloveless.MacAMDGPUHost.MacAMDGPU".prefix(16))
+    let found = procs.prefix(size / MemoryLayout<kinfo_proc>.stride).filter { p in
+        var comm = p.kp_proc.p_comm
+        let name = withUnsafeBytes(of: &comm) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return p.kp_eproc.e_ucred.cr_uid == driverkit && name == want
+    }
+    return found.count == 1 ? found[0].kp_proc.p_pid : nil
 }
 
 private func option(_ options: [String], _ flag: String) -> String? {
@@ -227,7 +325,14 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     var stream: SCStream?
     var mode: VirtualDisplayPlan.Mode?
     var handles: [IOSurfaceID: UInt32] = [:]
-    var frames = 0, presented = 0, copyNs: UInt64 = 0, flipNs: UInt64 = 0, bytes: UInt64 = 0
+    /// Presented frames whose buffers ScreenCaptureKit must not reuse yet,
+    /// with the driver's received count once each was queued: the driver
+    /// copies after PRESENT returns, so a frame's buffer is held until the
+    /// driver has flipped it (its copy is done; the flip waited for it) or
+    /// replaced it with a newer frame (never copied).
+    var held: [(sample: CMSampleBuffer, received: UInt64)] = []
+    var measurement = PresentMeasurement()
+    var last: PresentStats?
     var failure: String?
     var stopped = false
 
@@ -320,7 +425,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         configuration.height = mode.height
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.minimumFrameInterval = CMTime(value: 1000, timescale: CMTimeScale((mode.refreshRate * 1000).rounded()))
-        configuration.queueDepth = 4
+        configuration.queueDepth = 6 // frames held until flipped (see held) and one being captured
         configuration.showsCursor = true
         let stream = SCStream(filter: SCContentFilter(display: scDisplay, excludingWindows: []),
                               configuration: configuration, delegate: self)
@@ -353,6 +458,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
 
     func releaseImports() {
         queue.sync {
+            held.removeAll()
             for handle in handles.values { _ = observer.displayRelease(handle: handle) }
             handles.removeAll()
         }
@@ -369,7 +475,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
               let raw = info[.status] as? Int, SCFrameStatus(rawValue: raw) == .complete,
               let pixels = CMSampleBufferGetImageBuffer(sample),
               let surface = CVPixelBufferGetIOSurface(pixels)?.takeUnretainedValue() else { return }
-        frames += 1
+        let handlerStart = threadCPUNs()
+        measurement.frames += 1
         let id = IOSurfaceGetID(surface)
         var handle = handles[id]
         if handle == nil {
@@ -391,18 +498,95 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         let dirty = (info[.dirtyRects] as? [NSDictionary] ?? []).compactMap { CGRect(dictionaryRepresentation: $0) }
         let rects = presentRects(dirty, width: mode.width, height: mode.height)
-        if rects.isEmpty { return }
-        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: rects)
+        if rects.isEmpty { measurement.idleFrames += 1; return }
+        // The frame's composition time on the virtual display.
+        let captureNs = (info[.displayTime] as? UInt64).map(machToNs) ?? 0
+        let callCPU = threadCPUNs(), callWall = uptimeNs()
+        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: rects, captureNs: captureNs)
+        let callWallNs = uptimeNs() - callWall, callCPUNs = threadCPUNs() - callCPU
         guard kr == kIOReturnSuccess, status == 0, let stats else {
             failure = kr == kIOReturnSuccess ?
-                "PRESENT: \(displayErrno(status))" + (stats.map { " (copy \($0.copyStatus), flip \($0.flipStatus))" } ?? "") :
+                "PRESENT: \(displayErrno(status))" + (stats.map { " (worker error \($0.error))" } ?? "") :
                 callFailure(kr, "PRESENT")
             return
         }
-        presented += 1
-        copyNs += stats.copyNs
-        flipNs += stats.flipNs
-        bytes += stats.bytesCopied
+        last = stats
+        measurement.observe(stats)
+        held.removeAll { stats.flipped + stats.replaced >= $0.received }
+        held.append((sample, stats.received))
+        measurement.present(callCPUNs: callCPUNs, callWallNs: callWallNs, handlerCPUNs: threadCPUNs() - handlerStart)
+    }
+}
+
+/// --workload: what the virtual display shows while it is measured.
+///   still  nothing moves (the desktop as it is)
+///   move   a 480x320 window crosses the display, moved every refresh
+///   full   a window covering the display changes colour every refresh
+///          (the damage of full-screen video)
+private final class Workload {
+    let kind: String
+    var window: NSWindow?
+    var timer: Timer?
+    var tick = 0
+    var position = CGPoint(x: 0, y: 0), velocity = CGPoint(x: 9, y: 6)
+
+    init(kind: String) { self.kind = kind }
+
+    /// nil when started; otherwise why not.
+    func start(displayID: CGDirectDisplayID, refreshHz: Double) -> String? {
+        if kind == "still" { return nil }
+        guard kind == "move" || kind == "full" else { return "unknown workload \(kind) (still, move or full)" }
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        app.finishLaunching()
+        // CoreGraphics' global space has its origin at the top left of the
+        // main display, AppKit's at the bottom left.
+        let bounds = CGDisplayBounds(displayID), main = CGDisplayBounds(CGMainDisplayID())
+        guard bounds.width > 0 else { return "the virtual display has no bounds" }
+        let screen = NSRect(x: bounds.minX, y: main.height - bounds.maxY, width: bounds.width, height: bounds.height)
+        let frame = kind == "full" ? screen : NSRect(x: screen.minX, y: screen.minY, width: 480, height: 320)
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.ignoresMouseEvents = true
+        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        view.wantsLayer = true
+        view.layer?.backgroundColor = NSColor.systemOrange.cgColor
+        window.contentView = view
+        window.setFrame(frame, display: true)
+        window.orderFrontRegardless()
+        self.window = window
+        let interval = 1 / max(refreshHz, 1)
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.step(screen: screen) }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+        return nil
+    }
+
+    private func step(screen: NSRect) {
+        guard let window else { return }
+        tick += 1
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if kind == "full" {
+            window.contentView?.layer?.backgroundColor =
+                NSColor(hue: CGFloat(tick % 240) / 240, saturation: 0.8, brightness: 0.9, alpha: 1).cgColor
+        } else {
+            var p = position
+            p.x += velocity.x; p.y += velocity.y
+            if p.x < 0 || p.x + 480 > screen.width { velocity.x = -velocity.x; p.x = min(max(p.x, 0), screen.width - 480) }
+            if p.y < 0 || p.y + 320 > screen.height { velocity.y = -velocity.y; p.y = min(max(p.y, 0), screen.height - 320) }
+            position = p
+            window.setFrameOrigin(NSPoint(x: screen.minX + p.x, y: screen.minY + p.y))
+        }
+        CATransaction.commit()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+        window?.orderOut(nil)
+        window = nil
     }
 }
 
@@ -443,8 +627,48 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     plan.lines.forEach { print($0) }
 
     let mirror = MirroredDisplay(observer: observer, plan: plan)
+    let workload = Workload(kind: option(options, "--workload") ?? "still")
+    let warmup = Double(option(options, "--warmup") ?? "") ?? 2
+    let dextPID = driverProcessID(options)
     var outputOn = false
+    // The measured window: from --warmup after mirroring starts to the end.
+    var started: (stats: PresentStats, agent: ProcessUsage?, dext: ProcessUsage?, at: UInt64)?
+
+    func report() {
+        guard let started, let mode = mirror.mode else {
+            print("display-agent: nothing measured (the run ended within --warmup)")
+            return
+        }
+        guard let end = observer.displayStats() else {
+            print("display-agent: the driver's statistics could not be read at the end")
+            return
+        }
+        let seconds = Double(uptimeNs() - started.at) / 1e9
+        let measured = mirror.queue.sync { mirror.measurement }
+        print(String(format: "display-agent: measured %.1f s of workload %@", seconds, workload.kind))
+        for line in measured.lines(start: started.stats, end: end, seconds: seconds, refreshHz: mode.refreshRate) {
+            print("display-agent:   " + line)
+        }
+        let flips = Double(max(end.flipped - started.stats.flipped, 1))
+        if let a0 = started.agent, let a1 = ProcessUsage.current() {
+            let (cpu, wakeups) = a1.rates(since: a0)
+            print(String(format: "display-agent:   agent process: %.2f%% CPU, %.0f wakeups/s, %.1f us CPU per flipped frame",
+                         cpu, wakeups, Double(a1.cpuNs - a0.cpuNs) / flips / 1e3))
+        }
+        if let d0 = started.dext, let pid = dextPID, let d1 = ProcessUsage.sampled(pid: pid) {
+            let (cpu, wakeups) = d1.rates(since: d0)
+            print(String(format: "display-agent:   driver process %d: %.2f%% CPU, %.0f idle wakeups/s, %.1f us CPU per flipped frame (top: 10 ms CPU resolution)",
+                         pid, cpu, wakeups, Double(d1.cpuNs - d0.cpuNs) / flips / 1e3))
+        } else {
+            print("display-agent:   driver process: not measured (" +
+                  (dextPID == nil ? "not found; pass --dext-pid" : "top(1) did not report it") + ")")
+        }
+        if end.error != 0 { print("display-agent:   the driver's output worker stopped: \(displayErrno(Int64(end.error)))") }
+    }
+
     func teardown() -> Int32 {
+        workload.stop()
+        if outputOn { report() }
         mirror.stopCapture()
         mirror.releaseImports()
         if outputOn {
@@ -453,14 +677,6 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
         }
         mirror.display = nil
         print("display-agent: virtual display removed")
-        var usage = rusage()
-        getrusage(RUSAGE_SELF, &usage)
-        let cpu = Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
-                  Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
-        let n = max(mirror.presented, 1)
-        print(String(format: "display-agent: %d frame(s) captured, %d presented; copy %.2f ms, flip %.2f ms on average; %.1f MB copied; agent CPU %.2f s",
-                     mirror.frames, mirror.presented, Double(mirror.copyNs) / Double(n) / 1e6,
-                     Double(mirror.flipNs) / Double(n) / 1e6, Double(mirror.bytes) / 1e6, cpu))
         if let failure = mirror.failure {
             print("display-agent: FAILED: \(failure)")
             return 1
@@ -477,7 +693,12 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     guard mirror.startOutput(mode) else { return teardown() }
     outputOn = true
     guard mirror.startCapture(mode) else { return teardown() }
-    print("display-agent: mirroring; " + (seconds > 0 ? "for \(Int(seconds)) s" : "Ctrl-C to stop"))
+    if let error = workload.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) {
+        mirror.failure = "workload: \(error)"
+        return teardown()
+    }
+    print("display-agent: mirroring with workload \(workload.kind); " +
+          (seconds > 0 ? "for \(Int(seconds)) s" : "Ctrl-C to stop") + String(format: ", measured after %.1f s", warmup))
 
     var interrupted = false
     signal(SIGINT, SIG_IGN)
@@ -489,23 +710,35 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
         return source
     }
     defer { sources.forEach { $0.cancel() } }
-    let deadline = seconds > 0 ? Date().addingTimeInterval(seconds) : Date.distantFuture
+    let begin = Date()
+    let deadline = seconds > 0 ? begin.addingTimeInterval(seconds) : Date.distantFuture
     var lastReport = Date()
     while !interrupted && Date() < deadline {
-        RunLoop.main.run(until: Date().addingTimeInterval(0.25))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         if mirror.queue.sync(execute: { mirror.failure }) != nil { break }
+        if started == nil && Date().timeIntervalSince(begin) >= warmup {
+            guard let stats = observer.displayStats() else {
+                mirror.failure = "the driver's statistics could not be read"
+                break
+            }
+            mirror.queue.sync { mirror.measurement = PresentMeasurement(); mirror.measurement.lastFlipped = stats.flipped }
+            started = (stats, ProcessUsage.current(), dextPID.flatMap { ProcessUsage.sampled(pid: $0) }, uptimeNs())
+        }
         // A mode chosen in System Settings › Displays: relight at it.
         if let now = mirror.currentMode(), now != mirror.mode {
-            print(String(format: "display-agent: macOS switched to %dx%d @ %.3f Hz", now.width, now.height, now.refreshRate))
+            print(String(format: "display-agent: macOS switched to %dx%d @ %.3f Hz; the measurement restarts",
+                         now.width, now.height, now.refreshRate))
             mirror.stopCapture()
             mirror.releaseImports()
             mirror.queue.sync { mirror.stopped = false }
             guard mirror.startOutput(now), mirror.startCapture(now) else { break }
+            started = nil
         }
         if Date().timeIntervalSince(lastReport) >= 5 {
             lastReport = Date()
-            let (f, p) = mirror.queue.sync { (mirror.frames, mirror.presented) }
-            print("display-agent: \(f) frame(s) captured, \(p) presented")
+            let (f, p, l) = mirror.queue.sync { (mirror.measurement.frames, mirror.measurement.presented, mirror.last) }
+            print("display-agent: \(f) frame(s) captured, \(p) presented" +
+                  (l.map { ", \($0.flipped) flipped since OUTPUT" } ?? ""))
         }
     }
     return teardown()
