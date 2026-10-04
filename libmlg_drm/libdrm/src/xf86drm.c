@@ -143,6 +143,9 @@ struct request_stat {
 };
 static struct request_stat request_stats[256];
 static struct request_stat mmap_stat, munmap_stat;
+/* Syncobj waits with a zero timeout (polls: a failure is "not yet"),
+ * apart from the ones that may sleep. */
+static struct request_stat wait_poll_stat, timeline_wait_poll_stat;
 static int stats_enabled = -1;
 
 static uint64_t now_ns(void)
@@ -223,8 +226,11 @@ static void stats_print(void)
 			snprintf(other, sizeof(other), "request 0x%02x", nr);
 			name = other;
 		}
-		stat_print(name, &request_stats[nr]);
+		stat_print(nr == 0xc3 || nr == 0xca ? (nr == 0xc3 ? "SYNCOBJ_WAIT (may sleep)" :
+			   "SYNCOBJ_TIMELINE_WAIT (may sleep)") : name, &request_stats[nr]);
 	}
+	stat_print("SYNCOBJ_WAIT (polls)", &wait_poll_stat);
+	stat_print("SYNCOBJ_TIMELINE_WAIT (polls)", &timeline_wait_poll_stat);
 	stat_print("mmap", &mmap_stat);
 	stat_print("munmap", &munmap_stat);
 }
@@ -241,6 +247,17 @@ static bool stats_on(void)
 	return stats_enabled;
 }
 
+static struct request_stat *stat_slot(unsigned long req, const void *arg)
+{
+	if (req == DRM_IOCTL_SYNCOBJ_WAIT &&
+	    !((const struct drm_syncobj_wait *)arg)->timeout_nsec)
+		return &wait_poll_stat;
+	if (req == DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT &&
+	    !((const struct drm_syncobj_timeline_wait *)arg)->timeout_nsec)
+		return &timeline_wait_poll_stat;
+	return &request_stats[req & 0xff];
+}
+
 int drmIoctl(int fd, unsigned long req, void *arg)
 {
 	uint64_t start;
@@ -250,7 +267,7 @@ int drmIoctl(int fd, unsigned long req, void *arg)
 		return report("request", req, drm_ioctl_fd(fd, req, arg));
 	start = now_ns();
 	r = drm_ioctl_fd(fd, req, arg);
-	stat_add(&request_stats[req & 0xff], now_ns() - start, r != 0);
+	stat_add(stat_slot(req, arg), now_ns() - start, r != 0);
 	return report("request", req, r);
 }
 

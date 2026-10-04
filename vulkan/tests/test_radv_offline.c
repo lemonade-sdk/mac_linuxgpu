@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <vulkan/vulkan.h>
 
@@ -296,7 +297,14 @@ int main(int argc, char **argv)
 	VK(vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cpi, NULL, &pipeline));
 	cs_fixture_stats(&after);
 #if defined(__APPLE__) && defined(__aarch64__)
-	/* No CPU-visible VRAM: the shader reached VRAM by an SDMA copy. */
+	/* No CPU-visible VRAM: the shader reached VRAM by an SDMA copy. The
+	 * pipeline is created once the copy is submitted; the engine runs it
+	 * after (RADV waits for the upload before the shader's first use). */
+	for (int ms = 0; ms < 10000 && !(after.copies > before.copies &&
+					  after.sdma_ibs > before.sdma_ibs); ++ms) {
+		usleep(1000);
+		cs_fixture_stats(&after);
+	}
 	CHECK(after.copies > before.copies && after.sdma_ibs > before.sdma_ibs);
 	printf("compute pipeline compiled, uploaded to VRAM by SDMA (%lu copy)\n",
 	       after.copies - before.copies);
