@@ -15,6 +15,9 @@
  * exit path, with every kmalloc allocation released. The amdgpu side is
  * kfd_session_fixture.c. */
 #include <assert.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -294,6 +297,171 @@ static void process_death(void)
 	     "removed mid-session");
 }
 
+
+/* ---- signal events: interrupt-driven waits ---- */
+
+struct waiter {
+	struct rt_kfd_session *s;
+	uint32_t id;
+	uint32_t timeout_ms;
+	int ret;
+	uint32_t result;
+	uint64_t elapsed_ms;
+	pthread_t thread;
+};
+
+static uint64_t now_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
+static void *waiter_main(void *arg)
+{
+	struct waiter *w = arg;
+	struct rt_kfd_wait *wait = NULL;
+	const uint64_t start = now_ms();
+	uint32_t result = KFD_IOC_WAIT_RESULT_FAIL;
+	int ret = rt_kfd_wait_begin(w->s, &w->id, 1, 0, w->timeout_ms, &wait);
+
+	if (!ret)
+		ret = rt_kfd_wait_run(wait, &result);
+	w->result = result;
+	w->elapsed_ms = now_ms() - start;
+	__atomic_store_n(&w->ret, ret, __ATOMIC_RELEASE);	/* 1 until it returns */
+	return NULL;
+}
+
+static void start_waiter(struct waiter *w, struct rt_kfd_session *s, uint32_t id, uint32_t timeout_ms)
+{
+	memset(w, 0, sizeof(*w));
+	w->s = s;
+	w->id = id;
+	w->timeout_ms = timeout_ms;
+	w->ret = 1;
+	assert(!pthread_create(&w->thread, NULL, waiter_main, w));
+}
+
+/* One AQL dispatch on @set whose completion signal (an amd_signal_t at
+ * @signal_offset of @host, value 1) carries @event: the fixture's CP
+ * decrements the value, writes the mailbox and raises the interrupt. */
+static void dispatch_with_signal(struct rt_kfd_session *s, struct queue_set *set, uint64_t *next_id,
+				 struct rt_kfd_bo *host, uint64_t signal_offset,
+				 const struct rt_kfd_event *event)
+{
+	struct rt_kfd_bo_info ring, meta, hostinfo;
+	uint64_t abi[8] = {1, 1, event ? event->mailbox_va : 0, event ? event->trigger : 0};
+	uint8_t packet[64] = {0};
+	uint64_t signal, id = (*next_id)++;
+	uint32_t packets;
+
+	assert(!rt_kfd_bo_info(s, set->ring, &ring) && !rt_kfd_bo_info(s, set->meta, &meta) &&
+	       !rt_kfd_bo_info(s, host, &hostinfo));
+	packets = (uint32_t)(ring.size / 64);
+	signal = hostinfo.va + signal_offset;
+	assert(!rt_kfd_bo_write(s, host, signal_offset, abi, sizeof(abi)));
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_RING_BASE, &ring.va, 8));
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_RING_SIZE, &packets, 4));
+	packet[0] = FIXTURE_AQL_PACKET_DISPATCH;
+	memcpy(packet + FIXTURE_AQL_COMPLETION, &signal, 8);
+	assert(!rt_kfd_bo_write(s, set->ring, (id % packets) * 64, packet, sizeof(packet)));
+	id++;
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_WRITE_ID, &id, 8));
+	assert(!rt_kfd_queue_kick(s, set->q, id - 1));
+}
+
+static int64_t signal_value(struct rt_kfd_session *s, struct rt_kfd_bo *host, uint64_t offset)
+{
+	int64_t v = 0;
+
+	assert(!rt_kfd_bo_read(s, host, offset + 8, &v, 8));
+	return v;
+}
+
+static void events_and_waits(struct rt_kfd_session *s, struct queue_set *set, struct rt_kfd_bo *host)
+{
+	struct rt_kfd_event e0, e1, e2;
+	struct waiter a, b, c;
+	uint64_t next_id = 0, start;
+	unsigned int interrupts;
+
+	/* CREATE_EVENT: the first hands KFD the event page. */
+	assert(!rt_kfd_event_create(s, &e0) && !rt_kfd_event_create(s, &e1));
+	assert(rt_kfd_event_count(s) == 2);
+	assert(e0.id != e1.id && e0.trigger == e0.id && e1.trigger == e1.id);
+	assert(e0.mailbox_va != e1.mailbox_va && e0.mailbox_va >= 3ULL << 45);
+	{
+		/* KFD filled the page with UNSIGNALED_EVENT_SLOT. */
+		uint64_t *slot = fixture_va_to_host(TEST_PASID, e1.mailbox_va, 8);
+		assert(slot && *slot == UINT64_MAX);
+	}
+	/* Waits name live events only. */
+	{
+		struct rt_kfd_wait *w = NULL;
+		uint32_t bogus = 4000;
+		assert(rt_kfd_wait_begin(s, &bogus, 1, 0, 10, &w) == -ENOENT && !w);
+	}
+	fixture_cp_start();
+
+	/* The interrupt wakes the waiter on its event and no other. */
+	start_waiter(&a, s, e0.id, 1000);
+	start_waiter(&b, s, e1.id, 300);
+	usleep(20000);
+	interrupts = fixture_cp_interrupts();
+	start = now_ms();
+	dispatch_with_signal(s, set, &next_id, host, 0, &e0);
+	assert(!pthread_join(a.thread, NULL));
+	assert(!a.ret && a.result == KFD_IOC_WAIT_RESULT_COMPLETE);
+	assert(now_ms() - start < 200 && fixture_cp_interrupts() == interrupts + 1);
+	assert(signal_value(s, host, 0) == 0);
+	assert(!pthread_join(b.thread, NULL));
+	assert(!b.ret && b.result == KFD_IOC_WAIT_RESULT_TIMEOUT && b.elapsed_ms >= 290);
+	printf("events: interrupt woke its waiter in %llu ms; the other slept to its %u ms timeout\n",
+	       (unsigned long long)a.elapsed_ms, b.timeout_ms);
+
+	/* An interrupt that never arrives: the wait ends at its timeout (the
+	 * runtime's backstop) and the signal is found complete then. */
+	fixture_cp_drop_interrupts(true);
+	start_waiter(&a, s, e0.id, 50);
+	usleep(5000);
+	dispatch_with_signal(s, set, &next_id, host, 64, &e0);
+	assert(!pthread_join(a.thread, NULL));
+	assert(!a.ret && a.result == KFD_IOC_WAIT_RESULT_TIMEOUT && a.elapsed_ms >= 45);
+	assert(signal_value(s, host, 64) == 0 && fixture_cp_interrupts_dropped() == 1);
+	fixture_cp_drop_interrupts(false);
+
+	/* An interrupt before the wait: the auto-reset event stays signaled
+	 * until a wait consumes it. */
+	dispatch_with_signal(s, set, &next_id, host, 128, &e1);
+	start = now_ms();
+	while (signal_value(s, host, 128) != 0 && now_ms() - start < 1000)
+		usleep(100);
+	start_waiter(&a, s, e1.id, 1000);
+	assert(!pthread_join(a.thread, NULL));
+	assert(!a.ret && a.result == KFD_IOC_WAIT_RESULT_COMPLETE && a.elapsed_ms < 100);
+
+	/* SET_EVENT (a host-side store) wakes a waiter. */
+	start_waiter(&a, s, e1.id, 1000);
+	usleep(20000);
+	assert(!rt_kfd_event_set(s, e1.id));
+	assert(!pthread_join(a.thread, NULL));
+	assert(!a.ret && a.result == KFD_IOC_WAIT_RESULT_COMPLETE && a.elapsed_ms < 500);
+
+	/* DESTROY_EVENT ends a wait on it. */
+	assert(!rt_kfd_event_create(s, &e2));
+	start_waiter(&c, s, e2.id, 1000);
+	usleep(20000);
+	assert(!rt_kfd_event_destroy(s, e2.id) && rt_kfd_event_count(s) == 2);
+	assert(!pthread_join(c.thread, NULL));
+	/* KFD reports a wait whose event went away as -EIO, result FAIL. */
+	assert(c.ret == -EIO && c.result == KFD_IOC_WAIT_RESULT_FAIL && c.elapsed_ms < 500);
+	assert(rt_kfd_event_destroy(s, e2.id) == -ENOENT);
+
+	fixture_cp_stop();
+}
+
 int main(void)
 {
 	struct rt_kfd_session *s, *second;
@@ -448,8 +616,27 @@ int main(void)
 	make_queue(s, &q2, 64);
 	assert(mes_adds == 4 && q2.info.doorbell_index == mes_doorbells[3]);
 
-	/* ---- close: queues, memory, then the process exits ---- */
-	assert(!rt_kfd_session_close(s));
+	/* ---- signal events and interrupt-driven waits ---- */
+	{
+		struct waiter late;
+		uint32_t id;
+
+		events_and_waits(s, &q2, host);
+		/* A wait running when the session closes: close destroys the
+		 * events, the wait ends (FAIL), and close goes on once it has. */
+		{
+			struct rt_kfd_event e;
+			assert(!rt_kfd_event_create(s, &e));
+			id = e.id;
+		}
+		start_waiter(&late, s, id, 1000);
+		usleep(20000);
+		assert(__atomic_load_n(&late.ret, __ATOMIC_ACQUIRE) == 1);	/* still asleep */
+		assert(!rt_kfd_session_close(s));
+		assert(!pthread_join(late.thread, NULL));
+		assert(late.ret == -EIO && late.result == KFD_IOC_WAIT_RESULT_FAIL);
+		assert(late.elapsed_ms < 900);
+	}
 	assert(mes_removes == 4);
 
 	process_death();

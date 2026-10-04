@@ -3,6 +3,7 @@
  * functions. */
 #ifndef KFD_SESSION_FIXTURE_H
 #define KFD_SESSION_FIXTURE_H
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -43,6 +44,11 @@ void fixture_kfd_release_processes(void);
 void fixture_kfd_exit(void);
 void fixture_cp_start(void);
 void fixture_cp_stop(void);
+/* Completions of interrupt signals (a nonzero event mailbox) raise the
+ * end-of-pipe interrupt (kfd_signal_event_interrupt) unless dropped. */
+void fixture_cp_drop_interrupts(bool drop);
+unsigned int fixture_cp_interrupts(void);
+unsigned int fixture_cp_interrupts_dropped(void);
 
 struct amdgpu_device *fixture_adev(void);
 struct rt_compute_ctx *fixture_compute_ctx(void);
