@@ -1182,6 +1182,27 @@ test-radv-offline: lib
 test-llama-offline: lib
 	bash scripts/test-llama-offline.sh
 
+# mlg-run: a Vulkan program on RADV with its frames scanned out by the GPU
+# on the display output's monitor (tools/mlg-run). build/mlg-run finds
+# libdrm-mlg and the RADV ICD in the build tree.
+MLG_RUN_SRCS := tools/mlg-run/mlg-run.c tools/mlg-run/plan.c
+$(BUILD)/mlg-run: $(MLG_RUN_SRCS) tools/mlg-run/plan.h | libdrm-mlg
+	clang -std=c11 -Wall -Wextra -Werror -O2 -g -I$(LIBDRM_MLG)/include \
+		-I$(LIBDRM_MLG)/include/libdrm -Itools/mlg-run $(MLG_RUN_SRCS) \
+		-L$(LIBDRM_MLG)/lib -ldrm_mlg -Wl,-rpath,@executable_path/libdrm-mlg/lib \
+		-framework CoreGraphics -o $@
+
+mlg-run: $(BUILD)/mlg-run
+
+test-mlg-run:
+	@mkdir -p $(BUILD)
+	clang -std=c11 -Wall -Wextra -Werror -g -fsanitize=address,undefined -Itools/mlg-run \
+		tools/mlg-run/test_plan.c tools/mlg-run/plan.c -o $(BUILD)/test-mlg-run-plan
+	$(BUILD)/test-mlg-run-plan
+
+test: test-mlg-run
+.PHONY: mlg-run test-mlg-run
+
 # RADV's Metal surfaces on the fixture's display output (drmMlgScanout);
 # skips when RADV has not been built.
 test-radv-scanout: lib

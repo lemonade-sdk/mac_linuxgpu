@@ -281,6 +281,21 @@ it.
 - `make test-radv-scanout` runs it offline on the fixture's display
   output.
 
+`mlg-run` (`make mlg-run`, `tools/mlg-run`) runs a program that way
+whatever it would pick itself: only RADV for the Vulkan loader
+(`VK_DRIVER_FILES`, so not MoltenVK), the Khronos loader for SDL
+(`SDL_VULKAN_LIBRARY`, so not a bundled MoltenVK), `MLG_WSI_OUTPUT` set to
+the connector the display output drives (`--output` checks it),
+`MLG_WSI_MODE` from `--mode`, and SDL's full screen as a window on its own
+screen. `--quake3` adds Quake3e's settings: the Vulkan renderer, vsync, and
+full screen at the desktop's mode or a window three quarters of the
+monitor's screen, placed on that screen. `--dry-run` prints the plan.
+
+```sh
+build/mlg-run --quake3 --mode fullscreen -- ./quake3e.aarch64
+build/mlg-run --quake3 --mode windowed -- ./quake3e.aarch64 +map q3dm17
+```
+
 ## Remaining gaps
 
 - **Presenting elsewhere.** Only the display engine path: a window on
