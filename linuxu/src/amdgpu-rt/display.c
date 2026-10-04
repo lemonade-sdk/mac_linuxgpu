@@ -2431,6 +2431,15 @@ static int lx_scanout(struct pci_dev *pdev, void *owner, struct file *file,
 			ret = -EACCES;
 		}
 		break;
+	case MLG_LX_SCANOUT_HIDE:
+		/* Off the screen, still attached. */
+		if (!o)
+			ret = -ENOENT;
+		else if (o->client.owner != owner)
+			ret = -EACCES;
+		else
+			ret = scanout_detach(o);
+		break;
 	default:
 		ret = -EINVAL;
 		break;

@@ -142,6 +142,9 @@ extern "C" {
  *          is not committed yet; the output's worker error otherwise.
  * DETACH   the desktop back on the primary plane, the overlay off; returns
  *          once that flip happened. Closing the client does the same.
+ * HIDE     as DETACH, but the client stays attached (its overlay plane stays
+ *          reserved): nothing of it is on screen until its next PRESENT (a
+ *          window that left the monitor's screen).
  * STATE    the output and this client's attachment.
  *
  * src is in framebuffer pixels, dst in CRTC pixels; a zero width or height
@@ -151,6 +154,7 @@ extern "C" {
 #define MLG_LX_SCANOUT_PRESENT	3u
 #define MLG_LX_SCANOUT_DETACH	4u
 #define MLG_LX_SCANOUT_STATE	5u
+#define MLG_LX_SCANOUT_HIDE	6u
 
 #define MLG_LX_LAYER_PRIMARY	1u
 #define MLG_LX_LAYER_OVERLAY	2u

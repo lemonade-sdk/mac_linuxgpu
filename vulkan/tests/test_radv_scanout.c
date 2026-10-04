@@ -14,7 +14,8 @@
  * images are tiled framebuffers on the output's primary plane in place of
  * the desktop, acquired and presented frame after frame (each present's
  * vblank before the next); the desktop back when the swapchain goes; a
- * windowed swapchain on an overlay plane, centred. The software GPU runs
+ * windowed swapchain on an overlay plane, centred, its presents
+ * suboptimal for a layer of another size. The software GPU runs
  * no shaders, so what the images contain is not checked: which
  * framebuffers the planes scan out is. */
 #include <dlfcn.h>
@@ -355,7 +356,9 @@ int main(int argc, char **argv)
 		VkPresentInfoKHR pi = { .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
 			.waitSemaphoreCount = 1, .pWaitSemaphores = &r, .swapchainCount = 1,
 			.pSwapchains = &swapchain, .pImageIndices = &index };
-		VK(vkQueuePresentKHR(queue, &pi));
+		/* Shown, and suboptimal: the layer is 1920x1080, the images
+		 * 640x360 (the application would make new ones). */
+		CHECK(vkQueuePresentKHR(queue, &pi) == VK_SUBOPTIMAL_KHR);
 	}
 	{
 		int32_t x, y;

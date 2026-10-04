@@ -245,6 +245,46 @@ extern int drmMlgConnectorDisplay(int fd, uint32_t connector_id, uint32_t *displ
 extern int drmMlgEdidIdentity(const void *edid, size_t length, uint32_t *vendor,
 			      uint32_t *product, uint32_t *serial);
 
+/* Where a window's frames go on the output (drmMlgPlaceWindow). Rectangles
+ * of macOS are in global points, origin top left (CoreGraphics' space);
+ * the monitor's screen covers the output's whole mode, so a point maps to
+ * crtc_w / screen width pixels (the screen's backing scale and the mode in
+ * one factor). */
+#define DRM_MLG_PLACE_AUTO		0	/* full screen when the window fills its screen */
+#define DRM_MLG_PLACE_FULLSCREEN	1
+#define DRM_MLG_PLACE_WINDOWED		2
+/* DC's smallest viewport (MIN_VIEWPORT_SIZE): a smaller visible part of a
+ * window is not shown rather than grown by DC. */
+#define DRM_MLG_MIN_VIEWPORT		12
+
+struct drm_mlg_place_in {
+	int mode;			/* DRM_MLG_PLACE_* */
+	int have_screen;		/* the monitor has a macOS screen */
+	double screen_x, screen_y, screen_w, screen_h;
+	int have_window;		/* the layer is in a window */
+	int window_native_fullscreen;	/* AppKit's full screen, on the monitor's screen */
+	double win_x, win_y, win_w, win_h;	/* the window's content */
+	uint32_t crtc_w, crtc_h;	/* the output's mode */
+	uint32_t image_w, image_h;	/* the swapchain's images */
+};
+
+struct drm_mlg_placement {
+	uint32_t layer;			/* MLG_LX_LAYER_*, or 0: nothing shown */
+	uint32_t src_x, src_y, src_w, src_h;	/* in image pixels */
+	int32_t dst_x, dst_y;		/* on the CRTC */
+	uint32_t dst_w, dst_h;
+	char why[128];			/* for layer 0 or an error: the reason */
+};
+
+/* The layer and rectangles for one frame: the primary plane, whole, for a
+ * window that fills the monitor's screen (or MODE_FULLSCREEN, or no screen
+ * to place it on); else an overlay plane at the window's content mapped to
+ * CRTC pixels, clipped to the CRTC with the matching crop of the image;
+ * nothing (layer 0, with why) when no part of the window is on the
+ * monitor, or the part is under DRM_MLG_MIN_VIEWPORT pixels. Returns 0, or
+ * -EINVAL with why for inputs that make no placement. */
+extern int drmMlgPlaceWindow(const struct drm_mlg_place_in *in, struct drm_mlg_placement *out);
+
 #if defined(__cplusplus)
 }
 #endif

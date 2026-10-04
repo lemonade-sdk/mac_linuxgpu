@@ -12,7 +12,8 @@
  * from a client that is not attached, framebuffers of no file); presents on
  * the primary plane (the desktop's frames wait and are counted), a present
  * while the previous one is not committed (EBUSY), the overlay plane over
- * the desktop, the syncobj signalling at the flip, TEST; detach; the output
+ * the desktop, the syncobj signalling at the flip, TEST; hide (a window off
+ * the monitor) and a cropped present after it; detach; the output
  * relit under an attached client.
  *
  * This file is a library of its own linked against libdrm-mlg (as
@@ -387,6 +388,42 @@ int test_scanout(void)
 		CHECK(present(card, &small, MLG_LX_LAYER_OVERLAY, sync, 800, 500, 640, 360, &st) == 0);
 		CHECK(flip_wait(card, sync, 2000) == 0);
 		CHECK(EVENTUALLY(scanout_fx_pipes_showing(0x00aa0004u)));
+
+		/* A window that leaves the monitor: HIDE takes the overlay off
+		 * and leaves the client attached; its next present (cropped:
+		 * the window back half over the left edge) shows it again. */
+		{
+			int32_t x, y;
+			uint32_t w, h;
+
+			req = request(MLG_LX_SCANOUT_HIDE);
+			CHECK(drmMlgScanout(&req, &st) == 0 && st.attached && st.overlay_plane_id);
+			CHECK(EVENTUALLY(!scanout_fx_pipes_showing(0x00aa0004u) &&
+					 one_pipe(scanout_fx_pipes_showing(0x00405060u))));
+			CHECK(!scanout_fx_overlay(&x, &y, &w, &h));
+			CHECK(drmMlgScanout(&req, &st) == 0);	/* again: nothing to do */
+			req = request(MLG_LX_SCANOUT_PRESENT);
+			req.fd = card;
+			req.layer = MLG_LX_LAYER_OVERLAY;
+			req.fb_id = small.fb;
+			req.syncobj = sync;
+			req.src_x = 320;
+			req.src_y = 0;
+			req.src_w = 320;
+			req.src_h = 360;
+			req.dst_x = 0;
+			req.dst_y = 200;
+			req.dst_w = 320;
+			req.dst_h = 360;
+			CHECK(drmMlgScanout(&req, &st) == 0);
+			CHECK(flip_wait(card, sync, 2000) == 0);
+			CHECK(EVENTUALLY(scanout_fx_overlay(&x, &y, &w, &h) && x == 0 && y == 200 &&
+					 w == 320 && h == 360));
+			/* A crop past the framebuffer is refused, not trimmed. */
+			req.op = MLG_LX_SCANOUT_TEST;
+			req.src_x = 400;
+			CHECK(drmMlgScanout(&req, &st) == -ERANGE);
+		}
 
 		/* Detach: the overlay goes; presents are refused. */
 		req = request(MLG_LX_SCANOUT_DETACH);
