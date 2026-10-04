@@ -1,6 +1,6 @@
 /* linuxu: SHIM (third_party/linux/include/linux/jiffies.h)
  *
- * Jiffies over a monotonic 100 Hz userspace counter.
+ * Jiffies over a monotonic 1000 Hz userspace counter.
  * Runtime: linuxu/src/sync/time.c (or kmem).
  */
 #ifndef __LINUX_JIFFIES_H
@@ -13,14 +13,16 @@
 #include <time.h>
 #include <rt/fatal.h>
 
-/* 100 Hz tick (matches CONFIG_HZ=100 in the shim autoconf) */
-#define HZ			100
+/* 1000 Hz: a jiffy is a millisecond, so millisecond timeouts (KFD's
+ * WAIT_EVENTS, msecs_to_jiffies) are not rounded up to 10 ms. Nothing ticks:
+ * jiffies are read from the clock, and every sleep is a deadline. */
+#define HZ			1000
 /* vdso/jiffies.h: time between ticks in nsec */
 #ifndef TICK_NSEC
 #define TICK_NSEC ((NSEC_PER_SEC+HZ/2)/HZ)
 #endif
 #define USER_HZ			100
-#define CONFIG_HZ			100
+#define CONFIG_HZ			1000
 
 /* Read the clock on demand; no kernel timer interrupt updates a global. */
 static inline unsigned long long get_jiffies_64(void)
