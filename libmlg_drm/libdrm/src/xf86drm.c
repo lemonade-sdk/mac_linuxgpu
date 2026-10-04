@@ -15,6 +15,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "xf86drm.h"
@@ -134,9 +135,123 @@ static int report(const char *what, unsigned long req, int r)
 
 static int drm_ioctl_fd(int fd, unsigned long req, void *arg);
 
+/* LIBDRM_MLG_STATS=1: count every request by number with the time it took
+ * (the round trip to the driver, waits included) and print the table at
+ * exit. Per-number slots, updated atomically: no lock on the hot path. */
+struct request_stat {
+	uint64_t count, ns, max_ns, failures;
+};
+static struct request_stat request_stats[256];
+static struct request_stat mmap_stat, munmap_stat;
+static int stats_enabled = -1;
+
+static uint64_t now_ns(void)
+{
+	return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static const char *request_name(unsigned int nr)
+{
+	switch (nr) {
+	case 0x00: return "VERSION";
+	case 0x09: return "GEM_CLOSE";
+	case 0x0c: return "GET_CAP";
+	case 0x2d: return "PRIME_HANDLE_TO_FD";
+	case 0x2e: return "PRIME_FD_TO_HANDLE";
+	case 0xbf: return "SYNCOBJ_CREATE";
+	case 0xc0: return "SYNCOBJ_DESTROY";
+	case 0xc1: return "SYNCOBJ_HANDLE_TO_FD";
+	case 0xc2: return "SYNCOBJ_FD_TO_HANDLE";
+	case 0xc3: return "SYNCOBJ_WAIT";
+	case 0xc4: return "SYNCOBJ_RESET";
+	case 0xc5: return "SYNCOBJ_SIGNAL";
+	case 0xca: return "SYNCOBJ_TIMELINE_WAIT";
+	case 0xcb: return "SYNCOBJ_QUERY";
+	case 0xcc: return "SYNCOBJ_TRANSFER";
+	case 0xcd: return "SYNCOBJ_TIMELINE_SIGNAL";
+	case 0x40: return "AMDGPU_GEM_CREATE";
+	case 0x41: return "AMDGPU_GEM_MMAP";
+	case 0x42: return "AMDGPU_CTX";
+	case 0x43: return "AMDGPU_BO_LIST";
+	case 0x44: return "AMDGPU_CS";
+	case 0x45: return "AMDGPU_INFO";
+	case 0x46: return "AMDGPU_GEM_METADATA";
+	case 0x47: return "AMDGPU_GEM_WAIT_IDLE";
+	case 0x48: return "AMDGPU_GEM_VA";
+	case 0x49: return "AMDGPU_WAIT_CS";
+	case 0x50: return "AMDGPU_GEM_OP";
+	case 0x51: return "AMDGPU_GEM_USERPTR";
+	case 0x52: return "AMDGPU_WAIT_FENCES";
+	case 0x53: return "AMDGPU_VM";
+	case 0x54: return "AMDGPU_FENCE_TO_HANDLE";
+	case 0x55: return "AMDGPU_SCHED";
+	default: return NULL;
+	}
+}
+
+static void stat_add(struct request_stat *st, uint64_t ns, bool failed)
+{
+	uint64_t max = __atomic_load_n(&st->max_ns, __ATOMIC_RELAXED);
+
+	__atomic_add_fetch(&st->count, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&st->ns, ns, __ATOMIC_RELAXED);
+	if (failed)
+		__atomic_add_fetch(&st->failures, 1, __ATOMIC_RELAXED);
+	while (ns > max && !__atomic_compare_exchange_n(&st->max_ns, &max, ns, true,
+							  __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+		;
+}
+
+static void stat_print(const char *name, const struct request_stat *st)
+{
+	if (!st->count)
+		return;
+	fprintf(stderr, "libdrm-mlg: %-24s %10llu calls %12.3f ms total %9.1f us mean %10.1f us max%s\n",
+		name, (unsigned long long)st->count, st->ns / 1e6, st->ns / 1e3 / st->count,
+		st->max_ns / 1e3, st->failures ? " (some failed)" : "");
+}
+
+static void stats_print(void)
+{
+	char other[32];
+
+	fprintf(stderr, "libdrm-mlg: requests to the driver (round trip, waits included):\n");
+	for (unsigned int nr = 0; nr < 256; ++nr) {
+		const char *name = request_name(nr);
+
+		if (!name) {
+			snprintf(other, sizeof(other), "request 0x%02x", nr);
+			name = other;
+		}
+		stat_print(name, &request_stats[nr]);
+	}
+	stat_print("mmap", &mmap_stat);
+	stat_print("munmap", &munmap_stat);
+}
+
+static bool stats_on(void)
+{
+	if (stats_enabled < 0) {
+		const char *v = getenv("LIBDRM_MLG_STATS");
+
+		stats_enabled = v && *v && *v != '0';
+		if (stats_enabled)
+			atexit(stats_print);
+	}
+	return stats_enabled;
+}
+
 int drmIoctl(int fd, unsigned long req, void *arg)
 {
-	return report("request", req, drm_ioctl_fd(fd, req, arg));
+	uint64_t start;
+	int r;
+
+	if (!stats_on())
+		return report("request", req, drm_ioctl_fd(fd, req, arg));
+	start = now_ns();
+	r = drm_ioctl_fd(fd, req, arg);
+	stat_add(&request_stats[req & 0xff], now_ns() - start, r != 0);
+	return report("request", req, r);
 }
 
 static int drm_ioctl_fd(int fd, unsigned long req, void *arg)
@@ -789,7 +904,14 @@ void *drmFileMmap(void *addr, size_t length, int prot, int flags, int fd, off_t 
 
 	if (fd < 0 || (dfd = drm_file_driver_fd(fd)) < 0)
 		return mmap(addr, length, prot, flags, fd, offset);
-	p = mlg_mmap(addr, length, prot, flags, dfd, offset);
+	if (stats_on()) {
+		const uint64_t start = now_ns();
+
+		p = mlg_mmap(addr, length, prot, flags, dfd, offset);
+		stat_add(&mmap_stat, now_ns() - start, p == MAP_FAILED);
+	} else {
+		p = mlg_mmap(addr, length, prot, flags, dfd, offset);
+	}
 	if (p == MAP_FAILED)
 		report("mmap at offset", (unsigned long)offset, -1);
 	return p;
@@ -797,7 +919,16 @@ void *drmFileMmap(void *addr, size_t length, int prot, int flags, int fd, off_t 
 
 int drmFileMunmap(void *addr, size_t length)
 {
-	if (mlg_is_mapping(addr, length))
-		return mlg_munmap(addr, length);
+	if (mlg_is_mapping(addr, length)) {
+		uint64_t start;
+		int r;
+
+		if (!stats_on())
+			return mlg_munmap(addr, length);
+		start = now_ns();
+		r = mlg_munmap(addr, length);
+		stat_add(&munmap_stat, now_ns() - start, r != 0);
+		return r;
+	}
 	return munmap(addr, length);
 }

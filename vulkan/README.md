@@ -5,11 +5,10 @@ interface that mac_linuxgpu exposes through its Linux-file transport.
 Applications reach the GPU through the Vulkan loader, as on Linux: first
 llama.cpp's Vulkan backend, then games.
 
-Status: RADV builds for macOS arm64 and runs offline on the CS fixture's
-software GPU (device creation, memory, fenced submits, data written by the
-GPU checked, ACO pipelines, dispatches), and so does llama.cpp's Vulkan
-backend on top of it. It has not yet run on an R9700; see
-[the hardware plan](#hardware-test-plan-r9700).
+Status: RADV runs on the R9700. `vulkaninfo` lists the GPU, and
+llama.cpp's `test-backend-ops` passes on it: ADD 103/103 and MUL_MAT
+1132/1132, computed by the GPU and compared with the CPU. Offline, RADV and
+llama.cpp's Vulkan backend also run on the CS fixture's software GPU.
 
 ```
  application (llama.cpp, vulkaninfo, ...)
@@ -86,12 +85,13 @@ to two points of a timeline syncobj and exports the later one).
 pinned, declared in `patches/manifest.json` as an optional upstream (marked
 `update = none` in `.gitmodules`, so a plain recursive clone does not fetch
 it). The sparse set is what a RADV-only Meson build reads (about 60 MB).
-Two patches, 8 files, 88 lines added and 9 removed:
+Three patches:
 
 | Patch | Files | What |
 | --- | --- | --- |
 | `patches/mesa/radv-macos-build.patch` | `meson.build`, `src/amd/addrlib/meson.build`, `src/amd/common/meson.build`, `src/amd/vulkan/meson.build` | Find libdrm through pkg-config on Darwin when RADV is built; select addrlib's portable type definitions (`HAVE_TSERVER`) instead of the Apple kernel driver's private header; link RADV with `-undefined dynamic_lookup` as KosmicKrisp does (Mach-O cannot leave the entrypoint tables' weak layer symbols undefined). |
 | `patches/mesa/drm-file-ops.patch` | `src/util/os_drm.h`, `src/amd/vulkan/radv_device.c`, `src/amd/vulkan/radv_physical_device.c`, `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c` | `drm_ioctl` uses `drmIoctl` when libdrm defines `LIBDRM_FILE_OPS`; new `os_drm_open/stat/mmap/munmap` wrappers; RADV's six call sites use them. Without `LIBDRM_FILE_OPS` nothing changes. |
+| `patches/mesa/radv-apple-silicon-vram.patch` | `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c`, `src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c` | On Apple silicon, report no CPU-visible VRAM and place every buffer that is not `NO_CPU_ACCESS` in GTT (see [VRAM and the CPU on Apple silicon](#vram-and-the-cpu-on-apple-silicon)). |
 
 `scripts/verify-upstream.py` (`make verify-source`) checks the Mesa pin,
 sparse set and that the working tree is the pin plus exactly these patches,
@@ -100,6 +100,33 @@ once Mesa is checked out. `lib-dext` verifies only the Linux tree
 
 `third_party/llama.cpp` is pinned the same way at **b11379**
 (`1537a0a8b2f8711d840878b0a0677ab2213c882c`), unpatched.
+
+## VRAM and the CPU on Apple silicon
+
+Apple silicon gives the CPU only Device memory attributes for PCIe BARs, even
+for a mapping that asks for write combining. Aligned stores to a VRAM mapping
+work, but unaligned ones take an alignment fault, and `memcpy` makes them. On
+the R9700, RADV put its command buffers in CPU-visible VRAM (resizable BAR
+makes all of it visible), and the first `vkCreateDevice` died with `SIGBUS`
+(`EXC_ARM_DA_ALIGN`) in `memmove` writing the graphics preamble. A probe of
+each mapping on the R9700:
+
+| Mapping | aligned store | unaligned store | unaligned memcpy | memset 0 |
+| --- | --- | --- | --- | --- |
+| GTT, cached | ok | ok | ok | ok |
+| GTT, USWC (write-combined) | ok | ok | ok | ok |
+| VRAM through BAR0 (write-combined) | ok | SIGBUS | SIGBUS | ok |
+
+No mapping option makes BAR space normal memory (and a cacheable mapping of
+it is not safe to try), so the CPU must not write VRAM through a mapping.
+`radv-apple-silicon-vram.patch` makes RADV's winsys report no CPU-visible
+VRAM on Apple silicon (no `HOST_VISIBLE | DEVICE_LOCAL` memory type; all VRAM
+is one device-local heap) and place every buffer the CPU may map in GTT:
+command buffers, descriptor pools, shader arenas, upload buffers. The GPU
+reads them from system memory over the link; buffers the GPU alone uses
+(`NO_CPU_ACCESS`: images, device-local Vulkan memory, model weights) stay in
+VRAM. The dext's own CPU access to VRAM already uses aligned word copies
+(`rt/device_string.h`) for the same reason.
 
 ## Building
 

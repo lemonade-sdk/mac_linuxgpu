@@ -133,6 +133,15 @@
           "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c"
         ],
         "reason": "RADV opens and stats render nodes, maps buffers and issues requests with the system calls, which cannot reach a driver outside the kernel. When libdrm defines LIBDRM_FILE_OPS (libdrm-mlg), util/os_drm.h routes ioctl through drmIoctl and new os_drm_open/stat/mmap/munmap wrappers through libdrm's drmFile* functions; RADV's six call sites use the wrappers. Without LIBDRM_FILE_OPS nothing changes."
+      },
+      {
+        "patch": "patches/mesa/radv-apple-silicon-vram.patch",
+        "sha256": "f0ca923af6037e86bbdf5d80164c8e345ae793d88b37760cafc80dbd5dd4f08d",
+        "files": [
+          "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c",
+          "src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c"
+        ],
+        "reason": "Apple silicon maps PCIe BARs for the CPU as Device memory only, so memcpy into a CPU mapping of VRAM faults on unaligned stores (seen on the R9700: SIGBUS creating the device). On Apple silicon the winsys reports no CPU-visible VRAM and places any buffer that is not NO_CPU_ACCESS in GTT, whose mappings are normal memory."
       }
     ]
   },

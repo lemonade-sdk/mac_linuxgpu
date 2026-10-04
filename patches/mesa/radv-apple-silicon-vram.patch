@@ -1,0 +1,56 @@
+radv/amdgpu: on Apple silicon, keep buffers the CPU maps in GTT
+
+Apple silicon gives the CPU only Device memory attributes for PCIe BARs,
+even when a mapping asks for write combining: unaligned stores fault. On
+an R9700 behind mac_linuxgpu, RADV put its command buffers in CPU-visible
+VRAM and memcpy into them took an alignment fault (SIGBUS) while creating
+the device; GTT mappings, cached or write-combined, are normal memory.
+
+- radv_amdgpu_winsys_query_info: report no CPU-visible VRAM, so there is no
+  host-visible device-local memory type and no upload or IB placement that
+  counts on one.
+- radv_amdgpu_winsys_bo_create: a VRAM buffer that is not NO_CPU_ACCESS is
+  placed in GTT instead, whatever the caller asked (command buffers,
+  descriptor pools, shader arenas, upload buffers).
+
+Other platforms are unchanged.
+
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index 4398d6e..d9e0707 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -528,6 +528,13 @@ radv_amdgpu_winsys_bo_create(struct radeon_winsys *_ws, uint64_t size, unsigned
+    if (flags & RADEON_FLAG_VIRTUAL)
+       return radv_amdgpu_winsys_virtual_bo_create(_ws, size, alignment, flags, replay_address, out_bo);
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++   /* A CPU mapping of VRAM is Device memory on Apple silicon (see
++    * radv_amdgpu_winsys_query_info): a buffer the CPU may map lives in GTT. */
++   if ((initial_domain & RADEON_DOMAIN_VRAM) && !(flags & RADEON_FLAG_NO_CPU_ACCESS))
++      initial_domain = (initial_domain & ~RADEON_DOMAIN_VRAM) | RADEON_DOMAIN_GTT;
++#endif
++
+    /* Just be robust for callers that might use NULL-ness for determining if things should be freed.
+     */
+    *out_bo = NULL;
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index c47d421..fdb697a 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -345,6 +345,16 @@ radv_amdgpu_winsys_query_info(int fd, uint64_t debug_flags, bool is_virtio, stru
+       goto fail;
+    }
+ 
++#if defined(__APPLE__) && defined(__aarch64__)
++   /* Apple silicon gives the CPU only Device memory attributes for PCIe BARs,
++    * even for a write-combined mapping: unaligned stores fault, so memcpy into
++    * a VRAM mapping does. No VRAM is CPU-visible here: there is no host-visible
++    * device-local memory type, and buffers the CPU may map are placed in GTT
++    * (radv_amdgpu_winsys_bo_create). */
++   info->base.vram_vis_size_kb = 0;
++   info->base.all_vram_visible = false;
++#endif
++
+    /*
+     * Override the max submits on video queues.
+     * If you submit multiple session contexts in the same IB sequence the
