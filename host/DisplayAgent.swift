@@ -430,8 +430,13 @@ struct PresentMeasurement {
     var bucketCopyNs = [UInt64](repeating: 0, count: 4)
     var lastFlipped: UInt64 = 0
 
-    mutating func present(callCPUNs: UInt64, callWallNs: UInt64, handlerCPUNs: UInt64) {
+    /// Waiting for the compositor to finish writing the captured buffer.
+    var lockWaitNs: UInt64 = 0, lockWaitMaxNs: UInt64 = 0
+
+    mutating func present(callCPUNs: UInt64, callWallNs: UInt64, handlerCPUNs: UInt64, lockWaitNs: UInt64 = 0) {
         presented += 1
+        self.lockWaitNs += lockWaitNs
+        lockWaitMaxNs = max(lockWaitMaxNs, lockWaitNs)
         self.callCPUNs += callCPUNs
         self.callWallNs += callWallNs
         callWallMaxNs = max(callWallMaxNs, callWallNs)
@@ -462,6 +467,8 @@ struct PresentMeasurement {
         out.append(String(format: "agent per presented frame: PRESENT %.1f us CPU, %.1f us wall (max %.1f); whole frame handler %.1f us CPU",
                           Double(callCPUNs) / p / 1e3, Double(callWallNs) / p / 1e3,
                           Double(callWallMaxNs) / 1e3, Double(handlerCPUNs) / p / 1e3))
+        out.append(String(format: "waiting for the compositor to finish the captured frame: %.1f us on average, %.1f us at most",
+                          Double(lockWaitNs) / p / 1e3, Double(lockWaitMaxNs) / 1e3))
         out.append(String(format: "driver per flipped frame: %.1f KB copied in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
                           Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
                           Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
@@ -480,6 +487,62 @@ struct PresentMeasurement {
                               mb > 0 ? Double(bucketCopyNs[i]) / 1e6 / mb : 0))
         }
         return out
+    }
+}
+
+/// Presented frames whose capture buffers must stay unreused until the
+/// driver is done reading them. PRESENT only queues a frame (a mailbox of
+/// one); the driver's worker later takes it and copies it (SDMA reads the
+/// buffer) or a newer frame replaces it first (never read). A taken frame
+/// is done at its flip: the flip waits for its copy, and frames flip in
+/// the order they were taken. Which happened to a frame is known at the
+/// next PRESENT: the replaced count went up when it was still in the
+/// mailbox. The driver's counts alone do not say which frames are done:
+/// a replacement counts the newest frame while an older one taken before
+/// it may still be copying.
+struct PresentedFrames<Item> {
+    /// Taken frames: the flipped count at which each is done, oldest first.
+    private(set) var taken: [(item: Item, flip: UInt64)] = []
+    /// The newest frame: in the mailbox or taken, not known until the next PRESENT.
+    private(set) var newest: Item?
+    private var replaced: UInt64 = 0
+
+    var count: Int { taken.count + (newest == nil ? 0 : 1) }
+
+    /// @item was just queued; @received, @replaced and @flipped are the
+    /// driver's counts PRESENT returned for it. Returns the items now free.
+    mutating func presented(_ item: Item, received: UInt64, replaced nowReplaced: UInt64,
+                            flipped: UInt64) -> [Item] {
+        var free: [Item] = []
+        if let previous = newest {
+            if nowReplaced > replaced {
+                free.append(previous)      // still in the mailbox: never read
+            } else {
+                // Taken: every frame before this one was taken or replaced,
+                // so it was taken frame number (received - 1 - replaced).
+                taken.append((previous, received - 1 - nowReplaced))
+            }
+        }
+        newest = item
+        replaced = nowReplaced
+        free += retire(flipped: flipped)
+        return free
+    }
+
+    /// Frames flipped by @flipped are done.
+    mutating func retire(flipped: UInt64) -> [Item] {
+        var free: [Item] = []
+        while let first = taken.first, first.flip <= flipped {
+            free.append(first.item)
+            taken.removeFirst()
+        }
+        return free
+    }
+
+    mutating func removeAll() {
+        taken.removeAll()
+        newest = nil
+        replaced = 0
     }
 }
 

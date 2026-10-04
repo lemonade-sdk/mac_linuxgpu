@@ -329,12 +329,11 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     var stream: SCStream?
     var mode: VirtualDisplayPlan.Mode?
     var handles: [IOSurfaceID: UInt32] = [:]
-    /// Presented frames whose buffers ScreenCaptureKit must not reuse yet,
-    /// with the driver's received count once each was queued: the driver
-    /// copies after PRESENT returns, so a frame's buffer is held until the
-    /// driver has flipped it (its copy is done; the flip waited for it) or
-    /// replaced it with a newer frame (never copied).
-    var held: [(sample: CMSampleBuffer, received: UInt64)] = []
+    /// Presented frames whose buffers ScreenCaptureKit must not reuse yet:
+    /// the driver copies after PRESENT returns, so a frame's buffer is held
+    /// until the driver has flipped it (its copy is done; the flip waited
+    /// for it) or replaced it with a newer frame (never copied).
+    var held = PresentedFrames<CMSampleBuffer>()
     var measurement = PresentMeasurement()
     var last: PresentStats?
     var failure: String?
@@ -431,7 +430,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         configuration.height = mode.height
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
         configuration.minimumFrameInterval = CMTime(value: 1000, timescale: CMTimeScale((mode.refreshRate * 1000).rounded()))
-        configuration.queueDepth = 6 // frames held until flipped (see held) and one being captured
+        configuration.queueDepth = 6 // frames held until done (see held) and one being captured
         configuration.showsCursor = true
         let stream = SCStream(filter: SCContentFilter(display: scDisplay, excludingWindows: []),
                               configuration: configuration, delegate: self)
@@ -505,6 +504,19 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         let dirty = (info[.dirtyRects] as? [NSDictionary] ?? []).compactMap { CGRect(dictionaryRepresentation: $0) }
         let rects = presentRects(dirty, width: mode.width, height: mode.height)
         if rects.isEmpty { measurement.idleFrames += 1; return }
+        // ScreenCaptureKit hands over the buffer while the compositor's GPU
+        // may still be writing it: read at delivery, its damaged rows can
+        // still hold the previous frame (an old window position the
+        // driver's copy would then keep on screen). The lock waits for
+        // those writes; nothing writes the buffer again while it is held.
+        let lockWall = uptimeNs()
+        let lock = IOSurfaceLock(surface, .readOnly, nil)
+        let lockWaitNs = uptimeNs() - lockWall
+        guard lock == kIOReturnSuccess else {
+            failure = "IOSurfaceLock of capture surface \(id): " + String(format: "0x%08x", lock)
+            return
+        }
+        defer { IOSurfaceUnlock(surface, .readOnly, nil) }
         // The frame's composition time on the virtual display.
         let captureNs = (info[.displayTime] as? UInt64).map(machToNs) ?? 0
         let callCPU = threadCPUNs(), callWall = uptimeNs()
@@ -518,9 +530,9 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         last = stats
         measurement.observe(stats)
-        held.removeAll { stats.flipped + stats.replaced >= $0.received }
-        held.append((sample, stats.received))
-        measurement.present(callCPUNs: callCPUNs, callWallNs: callWallNs, handlerCPUNs: threadCPUNs() - handlerStart)
+        _ = held.presented(sample, received: stats.received, replaced: stats.replaced, flipped: stats.flipped)
+        measurement.present(callCPUNs: callCPUNs, callWallNs: callWallNs, handlerCPUNs: threadCPUNs() - handlerStart,
+                            lockWaitNs: lockWaitNs)
     }
 }
 
