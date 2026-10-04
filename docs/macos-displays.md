@@ -237,7 +237,77 @@ Apple GPU. The AMD GPU only scans out.
   - teardown restored the monitor and removed the display, with no
     quarantine.
 
-## 4. Increments
+## 3b. System Information (implemented)
+
+What macOS System Information (`system_profiler SPDisplaysDataType` and
+`SPPCIDataType`) can show for the GPU, and what it cannot, checked against
+SPDisplaysReporter and SPPCIReporter on macOS 26.6.2 and xnu's
+IOUserServer.cpp:
+
+- **Where it reads.** Each PCI GPU entry is built from the IOPCIDevice's
+  properties merged with the properties of each of its direct children in
+  the IOService plane (`IORegistryEntryGetChildIterator`, then
+  `addEntriesFromDictionary:`; a child's key wins). The dext's
+  `MacLinuxGPU` service is such a child. That is why the GPU shows up
+  today at all (a PCI device with no child is skipped), and why
+  `sppci_tunnel-compatible: Yes` comes from our personality.
+- **What a dext can publish.** `IOService::SetProperties()` on its own
+  service stores the keys under `IOUserServiceProperties`, and the kernel
+  merges that dictionary into the top level of what
+  `IORegistryEntryCreateCFProperties` returns
+  (`is_io_registry_entry_get_properties_bin_buf`). So System Information
+  sees them as ordinary keys of our service. A dext cannot set properties
+  on its provider (`SetProperties` on another service goes to that
+  service's kernel `setProperties`; IOPCIDevice's acts only on
+  `IOPCIOnline` = false, an eject request, and refuses everything else),
+  and user
+  space cannot set them on ours (`IOUserService` has no `setProperties`;
+  `UserSetProperties` is private). Personality keys are static, the same
+  for every device a personality matches.
+- **The keys it reads** for a PCI GPU, with their labels: `model` (the
+  name and "Chipset Model"; SPPCI's name too), `VRAM,totalMB` ("VRAM
+  (Total)", MB, shown as GB from 1024), `ATY,EFIVersionB` ("VBIOS
+  Version"), `rom-revision` ("ROM Revision"), `IOPCITunnelled` ("External
+  GPU"), the PCI IDs, and the link width from `IOPCIExpressLinkStatus`.
+  `model` and the version keys may be strings or data (SPSupport's
+  `stringValue` takes both). Keys that would claim Metal support
+  (`MetalPluginName`) or Apple GPU cores (`gpu-core-count`) are not
+  published: they would be false.
+- **Displays under the R9700: not possible.** For a PCI GPU, "Displays:"
+  lists only framebuffers below the device that conform to the kernel
+  class `IOFramebuffer` (IOGraphicsFamily, which has no DriverKit family;
+  `IOObjectConformsTo` checks the kernel class, and a dext's services are
+  `IOUserService`). For the Apple GPU it lists every `AppleCLCD2` /
+  `IOMobileFramebufferShim` in the registry and every display in
+  WindowServer's list, virtual ones included, which is where our
+  CGVirtualDisplays appear. Nothing a dext or an app can publish moves
+  them.
+
+What the dext publishes (`dext/sources/device_identity.h`,
+`device_properties.h`):
+
+- At Start, from the provider's registers: `model` from libdrm's product
+  table (`linuxu/headers/rt/amdgpu_ids.h`, shared with libmlg_drm), and
+  `MacLinuxGPUDevice` (IDs, PCIe link). A device the table does not list
+  gets no `model`; nothing is made up.
+- After the upstream probe (`rt_device_identity`, copies of the amdgpu
+  device's fields): `VRAM,totalMB` (gmc.real_vram_size), `ATY,EFIVersionB`
+  (the VBIOS part number, sysfs vbios_version), `rom-revision` (the VBIOS
+  version string), and in `MacLinuxGPUDevice` the VRAM type and width, CU
+  count, GC version, KFD's ISA target, VBIOS build and date, FRU name.
+- `MacLinuxGPUDisplays`: the DRM connectors with status, the EDID monitor
+  name (`rt_display_monitor`, `drm_edid_get_monitor_name`), physical size,
+  preferred and driven mode, and the hotplug epoch. Updated by the display
+  operations (a STATUS poll republishes only when something changed) and
+  removed when the session closes.
+
+`MacLinuxGPUHost device` prints the GPU with its monitors from these
+properties without opening a user client, and the host app's window shows
+the same. Tests: `test-device-properties` (the property set, with
+DriverKit container substitutes, every allocation failure),
+`test-device-info` (the host view), and the identity and monitor reads in
+`test-dm-offline`.
+
 
 1. **Done on feature/display-c:** STATUS (cached state, hotplug epoch via
    the monitor client), MODES, display-test.py `status`/`modes`, and
