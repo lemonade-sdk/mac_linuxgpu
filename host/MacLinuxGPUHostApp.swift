@@ -712,8 +712,8 @@ enum DriverUpgrade {
     static func quiescePrevious(force: Bool, report: (String) -> Void) {
         // The display daemon's session would keep the previous driver from
         // closing; it starts again once the new driver is verified.
-        if !DriverInstances.previous().isEmpty && DisplayAutostart.isRunning {
-            report("Stopping the display agent while the driver is replaced.")
+        if !DriverInstances.previous().isEmpty {
+            report("Stopping display agents while the driver is replaced.")
             DisplayAutostart.suspendForUpgrade()
         }
         for instance in DriverInstances.previous() {
@@ -740,8 +740,8 @@ enum DriverUpgrade {
     /// when none is left; otherwise reports why and how to recover.
     @discardableResult
     static func retirePrevious(force: Bool, timeout: TimeInterval, report: (String) -> Void) -> Bool {
-        if !DriverInstances.previous().isEmpty && DisplayAutostart.isRunning {
-            report("Stopping the display agent while the previous driver hands over the GPU.")
+        if !DriverInstances.previous().isEmpty {
+            report("Stopping display agents while the previous driver hands over the GPU.")
             DisplayAutostart.suspendForUpgrade()
         }
         if DriverInstances.bundledCDHash() == nil {

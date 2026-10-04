@@ -1023,6 +1023,8 @@ enum DisplayAutostart {
             return "could not write \(plistURL.path): \(error.localizedDescription)"
         }
         launchctl(["bootout", "\(domain)/\(label)"])
+        // One agent per monitor: one started by hand would compete for it.
+        stopOtherAgents()
         let started = launchctl(["bootstrap", domain, plistURL.path])
         return started.status == 0 ? nil : "launchctl bootstrap failed (\(started.status)): \(started.output)"
     }
@@ -1046,10 +1048,35 @@ enum DisplayAutostart {
         return enable()
     }
 
-    /// A driver upgrade: the daemon's session would keep the previous driver
-    /// from handing over the GPU. Stopped, and started again afterwards.
+    /// A driver upgrade: a display agent's session would keep the previous
+    /// driver from handing over the GPU. Stopped (the LaunchAgent, and any
+    /// agent started by hand), and the LaunchAgent started again afterwards.
     static func suspendForUpgrade() {
         if isEnabled { launchctl(["bootout", "\(domain)/\(label)"]) }
+        stopOtherAgents()
+    }
+
+    /// Display agents of this user not run by the LaunchAgent (started by
+    /// hand, or by an older app): SIGTERM, which restores the monitor and
+    /// removes the virtual display; waits up to 15 s for them to go.
+    static func stopOtherAgents() {
+        let pattern = "MacLinuxGPUHost display-agent --create"
+        let list = { () -> [pid_t] in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            process.arguments = ["-U", String(getuid()), "-f", pattern]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            guard (try? process.run()) != nil else { return [] }
+            let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            process.waitUntilExit()
+            return text.split(separator: "\n").compactMap { pid_t($0) }.filter { $0 != getpid() }
+        }
+        let pids = list()
+        guard !pids.isEmpty else { return }
+        pids.forEach { kill($0, SIGTERM) }
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline && !list().isEmpty { Thread.sleep(forTimeInterval: 0.25) }
     }
     static func resumeAfterUpgrade() {
         if isEnabled && !isRunning { launchctl(["bootstrap", domain, plistURL.path]) }
