@@ -231,6 +231,22 @@ int dext_compute_cs_write_dwords(uint64_t handle, const uint32_t *dwords,
 /* CSDestroy (39): in handle. */
 int dext_compute_cs_destroy(uint64_t handle);
 
+/* Signal events (selector 86) of the selected client's KFD process: the
+ * runtime's interrupt signals. create: out[0] id, [1] trigger (the
+ * amd_signal_t event_id), [2] mailbox VA (event_mailbox_ptr). A client on
+ * the legacy path has none: -ENOTREADY_L. */
+#define DEXT_COMPUTE_EVENT_CREATE  0u
+#define DEXT_COMPUTE_EVENT_DESTROY 1u
+#define DEXT_COMPUTE_EVENT_SET     2u
+int dext_compute_event(uint32_t op, uint32_t id, uint64_t out[3]);
+/* Selector 87: register a wait on the selected client's events
+ * (rt_kfd_wait_begin); the caller runs it with rt_kfd_wait_run off its
+ * queue, or frees it with rt_kfd_wait_cancel. -EBUSY_L when the client
+ * has too many waits running. */
+struct rt_kfd_wait;
+int dext_compute_event_wait_begin(const uint32_t *ids, uint32_t count, int all,
+                                  uint32_t timeout_ms, struct rt_kfd_wait **out);
+
 #ifdef __cplusplus
 }
 #endif

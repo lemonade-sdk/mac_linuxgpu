@@ -760,6 +760,21 @@ int dext_compute_cs_destroy(uint64_t handle)
     memset(e, 0, sizeof(*e));
     return 0;
 }
+
+/* The in-memory model has no KFD process: no signal events. */
+int dext_compute_event(uint32_t op, uint32_t id, uint64_t out[3])
+{
+    (void)op; (void)id; (void)out;
+    return -ENOTREADY_L;
+}
+
+int dext_compute_event_wait_begin(const uint32_t *ids, uint32_t count, int all,
+                                  uint32_t timeout_ms, struct rt_kfd_wait **out)
+{
+    (void)ids; (void)count; (void)all; (void)timeout_ms;
+    if (out) *out = NULL;
+    return -ENOTREADY_L;
+}
 #endif /* LINUXU_DEXT */
 
 /* AtomicRequester (60): shared by both builds; touches no device state. */

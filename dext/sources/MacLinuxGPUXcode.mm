@@ -79,6 +79,8 @@
 #include <rt/drm_info.h>
 #include <rt/lx_abi.h>
 #include <rt/lx_files.h>
+#include <rt/kfd_session.h>
+#include <rt/wait_pool.h>
 #include <rt/sysfs.h>
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
@@ -169,6 +171,13 @@ static_assert(MLG_SELECTOR_SYSFS_READ > kMacAMDGPUMethodReleaseQuarantine &&
               MLG_SELECTOR_DRM_INFO > kMacAMDGPUMethodReleaseQuarantine, "Linux read selectors");
 static_assert(MLG_SELECTOR_DISPLAY > MLG_SELECTOR_DRM_SELFTEST &&
               MLG_SELECTOR_DISPLAY < MLG_SELECTOR_LX_OPEN, "display selector");
+static_assert(MLG_SELECTOR_EVENT > MLG_SELECTOR_RETIRE &&
+              MLG_SELECTOR_EVENT_WAIT < MLG_SELECTOR_LX_OPEN &&
+              MLG_EVENT_WAIT_IDS == RT_KFD_WAIT_EVENTS_MAX &&
+              MLG_EVENT_WAIT_MAX_MS == RT_KFD_WAIT_MAX_MS &&
+              DEXT_COMPUTE_EVENT_CREATE == MLG_EVENT_OP_CREATE &&
+              DEXT_COMPUTE_EVENT_DESTROY == MLG_EVENT_OP_DESTROY &&
+              DEXT_COMPUTE_EVENT_SET == MLG_EVENT_OP_SET, "event selectors");
 static_assert(MLG_SELECTOR_RETIRE > MLG_SELECTOR_DISPLAY &&
               MLG_SELECTOR_RETIRE < MLG_SELECTOR_LX_OPEN, "retire selector");
 static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
@@ -2335,6 +2344,44 @@ static int lx_async_done(void *ctx, uint64_t token, int64_t result, const void *
     return inline_reply;
 }
 
+// Interrupt-driven waits (selectors 86 and 87, session_state.h).
+// dext_compute's linuxu error codes as the Linux errno the client sees.
+static int event_errno(int r)
+{
+    switch (r) {
+    case 0: return 0;
+    case -ENOENT_L: return -2;    /* ENOENT */
+    case -ENOMEM_L: return -12;   /* ENOMEM */
+    case -EBUSY_L: return -16;    /* EBUSY */
+    case -EINVAL_L: return -22;   /* EINVAL */
+    default: return -19;          /* ENODEV: no KFD process, or not ready */
+    }
+}
+
+struct EventWaitJob {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+    struct rt_kfd_wait *wait;
+    uint64_t token;
+};
+
+// On a wait-pool thread: asleep in WAIT_EVENTS until KFD's interrupt
+// handler signals an event or the timeout passes, then the completion.
+static void event_wait_main(void *arg)
+{
+    auto *job = static_cast<EventWaitJob *>(arg);
+    uint32_t result = 2;
+    const int r = rt_kfd_wait_run(job->wait, &result);
+    IOUserClientAsyncArgumentsArray data = {};
+    data[0] = job->token;
+    data[1] = (uint64_t)(int64_t)r;
+    data[2] = result;
+    job->client->AsyncCompletion(job->action, kIOReturnSuccess, data, MLG_EVENT_WAIT_WORDS);
+    job->action->release();
+    job->client->release();
+    IOFree(job, sizeof(*job));
+}
+
 static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client *lx,
                              uint64_t selector, IOUserClientMethodArguments *a)
 {
@@ -3888,6 +3935,62 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                  (mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady);
         out[1] = blocker;
         arguments->scalarOutputCount = 2;
+        return kIOReturnSuccess;
+    }
+
+    case MLG_SELECTOR_EVENT: {
+        if (!in || arguments->scalarInputCount != 2 || !out ||
+            arguments->scalarOutputCount < MLG_EVENT_WORDS || in[0] > MLG_EVENT_OP_SET ||
+            in[1] > UINT32_MAX || arguments->structureInput)
+            return kIOReturnBadArgument;
+        uint64_t values[3] = {};
+        const int r = dext_compute_event((uint32_t)in[0], (uint32_t)in[1], values);
+        out[0] = (uint64_t)(int64_t)event_errno(r);
+        out[1] = values[0];
+        out[2] = values[1];
+        out[3] = values[2];
+        arguments->scalarOutputCount = MLG_EVENT_WORDS;
+        return kIOReturnSuccess;
+    }
+
+    case MLG_SELECTOR_EVENT_WAIT: {
+        const OSData *ids = arguments->structureInput;
+        if (!in || arguments->scalarInputCount != 4 || !out || arguments->scalarOutputCount < 1 ||
+            !arguments->completion || !ids || in[1] == 0 || in[1] > MLG_EVENT_WAIT_IDS ||
+            in[2] > 1 || in[3] > UINT32_MAX ||
+            ids->getLength() != in[1] * sizeof(uint32_t))
+            return kIOReturnBadArgument;
+        struct rt_kfd_wait *wait = nullptr;
+        int r = dext_compute_event_wait_begin(static_cast<const uint32_t *>(ids->getBytesNoCopy()),
+                                              (uint32_t)in[1], (int)in[2], (uint32_t)in[3], &wait);
+        if (!r) {
+            auto *job = static_cast<EventWaitJob *>(IOMallocZero(sizeof(EventWaitJob)));
+            if (!job) {
+                r = -ENOMEM_L;
+            } else {
+                job->client = this;
+                job->action = arguments->completion;
+                job->wait = wait;
+                job->token = in[0];
+                retain();
+                job->action->retain();
+                const int started = rt_wait_pool_run(event_wait_main, job);
+                if (started) {
+                    // Not started: the registered wait ends without sleeping.
+                    struct rt_kfd_wait *unused = job->wait;
+                    job->action->release();
+                    release();
+                    IOFree(job, sizeof(*job));
+                    rt_kfd_wait_cancel(unused);
+                    out[0] = (uint64_t)(int64_t)started;	/* Linux -EAGAIN / -ENOMEM */
+                    arguments->scalarOutputCount = 1;
+                    return kIOReturnSuccess;
+                }
+            }
+            if (r) rt_kfd_wait_cancel(wait);
+        }
+        out[0] = (uint64_t)(int64_t)event_errno(r);
+        arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
 

@@ -246,6 +246,8 @@ int rt_kfd_wait_begin(struct rt_kfd_session *s, const uint32_t *ids, uint32_t co
 /* 0 with *result KFD_IOC_WAIT_RESULT_COMPLETE (0), _TIMEOUT (1) or _FAIL
  * (2, an event was destroyed), or a negative errno. */
 int rt_kfd_wait_run(struct rt_kfd_wait *w, uint32_t *result);
+/* Free a wait that will not run. */
+void rt_kfd_wait_cancel(struct rt_kfd_wait *w);
 
 #ifdef __cplusplus
 }

@@ -137,6 +137,35 @@ int dext_kfd_set_window(dext_kfd_client *c, uint64_t base, uint64_t size)
     return c ? rt_kfd_session_set_window(c->session, base, size) : -EINVAL;
 }
 
+int dext_kfd_event_create(dext_kfd_client *c, uint32_t *id, uint32_t *trigger,
+                          uint64_t *mailbox_va)
+{
+    if (!c || !id || !trigger || !mailbox_va) return -EINVAL;
+    struct rt_kfd_event event = {};
+    const int r = rt_kfd_event_create(c->session, &event);
+    if (r) return r;
+    *id = event.id;
+    *trigger = event.trigger;
+    *mailbox_va = event.mailbox_va;
+    return 0;
+}
+
+int dext_kfd_event_destroy(dext_kfd_client *c, uint32_t id)
+{
+    return c ? rt_kfd_event_destroy(c->session, id) : -EINVAL;
+}
+
+int dext_kfd_event_set(dext_kfd_client *c, uint32_t id)
+{
+    return c ? rt_kfd_event_set(c->session, id) : -EINVAL;
+}
+
+int dext_kfd_wait_begin(dext_kfd_client *c, const uint32_t *ids, uint32_t count, int all,
+                        uint32_t timeout_ms, struct rt_kfd_wait **out)
+{
+    return c ? rt_kfd_wait_begin(c->session, ids, count, all, timeout_ms, out) : -EINVAL;
+}
+
 int dext_kfd_queue_abi(struct dext_aql_limits *out)
 {
     using namespace amdgpu;

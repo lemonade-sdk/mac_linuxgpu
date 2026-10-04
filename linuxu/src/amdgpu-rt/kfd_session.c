@@ -1973,6 +1973,24 @@ int rt_kfd_wait_begin(struct rt_kfd_session *s, const uint32_t *ids, uint32_t co
 	return 0;
 }
 
+static void wait_end(struct rt_kfd_wait *w)
+{
+	struct rt_kfd_session *s = w->s;
+
+	pthread_mutex_lock(&s->lock);
+	s->wait_slots &= ~(1ULL << w->slot);
+	if (!--s->waits)
+		pthread_cond_broadcast(&s->waits_done);
+	pthread_mutex_unlock(&s->lock);
+	kfree(w);
+}
+
+void rt_kfd_wait_cancel(struct rt_kfd_wait *w)
+{
+	if (w)
+		wait_end(w);
+}
+
 int rt_kfd_wait_run(struct rt_kfd_wait *w, uint32_t *result)
 {
 	struct {
@@ -2014,12 +2032,7 @@ int rt_kfd_wait_run(struct rt_kfd_wait *w, uint32_t *result)
 			*result = call->args.wait_result;
 		kfree(call);
 	}
-	pthread_mutex_lock(&s->lock);
-	s->wait_slots &= ~(1ULL << w->slot);
-	if (!--s->waits)
-		pthread_cond_broadcast(&s->waits_done);
-	pthread_mutex_unlock(&s->lock);
-	kfree(w);
+	wait_end(w);
 	return (int)r;
 }
 

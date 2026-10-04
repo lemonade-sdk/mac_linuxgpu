@@ -117,6 +117,35 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * (linuxu/headers/rt/lx_abi.h). */
 #define MLG_SELECTOR_DISPLAY             84u
 #define MLG_SELECTOR_RETIRE              85u
+#define MLG_SELECTOR_EVENT               86u
+#define MLG_SELECTOR_EVENT_WAIT          87u
+
+/* Interrupt-driven waits on KFD signal events (a session client on the KFD
+ * path; rt/kfd_session.h has the semantics).
+ *
+ * EVENT       in:  [0] op, [1] event id (DESTROY, SET)
+ *             out: [0] 0 or -errno (Linux values), and for CREATE
+ *                  [1] event id, [2] trigger (amd_signal_t.event_id),
+ *                  [3] mailbox VA (amd_signal_t.event_mailbox_ptr)
+ *             -ENODEV: no KFD process backs this client (legacy path).
+ * EVENT_WAIT  called with IOConnectCallAsync*. in: [0] token (echoed),
+ *             [1] event count, [2] 1 = all of them, [3] timeout in ms
+ *             (at most MLG_EVENT_WAIT_MAX_MS); struct in: the event ids
+ *             (uint32_t each, at most MLG_EVENT_WAIT_IDS)
+ *             out: [0] 0, or -errno when the wait did not start (then
+ *             nothing completes; -EAGAIN: every waiting thread is busy)
+ *             completion: async data [0] token, [1] 0 or -errno, [2] the
+ *             KFD wait result (0 complete, 1 timeout, 2 failed).
+ * The wait sleeps on a driver thread until KFD's interrupt handler signals
+ * an event it names, or the timeout: the client's thread sleeps in its
+ * own receive until the completion arrives. Nothing polls. */
+#define MLG_EVENT_OP_CREATE     0u
+#define MLG_EVENT_OP_DESTROY    1u
+#define MLG_EVENT_OP_SET        2u
+#define MLG_EVENT_WORDS         4u
+#define MLG_EVENT_WAIT_IDS      64u
+#define MLG_EVENT_WAIT_MAX_MS   1000u
+#define MLG_EVENT_WAIT_WORDS    3u
 
 /* Retire: hand the GPU to a replacement driver (a system extension upgrade).
  *
