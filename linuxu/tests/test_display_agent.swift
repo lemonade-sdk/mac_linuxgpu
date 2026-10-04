@@ -143,9 +143,11 @@ check(v.dwords == 4096 && v.gpuMismatches == 3 && v.cpuChecked && v.firstGPUMism
 func put64(_ b: inout [UInt8], _ at: Int, _ v: UInt64) {
     put32(&b, at, UInt32(truncatingIfNeeded: v)); put32(&b, at + 4, UInt32(truncatingIfNeeded: v >> 32))
 }
-func presentStats(flipped: UInt64, bytes: UInt64, lastBytes: UInt64, lastCopy: UInt64, latency: UInt64) -> PresentStats? {
+func presentStats(flipped: UInt64, bytes: UInt64, lastBytes: UInt64, lastCopy: UInt64, latency: UInt64,
+                  vram: UInt64 = 0, moved: UInt64 = 0, dropped: UInt64 = 0) -> PresentStats? {
     var b = [UInt8](repeating: 0, count: PresentStats.bytes)
-    put32(&b, 0, 2); put32(&b, 4, 2)
+    put32(&b, 0, 3); put32(&b, 4, 2)
+    put64(&b, 120, vram); put64(&b, 128, moved); put64(&b, 136, dropped)
     put64(&b, 8, flipped + 1); put64(&b, 16, flipped); put64(&b, 24, 1); put64(&b, 32, flipped * 2)
     put64(&b, 40, bytes); put64(&b, 48, flipped * 30_000); put64(&b, 56, flipped * 500_000)
     put64(&b, 64, latency); put64(&b, 72, 20_000_000)
@@ -161,23 +163,30 @@ check(ps.engines == 2 && ps.received == 10 && ps.flipped == 9 && ps.replaced == 
       ps.error == -19 && ps.fullFrames == 3)
 var v1 = [UInt8](repeating: 0, count: PresentStats.bytes); put32(&v1, 0, 1)
 check(PresentStats(Data(v1)) == nil && PresentStats(Data(count: 56)) == nil, "version 1 and short replies refused")
+// Version 2 (a driver before 240): 120 bytes, no VRAM counters. Version 3 must be whole.
+var v2 = [UInt8](repeating: 0, count: 120); put32(&v2, 0, 2); put64(&v2, 40, 77)
+check(PresentStats(Data(v2)).map { $0.bytesCopied == 77 && $0.vramBytes == 0 && $0.movedRows == 0 } == true)
+var v3short = [UInt8](repeating: 0, count: 120); put32(&v3short, 0, 3)
+check(PresentStats(Data(v3short)) == nil, "a short version 3 reply refused")
 // The measurement: one flip counted once, copy time by damage size.
 var m = PresentMeasurement()
 m.frames = 4; m.idleFrames = 1
 m.present(callCPUNs: 20_000, callWallNs: 40_000, handlerCPUNs: 60_000)
 m.present(callCPUNs: 30_000, callWallNs: 80_000, handlerCPUNs: 90_000, lockWaitNs: 1_200_000)
-m.filtered(reported: [(0, 0, 100, 10)], kept: [(0, 0, 50, 10)], ns: 30_000)
-m.filtered(reported: [(0, 0, 100, 10)], kept: [], ns: 10_000)
+m.filtered(reported: [(0, 0, 100, 10)], kept: DamageFilter.Damage(rects: [(0, 0, 50, 10)], moves: [(0, 20, 100, 30, 25)]), ns: 30_000)
+m.filtered(reported: [(0, 0, 100, 10)], kept: DamageFilter.Damage(), ns: 10_000)
 m.observe(ps); m.observe(ps)
-let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_400, lastCopy: 2_000_000, latency: 100_000_000)!
+let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_400, lastCopy: 2_000_000, latency: 100_000_000,
+                       vram: 51_200, moved: 300, dropped: 2)!
 m.observe(big)
 check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
 let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
-check(measured.count == 9 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+check(measured.count == 10 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
       measured[2].contains("600.0 us on average, 1200.0 us at most") &&
       measured[3].contains("1 of 2 damaged frame(s) changed nothing; 4.0 KB reported, 1.0 KB kept per damaged frame (75% dropped); hashing 20.0 us") &&
-      measured[4].contains("8294.4 KB copied") && measured[6].contains("10.00 ms on average") &&
-      measured[8].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
+      measured[4].contains("1 frame(s) with moves, 6.0 KB moved per damaged frame; driver: 300 rows moved in VRAM, 2 move(s) copied from the surface instead; 51.2 KB per flip copied in VRAM") &&
+      measured[5].contains("8294.4 KB copied from the surface") && measured[7].contains("10.00 ms on average") &&
+      measured[9].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)
@@ -274,7 +283,9 @@ do {
     var px = [UInt32](repeating: 0x00336699, count: pitch / 4 * h)
     var f = DamageFilter(width: w, height: h)
     func run(_ rects: [DamageFilter.Rect]) -> [DamageFilter.Rect] {
-        px.withUnsafeBytes { f.filter(rects, base: $0.baseAddress!, pitch: pitch) }
+        let d = px.withUnsafeBytes { f.filter(rects, base: $0.baseAddress!, pitch: pitch) }
+        check(d.moves.isEmpty, "no scroll here: \(d.moves)")
+        return d.rects
     }
     func same(_ a: [DamageFilter.Rect], _ b: [DamageFilter.Rect]) -> Bool { a.elementsEqual(b, by: ==) }
     // Nothing known yet: the whole rectangle, out to whole tiles.
@@ -331,10 +342,116 @@ do {
     var kept = 0
     for k in 0..<10 {
         big[k] &+= 1
-        kept += big.withUnsafeBytes { bf.filter([(0, 0, UInt32(bw), UInt32(bh))], base: $0.baseAddress!, pitch: bw * 4) }.count
+        kept += big.withUnsafeBytes { bf.filter([(0, 0, UInt32(bw), UInt32(bh))], base: $0.baseAddress!, pitch: bw * 4) }.rects.count
     }
     let ns = Double(DispatchTime.now().uptimeNanoseconds - start) / 10
     print(String(format: "damage filter: a whole 2560x1440 frame in %.2f ms (%.1f GB/s)", ns / 1e6, Double(bw * bh * 4) / ns))
     check(kept == 10)
 }
 print("PASS damage filter: unchanged tiles dropped, changed ones kept whole, edges and overlaps")
+
+// Scrolling: rows found shifted become moves; only the exposed rows and
+// rows that do not match are damage.
+do {
+    let w = 640, h = 480, pitch = w * 4
+    var px = [UInt32](repeating: 0, count: w * h)
+    /// Document line @line across the row, with a header of @header rows above @top.
+    func draw(offset: Int, top: Int = 0, viewX: Int = 0, viewW: Int = 640, header: UInt32 = 7) {
+        for y in 0..<h {
+            for x in 0..<w {
+                if y < top { px[y * w + x] = header &* 31 &+ UInt32(x) }
+                else if x >= viewX && x < viewX + viewW {
+                    px[y * w + x] = UInt32(truncatingIfNeeded: (offset + y) &* 2654435761) ^ UInt32(x << 12)
+                } else { px[y * w + x] = 0x00445566 }
+            }
+        }
+    }
+    var f = DamageFilter(width: w, height: h)
+    func run(_ rects: [DamageFilter.Rect]) -> DamageFilter.Damage {
+        px.withUnsafeBytes { f.filter(rects, base: $0.baseAddress!, pitch: pitch) }
+    }
+    func sameRects(_ a: [DamageFilter.Rect], _ b: [DamageFilter.Rect]) -> Bool { a.elementsEqual(b, by: ==) }
+    func sameMoves(_ a: [DamageFilter.Move], _ b: [DamageFilter.Move]) -> Bool { a.elementsEqual(b, by: ==) }
+    let all: DamageFilter.Rect = (0, 0, UInt32(w), UInt32(h))
+
+    // The whole frame scrolls down 30 rows (content moves up): one move, the exposed 30 rows.
+    draw(offset: 0); _ = run([all])
+    draw(offset: 30)
+    var d = run([all])
+    check(sameMoves(d.moves, [(0, 0, 640, 450, 30)]) && sameRects(d.rects, [(0, 450, 640, 30)]), "\(d.moves) \(d.rects)")
+    // Up 12 rows: the move goes the other way; the exposed rows are at the top.
+    draw(offset: 18)
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 12, 640, 468, 0)]) && sameRects(d.rects, [(0, 0, 640, 12)]), "\(d.moves) \(d.rects)")
+    // A fixed header of 40 rows: unchanged, so neither moved nor damaged.
+    f.reset()
+    draw(offset: 0, top: 40); _ = run([all])
+    draw(offset: 25, top: 40)
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 40, 640, 415, 65)]) && sameRects(d.rects, [(0, 455, 640, 25)]), "\(d.moves) \(d.rects)")
+    // The header changes too (a clock): its rows are damage, in their tiles.
+    draw(offset: 35, top: 40, header: 8)
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 40, 640, 430, 50)]) && sameRects(d.rects, [(0, 0, 640, 40), (0, 470, 640, 10)]),
+          "\(d.moves) \(d.rects)")
+    // A row that does not match its shifted source (an edit while scrolling): damage, the moves around it.
+    draw(offset: 45, top: 40, header: 8)
+    for x in 0..<w { px[200 * w + x] ^= 0xff }
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 40, 640, 160, 50), (0, 201, 640, 269, 211)]) &&
+          sameRects(d.rects, [(0, 200, 640, 1), (0, 470, 640, 10)]), "\(d.moves) \(d.rects)")
+    // A view inside a window (columns 100-499, rows 40-479), damage just the view:
+    // the move covers the view's whole tiles.
+    f.reset()
+    draw(offset: 0, top: 40, viewX: 128, viewW: 384); _ = run([all])
+    draw(offset: 8, top: 40, viewX: 128, viewW: 384)
+    d = run([(128, 40, 384, 440)])
+    check(sameMoves(d.moves, [(128, 40, 384, 432, 48)]) && sameRects(d.rects, [(128, 472, 384, 8)]), "\(d.moves) \(d.rects)")
+    // Rows not known (never hashed) are never a move's source.
+    f.reset()
+    draw(offset: 0); _ = run([(0, 0, 640, 240)])
+    draw(offset: 100)
+    d = run([all])
+    check(d.moves.allSatisfy { Int($0.srcY) + Int($0.h) <= 240 }, "\(d.moves)")
+    // With scroll detection off, the same scroll is damage only (no moves).
+    f.reset(); f.detectScroll = false
+    draw(offset: 0); _ = run([all])
+    draw(offset: 30)
+    d = run([all])
+    check(d.moves.isEmpty && sameRects(d.rects, [all]), "\(d.moves) \(d.rects)")
+    f.detectScroll = true
+    // Blank rows (all alike) do not vote; a scroll of a blank page is not a move.
+    f.reset()
+    for i in px.indices { px[i] = 0x00ffffff }
+    _ = run([all])
+    d = run([all])
+    check(d.isEmpty)
+    // The edges: a scroll by one row, sources and destinations at the frame's first and last rows.
+    f.reset()
+    draw(offset: 0); _ = run([all])
+    draw(offset: 1)
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 0, 640, 479, 1)]) && sameRects(d.rects, [(0, 479, 640, 1)]), "\(d.moves) \(d.rects)")
+    draw(offset: 0)
+    d = run([all])
+    check(sameMoves(d.moves, [(0, 1, 640, 479, 0)]) && sameRects(d.rects, [(0, 0, 640, 1)]), "\(d.moves) \(d.rects)")
+    // Applying moves then rectangles to what was given reproduces the frame (a model of the driver).
+    f.reset()
+    var screen = [UInt32](repeating: 0, count: w * h)
+    func apply(_ d: DamageFilter.Damage) {
+        let before = screen
+        for m in d.moves { for y in 0..<Int(m.h) { for x in Int(m.x)..<Int(m.x + m.w) {
+            screen[(Int(m.y) + y) * w + x] = before[(Int(m.srcY) + y) * w + x] } } }
+        for r in d.rects { for y in Int(r.y)..<Int(r.y + r.h) { for x in Int(r.x)..<Int(r.x + r.w) {
+            screen[y * w + x] = px[y * w + x] } } }
+    }
+    draw(offset: 0, top: 40); apply(run([all]))
+    var offset = 0
+    for step in [3, 17, 40, 1, 120, -9, -64, 25, 7, -1, 300, -200] {
+        offset += step
+        draw(offset: offset, top: 40, header: UInt32(offset & 3))
+        apply(run([all]))
+        check(screen == px, "after a scroll of \(step)")
+    }
+}
+print("PASS scroll detection: moves for shifted rows, header and edits as damage, edges, unknown rows")

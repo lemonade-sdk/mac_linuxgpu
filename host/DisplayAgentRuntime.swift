@@ -82,14 +82,21 @@ extension MacLinuxGPUHost {
     /// driver's output worker; returns once queued. No rectangle and handle
     /// 0 reads the worker's statistics only.
     func displayPresent(handle: UInt32, rects: [(x: UInt32, y: UInt32, w: UInt32, h: UInt32)],
-                        captureNs: UInt64) -> (kern_return_t, Int64, PresentStats?) {
-        var request = Data(count: 16 + rects.count * 16)
+                        moves: [DamageFilter.Move] = [], captureNs: UInt64) -> (kern_return_t, Int64, PresentStats?) {
+        var request = Data(count: 16 + rects.count * 16 + moves.count * 24)
         request.withUnsafeMutableBytes { raw in
             raw.storeBytes(of: UInt32(rects.count).littleEndian, toByteOffset: 0, as: UInt32.self)
+            raw.storeBytes(of: UInt32(moves.count).littleEndian, toByteOffset: 4, as: UInt32.self)
             raw.storeBytes(of: captureNs.littleEndian, toByteOffset: 8, as: UInt64.self)
             for (i, r) in rects.enumerated() {
                 for (j, v) in [r.x, r.y, r.w, r.h].enumerated() {
                     raw.storeBytes(of: v.littleEndian, toByteOffset: 16 + i * 16 + j * 4, as: UInt32.self)
+                }
+            }
+            let at = 16 + rects.count * 16
+            for (i, m) in moves.enumerated() {
+                for (j, v) in [m.x, m.y, m.w, m.h, m.srcY, 0].enumerated() {
+                    raw.storeBytes(of: v.littleEndian, toByteOffset: at + i * 24 + j * 4, as: UInt32.self)
                 }
             }
         }
@@ -334,8 +341,11 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     /// until the driver has flipped it (its copy is done; the flip waited
     /// for it) or replaced it with a newer frame (never copied).
     var held = PresentedFrames<CMSampleBuffer>()
-    /// What the driver was given, by tile: damage that changes nothing is dropped.
+    /// What the driver was given, by tile: damage that changes nothing is
+    /// dropped, rows that scrolled are moved (damageMode).
     var filter: DamageFilter?
+    enum DamageMode { case raw, filtered, scroll }
+    var damageMode = DamageMode.scroll
     var measurement = PresentMeasurement()
     var last: PresentStats?
     var failure: String?
@@ -521,16 +531,19 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         defer { IOSurfaceUnlock(surface, .readOnly, nil) }
         if filter?.width != mode.width || filter?.height != mode.height {
             filter = DamageFilter(width: mode.width, height: mode.height)
+            filter!.detectScroll = damageMode == .scroll
         }
         let filterWall = uptimeNs()
-        let kept = filter!.filter(rects, base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
-                                  pitch: IOSurfaceGetBytesPerRow(surface))
+        let kept = damageMode == .raw ? DamageFilter.Damage(rects: rects, moves: []) :
+            filter!.filter(rects, base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
+                           pitch: IOSurfaceGetBytesPerRow(surface))
         measurement.filtered(reported: rects, kept: kept, ns: uptimeNs() - filterWall)
         if kept.isEmpty { return }
         // The frame's composition time on the virtual display.
         let captureNs = (info[.displayTime] as? UInt64).map(machToNs) ?? 0
         let callCPU = threadCPUNs(), callWall = uptimeNs()
-        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: kept, captureNs: captureNs)
+        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: kept.rects, moves: kept.moves,
+                                                          captureNs: captureNs)
         let callWallNs = uptimeNs() - callWall, callCPUNs = threadCPUNs() - callCPU
         guard kr == kIOReturnSuccess, status == 0, let stats else {
             failure = kr == kIOReturnSuccess ?
@@ -551,34 +564,65 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
 ///   move   a 480x320 window crosses the display, moved every refresh
 ///   full   a window covering the display changes colour every refresh
 ///          (the damage of full-screen video)
+///   scroll a 1600x1100 window scrolls a text document 6 points every
+///          refresh under a header that stays
 private final class Workload {
     let kind: String
     var window: NSWindow?
     var timer: Timer?
     var tick = 0
     var position = CGPoint(x: 0, y: 0), velocity = CGPoint(x: 9, y: 6)
+    var scrollView: NSScrollView?
 
     init(kind: String) { self.kind = kind }
 
     /// nil when started; otherwise why not.
     func start(displayID: CGDirectDisplayID, refreshHz: Double) -> String? {
         if kind == "still" { return nil }
-        guard kind == "move" || kind == "full" else { return "unknown workload \(kind) (still, move or full)" }
+        guard ["move", "full", "scroll"].contains(kind) else {
+            return "unknown workload \(kind) (still, move, full or scroll)"
+        }
         // The app is already a background agent (runDisplayAgent).
         // CoreGraphics' global space has its origin at the top left of the
         // main display, AppKit's at the bottom left.
         let bounds = CGDisplayBounds(displayID), main = CGDisplayBounds(CGMainDisplayID())
         guard bounds.width > 0 else { return "the virtual display has no bounds" }
         let screen = NSRect(x: bounds.minX, y: main.height - bounds.maxY, width: bounds.width, height: bounds.height)
-        let frame = kind == "full" ? screen : NSRect(x: screen.minX, y: screen.minY, width: 480, height: 320)
+        let frame = kind == "full" ? screen :
+            kind == "scroll" ? NSRect(x: screen.minX + 200, y: screen.minY + 100, width: min(1600, screen.width - 400),
+                                      height: min(1100, screen.height - 200)) :
+            NSRect(x: screen.minX, y: screen.minY, width: 480, height: 320)
         let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.level = .floating
         window.ignoresMouseEvents = true
-        let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
-        view.wantsLayer = true
-        view.layer?.backgroundColor = NSColor.systemOrange.cgColor
-        window.contentView = view
+        if kind == "scroll" {
+            // A text document in a scroll view: a header bar that stays, lines that move.
+            let content = NSView(frame: NSRect(origin: .zero, size: frame.size))
+            let header = NSTextField(labelWithString: "MacLinuxGPU scroll workload")
+            header.frame = NSRect(x: 0, y: frame.height - 48, width: frame.width, height: 48)
+            header.font = .boldSystemFont(ofSize: 24)
+            header.drawsBackground = true
+            header.backgroundColor = .controlAccentColor
+            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: frame.width, height: frame.height - 48))
+            let text = NSTextView(frame: scroll.bounds)
+            text.isEditable = false
+            text.font = .monospacedSystemFont(ofSize: 15, weight: .regular)
+            text.string = (0..<4000).map { String(format: "%05d  the quick brown fox jumps over the lazy dog %08x %@", $0,
+                                                  UInt32(truncatingIfNeeded: $0 &* 2654435761),
+                                                  String(repeating: "=", count: $0 % 60)) }.joined(separator: "\n")
+            scroll.documentView = text
+            scroll.hasVerticalScroller = true
+            content.addSubview(scroll)
+            content.addSubview(header)
+            window.contentView = content
+            scrollView = scroll
+        } else {
+            let view = NSView(frame: NSRect(origin: .zero, size: frame.size))
+            view.wantsLayer = true
+            view.layer?.backgroundColor = NSColor.systemOrange.cgColor
+            window.contentView = view
+        }
         window.setFrame(frame, display: true)
         window.orderFrontRegardless()
         self.window = window
@@ -597,6 +641,13 @@ private final class Workload {
         if kind == "full" {
             window.contentView?.layer?.backgroundColor =
                 NSColor(hue: CGFloat(tick % 240) / 240, saturation: 0.8, brightness: 0.9, alpha: 1).cgColor
+        } else if kind == "scroll", let scrollView, let doc = scrollView.documentView {
+            // 6 points a refresh, back to the top at the end.
+            let clip = scrollView.contentView
+            var y = clip.bounds.origin.y + 6
+            if y > doc.frame.height - clip.bounds.height { y = 0 }
+            clip.scroll(to: NSPoint(x: 0, y: y))
+            scrollView.reflectScrolledClipView(clip)
         } else {
             var p = position
             p.x += velocity.x; p.y += velocity.y
@@ -712,6 +763,17 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
     if !daemon { plan.lines.forEach { print($0) } }
 
     let mirror = MirroredDisplay(observer: observer, plan: plan)
+    // --damage, for measuring: raw (ScreenCaptureKit's rectangles as they
+    // come), filtered (unchanged tiles dropped, no moves: a driver before
+    // 240 refuses moves) or scroll (the default: filtered, and moves).
+    switch daemon ? "scroll" : option(options, "--damage") ?? "scroll" {
+    case "raw": mirror.damageMode = .raw
+    case "filtered": mirror.damageMode = .filtered
+    case "scroll": mirror.damageMode = .scroll
+    case let other:
+        print("display-agent: unknown --damage \(other) (raw, filtered or scroll)")
+        return .ended(1)
+    }
     let workload = Workload(kind: daemon ? "still" : option(options, "--workload") ?? "still")
     let warmup = daemon ? Double.infinity : Double(option(options, "--warmup") ?? "") ?? 2
     let dextPID = daemon ? nil : driverProcessID(options)

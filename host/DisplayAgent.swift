@@ -384,12 +384,13 @@ struct SurfaceVerifyResult {
 }
 
 /// struct rt_display_present_stats, version 1.
-/// struct rt_display_present_stats, version 2 (linuxu/headers/rt/display.h):
+/// struct rt_display_present_stats, version 3 (linuxu/headers/rt/display.h;
+/// version 2, 120 bytes, without the VRAM counters, from a driver before 240):
 /// the output worker's counters since OUTPUT. PRESENT returns them as they
 /// stand when it queues a frame (the frame itself is copied and flipped
 /// later); PRESENT with no rectangle only reads them.
 struct PresentStats: Equatable {
-    static let bytes = 120
+    static let bytes = 144
     let engines: UInt32
     let received, flipped, replaced, copyJobs, bytesCopied: UInt64
     let copySubmitNs, copyGPUNs, latencyNs, latencyMaxNs: UInt64
@@ -399,18 +400,28 @@ struct PresentStats: Equatable {
     /// CPU accesses to the VRAM aperture (all users): what a power-off
     /// could catch in flight (the driver gates them once it knows).
     let apertureOps: UInt64
+    /// Version 3: bytes copied from the framebuffer drawn before (in VRAM;
+    /// bytesCopied came over PCIe), rows moved there, moves copied from the
+    /// surface instead (the frame before was replaced in the mailbox).
+    let vramBytes, movedRows, movesDropped: UInt64
 
     init?(_ data: Data) {
-        guard data.count >= PresentStats.bytes else { return nil }
+        guard data.count >= 120 else { return nil }
         let b = [UInt8](data)
         func u64(_ at: Int) -> UInt64 { UInt64(le32(b, at)) | UInt64(le32(b, at + 4)) << 32 }
-        guard le32(b, 0) == 2 else { return nil }
+        let version = le32(b, 0)
+        guard version == 2 || (version == 3 && data.count >= PresentStats.bytes) else { return nil }
         engines = le32(b, 4)
         received = u64(8); flipped = u64(16); replaced = u64(24); copyJobs = u64(32); bytesCopied = u64(40)
         copySubmitNs = u64(48); copyGPUNs = u64(56); latencyNs = u64(64); latencyMaxNs = u64(72)
         lastBytes = u64(80); lastCopyGPUNs = u64(88); lastLatencyNs = u64(96)
         error = Int32(bitPattern: le32(b, 104)); fullFrames = le32(b, 108)
         apertureOps = u64(112)
+        if version == 3 {
+            vramBytes = u64(120); movedRows = u64(128); movesDropped = u64(136)
+        } else {
+            vramBytes = 0; movedRows = 0; movesDropped = 0
+        }
     }
 }
 
@@ -433,11 +444,15 @@ struct PresentMeasurement {
     /// Damage ScreenCaptureKit reported and what was left once unchanged
     /// tiles were dropped (bytes), frames left with none, hashing time.
     var reportedBytes: UInt64 = 0, keptBytes: UInt64 = 0, unchangedFrames = 0, filterNs: UInt64 = 0, filterFrames = 0
+    /// Bytes the moves cover (copied in VRAM rather than over PCIe), frames with a move.
+    var movedBytes: UInt64 = 0, movedFrames = 0
 
-    mutating func filtered(reported: [DamageFilter.Rect], kept: [DamageFilter.Rect], ns: UInt64) {
+    mutating func filtered(reported: [DamageFilter.Rect], kept: DamageFilter.Damage, ns: UInt64) {
         func bytes(_ r: [DamageFilter.Rect]) -> UInt64 { r.reduce(0) { $0 + UInt64($1.w) * UInt64($1.h) * 4 } }
         reportedBytes += bytes(reported)
-        keptBytes += bytes(kept)
+        keptBytes += bytes(kept.rects)
+        movedBytes += kept.moves.reduce(0) { $0 + UInt64($1.w) * UInt64($1.h) * 4 }
+        movedFrames += kept.moves.isEmpty ? 0 : 1
         unchangedFrames += kept.isEmpty ? 1 : 0
         filterNs += ns
         filterFrames += 1
@@ -487,7 +502,10 @@ struct PresentMeasurement {
                           unchangedFrames, filterFrames, Double(reportedBytes) / ff / 1e3, Double(keptBytes) / ff / 1e3,
                           reportedBytes > 0 ? 100 * (1 - Double(keptBytes) / Double(reportedBytes)) : 0,
                           Double(filterNs) / ff / 1e3))
-        out.append(String(format: "driver per flipped frame: %.1f KB copied in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
+        out.append(String(format: "scrolling: %d frame(s) with moves, %.1f KB moved per damaged frame; driver: %llu rows moved in VRAM, %llu move(s) copied from the surface instead; %.1f KB per flip copied in VRAM",
+                          movedFrames, Double(movedBytes) / ff / 1e3, end.movedRows &- start.movedRows,
+                          end.movesDropped &- start.movesDropped, Double(end.vramBytes &- start.vramBytes) / f / 1e3))
+        out.append(String(format: "driver per flipped frame: %.1f KB copied from the surface (PCIe) in %.2f copy jobs, worker submit %.1f us CPU, GPU copy %.3f ms",
                           Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
                           Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
                           Double(end.copyGPUNs - start.copyGPUNs) / f / 1e6))
@@ -564,25 +582,42 @@ struct PresentedFrames<Item> {
     }
 }
 
-/// Damage that changes nothing on screen, dropped before PRESENT. Some
-/// windows are redrawn every frame with the same pixels (menu bar status
-/// items, a cursor drawn by the hardware rather than into the capture) and
-/// ScreenCaptureKit reports them as damage; copied and flipped, an idle
-/// display would cost a frame's work every refresh. Each row of the frame
-/// is cut into tiles of 64 pixels with a 64-bit hash of each; a dirty
-/// rectangle's tiles are hashed again and only those that differ from what
-/// the driver was last given are kept, in whole tiles (so a tile is never
-/// recorded as sent while part of it was not), runs of changed rows
-/// merged into one rectangle each.
+/// Damage that changes nothing on screen, dropped before PRESENT, and rows
+/// that scrolled, sent as moves. Some windows are redrawn every frame with
+/// the same pixels (menu bar status items, a cursor drawn by the hardware
+/// rather than into the capture) and ScreenCaptureKit reports them as
+/// damage; copied and flipped, an idle display would cost a frame's work
+/// every refresh. Each row of the frame is cut into tiles of 64 pixels
+/// with a 64-bit hash of each, of what the driver was last given. A dirty
+/// rectangle's tiles are hashed again: tiles that did not change are
+/// dropped; rows whose tiles equal another row's from before (a scroll,
+/// found by the shift most rows agree on) become moves, which the driver
+/// copies in VRAM; the rest are kept in whole tiles (a tile is never
+/// recorded as given while part of it was not), consecutive changed rows
+/// merged into one rectangle. Everything is compared with the hashes from
+/// before the frame, so rectangles that overlap agree.
 struct DamageFilter {
     typealias Rect = (x: UInt32, y: UInt32, w: UInt32, h: UInt32)
+    /// @w x @h pixels at (@x, @y) are the previous frame's at (@x, @srcY).
+    typealias Move = (x: UInt32, y: UInt32, w: UInt32, h: UInt32, srcY: UInt32)
+    struct Damage {
+        var rects: [Rect] = []
+        var moves: [Move] = []
+        var isEmpty: Bool { rects.isEmpty && moves.isEmpty }
+    }
     static let tile = 64
+    /// PRESENT's limits: moves, and the request (16 bytes, 16 per rectangle, 24 per move).
+    static let movesMax = 32, requestMax = 4096
+    /// Shorter runs of scrolled rows are damage: a move per row or two is not worth it.
+    static let moveRowsMin = 4
     let width: Int, height: Int, columns: Int
+    /// Off: no moves, only unchanged tiles dropped.
+    var detectScroll = true
     /// Per row, per tile: the hash of what the driver was given; 0 when
     /// not known (hashes are odd).
     private var hashes: [UInt64]
-    /// Scratch: a rectangle's new hashes, row by row.
-    private var fresh: [UInt64] = []
+    /// Scratch.
+    private var fresh: [UInt64] = [], newRow: [UInt64] = [], oldRow: [UInt64] = []
 
     init(width: Int, height: Int) {
         self.width = width
@@ -596,17 +631,18 @@ struct DamageFilter {
         for i in hashes.indices { hashes[i] = 0 }
     }
 
-    /// The rectangles of @rects whose content changed, given the frame at
-    /// @base (BGRA, @pitch bytes per row, readable while this runs). More
-    /// than 255 become the whole frame.
-    mutating func filter(_ rects: [Rect], base: UnsafeRawPointer, pitch: Int) -> [Rect] {
-        var out: [Rect] = []
+    /// The damage of @rects that changed anything, given the frame at
+    /// @base (BGRA, @pitch bytes per row, readable while this runs). When
+    /// it does not fit PRESENT, the whole frame.
+    mutating func filter(_ rects: [Rect], base: UnsafeRawPointer, pitch: Int) -> Damage {
+        var out = Damage()
+        var updates: [(at: Int, rows: Int, c0: Int, n: Int, hashes: [UInt64])] = []
         let t = DamageFilter.tile
         for r in rects {
             let x0 = Int(r.x), y0 = Int(r.y)
             let x1 = min(x0 + Int(r.w), width), y1 = min(y0 + Int(r.h), height)
             guard x0 < x1, y0 < y1 else { continue }
-            let c0 = x0 / t, c1 = (x1 - 1) / t, n = c1 - c0 + 1
+            let c0 = x0 / t, c1 = (x1 - 1) / t, n = c1 - c0 + 1, rows = y1 - y0
             fresh.removeAll(keepingCapacity: true)
             for y in y0..<y1 {
                 let row = base + y * pitch
@@ -615,36 +651,109 @@ struct DamageFilter {
                     fresh.append(DamageFilter.hash(row + px * 4, bytes: count * 4))
                 }
             }
-            var runStart = -1, runMin = 0, runMax = 0
+            // Row signatures over the rectangle's tiles, new and as given (0: not known).
+            newRow.removeAll(keepingCapacity: true)
+            oldRow.removeAll(keepingCapacity: true)
+            for i in 0..<rows {
+                newRow.append(DamageFilter.fold(fresh, from: i * n, count: n))
+                oldRow.append(DamageFilter.fold(hashes, from: (y0 + i) * columns + c0, count: n))
+            }
+            let shift = detectScroll && out.moves.count < DamageFilter.movesMax ? scrollShift(rows) : 0
+            let px0 = c0 * t, pxw = min((c1 + 1) * t, width) - px0
+            var runStart = -1, runMin = 0, runMax = 0, moveStart = -1
             func close(_ end: Int) {
                 guard runStart >= 0 else { return }
                 let px = runMin * t
-                out.append((UInt32(px), UInt32(runStart), UInt32(min((runMax + 1) * t, width) - px),
-                            UInt32(end - runStart)))
+                out.rects.append((UInt32(px), UInt32(runStart), UInt32(min((runMax + 1) * t, width) - px),
+                                  UInt32(end - runStart)))
                 runStart = -1
             }
-            for y in y0..<y1 {
+            func closeMove(_ end: Int) {
+                guard moveStart >= 0 else { return }
+                let count = end - moveStart
+                if count >= DamageFilter.moveRowsMin && out.moves.count < DamageFilter.movesMax {
+                    out.moves.append((UInt32(px0), UInt32(moveStart), UInt32(pxw), UInt32(count),
+                                      UInt32(moveStart + shift)))
+                } else {
+                    // Too short to move: damage, its changed tiles.
+                    for y in moveStart..<end { tileRow(y, y0: y0, c0: c0, n: n) }
+                }
+                moveStart = -1
+            }
+            func tileRow(_ y: Int, y0: Int, c0: Int, n: Int) {
                 var lo = Int.max, hi = -1
-                for i in 0..<n {
-                    let h = fresh[(y - y0) * n + i], at = y * columns + c0 + i
-                    if hashes[at] != h {
-                        hashes[at] = h
-                        lo = min(lo, c0 + i)
-                        hi = c0 + i
-                    }
+                for i in 0..<n where hashes[y * columns + c0 + i] != fresh[(y - y0) * n + i] {
+                    lo = min(lo, c0 + i)
+                    hi = c0 + i
                 }
                 if hi < 0 {
                     close(y)
                 } else if runStart < 0 {
                     runStart = y; runMin = lo; runMax = hi
-                } else {
+                } else if runStart >= 0 {
                     runMin = min(runMin, lo); runMax = max(runMax, hi)
                 }
             }
+            for y in y0..<y1 {
+                let i = y - y0, src = i + shift
+                if shift != 0 && newRow[i] != oldRow[i] && src >= 0 && src < rows && oldRow[src] != 0 &&
+                    oldRow[src] == newRow[i] {
+                    close(y)
+                    if moveStart < 0 { moveStart = y }
+                    continue
+                }
+                closeMove(y)
+                tileRow(y, y0: y0, c0: c0, n: n)
+            }
+            closeMove(y1)
             close(y1)
+            updates.append((y0 * columns + c0, rows, c0, n, fresh))
         }
-        if out.count > 255 { return [(0, 0, UInt32(width), UInt32(height))] }
+        for u in updates {
+            for i in 0..<u.rows {
+                for k in 0..<u.n { hashes[u.at + i * columns + k] = u.hashes[i * u.n + k] }
+            }
+        }
+        // Overlapping rectangles report the tiles they share each: once is enough.
+        var seen = Set<[UInt32]>()
+        out.rects = out.rects.filter { seen.insert([$0.x, $0.y, $0.w, $0.h]).inserted }
+        seen.removeAll()
+        out.moves = out.moves.filter { seen.insert([$0.x, $0.y, $0.w, $0.h, $0.srcY]).inserted }
+        if 16 + out.rects.count * 16 + out.moves.count * 24 > DamageFilter.requestMax || out.rects.count > 255 {
+            return Damage(rects: [(0, 0, UInt32(width), UInt32(height))], moves: [])
+        }
         return out
+    }
+
+    /// The vertical shift most changed rows of the rectangle agree on (a
+    /// row's new signature found at row + shift before), counted only
+    /// over rows whose old signature is unique (blank rows say nothing);
+    /// 0 when fewer than moveRowsMin agree.
+    private func scrollShift(_ rows: Int) -> Int {
+        guard rows >= 2 * DamageFilter.moveRowsMin else { return 0 }
+        var at: [UInt64: Int] = [:], repeated = Set<UInt64>()
+        at.reserveCapacity(rows)
+        for i in 0..<rows where oldRow[i] != 0 {
+            if at.updateValue(i, forKey: oldRow[i]) != nil { repeated.insert(oldRow[i]) }
+        }
+        var votes: [Int: Int] = [:]
+        for i in 0..<rows where newRow[i] != oldRow[i] {
+            if let src = at[newRow[i]], !repeated.contains(newRow[i]), src != i { votes[src - i, default: 0] += 1 }
+        }
+        guard let best = votes.max(by: { $0.value < $1.value || ($0.value == $1.value && abs($0.key) > abs($1.key)) }),
+              best.value >= DamageFilter.moveRowsMin else { return 0 }
+        return best.key
+    }
+
+    /// One signature for @count tile hashes from @from; 0 if one is not known.
+    private static func fold(_ h: [UInt64], from: Int, count: Int) -> UInt64 {
+        var s: UInt64 = 0x2d358dccaa6c78a5
+        for k in 0..<count {
+            let v = h[from + k]
+            if v == 0 { return 0 }
+            s = mum(s ^ v, 0x8bb84b93962eacc9)
+        }
+        return s | 1
     }
 
     @inline(__always) private static func mum(_ a: UInt64, _ b: UInt64) -> UInt64 {
