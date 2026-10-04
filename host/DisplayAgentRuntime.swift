@@ -376,14 +376,16 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         }
         self.display = display
         // macOS brings the display online, then gives it a mode,
-        // asynchronously.
+        // asynchronously. The process sees it through CoreGraphics'
+        // reconfiguration notifications (agentWindowServerSetup), which
+        // arrive while the run loop turns.
         for _ in 0..<50 {
             var count: UInt32 = 0
             CGGetOnlineDisplayList(0, nil, &count)
             var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
             CGGetOnlineDisplayList(count, &ids, &count)
             if ids.contains(display.displayID) && currentMode() != nil { return true }
-            Thread.sleep(forTimeInterval: 0.1)
+            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         }
         failure = "the virtual display \(display.displayID) did not come online in a mode the monitor listed" +
             (CGDisplayCopyDisplayMode(display.displayID).map { " (macOS chose \($0.pixelWidth)x\($0.pixelHeight) @ \($0.refreshRate) Hz)" } ?? "")
@@ -598,8 +600,48 @@ private final class Workload {
 /// display for --seconds (default until Ctrl-C), then everything is undone:
 /// capture stopped, imports released, the monitor's previous configuration
 /// restored, the virtual display removed.
+/// The agent talks to the WindowServer (CGVirtualDisplay, ScreenCaptureKit)
+/// from the app's own executable: as a background agent that has finished
+/// launching (never in the Dock, never bouncing), and with a display
+/// reconfiguration callback registered. CoreGraphics caches the display
+/// configuration a process has seen; without the callback (and the run
+/// loop turning) a virtual display created after that has no modes in this
+/// process (CGDisplayCopyDisplayMode is nil), which a daemon that
+/// re-creates displays on hotplug would always hit.
+func agentWindowServerSetup() {
+    NSApplication.shared.setActivationPolicy(.accessory)
+    NSApplication.shared.finishLaunching()
+    CGDisplayRegisterReconfigurationCallback({ _, _, _ in }, nil)
+}
+
+/// SIGINT/SIGTERM end the agent: the mirroring stops and everything is
+/// undone. Detached and launchd runs have no terminal; nothing else ends it.
+private var agentInterrupted = false
+private var agentSignalSources: [DispatchSourceSignal] = []
+private func agentHandleSignals() {
+    guard agentSignalSources.isEmpty else { return }
+    signal(SIGINT, SIG_IGN)
+    signal(SIGTERM, SIG_IGN)
+    signal(SIGHUP, SIG_IGN)
+    agentSignalSources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
+        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+        source.setEventHandler { agentInterrupted = true }
+        source.resume()
+        return source
+    }
+}
+
+private func agentLog(_ text: String) {
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    print("\(stamp) \(text)")
+    fflush(stdout)
+}
+
 func runDisplayAgentCreate(_ options: [String]) -> Int32 {
+    if options.contains("--daemon") { return runDisplayAgentDaemon(options) }
     let seconds = Double(option(options, "--seconds") ?? "") ?? 0
+    agentWindowServerSetup()
+    agentHandleSignals()
     guard CGPreflightScreenCaptureAccess() else {
         _ = CGRequestScreenCaptureAccess()
         print("display-agent: Screen Recording permission is needed to capture the virtual display.")
@@ -609,32 +651,46 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     }
     guard let (session, observer) = openClients(options) else { return 1 }
     defer { observer.closeUserClient(); session?.closeUserClient() }
+    let deadline = seconds > 0 ? Date().addingTimeInterval(seconds) : Date.distantFuture
+    switch mirrorMonitor(observer: observer, options: options, daemon: false,
+                         shouldStop: { agentInterrupted || Date() >= deadline }) {
+    case .ended(let code): return code
+    case .noMonitor, .monitorGone: return 1
+    }
+}
 
+enum MirrorEnd { case ended(Int32), noMonitor, monitorGone }
+
+/// One connected monitor mirrored until @shouldStop, the monitor leaving
+/// (daemon: checked from the driver's cached hotplug state), or a failure.
+private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon: Bool,
+                           shouldStop: () -> Bool) -> MirrorEnd {
     let (pkr, pstatus, probed) = observer.display(.probe)
-    guard pkr == kIOReturnSuccess, let probed else { print("display-agent: " + callFailure(pkr, "PROBE")); return 1 }
+    guard pkr == kIOReturnSuccess, let probed else { print("display-agent: " + callFailure(pkr, "PROBE")); return .ended(1) }
     if pstatus != 0 { print("display-agent: probe: \(displayErrno(pstatus))") }
     let wanted = option(options, "--connector")
     guard let connector = probed.connectors.first(where: { $0.connected && (wanted == nil || $0.name == wanted) }) else {
         print("display-agent: no connected monitor" + (wanted.map { " named \($0)" } ?? ""))
-        return 1
+        return .noMonitor
     }
     let (mkr, mstatus, modes) = observer.displayModes(connector.name)
     guard mkr == kIOReturnSuccess, mstatus == 0, let modes else {
         print("display-agent: \(connector.name): " + (mkr == kIOReturnSuccess ? displayErrno(mstatus) : callFailure(mkr, "MODES")))
-        return 1
+        return .ended(1)
     }
     let plan: VirtualDisplayPlan
     switch planVirtualDisplay(connector: connector.name, modes: modes, edid: observer.connectorEDID(connector.name)) {
     case .success(let p): plan = p
-    case .failure(let error): print("display-agent: \(connector.name): \(error)"); return 1
+    case .failure(let error): print("display-agent: \(connector.name): \(error)"); return .ended(1)
     }
-    plan.lines.forEach { print($0) }
+    if !daemon { plan.lines.forEach { print($0) } }
 
     let mirror = MirroredDisplay(observer: observer, plan: plan)
-    let workload = Workload(kind: option(options, "--workload") ?? "still")
-    let warmup = Double(option(options, "--warmup") ?? "") ?? 2
-    let dextPID = driverProcessID(options)
+    let workload = Workload(kind: daemon ? "still" : option(options, "--workload") ?? "still")
+    let warmup = daemon ? Double.infinity : Double(option(options, "--warmup") ?? "") ?? 2
+    let dextPID = daemon ? nil : driverProcessID(options)
     var outputOn = false
+    var monitorLeft = false
     // The measured window: from --warmup after mirroring starts to the end.
     var started: (stats: PresentStats, agent: ProcessUsage?, dext: ProcessUsage?, at: UInt64)?
 
@@ -689,44 +745,27 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
         return 0
     }
 
-    guard mirror.createDisplay() else { return teardown() }
+    guard mirror.createDisplay() else { return .ended(teardown()) }
     print("display-agent: virtual display \(mirror.display!.displayID) \"\(plan.name)\" is online")
     guard let mode = mirror.currentMode() else {
         mirror.failure = "macOS uses a mode for the virtual display that the monitor did not list"
-        return teardown()
+        return .ended(teardown())
     }
-    guard mirror.startOutput(mode) else { return teardown() }
+    guard mirror.startOutput(mode) else { return .ended(teardown()) }
     outputOn = true
-    guard mirror.startCapture(mode) else { return teardown() }
-    // The agent talks to the WindowServer from the app's own executable:
-    // as a background agent that has finished launching, or the Dock shows
-    // the app bouncing for as long as it runs. Only once the virtual
-    // display has its mode: made an NSApplication before, the process does
-    // not see the new display's modes (CGDisplayCopyDisplayMode is nil).
-    NSApplication.shared.setActivationPolicy(.accessory)
-    NSApplication.shared.finishLaunching()
+    guard mirror.startCapture(mode) else { return .ended(teardown()) }
     if let error = workload.start(displayID: mirror.display!.displayID, refreshHz: mode.refreshRate) {
         mirror.failure = "workload: \(error)"
-        return teardown()
+        return .ended(teardown())
     }
-    print("display-agent: mirroring with workload \(workload.kind); " +
-          (seconds > 0 ? "for \(Int(seconds)) s" : "Ctrl-C to stop") + String(format: ", measured after %.1f s", warmup))
+    print("display-agent: mirroring \(plan.connector) with workload \(workload.kind)" +
+          (warmup.isFinite ? String(format: ", measured after %.1f s", warmup) : ""))
+    fflush(stdout)
 
-    var interrupted = false
-    signal(SIGINT, SIG_IGN)
-    signal(SIGTERM, SIG_IGN)
-    let sources = [SIGINT, SIGTERM].map { sig -> DispatchSourceSignal in
-        let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
-        source.setEventHandler { interrupted = true }
-        source.resume()
-        return source
-    }
-    defer { sources.forEach { $0.cancel() } }
     let begin = Date()
-    let deadline = seconds > 0 ? begin.addingTimeInterval(seconds) : Date.distantFuture
-    var lastReport = Date()
+    var lastReport = Date(), lastHotplugCheck = Date()
     var measurementSkipped = false
-    while !interrupted && Date() < deadline {
+    while !shouldStop() {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         if mirror.queue.sync(execute: { mirror.failure }) != nil { break }
         // The measured window opens once a surface is imported (statistics
@@ -752,12 +791,276 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
             guard mirror.startOutput(now), mirror.startCapture(now) else { break }
             started = nil
         }
-        if Date().timeIntervalSince(lastReport) >= 5 {
+        // The daemon follows hotplug: the driver's cached state, read every
+        // 2 s (no GPU access); the monitor gone ends this mirroring.
+        if daemon && Date().timeIntervalSince(lastHotplugCheck) >= 2 {
+            lastHotplugCheck = Date()
+            let (kr, _, status) = observer.display(.status)
+            if kr != kIOReturnSuccess { mirror.failure = callFailure(kr, "STATUS"); break }
+            if let status, !status.connectors.contains(where: { $0.name == plan.connector && $0.connected }) {
+                print("display-agent: \(plan.connector) disconnected")
+                monitorLeft = true
+                break
+            }
+        }
+        if !daemon && Date().timeIntervalSince(lastReport) >= 5 {
             lastReport = Date()
             let (f, p, l) = mirror.queue.sync { (mirror.measurement.frames, mirror.measurement.presented, mirror.last) }
             print("display-agent: \(f) frame(s) captured, \(p) presented" +
                   (l.map { ", \($0.flipped) flipped since OUTPUT" } ?? ""))
         }
     }
-    return teardown()
+    let code = teardown()
+    return monitorLeft && code == 0 ? .monitorGone : .ended(code)
+}
+
+// ----------------------------------------------------------------
+// MARK: - display-agent --create --daemon
+// ----------------------------------------------------------------
+
+/// The driver service, followed with IOKit matching notifications on the
+/// main run loop: no polling while it is absent.
+private final class DriverWatch {
+    private(set) var present = false
+    private var port: IONotificationPortRef?
+    private var matched: io_iterator_t = 0, terminated: io_iterator_t = 0
+
+    init?(bundleIdentifier: String) {
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return nil }
+        self.port = port
+        CFRunLoopAddSource(CFRunLoopGetMain(), IONotificationPortGetRunLoopSource(port).takeUnretainedValue(),
+                           .defaultMode)
+        func matching() -> CFDictionary {
+            let dict = IOServiceMatching("IOUserService") as NSMutableDictionary
+            dict["IOPropertyMatch"] = ["CFBundleIdentifier": bundleIdentifier]
+            return dict
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let onMatch: IOServiceMatchingCallback = { context, iterator in
+            let watch = Unmanaged<DriverWatch>.fromOpaque(context!).takeUnretainedValue()
+            if DriverWatch.drain(iterator) { watch.present = true; agentLog("display-agent: the driver is attached") }
+        }
+        let onTerminate: IOServiceMatchingCallback = { context, iterator in
+            let watch = Unmanaged<DriverWatch>.fromOpaque(context!).takeUnretainedValue()
+            if DriverWatch.drain(iterator) {
+                watch.present = !DriverInstances.list().isEmpty
+                agentLog("display-agent: a driver instance left" + (watch.present ? "; another is attached" : ""))
+            }
+        }
+        guard IOServiceAddMatchingNotification(port, kIOFirstMatchNotification, matching(), onMatch, context,
+                                               &matched) == KERN_SUCCESS,
+              IOServiceAddMatchingNotification(port, kIOTerminatedNotification, matching(), onTerminate, context,
+                                               &terminated) == KERN_SUCCESS else { return nil }
+        // Arm both iterators; services already present count as matched.
+        present = DriverWatch.drain(matched)
+        _ = DriverWatch.drain(terminated)
+    }
+
+    /// Consume an iterator (which re-arms its notification); true if it
+    /// held a service.
+    private static func drain(_ iterator: io_iterator_t) -> Bool {
+        var any = false
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            any = true
+            IOObjectRelease(service)
+        }
+        return any
+    }
+}
+
+/// display-agent --create --daemon: the per-user LaunchAgent
+/// (DisplayAutostart) that makes the GPU's monitor a Mac display whenever
+/// the driver runs. It waits for the driver (IOKit matching), brings the
+/// GPU up if needed (its own session), mirrors the connected monitor, follows
+/// hotplug, tears down when the driver or the monitor leaves, and comes back
+/// when they return. SIGTERM (launchctl bootout) ends it cleanly. It never
+/// shows in the Dock.
+func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
+    agentWindowServerSetup()
+    agentHandleSignals()
+    agentLog("display-agent: daemon started (pid \(getpid()))")
+    guard CGPreflightScreenCaptureAccess() else {
+        _ = CGRequestScreenCaptureAccess()
+        agentLog("display-agent: Screen Recording permission is needed: allow MacLinuxGPUHost in System Settings › Privacy & Security › Screen & System Audio Recording")
+        // launchd restarts the agent (not a successful exit) after its throttle.
+        return 1
+    }
+    guard let watch = DriverWatch(bundleIdentifier: "com.geramyloveless.MacAMDGPUHost.MacAMDGPU") else {
+        agentLog("display-agent: could not watch for the driver (IOKit notifications)")
+        return 1
+    }
+    var retryAfter: Date?
+    while !agentInterrupted {
+        if !watch.present {
+            agentLog("display-agent: waiting for the driver")
+            while !agentInterrupted && !watch.present {
+                // Returns when a source fires: the match, or a signal.
+                _ = RunLoop.main.run(mode: .default, before: .distantFuture)
+            }
+            continue
+        }
+        if let until = retryAfter {
+            retryAfter = nil
+            while !agentInterrupted && watch.present && Date() < until {
+                _ = RunLoop.main.run(mode: .default, before: until)
+            }
+            continue
+        }
+        // Our own session, so the GPU is up while a monitor is mirrored;
+        // compute clients join the same session alongside it.
+        guard let (session, observer) = openClients(["--init"]) else {
+            agentLog("display-agent: the GPU could not be brought up; retrying in 10 s")
+            retryAfter = Date().addingTimeInterval(10)
+            continue
+        }
+        let end = mirrorMonitor(observer: observer, options: options, daemon: true,
+                                shouldStop: { agentInterrupted || !watch.present })
+        if case .noMonitor = end {
+            // Wait for a monitor: the driver's cached hotplug state, every
+            // 2 s (no GPU access). The session stays, so the GPU need not
+            // come up again for the monitor.
+            agentLog("display-agent: no monitor connected; waiting for one")
+            var connected = false
+            while !agentInterrupted && watch.present && !connected {
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
+                let (kr, _, status) = observer.display(.status)
+                if kr != kIOReturnSuccess { break }
+                connected = status?.connectors.contains { $0.connected } ?? false
+            }
+            observer.closeUserClient()
+            session?.closeUserClient()
+            continue
+        }
+        observer.closeUserClient()
+        session?.closeUserClient()
+        switch end {
+        case .ended(let code) where code != 0 && !agentInterrupted && watch.present:
+            agentLog("display-agent: mirroring ended with an error; retrying in 10 s")
+            retryAfter = Date().addingTimeInterval(10)
+        case .monitorGone:
+            agentLog("display-agent: the monitor left; waiting for it")
+        default:
+            break
+        }
+    }
+    agentLog("display-agent: daemon stopped")
+    return 0
+}
+
+// ----------------------------------------------------------------
+// MARK: - autostart (per-user LaunchAgent)
+// ----------------------------------------------------------------
+
+/// The display daemon as a per-user LaunchAgent: it runs at login and
+/// whenever it is enabled, in the user's GUI session (the WindowServer is
+/// per user, so the driver cannot create Mac displays itself), and logs to
+/// ~/Library/Logs/MacLinuxGPU-display.log. The installer enables it once
+/// the driver is verified unless the user turned it off; a driver upgrade
+/// stops it while the previous driver hands over the GPU.
+enum DisplayAutostart {
+    static let label = "com.geramyloveless.maclinuxgpu.display-agent"
+    private static let declinedKey = "DisplayAutostartDeclined"
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+    static var logURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/MacLinuxGPU-display.log")
+    }
+    static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistURL.path) }
+    static var isRunning: Bool { launchctl(["print", "\(domain)/\(label)"]).status == 0 }
+    private static var domain: String { "gui/\(getuid())" }
+
+    static func plist(executable: String) -> [String: Any] {
+        [
+            "Label": label,
+            "ProgramArguments": [executable, "display-agent", "--create", "--daemon"],
+            "RunAtLoad": true,
+            "KeepAlive": ["SuccessfulExit": false],
+            "LimitLoadToSessionType": "Aqua",
+            "ProcessType": "Interactive",
+            "ThrottleInterval": 10,
+            "StandardOutPath": logURL.path,
+            "StandardErrorPath": logURL.path,
+        ]
+    }
+
+    @discardableResult
+    static func launchctl(_ arguments: [String]) -> (status: Int32, output: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do { try process.run() } catch { return (-1, "\(error)") }
+        let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        return (process.terminationStatus, output)
+    }
+
+    /// Install and start the agent for the app at @executable (the installed
+    /// app). nil on success, else why not.
+    static func enable(executable: String = Bundle.main.executablePath ?? "") -> String? {
+        UserDefaults.standard.set(false, forKey: declinedKey)
+        do {
+            try FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(at: logURL.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true)
+            let data = try PropertyListSerialization.data(fromPropertyList: plist(executable: executable),
+                                                          format: .xml, options: 0)
+            try data.write(to: plistURL, options: .atomic)
+        } catch {
+            return "could not write \(plistURL.path): \(error.localizedDescription)"
+        }
+        launchctl(["bootout", "\(domain)/\(label)"])
+        let started = launchctl(["bootstrap", domain, plistURL.path])
+        return started.status == 0 ? nil : "launchctl bootstrap failed (\(started.status)): \(started.output)"
+    }
+
+    /// Stop the agent and remove it; the installer will not enable it again.
+    static func disable() -> String? {
+        UserDefaults.standard.set(true, forKey: declinedKey)
+        launchctl(["bootout", "\(domain)/\(label)"])
+        do {
+            if isEnabled { try FileManager.default.removeItem(at: plistURL) }
+        } catch {
+            return "could not remove \(plistURL.path): \(error.localizedDescription)"
+        }
+        return nil
+    }
+
+    /// What the installer does after the driver is verified: enable unless
+    /// the user turned it off.
+    static func enableUnlessDeclined() -> String? {
+        if UserDefaults.standard.bool(forKey: declinedKey) { return nil }
+        return enable()
+    }
+
+    /// A driver upgrade: the daemon's session would keep the previous driver
+    /// from handing over the GPU. Stopped, and started again afterwards.
+    static func suspendForUpgrade() {
+        if isEnabled { launchctl(["bootout", "\(domain)/\(label)"]) }
+    }
+    static func resumeAfterUpgrade() {
+        if isEnabled && !isRunning { launchctl(["bootstrap", domain, plistURL.path]) }
+    }
+}
+
+/// display-autostart on|off|status (the CLI side of the app's toggle).
+func runDisplayAutostart(_ options: [String]) -> Int32 {
+    switch options.first ?? "status" {
+    case "on":
+        if let error = DisplayAutostart.enable() { print("display-autostart: \(error)"); return 1 }
+        print("display-autostart: on (\(DisplayAutostart.plistURL.path)); log \(DisplayAutostart.logURL.path)")
+    case "off":
+        if let error = DisplayAutostart.disable() { print("display-autostart: \(error)"); return 1 }
+        print("display-autostart: off")
+    default:
+        print("display-autostart: " + (DisplayAutostart.isEnabled ? "on" : "off") +
+              (DisplayAutostart.isRunning ? ", running" : ", not running") +
+              "; log \(DisplayAutostart.logURL.path)")
+    }
+    return 0
 }

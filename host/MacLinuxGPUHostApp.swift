@@ -710,6 +710,12 @@ enum DriverUpgrade {
     /// still use stays open (they are listed); Retire after the activation
     /// then waits for them.
     static func quiescePrevious(force: Bool, report: (String) -> Void) {
+        // The display daemon's session would keep the previous driver from
+        // closing; it starts again once the new driver is verified.
+        if !DriverInstances.previous().isEmpty && DisplayAutostart.isRunning {
+            report("Stopping the display agent while the driver is replaced.")
+            DisplayAutostart.suspendForUpgrade()
+        }
         for instance in DriverInstances.previous() {
             let (result, status, session) = call(instance, kRetireOpQuiesce, force: force)
             guard let result else {
@@ -734,6 +740,10 @@ enum DriverUpgrade {
     /// when none is left; otherwise reports why and how to recover.
     @discardableResult
     static func retirePrevious(force: Bool, timeout: TimeInterval, report: (String) -> Void) -> Bool {
+        if !DriverInstances.previous().isEmpty && DisplayAutostart.isRunning {
+            report("Stopping the display agent while the previous driver hands over the GPU.")
+            DisplayAutostart.suspendForUpgrade()
+        }
         if DriverInstances.bundledCDHash() == nil {
             report("Cannot read the bundled driver's code signature, so a previous driver instance cannot be " +
                    "told apart; `MacLinuxGPUHost instances` lists what is attached.")
@@ -1566,6 +1576,7 @@ private final class InstallerController: NSObject, ObservableObject,
     @Published var bundledVersion = "—"
     @Published var registeredVersion = "—"
     @Published var runningStatus = "not checked"
+    @Published var displayAutostart = DisplayAutostart.isEnabled
     /// The GPU and its monitors (readGPUDevices), refreshed while the app runs.
     @Published var gpuSummary = ""
 
@@ -1840,12 +1851,27 @@ private final class InstallerController: NSObject, ObservableObject,
             if attached {
                 self.status = "Driver attached"
                 self.append("\(result). GPU initialization and compute are not verified by this check.")
+                // Monitors on the GPU become Mac displays from now on, unless
+                // the user turned that off.
+                if let error = DisplayAutostart.enableUnlessDeclined() {
+                    self.append("Display autostart: \(error)")
+                } else if DisplayAutostart.isEnabled {
+                    self.append("Display autostart is on: monitors on the GPU appear as Mac displays (log: \(DisplayAutostart.logURL.path)).")
+                }
+                self.displayAutostart = DisplayAutostart.isEnabled
             } else {
                 self.status = "Driver not attached"
                 self.append(result + ". Registration alone does not show that the dext is running.")
             }
             self.isWorking = false
         }
+    }
+
+    func setDisplayAutostart(_ on: Bool) {
+        let error = on ? DisplayAutostart.enable() : DisplayAutostart.disable()
+        if let error { append("Display autostart: \(error)") }
+        else { append("Display autostart " + (on ? "on: the agent starts now and at every login." : "off.")) }
+        displayAutostart = DisplayAutostart.isEnabled
     }
 
     func refreshGPU() {
@@ -1897,6 +1923,10 @@ private struct InstallerView: View {
                     }
                 }
             }
+            Toggle("Show monitors on the GPU as Mac displays automatically", isOn: Binding(
+                get: { controller.displayAutostart },
+                set: { controller.setDisplayAutostart($0) }))
+                .disabled(controller.needsCopy || controller.isWorking)
             if !controller.gpuSummary.isEmpty {
                 GroupBox("GPU") {
                     Text(controller.gpuSummary)
@@ -2013,6 +2043,7 @@ struct AppMain {
                 exit(0)
             }
             let retired = DriverUpgrade.retirePrevious(force: options.contains("--force"), timeout: wait) { print($0) }
+            if retired { DisplayAutostart.resumeAfterUpgrade() }
             exit(retired ? 0 : 3)
         }
         if args[1] == "device" {
@@ -2031,6 +2062,9 @@ struct AppMain {
         }
         if args[1] == "display-agent" {
             exit(runDisplayAgent(Array(args.dropFirst(2))))
+        }
+        if args[1] == "display-autostart" {
+            exit(runDisplayAutostart(Array(args.dropFirst(2))))
         }
         if ["display-probe", "display-test", "display-off"].contains(args[1]) {
             exit(runDisplayCommand(args[1], Array(args.dropFirst(2))))
