@@ -1194,6 +1194,18 @@ $(BUILD)/mlg-run: $(MLG_RUN_SRCS) tools/mlg-run/plan.h | libdrm-mlg
 
 mlg-run: $(BUILD)/mlg-run
 
+# vk-copy-bench: copy throughput on RADV's transfer (SDMA) and compute
+# queues, host to VRAM, VRAM to host, VRAM to VRAM (tools/vk-copy-bench).
+# Run it with VK_DRIVER_FILES set to the RADV ICD and, for the transfer
+# queue, RADV_EXPERIMENTAL=transfer_queue. Needs the Vulkan loader's
+# headers and library (Homebrew vulkan-loader, vulkan-headers).
+VULKAN_PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
+$(BUILD)/vk-copy-bench: tools/vk-copy-bench/vk-copy-bench.c
+	clang -std=c11 -Wall -Wextra -Werror -O2 -g -I$(VULKAN_PREFIX)/include $< \
+		-L$(VULKAN_PREFIX)/lib -lvulkan -Wl,-rpath,$(VULKAN_PREFIX)/lib -o $@
+
+vk-copy-bench: $(BUILD)/vk-copy-bench
+
 # Quake3e, Vulkan renderer only, for mlg-run --quake3 (build/quake3e).
 quake3e:
 	bash scripts/build-quake3e.sh
@@ -1213,7 +1225,7 @@ test-radv-scanout: lib
 	bash scripts/test-radv-scanout.sh
 
 test: test-radv-offline test-llama-offline test-radv-scanout
-.PHONY: libdrm-mlg test-libdrm-mlg radv llama-vulkan test-radv-offline test-llama-offline \
+.PHONY: libdrm-mlg test-libdrm-mlg radv llama-vulkan test-radv-offline test-llama-offline vk-copy-bench \
 	test-radv-scanout
 
 # The hardware CS self-test runner (scripts/drm-selftest.py) against a fake
