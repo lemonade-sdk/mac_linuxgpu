@@ -144,6 +144,22 @@ struct rt_display_modes {
  * connector, -ENODEV without display. */
 int rt_display_modes(struct pci_dev *pdev, const char *connector, struct rt_display_modes *out);
 
+/* The monitor on one connector, from the state the last probe left (no
+ * detection, no AUX or DDC traffic): the EDID's monitor name descriptor
+ * (drm_edid_get_monitor_name; empty without an EDID or without the
+ * descriptor) and the display_info physical size. -ENOENT for no such
+ * connector, -ENODEV without display. */
+#define RT_DISPLAY_MONITOR_NAME_BYTES	14u
+
+struct rt_display_monitor {
+	uint32_t status;		/* enum drm_connector_status */
+	uint32_t width_mm, height_mm;
+	char name[RT_DISPLAY_MONITOR_NAME_BYTES];
+};
+
+int rt_display_monitor(struct pci_dev *pdev, const char *connector,
+		       struct rt_display_monitor *out);
+
 /* ---- an output a display agent feeds (docs/macos-displays.md) ----
  * rt_display_output() lights one connector at the mode @width x @height at
  * @refresh_mhz (one of its probed modes, matched within 50 mHz; -EINVAL

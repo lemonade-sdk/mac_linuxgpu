@@ -46,6 +46,8 @@
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/OSBoolean.h>
 #include <DriverKit/OSString.h>
+#include <DriverKit/OSArray.h>
+#include <DriverKit/OSNumber.h>
 #include <DriverKit/IOInterruptDispatchSource.h>
 #include <DriverKit/IODMACommand.h>
 #include <DriverKit/IOMemoryDescriptor.h>
@@ -69,6 +71,7 @@
 #include "power_state.h"
 #include "raw_bar_lease.h"
 #include "session_state.h"
+#include "device_properties.h"
 #include <rt/bootstrap.h>
 #include <rt/cs_selftest.h>
 #include <rt/display.h>
@@ -763,6 +766,8 @@ static void release_display_owners(const char *why)
     }
 }
 
+// The session's connectors leave this service's properties (displays_publish).
+static void displays_unpublish(MacLinuxGPU *driver);
 static void close_session(MacLinuxGPU *driver)
 {
     if (s_sessionClosing) return;
@@ -770,6 +775,7 @@ static void close_session(MacLinuxGPU *driver)
     s_finalCleanup = false;
     // No observer read may run an upstream callback past this point.
     observer_reads_close();
+    displays_unpublish(driver);
     // The display goes first. A quarantined session keeps every upstream
     // owner, the display's included, unless its device is gone.
     if (s_modulesRunning && (!s_dmaQuarantined || s_deviceRemoved))
@@ -1045,6 +1051,139 @@ static kern_return_t prepare_interrupts(MacLinuxGPU *driver)
     }
     action->release();
     return s_irqReady ? kIOReturnSuccess : kIOReturnError;
+}
+
+// ----------------------------------------------------------------
+// The GPU's identity and its monitors as properties of this service
+// (device_identity.h): System Information reads model, VRAM,totalMB,
+// ATY,EFIVersionB and rom-revision from here; our tools read
+// MacLinuxGPUDevice and MacLinuxGPUDisplays. Identity is set at Start from
+// the provider's PCI registers and again after the upstream probe;
+// displays follow the display operations and are removed with the session.
+// ----------------------------------------------------------------
+static maclinuxgpu::DeviceIdentity s_identity;
+static maclinuxgpu::DisplayState s_displayReport;    // last report published (monitors not read)
+static maclinuxgpu::DisplayState s_displayPublished; // what MacLinuxGPUDisplays holds
+static bool s_displaysPublished = false;
+
+static bool provider_register(OSDictionary *properties, const char *key, uint32_t &value)
+{
+    OSData *data = OSDynamicCast(OSData, properties->getObject(key));
+    return data && maclinuxgpu::pci_register_value(data->getBytesNoCopy(), data->getLength(), value);
+}
+
+// The provider's configuration registers as IOPCIFamily published them,
+// and its current link (IOPCIExpressLinkStatus). No configuration access.
+static void identity_read_provider(IOService *provider)
+{
+    OSDictionary *properties = nullptr;
+    if (!provider || provider->CopyProperties(&properties) != kIOReturnSuccess || !properties) return;
+    uint32_t vendor = 0, device = 0, revision = 0, subsystemVendor = 0, subsystem = 0;
+    if (provider_register(properties, "vendor-id", vendor) &&
+        provider_register(properties, "device-id", device) &&
+        provider_register(properties, "revision-id", revision)) {
+        s_identity.pci = true;
+        s_identity.vendor = (uint16_t)vendor;
+        s_identity.device = (uint16_t)device;
+        s_identity.revision = (uint8_t)revision;
+        if (provider_register(properties, "subsystem-vendor-id", subsystemVendor) &&
+            provider_register(properties, "subsystem-id", subsystem)) {
+            s_identity.subsystemVendor = (uint16_t)subsystemVendor;
+            s_identity.subsystem = (uint16_t)subsystem;
+        }
+    }
+    if (OSNumber *link = OSDynamicCast(OSNumber, properties->getObject("IOPCIExpressLinkStatus"))) {
+        s_identity.link = true;
+        s_identity.linkStatus = link->unsigned64BitValue();
+    }
+    properties->release();
+}
+
+static void identity_publish(MacLinuxGPU *driver, const char *when)
+{
+    if (!driver) return;
+    OSDictionary *properties = maclinuxgpu::identity_properties(s_identity);
+    if (!properties) {
+        MACLINUXGPU_LOG("identity (%s): no memory for the properties", when);
+        return;
+    }
+    const kern_return_t ret = driver->SetProperties(properties);
+    properties->release();
+    const char *name = maclinuxgpu::product_name(s_identity, nullptr);
+    if (s_identity.probed) {
+        MACLINUXGPU_LOG("identity (%s): %s, %u MB %s, VBIOS %s %s, %s -> %#x", when,
+                        name ? name : "no product name", maclinuxgpu::vram_total_mb(s_identity),
+                        s_identity.driver.vram_type_name, s_identity.driver.vbios_pn,
+                        s_identity.driver.vbios_version,
+                        s_identity.driver.gfx_target[0] ? s_identity.driver.gfx_target : "no KFD target",
+                        ret);
+    } else {
+        MACLINUXGPU_LOG("identity (%s): %04x:%04x rev %02x, %s -> %#x", when,
+                        (unsigned)s_identity.vendor, (unsigned)s_identity.device,
+                        (unsigned)s_identity.revision, name ? name : "no product name", ret);
+    }
+}
+
+// After a successful upstream probe: what the amdgpu device knows.
+static void identity_after_probe(MacLinuxGPU *driver, struct pci_dev *pdev)
+{
+    identity_read_provider(s_retainedPCI);
+    struct rt_device_identity driverIdentity;
+    const int r = rt_device_identity(pdev, &driverIdentity);
+    if (r != 0) {
+        MACLINUXGPU_LOG("identity: upstream device not readable (%d)", r);
+        return;
+    }
+    s_identity.driver = driverIdentity;
+    s_identity.probed = true;
+    identity_publish(driver, "probe");
+}
+
+// The connectors of @report as MacLinuxGPUDisplays, when they changed. Runs
+// inside the observer admission (the upstream driver is alive) and under
+// s_displayRunning (one display operation at a time).
+static void displays_publish(struct pci_dev *pdev, const struct rt_display_report &report)
+{
+    MacLinuxGPU *driver = s_driver;
+    if (!driver) return;
+    maclinuxgpu::DisplayState seen;
+    maclinuxgpu::display_state(report, [](const char *, struct rt_display_monitor &) { return -1; },
+                               seen);
+    if (s_displaysPublished && maclinuxgpu::display_state_equal(seen, s_displayReport)) return;
+    maclinuxgpu::DisplayState state;
+    maclinuxgpu::display_state(report, [pdev](const char *name, struct rt_display_monitor &monitor) {
+        return rt_display_monitor(pdev, name, &monitor);
+    }, state);
+    OSDictionary *properties = maclinuxgpu::display_properties(state);
+    if (!properties) return;
+    const kern_return_t ret = driver->SetProperties(properties);
+    properties->release();
+    if (ret != kIOReturnSuccess) {
+        MACLINUXGPU_LOG("displays: publishing the connectors failed (%#x)", ret);
+        return;
+    }
+    s_displayReport = seen;
+    if (!s_displaysPublished || !maclinuxgpu::display_state_equal(state, s_displayPublished)) {
+        for (uint32_t i = 0; i < state.count; ++i) {
+            const maclinuxgpu::ConnectorState &c = state.connector[i];
+            if (c.status == 1)
+                MACLINUXGPU_LOG("displays: %s connected%s%s%s", c.name, c.monitor[0] ? " (" : "",
+                                c.monitor, c.monitor[0] ? ")" : "");
+        }
+    }
+    s_displayPublished = state;
+    s_displaysPublished = true;
+}
+
+// The session closes: its connectors are no longer known.
+static void displays_unpublish(MacLinuxGPU *driver)
+{
+    if (!s_displaysPublished || !driver) return;
+    s_displaysPublished = false;
+    OSString *key = OSString::withCString(maclinuxgpu::kMLGDisplays);
+    if (!key) return;
+    (void)driver->RemoveProperty(key);
+    key->release();
 }
 
 // ----------------------------------------------------------------
@@ -1593,6 +1732,11 @@ IMPL(MacLinuxGPU, Start)
     s_probeAttempted = false;
     s_probeResult = 0;
     dext_compute_set_stage(DEXT_COMPUTE_STAGE_NONE);
+    // System Information reads the GPU's name from this service.
+    memset(&s_identity, 0, sizeof(s_identity));
+    s_displaysPublished = false;
+    identity_read_provider(pci);
+    identity_publish(this, "start");
     MACLINUXGPU_LOG("driver attached; PCI deferred until a client operation");
     RegisterService();
     return kIOReturnSuccess;
@@ -2730,7 +2874,10 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
         struct rt_display_report report;
         const int r = rt_display_output(pdev, request.connector, request.width, request.height,
                                         (uint32_t)in[1], &report);
-        if (!r) __atomic_store_n(&s_displayOwner, clientID, __ATOMIC_RELEASE);
+        if (!r) {
+            __atomic_store_n(&s_displayOwner, clientID, __ATOMIC_RELEASE);
+            displays_publish(pdev, report);	// the lit mode (MacLinuxGPUDisplays)
+        }
         MACLINUXGPU_LOG("display: OUTPUT %s at %ux%u %llu mHz -> %d (commit %d)", request.connector,
                         request.width, request.height, (unsigned long long)in[1], r, report.commit_status);
         a->structureOutput = OSData::withBytes(&report, sizeof(report));
@@ -2839,6 +2986,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
     if (in[0] == MLG_DISPLAY_OP_STATUS) {
         // Polled by a display agent: cached state only, not logged.
         r = rt_display_status(pdev, &report);
+        if (r == 0) displays_publish(pdev, report);
         s_observerReads.leave();
         __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
         arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
@@ -2857,6 +3005,7 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         r = rt_display_off(pdev, &report);
         __atomic_store_n(&s_displayOwner, 0, __ATOMIC_RELEASE);
     }
+    if (r == 0) displays_publish(pdev, report);
     s_observerReads.leave();
     __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
     unsigned connected = 0, lit = 0;
@@ -3153,6 +3302,8 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnError;
         }
         MACLINUXGPU_LOG("upstream AMDGPU PCI probe completed");
+        identity_after_probe(ivars->ownerDriver,
+                             static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         int computeResult = dext_compute_start(
             static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         if (computeResult != 0) {

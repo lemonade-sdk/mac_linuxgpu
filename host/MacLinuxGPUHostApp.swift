@@ -995,6 +995,10 @@ final class MacLinuxGPUHost {
     func deviceDescription() -> String {
         var text = String(format: "AMD GPU %04x:%04x rev %02x (subsystem %04x:%04x)",
                           vid, did, revision, subsystemVendor, subsystemDevice)
+        // The product name the dext publishes (libdrm's table), when it has one.
+        if let name = readGPUDevices().first(where: { $0.deviceID == Int(did) })?.name {
+            text = name + " (" + text + ")"
+        }
         let (kr, gfx) = callScalar(kSelQueryInfo, inScalars: [1], outScalars: 3)
         if kr == kIOReturnSuccess, gfx.count == 3, gfx[0] != 0 {
             text += String(format: " (GC %llu.%llu.%llu)", gfx[0], gfx[1], gfx[2])
@@ -1526,6 +1530,30 @@ func runDisplayCommand(_ command: String, _ options: [String]) -> Int32 {
     }
 }
 
+/// The GPUs the dext drives, as its services publish them in the IORegistry
+/// (host/DeviceInfo.swift). Needs no UserClient and joins no session.
+func readGPUDevices() -> [GPUDeviceInfo] {
+    guard let matching = IOServiceMatching("IOUserService") else { return [] }
+    var iter: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, matching as CFDictionary, &iter)
+            == kIOReturnSuccess else { return [] }
+    defer { IOObjectRelease(iter) }
+    var devices: [GPUDeviceInfo] = []
+    var svc = IOIteratorNext(iter)
+    while svc != 0 {
+        var props: Unmanaged<CFMutableDictionary>?
+        if IORegistryEntryCreateCFProperties(svc, &props, kCFAllocatorDefault, 0) == kIOReturnSuccess,
+           let dict = props?.takeRetainedValue() as? [String: Any],
+           dict["CFBundleIdentifier"] as? String == dextBundleIdentifier,
+           let device = GPUDeviceInfo(properties: dict) {
+            devices.append(device)
+        }
+        IOObjectRelease(svc)
+        svc = IOIteratorNext(iter)
+    }
+    return devices
+}
+
 // The normal app launch follows the mac_amdgpu self-installing host flow. The
 // CLI commands remain available to activate.sh and diagnostics tools.
 @MainActor
@@ -1538,14 +1566,21 @@ private final class InstallerController: NSObject, ObservableObject,
     @Published var bundledVersion = "—"
     @Published var registeredVersion = "—"
     @Published var runningStatus = "not checked"
+    /// The GPU and its monitors (readGPUDevices), refreshed while the app runs.
+    @Published var gpuSummary = ""
 
     private var request: OSSystemExtensionRequest?
+    private var gpuTimer: Timer?
     private var checkingProperties = false
     private var hasStarted = false
 
     func start() {
         guard !hasStarted else { return }
         hasStarted = true
+        refreshGPU()
+        gpuTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshGPU() }
+        }
         let source = Bundle.main.bundleURL.standardizedFileURL
         needsCopy = source != installedAppURL.standardizedFileURL
         if let version = InstallPackage.version(at: source) {
@@ -1813,6 +1848,12 @@ private final class InstallerController: NSObject, ObservableObject,
         }
     }
 
+    func refreshGPU() {
+        let summary = readGPUDevices().map { $0.summaryLines.joined(separator: "\n") }
+            .joined(separator: "\n\n")
+        if summary != gpuSummary { gpuSummary = summary }
+    }
+
     private func append(_ line: String) {
         log += "[\(Date().formatted(date: .omitted, time: .standard))] \(line)\n"
     }
@@ -1854,6 +1895,14 @@ private struct InstallerView: View {
                     if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
                         NSWorkspace.shared.open(url)
                     }
+                }
+            }
+            if !controller.gpuSummary.isEmpty {
+                GroupBox("GPU") {
+                    Text(controller.gpuSummary)
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
             ScrollView {
@@ -1965,6 +2014,17 @@ struct AppMain {
             }
             let retired = DriverUpgrade.retirePrevious(force: options.contains("--force"), timeout: wait) { print($0) }
             exit(retired ? 0 : 3)
+        }
+        if args[1] == "device" {
+            // The GPU and the monitors on its outputs, from the IORegistry:
+            // what System Information shows, plus the displays it cannot.
+            let devices = readGPUDevices()
+            if devices.isEmpty {
+                print("No MacLinuxGPU service publishes a GPU (is the driver attached?)")
+                exit(1)
+            }
+            print(devices.map { $0.summaryLines.joined(separator: "\n") }.joined(separator: "\n\n"))
+            exit(0)
         }
         if args[1] == "display-pin-test" {
             exit(runDisplayPinTest(Array(args.dropFirst(2))))
