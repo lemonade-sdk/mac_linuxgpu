@@ -3,8 +3,9 @@
  * async workers, mmaps of CPU-backed memory handed back as the dext
  * mapping itself (host memory in the host build), and other mappings
  * (scattered pages, VRAM through a BAR) gathered into one range of the
- * same memory. For tests that run a libmlg_drm client against the fixture
- * device. */
+ * same memory. LX_SCANOUT and the primary node go through the driver's
+ * display hooks, as in the dext. For tests that run a libmlg_drm client
+ * against the fixture device. */
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 #include <linux/errno.h>
 #include <linux/jiffies.h>
 #include <linux/pci.h>
+#include <rt/display.h>
 #include <rt/lx_files.h>
 
 #include "mlg_drm.h"
@@ -220,6 +222,14 @@ static int lb_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 	return rt_lx_munmap(client, handle);
 }
 
+static int lb_scanout(void *ctx, const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state,
+		      int64_t *result)
+{
+	(void)ctx;
+	*result = rt_lx_scanout(client, req, state);
+	return 0;
+}
+
 static struct pci_dev *lb_pdev;
 
 /* The PCI function, as the IOKit transport reads it from the registry. */
@@ -246,10 +256,13 @@ int lx_loopback_transport(struct pci_dev *pdev, struct mlg_transport *out)
 
 	if (r)
 		return r;
+	/* As the dext sets them for every Linux-file client. */
+	rt_lx_client_set_display(client, &rt_display_lx_hooks);
 	lb_pdev = pdev;
 	*out = (struct mlg_transport){
 		.open = lb_open, .close = lb_close, .ioctl = lb_ioctl,
 		.mmap = lb_mmap, .munmap = lb_munmap, .identity = lb_identity,
+		.scanout = lb_scanout,
 	};
 	return 0;
 }

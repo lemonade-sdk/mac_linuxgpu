@@ -202,12 +202,24 @@ static void forget(int fd)
 static int device_of_path(const char *path, uint32_t *dev)
 {
 	static const char render[] = "/dev/dri/renderD";
+	static const char card[] = "/dev/dri/card";
 
 	if (!path)
 		return -MLG_LX_EFAULT;
 	if (!strcmp(path, "/dev/kfd")) {
 		*dev = MLG_LX_DEV_KFD;
 		return 0;
+	}
+	if (!strncmp(path, card, sizeof(card) - 1)) {
+		const char *p = path + sizeof(card) - 1;
+		char *end = NULL;
+		long minor = strtol(p, &end, 10);
+
+		/* The GPU's primary node. */
+		if (end != p && !*end && minor >= 0 && minor < 64) {
+			*dev = MLG_LX_DEV_PRIMARY;
+			return 0;
+		}
 	}
 	if (!strncmp(path, render, sizeof(render) - 1)) {
 		const char *p = path + sizeof(render) - 1;
@@ -293,9 +305,9 @@ static uint64_t monotonic_ns(void)
  * transport knows requests by their exact encoding: send the table's. */
 static uint32_t table_cmd(uint32_t dev, uint32_t cmd)
 {
-	/* The render node's requests are known by exact encoding, so the
-	 * one that matches is the table's; KFD's are known by range. */
-	if (dev != MLG_LX_DEV_RENDER || mlg_lx_cmd_known(dev, cmd))
+	/* The DRM nodes' requests are known by exact encoding, so the one
+	 * that matches is the table's; KFD's are known by range. */
+	if (dev == MLG_LX_DEV_KFD || mlg_lx_cmd_known(dev, cmd))
 		return cmd;
 	for (uint32_t dir = 0; dir < 4; ++dir) {
 		const uint32_t c = (cmd & ~(3u << 30)) | dir << 30;
@@ -477,6 +489,33 @@ int mlg_munmap(void *addr, size_t length)
 	r = t.munmap(t.ctx, m->handle, m->addr, m->span);
 	free(m);
 	return r ? fail(-r) : 0;
+}
+
+/* ---- the display output ---- */
+
+int mlg_scanout(const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state)
+{
+	struct mlg_transport t;
+	int64_t result = 0;
+	int r;
+
+	if (!req || !state)
+		return fail(MLG_LX_EFAULT);
+	memset(state, 0, sizeof(*state));
+	if ((req->op == MLG_LX_SCANOUT_TEST || req->op == MLG_LX_SCANOUT_PRESENT) &&
+	    device_of(req->fd) != MLG_LX_DEV_PRIMARY)
+		return fail(MLG_LX_EBADF);
+	if (!get_transport(&t))
+		return fail(MLG_LX_ENODEV);
+	if (!t.scanout)
+		return fail(MLG_LX_ENODEV);
+	r = t.scanout(t.ctx, req, state, &result);
+	if (r)
+		return fail(-r);
+	if (result < 0)
+		return fail((int)-result);
+	last_linux_errno = 0;
+	return 0;
 }
 
 /* ---- the GPU's PCI identity ---- */

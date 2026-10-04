@@ -13,6 +13,9 @@
 #include <drm/drm_vblank.h>
 #include <linux/dma-fence.h>
 #include <linux/wait.h>
+#include <linux/completion.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/kthread.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
@@ -31,12 +34,17 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
+#include <drm/drm_auth.h>
+#include <drm/drm_syncobj.h>
+#include <drm/drm_plane.h>
 #include <rt/display.h>
+#include <rt/lx_abi.h>
 #include <rt/device_string.h>
 #include <rt/surface.h>
 #include <rt/removal.h>
 
 #include "amdgpu.h"
+#include "lx_internal.h"
 
 /* The largest framebuffer the test creates: two 4K monitors side by side
  * would not fit, one 8K mode does. */
@@ -96,12 +104,42 @@ struct output_frame {
 	struct dma_fence *copy[RT_SURFACE_ENGINES_MAX];
 };
 
+/* A client's framebuffer for one commit (LX_SCANOUT PRESENT): the layer
+ * (MLG_LX_LAYER_*), the framebuffer and the syncobj that gets the flip's
+ * fence, both referenced; src in framebuffer pixels, dst in CRTC pixels. */
+struct output_layer {
+	uint32_t layer;
+	struct drm_framebuffer *fb;
+	struct drm_syncobj *sync;
+	uint32_t src_x, src_y, src_w, src_h;
+	int32_t dst_x, dst_y;
+	uint32_t dst_w, dst_h;
+};
+
+/* The client attached to the output (rt_display_lx_hooks). The owner and
+ * the overlay plane change under rt_display_lock; the mailbox, the detach
+ * request, primary_owned and the counters under the output's lock; shown
+ * is the worker's. */
+struct output_client {
+	void *owner;
+	struct drm_plane *overlay;	/* reserved for the client, or NULL */
+	bool has_next;
+	struct output_layer next;
+	bool detach;
+	struct completion detached;
+	uint32_t shown;			/* the layer the screen shows now, 0: none */
+	bool primary_owned;		/* shown == MLG_LX_LAYER_PRIMARY, for presents */
+	uint32_t last_layer;
+	uint64_t presents, flips, desktop_held;
+};
+
 struct display_output {
 	struct drm_device *dev;
 	struct amdgpu_device *adev;
 	struct drm_crtc *crtc;
 	struct drm_plane *plane;
-	uint32_t width, height;
+	struct drm_connector *connector;	/* the modeset's, referenced by the client */
+	uint32_t width, height, refresh_mhz;
 	struct drm_client_buffer *fb[OUTPUT_BUFFERS];
 	uint64_t fb_address[OUTPUT_BUFFERS];
 	bool pinned[OUTPUT_BUFFERS];
@@ -112,6 +150,7 @@ struct display_output {
 	struct dma_fence *pending_flip;
 	struct dma_fence_cb flip_cb;
 	struct output_frame pending_frame;
+	bool pending_desktop, pending_client;	/* what the pending flip shows */
 	struct task_struct *worker;
 	/* The worker sleeps on this until a kick (a frame, a flip, stop) or
 	 * its timeout; nothing polls. A plain condition variable: linuxu's
@@ -127,6 +166,7 @@ struct display_output {
 	uint64_t next_capture_ns, next_received_ns;
 	bool flip_done;
 	struct rt_display_present_stats stats;
+	struct output_client client;
 };
 
 static void output_stop(struct display_output *o);
@@ -1199,7 +1239,7 @@ static void output_error(struct display_output *o, int error)
 	drm_err(o->dev, "display output: worker stopped by error %d\n", error);
 }
 
-/* The pending flip happened: account it, its buffer is on screen. */
+/* The pending flip happened: account it, its buffers are on screen. */
 static void output_flip_account(struct display_output *o)
 {
 	struct output_frame *f = &o->pending_frame;
@@ -1223,20 +1263,25 @@ static void output_flip_account(struct display_output *o)
 	if (f->capture_ns && flip_ns > f->capture_ns)
 		latency = flip_ns - f->capture_ns;
 	spin_lock_irqsave(&o->lock, flags);
-	o->stats.frames_flipped++;
-	o->stats.copy_gpu_ns += gpu_ns;
-	o->stats.last_copy_gpu_ns = gpu_ns;
-	o->stats.last_bytes = f->bytes;
-	o->stats.latency_ns += latency;
-	o->stats.last_latency_ns = latency;
-	if (latency > o->stats.latency_max_ns)
-		o->stats.latency_max_ns = latency;
+	if (o->pending_desktop) {
+		o->stats.frames_flipped++;
+		o->stats.copy_gpu_ns += gpu_ns;
+		o->stats.last_copy_gpu_ns = gpu_ns;
+		o->stats.last_bytes = f->bytes;
+		o->stats.latency_ns += latency;
+		o->stats.last_latency_ns = latency;
+		if (latency > o->stats.latency_max_ns)
+			o->stats.latency_max_ns = latency;
+	}
+	if (o->pending_client)
+		o->client.flips++;
 	o->flip_done = false;
 	spin_unlock_irqrestore(&o->lock, flags);
 	dma_fence_put(o->pending_flip);
 	o->pending_flip = NULL;
 	o->front = o->pending;
 	o->pending = -1;
+	o->pending_desktop = o->pending_client = false;
 }
 
 /* Wait (bounded) for the pending flip; 0 when it happened. */
@@ -1260,19 +1305,96 @@ static int output_flip_wait(struct display_output *o)
 			return left < 0 ? (int)left : -ETIME;
 		}
 	}
-	left = dma_fence_wait_timeout(o->pending_flip, false, msecs_to_jiffies(OUTPUT_FLIP_TIMEOUT_MS));
+	/* A client's frame waits for its rendering the same way (the
+	 * framebuffer's implicit fences), which only the GPU work bounds. */
+	left = dma_fence_wait_timeout(o->pending_flip, false,
+				      msecs_to_jiffies(o->pending_client ? OUTPUT_COPY_TIMEOUT_MS :
+						       OUTPUT_FLIP_TIMEOUT_MS));
 	if (left <= 0) {
-		pr_err("display: the flip did not complete within %u ms of its copy (%ld)\n",
-		       OUTPUT_FLIP_TIMEOUT_MS, left);
+		pr_err("display: the flip did not complete within %u ms of its %s (%ld)\n",
+		       o->pending_client ? OUTPUT_COPY_TIMEOUT_MS : OUTPUT_FLIP_TIMEOUT_MS,
+		       o->pending_client ? "client frame" : "copy", left);
 		return left < 0 ? (int)left : -ETIME;
 	}
 	output_flip_account(o);
 	return 0;
 }
 
-/* A nonblocking commit of buffer @b on the primary plane, with a CRTC
- * fence that signals at the flip. */
-static int output_commit(struct display_output *o, int b, struct dma_fence **out)
+/* @ps shows @fb's @src (pixels) at @dst on @crtc; a NULL @fb takes the
+ * plane off. */
+static int plane_place(struct drm_plane_state *ps, struct drm_crtc *crtc, struct drm_framebuffer *fb,
+		       uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h,
+		       int32_t dst_x, int32_t dst_y, uint32_t dst_w, uint32_t dst_h)
+{
+	int ret = drm_atomic_set_crtc_for_plane(ps, fb ? crtc : NULL);
+
+	if (ret)
+		return ret;
+	drm_atomic_set_fb_for_plane(ps, fb);
+	if (!fb) {
+		ps->crtc_x = ps->crtc_y = 0;
+		ps->crtc_w = ps->crtc_h = 0;
+		ps->src_x = ps->src_y = ps->src_w = ps->src_h = 0;
+		return 0;
+	}
+	ps->crtc_x = dst_x;
+	ps->crtc_y = dst_y;
+	ps->crtc_w = dst_w;
+	ps->crtc_h = dst_h;
+	ps->src_x = src_x << 16;
+	ps->src_y = src_y << 16;
+	ps->src_w = src_w << 16;
+	ps->src_h = src_h << 16;
+	return 0;
+}
+
+static int layer_place(struct drm_plane_state *ps, struct drm_crtc *crtc,
+		       const struct output_layer *cl)
+{
+	return plane_place(ps, crtc, cl->fb, cl->src_x, cl->src_y, cl->src_w, cl->src_h,
+			   cl->dst_x, cl->dst_y, cl->dst_w, cl->dst_h);
+}
+
+/* The planes of one commit in @state: the primary plane shows desktop
+ * buffer @b (-1: the last one shown) unless the client has it; the
+ * client's frame @cl, if any, goes on its layer; @off takes the client off
+ * the screen. The overlay plane is only touched when it changes. */
+static int output_scene(struct display_output *o, struct drm_atomic_state *state, int b,
+			const struct output_layer *cl, bool off)
+{
+	const uint32_t was = o->client.shown;
+	const uint32_t now = off ? 0 : cl ? cl->layer : was;
+	struct drm_plane_state *ps;
+	int ret = 0;
+
+	if (b < 0)
+		b = o->front >= 0 ? o->front : 0;
+	ps = drm_atomic_get_plane_state(state, o->plane);
+	if (IS_ERR(ps))
+		return PTR_ERR(ps);
+	if (now == MLG_LX_LAYER_PRIMARY && cl)
+		ret = layer_place(ps, o->crtc, cl);
+	else if (now != MLG_LX_LAYER_PRIMARY)
+		ret = plane_place(ps, o->crtc, o->fb[b]->fb, 0, 0, o->width, o->height, 0, 0,
+				  o->width, o->height);
+	/* else the client's last frame stays on the primary plane */
+	if (ret || !o->client.overlay)
+		return ret;
+	if (now == MLG_LX_LAYER_OVERLAY && cl) {
+		ps = drm_atomic_get_plane_state(state, o->client.overlay);
+		return IS_ERR(ps) ? PTR_ERR(ps) : layer_place(ps, o->crtc, cl);
+	}
+	if (was == MLG_LX_LAYER_OVERLAY && now != MLG_LX_LAYER_OVERLAY) {
+		ps = drm_atomic_get_plane_state(state, o->client.overlay);
+		return IS_ERR(ps) ? PTR_ERR(ps) : plane_place(ps, o->crtc, NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+	}
+	return 0;
+}
+
+/* A nonblocking commit of the scene (output_scene), with a CRTC fence that
+ * signals at the flip. */
+static int output_commit(struct display_output *o, int b, const struct output_layer *cl, bool off,
+			 struct dma_fence **out)
 {
 	struct drm_modeset_acquire_ctx ctx;
 	struct drm_atomic_state *state;
@@ -1289,14 +1411,12 @@ static int output_commit(struct display_output *o, int b, struct dma_fence **out
 	state->acquire_ctx = &ctx;
 retry:
 	{
-		struct drm_plane_state *ps = drm_atomic_get_plane_state(state, o->plane);
 		struct drm_crtc_state *cs;
 		struct drm_pending_vblank_event *e;
 
-		ret = PTR_ERR_OR_ZERO(ps);
+		ret = output_scene(o, state, b, cl, off);
 		if (ret)
 			goto backoff;
-		drm_atomic_set_fb_for_plane(ps, o->fb[b]->fb);
 		cs = drm_atomic_get_crtc_state(state, o->crtc);
 		ret = PTR_ERR_OR_ZERO(cs);
 		if (ret)
@@ -1342,62 +1462,142 @@ fini:
 	return ret;
 }
 
-/* One frame: copy into a free buffer, wait for the previous flip, flip. */
+/* An atomic check of the scene with the client's frame @cl, nothing
+ * committed (LX_SCANOUT TEST). */
+static int output_check(struct display_output *o, const struct output_layer *cl)
+{
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_atomic_state *state;
+	int ret;
+
+	drm_modeset_acquire_init(&ctx, 0);
+	state = drm_atomic_state_alloc(o->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto fini;
+	}
+	state->acquire_ctx = &ctx;
+retry:
+	ret = output_scene(o, state, -1, cl, false);
+	if (!ret)
+		ret = drm_atomic_check_only(state);
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		drm_modeset_backoff(&ctx);
+		goto retry;
+	}
+	drm_atomic_state_put(state);
+fini:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+/* A client frame that will not be shown: its syncobj signals at once (the
+ * client's wait ends; its next call reports why) and the references go. */
+static void layer_drop(struct output_layer *cl)
+{
+	if (cl->sync) {
+		struct dma_fence *stub = dma_fence_get_stub();
+
+		drm_syncobj_replace_fence(cl->sync, stub);
+		dma_fence_put(stub);
+		drm_syncobj_put(cl->sync);
+	}
+	if (cl->fb)
+		drm_framebuffer_put(cl->fb);
+	memset(cl, 0, sizeof(*cl));
+}
+
+/* One step: copy a desktop frame (@surface, may be NULL) into a free
+ * buffer, wait for the previous flip, then commit the desktop with the
+ * client's frame @cl (may be NULL), or with the client taken off (@off). */
 static int output_frame(struct display_output *o, struct rt_surface *surface,
-			struct output_damage *damage, uint64_t capture_ns, uint64_t received_ns)
+			struct output_damage *damage, uint64_t capture_ns, uint64_t received_ns,
+			struct output_layer *cl, bool off)
 {
 	struct rt_surface_rect full = { 0, 0, o->width, o->height };
-	struct output_damage copy;
-	struct rt_surface_copy_stats cs;
 	struct output_frame frame = { .capture_ns = capture_ns, .received_ns = received_ns };
 	struct dma_fence *flip;
 	unsigned long flags;
-	int b = 0, r;
+	int b = -1, r;
 	u64 start = ktime_get_ns();
 
-	while (b == o->front || b == o->pending)
-		b++;
-	copy = o->missed[b];
-	damage_merge(&copy, damage);
-	damage_settle(&copy, o->width, o->height);
-	r = rt_surface_copy_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b], o->fb[b]->fb->pitches[0],
-				   copy.full ? &full : copy.rect, copy.full ? 1 : copy.count, &o->engines,
-				   frame.copy, &cs);
-	rt_surface_release(surface);
-	if (r)
-		return r;
-	frame.submitted_ns = ktime_get_ns();
-	frame.bytes = cs.bytes;
-	memset(&o->missed[b], 0, sizeof(o->missed[b]));
-	for (int i = 0; i < OUTPUT_BUFFERS; i++)
-		if (i != b)
-			damage_merge(&o->missed[i], damage);
-	spin_lock_irqsave(&o->lock, flags);
-	o->stats.copy_jobs += cs.jobs;
-	o->stats.bytes += cs.bytes;
-	o->stats.copy_submit_ns += frame.submitted_ns - start;
-	o->stats.full_frames += copy.full;
-	spin_unlock_irqrestore(&o->lock, flags);
+	if (surface) {
+		struct output_damage copy;
+		struct rt_surface_copy_stats cs;
+
+		b = 0;
+		while (b == o->front || b == o->pending)
+			b++;
+		copy = o->missed[b];
+		damage_merge(&copy, damage);
+		damage_settle(&copy, o->width, o->height);
+		r = rt_surface_copy_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b],
+					   o->fb[b]->fb->pitches[0], copy.full ? &full : copy.rect,
+					   copy.full ? 1 : copy.count, &o->engines, frame.copy, &cs);
+		rt_surface_release(surface);
+		if (r)
+			return r;
+		frame.submitted_ns = ktime_get_ns();
+		frame.bytes = cs.bytes;
+		memset(&o->missed[b], 0, sizeof(o->missed[b]));
+		for (int i = 0; i < OUTPUT_BUFFERS; i++)
+			if (i != b)
+				damage_merge(&o->missed[i], damage);
+		spin_lock_irqsave(&o->lock, flags);
+		o->stats.copy_jobs += cs.jobs;
+		o->stats.bytes += cs.bytes;
+		o->stats.copy_submit_ns += frame.submitted_ns - start;
+		o->stats.full_frames += copy.full;
+		spin_unlock_irqrestore(&o->lock, flags);
+	}
 
 	/* One flip in flight per CRTC: the previous one first. */
 	r = output_flip_wait(o);
 	if (!r)
-		r = output_commit(o, b, &flip);
+		r = output_commit(o, b, cl, off, &flip);
 	if (r) {
 		for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
 			if (frame.copy[i])
 				dma_fence_put(frame.copy[i]);
 		return r;
 	}
-	o->pending = b;
+	if (cl) {
+		/* The client's syncobj signals at this flip; the plane state
+		 * holds the framebuffer now. */
+		drm_syncobj_replace_fence(cl->sync, flip);
+		drm_syncobj_put(cl->sync);
+		drm_framebuffer_put(cl->fb);
+		cl->sync = NULL;
+		cl->fb = NULL;
+	}
+	o->pending = b >= 0 ? b : o->front;
 	o->pending_flip = flip;
 	o->pending_frame = frame;
+	o->pending_desktop = b >= 0;
+	o->pending_client = cl != NULL;
 	spin_lock_irqsave(&o->lock, flags);
+	if (off)
+		o->client.shown = 0;
+	else if (cl)
+		o->client.shown = cl->layer;
 	o->flip_done = false;
+	o->client.primary_owned = o->client.shown == MLG_LX_LAYER_PRIMARY;
 	spin_unlock_irqrestore(&o->lock, flags);
 	if (dma_fence_add_callback(flip, &o->flip_cb, output_flip_signaled))
 		output_flip_signaled(flip, &o->flip_cb);	/* already signalled */
 	return 0;
+}
+
+/* Desktop frames wait while the client has the primary plane, unless its
+ * next frame or a detach gives the plane back. Under the lock. */
+static bool output_desktop_held(struct display_output *o)
+{
+	const uint32_t next = o->client.detach ? 0 :
+			      o->client.has_next ? o->client.next.layer : o->client.shown;
+
+	return next == MLG_LX_LAYER_PRIMARY;
 }
 
 static bool output_has_work(struct display_output *o)
@@ -1406,9 +1606,21 @@ static bool output_has_work(struct display_output *o)
 	bool work;
 
 	spin_lock_irqsave(&o->lock, flags);
-	work = o->next || o->flip_done;
+	work = (o->next && !output_desktop_held(o)) || o->flip_done || o->client.has_next ||
+	       o->client.detach;
 	spin_unlock_irqrestore(&o->lock, flags);
 	return work || o->stop || kthread_should_stop();
+}
+
+/* The detach the worker carried out (or had nothing to do for). */
+static void output_detached(struct display_output *o)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&o->lock, flags);
+	o->client.detach = false;
+	spin_unlock_irqrestore(&o->lock, flags);
+	complete(&o->client.detached);
 }
 
 static int output_worker(void *arg)
@@ -1417,56 +1629,109 @@ static int output_worker(void *arg)
 
 	while (!kthread_should_stop()) {
 		struct output_damage damage;
-		struct rt_surface *surface;
-		uint64_t capture_ns, received_ns;
+		struct output_layer cl = { 0 };
+		struct rt_surface *surface = NULL;
+		uint64_t capture_ns = 0, received_ns = 0;
 		unsigned long flags;
-		bool done;
+		bool done, has_cl, detach;
 		int r;
 
-		/* Nothing outstanding: sleep until a frame or a flip arrives.
-		 * A pending flip is also checked after a bounded wait, the
-		 * backstop for a lost flip interrupt. */
+		/* Nothing outstanding: sleep until a frame, a client frame, a
+		 * detach or a flip arrives. A pending flip is also checked
+		 * after a bounded wait, the backstop for a lost flip
+		 * interrupt. */
 		if (!output_has_work(o))
 			output_sleep(o, o->pending_flip ? OUTPUT_FLIP_TIMEOUT_MS : 0);
 		if (kthread_should_stop())
 			break;
+		memset(&damage, 0, sizeof(damage));
 		spin_lock_irqsave(&o->lock, flags);
 		done = o->flip_done;
-		surface = o->next;
-		o->next = NULL;
-		damage = o->next_damage;
-		memset(&o->next_damage, 0, sizeof(o->next_damage));
-		capture_ns = o->next_capture_ns;
-		received_ns = o->next_received_ns;
+		detach = o->client.detach;
+		if (o->client.has_next) {
+			cl = o->client.next;
+			memset(&o->client.next, 0, sizeof(o->client.next));
+			o->client.has_next = false;
+		}
+		has_cl = cl.fb && !detach;
+		/* The desktop frame is taken unless the client keeps (or
+		 * takes) the primary plane. */
+		if (detach || (has_cl ? cl.layer : o->client.shown) != MLG_LX_LAYER_PRIMARY) {
+			surface = o->next;
+			o->next = NULL;
+			damage = o->next_damage;
+			memset(&o->next_damage, 0, sizeof(o->next_damage));
+			capture_ns = o->next_capture_ns;
+			received_ns = o->next_received_ns;
+		}
 		spin_unlock_irqrestore(&o->lock, flags);
+		if (cl.fb && !has_cl)
+			layer_drop(&cl);	/* overtaken by the detach */
 		if ((done || (o->pending_flip && dma_fence_is_signaled(o->pending_flip))) && o->pending_flip)
 			output_flip_account(o);
-		if (!surface)
+		if (detach && !o->client.shown && !surface) {
+			output_detached(o);
+			continue;
+		}
+		if (!surface && !has_cl && !detach)
 			continue;
 		if (rt_removal_active(o->adev)) {
 			rt_surface_release(surface);
+			if (has_cl)
+				layer_drop(&cl);
 			output_error(o, -ENODEV);
+			if (detach)
+				output_detached(o);
 			break;
 		}
-		r = output_frame(o, surface, &damage, capture_ns, received_ns);
+		r = output_frame(o, surface, &damage, capture_ns, received_ns, has_cl ? &cl : NULL,
+				 detach);
+		if (!r && detach) {
+			/* The detach returns once the desktop is on screen. */
+			r = output_flip_wait(o);
+			output_detached(o);
+			detach = false;
+		}
 		if (r) {
+			if (has_cl)
+				layer_drop(&cl);
 			output_error(o, r);
+			if (detach)
+				output_detached(o);
 			break;
 		}
 	}
-	/* Whatever is left in the mailbox is not shown. */
+	/* Whatever is left in the mailboxes is not shown. */
 	{
+		struct output_layer cl = { 0 };
 		unsigned long flags;
 		struct rt_surface *left;
 
 		spin_lock_irqsave(&o->lock, flags);
 		left = o->next;
 		o->next = NULL;
+		if (o->client.has_next) {
+			cl = o->client.next;
+			memset(&o->client.next, 0, sizeof(o->client.next));
+			o->client.has_next = false;
+		}
 		spin_unlock_irqrestore(&o->lock, flags);
 		rt_surface_release(left);
+		layer_drop(&cl);
 	}
-	while (!kthread_should_stop())
+	while (!kthread_should_stop()) {
+		unsigned long flags;
+		bool detach;
+
+		/* A detach after an error commits nothing: the output's
+		 * restore (rt_display_off) puts the screen back. */
+		spin_lock_irqsave(&o->lock, flags);
+		detach = o->client.detach;
+		spin_unlock_irqrestore(&o->lock, flags);
+		if (detach)
+			output_detached(o);
 		output_sleep(o, 1000);
+	}
 	return 0;
 }
 
@@ -1502,6 +1767,11 @@ static void output_stop(struct display_output *o)
 static void output_free(struct display_output *o)
 {
 	output_stop(o);
+	/* A client frame the stopped worker never took. */
+	if (o->client.has_next) {
+		layer_drop(&o->client.next);
+		o->client.has_next = false;
+	}
 	if (o->engines.count)
 		rt_surface_engines_fini(&o->engines);
 	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
@@ -1562,6 +1832,7 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 	o->width = width;
 	o->height = height;
 	o->front = o->pending = -1;
+	init_completion(&o->client.detached);
 	spin_lock_init(&o->lock);
 	pthread_mutex_init(&o->sleep_lock, NULL);
 	pthread_cond_init(&o->sleep_cond, NULL);
@@ -1584,8 +1855,11 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 	}
 	mutex_lock(&rt_display.client.modeset_mutex);
 	drm_client_for_each_modeset(modeset, &rt_display.client)
-		if (modeset->mode && modeset->num_connectors)
+		if (modeset->mode && modeset->num_connectors) {
 			o->crtc = modeset->crtc;
+			o->connector = modeset->connectors[0];
+			o->refresh_mhz = mode_refresh_mhz(modeset->mode);
+		}
 	mutex_unlock(&rt_display.client.modeset_mutex);
 	o->plane = o->crtc ? o->crtc->primary : NULL;
 	if (!o->plane) {
@@ -1716,6 +1990,8 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 		o->next_capture_ns = capture_ns;
 		o->next_received_ns = ktime_get_ns();
 		o->stats.frames_received++;
+		if (o->client.primary_owned)
+			o->client.desktop_held++;	/* waits for the primary plane */
 	}
 	if (stats)
 		*stats = o->stats;
@@ -1764,3 +2040,308 @@ int rt_display_showing(void)
 {
 	return __atomic_load_n(&rt_display_on, __ATOMIC_ACQUIRE);
 }
+
+/* ---- a client's framebuffers on the output (rt_display_lx_hooks) ----
+ *
+ * A Linux-file client (rt/lx_files.h) opens the primary node, never as DRM
+ * master, creates framebuffers there and hands them to the output's worker
+ * with LX_SCANOUT (rt/lx_abi.h). The worker stays the only committer: a
+ * client frame goes into its next commit, on the primary plane in place of
+ * the desktop or on the overlay plane reserved for the client, and the
+ * client's syncobj gets that flip's fence. */
+
+extern int drm_dropmaster_ioctl(struct drm_device *dev, void *data, struct drm_file *file_priv);
+
+static void lx_primary_lock(void)
+{
+	mutex_lock(&rt_display_lock);
+}
+
+static void lx_primary_unlock(void)
+{
+	mutex_unlock(&rt_display_lock);
+}
+
+/* drm_open made the file master when no master existed. A client must not
+ * be: the driver's own modesets (drm_client_modeset_commit) fail while any
+ * file is master, and KMS that changes the screen is the output's. */
+static int lx_primary_opened(struct drm_device *dev, struct file *file)
+{
+	struct drm_file *fp = file ? file->private_data : NULL;
+	int ret;
+
+	if (!fp)
+		return -EINVAL;
+	if (!drm_is_current_master(fp))
+		return 0;
+	ret = drm_dropmaster_ioctl(dev, NULL, fp);
+	if (ret)
+		drm_err(dev, "display: a client's primary-node file stays DRM master (%d)\n", ret);
+	return ret;
+}
+
+/* The output for @pdev, under rt_display_lock. */
+static struct display_output *scanout_output(struct pci_dev *pdev)
+{
+	struct drm_device *dev = display_device(pdev);
+
+	return dev && rt_display.dev == dev ? rt_display.output : NULL;
+}
+
+static void scanout_state(struct display_output *o, void *owner, struct mlg_lx_scanout_state *st)
+{
+	unsigned long flags;
+
+	if (!o)
+		return;
+	st->output = 1;
+	st->connector_id = o->connector ? o->connector->base.id : 0;
+	if (o->connector)
+		strscpy(st->connector, o->connector->name, sizeof(st->connector));
+	st->crtc_id = o->crtc->base.id;
+	st->primary_plane_id = o->plane->base.id;
+	st->width = o->width;
+	st->height = o->height;
+	st->refresh_mhz = o->refresh_mhz;
+	if (o->client.owner != owner)
+		return;
+	st->attached = 1;
+	st->overlay_plane_id = o->client.overlay ? o->client.overlay->base.id : 0;
+	spin_lock_irqsave(&o->lock, flags);
+	st->error = o->stats.error;
+	st->layer = o->client.last_layer;
+	st->presents = o->client.presents;
+	st->flips = o->client.flips;
+	st->desktop_held = o->client.desktop_held;
+	spin_unlock_irqrestore(&o->lock, flags);
+}
+
+static bool fb_owned(struct drm_file *fp, struct drm_framebuffer *fb)
+{
+	struct drm_framebuffer *it;
+	bool found = false;
+
+	mutex_lock(&fp->fbs_lock);
+	list_for_each_entry(it, &fp->fbs, filp_head)
+		if (it == fb) {
+			found = true;
+			break;
+		}
+	mutex_unlock(&fp->fbs_lock);
+	return found;
+}
+
+/* A client frame from a request: its framebuffer (of the client's file
+ * @fp), rectangles and, with @sync, its syncobj. 0 with references in
+ * @cl, or -errno. */
+static int scanout_layer(struct display_output *o, struct drm_file *fp,
+			 const struct mlg_lx_scanout *req, bool sync, struct output_layer *cl)
+{
+	struct drm_framebuffer *fb;
+
+	memset(cl, 0, sizeof(*cl));
+	if (req->layer != MLG_LX_LAYER_PRIMARY && req->layer != MLG_LX_LAYER_OVERLAY)
+		return -EINVAL;
+	if (req->layer == MLG_LX_LAYER_OVERLAY && !o->client.overlay)
+		return -ENXIO;	/* no overlay plane was free for this CRTC */
+	fb = drm_framebuffer_lookup(o->dev, fp, req->fb_id);
+	if (!fb)
+		return -ENOENT;
+	if (!fb_owned(fp, fb)) {
+		drm_framebuffer_put(fb);
+		return -EPERM;
+	}
+	cl->layer = req->layer;
+	cl->fb = fb;
+	if (req->src_w && req->src_h) {
+		cl->src_x = req->src_x;
+		cl->src_y = req->src_y;
+		cl->src_w = req->src_w;
+		cl->src_h = req->src_h;
+	} else {
+		cl->src_w = fb->width;
+		cl->src_h = fb->height;
+	}
+	if ((u64)cl->src_x + cl->src_w > fb->width || (u64)cl->src_y + cl->src_h > fb->height ||
+	    cl->src_w > 0xffff || cl->src_h > 0xffff) {
+		layer_drop(cl);
+		return -ERANGE;
+	}
+	if (req->dst_w && req->dst_h) {
+		cl->dst_x = req->dst_x;
+		cl->dst_y = req->dst_y;
+		cl->dst_w = req->dst_w;
+		cl->dst_h = req->dst_h;
+	} else {
+		cl->dst_w = o->width;
+		cl->dst_h = o->height;
+	}
+	if (sync) {
+		cl->sync = drm_syncobj_find(fp, req->syncobj);
+		if (!cl->sync) {
+			layer_drop(cl);
+			return -ENOENT;
+		}
+	}
+	return 0;
+}
+
+/* Take the client off the screen through the worker: returns once the
+ * desktop is back (or the worker reported why not). rt_display_lock. */
+static int scanout_detach(struct display_output *o)
+{
+	unsigned long flags;
+	bool busy;
+	int ret;
+
+	spin_lock_irqsave(&o->lock, flags);
+	busy = o->client.has_next || o->client.primary_owned || o->client.shown;
+	if (busy) {
+		reinit_completion(&o->client.detached);
+		o->client.detach = true;
+	}
+	spin_unlock_irqrestore(&o->lock, flags);
+	if (busy && o->worker) {
+		output_kick(o);
+		if (!wait_for_completion_timeout(&o->client.detached,
+						 msecs_to_jiffies(2 * OUTPUT_COPY_TIMEOUT_MS))) {
+			drm_err(o->dev, "display: the client's frame did not leave the screen in %u ms\n",
+				2 * OUTPUT_COPY_TIMEOUT_MS);
+			return -ETIME;
+		}
+	}
+	spin_lock_irqsave(&o->lock, flags);
+	ret = o->stats.error;
+	o->client.detach = false;
+	spin_unlock_irqrestore(&o->lock, flags);
+	return ret;
+}
+
+static void scanout_release(struct display_output *o)
+{
+	o->client.owner = NULL;
+	o->client.overlay = NULL;
+}
+
+static int lx_scanout(struct pci_dev *pdev, void *owner, struct file *file,
+		      const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state)
+{
+	struct drm_file *fp = file ? file->private_data : NULL;
+	struct display_output *o;
+	struct output_layer cl;
+	unsigned long flags;
+	int ret = 0;
+
+	mutex_lock(&rt_display_lock);
+	o = scanout_output(pdev);
+	switch (req->op) {
+	case MLG_LX_SCANOUT_STATE:
+		break;
+	case MLG_LX_SCANOUT_ATTACH:
+		if (!o) {
+			ret = -ENOENT;
+		} else if (req->connector[0] && (!o->connector || !connector_named(o->connector,
+										   req->connector))) {
+			ret = -ENOENT;
+		} else if (o->client.owner && o->client.owner != owner) {
+			ret = -EBUSY;
+		} else if (!o->client.owner) {
+			struct drm_plane *plane;
+
+			o->client.owner = owner;
+			o->client.overlay = NULL;
+			drm_for_each_plane(plane, o->dev) {
+				if (plane->type != DRM_PLANE_TYPE_OVERLAY ||
+				    !(plane->possible_crtcs & drm_crtc_mask(o->crtc)) ||
+				    (plane->state && plane->state->crtc))
+					continue;
+				o->client.overlay = plane;
+				break;
+			}
+			spin_lock_irqsave(&o->lock, flags);
+			o->client.presents = o->client.flips = o->client.desktop_held = 0;
+			o->client.last_layer = 0;
+			spin_unlock_irqrestore(&o->lock, flags);
+		}
+		break;
+	case MLG_LX_SCANOUT_TEST:
+	case MLG_LX_SCANOUT_PRESENT:
+		if (!o) {
+			ret = -ENOENT;
+			break;
+		}
+		if (o->client.owner != owner) {
+			ret = -EACCES;
+			break;
+		}
+		if (!fp) {
+			ret = -EBADF;
+			break;
+		}
+		ret = scanout_layer(o, fp, req, req->op == MLG_LX_SCANOUT_PRESENT, &cl);
+		if (ret)
+			break;
+		if (req->op == MLG_LX_SCANOUT_TEST) {
+			ret = output_check(o, &cl);
+			layer_drop(&cl);
+			break;
+		}
+		/* Reset now: the fence it gets is the flip's. */
+		drm_syncobj_replace_fence(cl.sync, NULL);
+		spin_lock_irqsave(&o->lock, flags);
+		if (o->stats.error) {
+			ret = o->stats.error;
+		} else if (o->client.has_next) {
+			ret = -EBUSY;
+		} else {
+			o->client.next = cl;
+			o->client.has_next = true;
+			o->client.presents++;
+			o->client.last_layer = cl.layer;
+			memset(&cl, 0, sizeof(cl));
+		}
+		spin_unlock_irqrestore(&o->lock, flags);
+		layer_drop(&cl);
+		if (!ret)
+			output_kick(o);
+		break;
+	case MLG_LX_SCANOUT_DETACH:
+		if (o && o->client.owner == owner) {
+			ret = scanout_detach(o);
+			scanout_release(o);
+		} else if (o && o->client.owner) {
+			ret = -EACCES;
+		}
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+	scanout_state(o, owner, state);
+	mutex_unlock(&rt_display_lock);
+	return ret;
+}
+
+static void lx_client_gone(struct pci_dev *pdev, void *owner)
+{
+	struct display_output *o;
+
+	mutex_lock(&rt_display_lock);
+	o = scanout_output(pdev);
+	if (o && o->client.owner == owner) {
+		int ret = scanout_detach(o);
+
+		if (ret)
+			drm_err(o->dev, "display: taking a closed client's frame off failed (%d)\n", ret);
+		scanout_release(o);
+	}
+	mutex_unlock(&rt_display_lock);
+}
+
+const struct rt_lx_display_hooks rt_display_lx_hooks = {
+	.primary_lock = lx_primary_lock,
+	.primary_unlock = lx_primary_unlock,
+	.primary_opened = lx_primary_opened,
+	.scanout = lx_scanout,
+	.client_gone = lx_client_gone,
+};

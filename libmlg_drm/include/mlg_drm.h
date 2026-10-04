@@ -4,7 +4,9 @@
  * DriverKit extension, and gives each client process a Linux process of
  * its own there. These calls are open(2), close(2), ioctl(2), mmap(2) and
  * munmap(2) on that process's files: the GPU's DRM render node
- * ("/dev/dri/renderD128") and "/dev/kfd". A Mesa winsys (RADV's ac_drm
+ * ("/dev/dri/renderD128"), its primary node ("/dev/dri/card0", for the
+ * KMS queries and framebuffers of mlg_scanout; never DRM master) and
+ * "/dev/kfd". A Mesa winsys (RADV's ac_drm
  * layer) or a libdrm shim calls them where it would call the system calls
  * on Linux.
  *
@@ -77,6 +79,16 @@ struct mlg_pci_identity {
  * revision from the driver's AMDGPU_INFO_DEV_INFO. */
 int mlg_pci_identity(struct mlg_pci_identity *out);
 
+/* rt/lx_abi.h's LX_SCANOUT structures (include it to use these). */
+struct mlg_lx_scanout;
+struct mlg_lx_scanout_state;
+
+/* The display output: show framebuffers of a primary-node descriptor
+ * ("/dev/dri/card0", never DRM master) on it (LX_SCANOUT in rt/lx_abi.h;
+ * @req->fd is a descriptor of this library). 0 with *state filled, or -1
+ * with errno set (*state is filled as far as the driver got). */
+int mlg_scanout(const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state);
+
 /* ---- transports ----
  * The default transport is the DriverKit extension's IOKit user client
  * (type 2, MLG_USER_CLIENT_LINUX_FILE in rt/lx_abi.h). Tests and other
@@ -100,6 +112,10 @@ struct mlg_transport {
 	int (*munmap)(void *ctx, uint64_t handle, void *addr, uint64_t length);
 	/* Optional: the GPU's PCI identity (0 or -errno). */
 	int (*identity)(void *ctx, struct mlg_pci_identity *out);
+	/* Optional: LX_SCANOUT. On 0, *result is the driver's 0 or -errno
+	 * and *state is filled. */
+	int (*scanout)(void *ctx, const struct mlg_lx_scanout *req,
+		       struct mlg_lx_scanout_state *state, int64_t *result);
 };
 /* Install @t (copied) for every later call; NULL restores the default.
  * Returns -1 with EBUSY once descriptors are open. */

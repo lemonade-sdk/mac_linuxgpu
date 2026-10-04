@@ -26,4 +26,27 @@ int rt_lx_gem_map(struct drm_device *ddev, struct pci_dev *pdev,
 		  void *arg);
 void rt_lx_gem_unpin(void *pinned);
 
+/* What a client's primary-node files and LX_SCANOUT need from the display
+ * (display.c's rt_display_lx_hooks; rt_lx_client_set_display). */
+struct file;
+struct mlg_lx_scanout;
+struct mlg_lx_scanout_state;
+struct rt_lx_display_hooks {
+	/* Around opening a primary-node file: no modeset of the driver's
+	 * own may run while the new file is briefly DRM master. */
+	void (*primary_lock)(void);
+	void (*primary_unlock)(void);
+	/* Inside the process, the file just opened: make it a client that
+	 * is not DRM master. 0 or -errno (the file is then closed). */
+	int (*primary_opened)(struct drm_device *ddev, struct file *file);
+	/* LX_SCANOUT inside the client's process; @file is the client's
+	 * primary-node file @req->fd names, for TEST and PRESENT (else NULL);
+	 * @owner identifies the client. */
+	int (*scanout)(struct pci_dev *pdev, void *owner, struct file *file,
+		       const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state);
+	/* The client is going away, before its files close: take its
+	 * framebuffers off the screen. */
+	void (*client_gone)(struct pci_dev *pdev, void *owner);
+};
+
 #endif

@@ -91,7 +91,9 @@ extern "C" {
  *                 (places the mapping in the Linux process's address
  *                 space at that address; optional)
  * LX_MUNMAP  in:  [0] memory type              out: [0] 0 or -errno
- *                 (after IOConnectUnmapMemory64) */
+ *                 (after IOConnectUnmapMemory64)
+ * LX_SCANOUT struct in: struct mlg_lx_scanout; out: [0] 0 or -errno;
+ *                 struct out: struct mlg_lx_scanout_state (below) */
 #define MLG_SELECTOR_LX_OPEN		96u
 #define MLG_SELECTOR_LX_CLOSE		97u
 #define MLG_SELECTOR_LX_IOCTL		98u
@@ -100,10 +102,97 @@ extern "C" {
 #define MLG_SELECTOR_LX_MMAP		101u
 #define MLG_SELECTOR_LX_MMAP_COMMIT	102u
 #define MLG_SELECTOR_LX_MUNMAP		103u
+#define MLG_SELECTOR_LX_SCANOUT		104u
 
 /* LX_OPEN devices. */
 #define MLG_LX_DEV_RENDER	1u	/* the GPU's DRM render node */
 #define MLG_LX_DEV_KFD		2u	/* /dev/kfd */
+/* The GPU's DRM primary node, never as DRM master: the driver keeps
+ * modesetting to itself (its display output, docs/macos-displays.md). A
+ * client reads the KMS objects, imports buffers and creates framebuffers
+ * on it, and shows them through LX_SCANOUT. */
+#define MLG_LX_DEV_PRIMARY	3u
+
+/* ---- LX_SCANOUT: a client's framebuffer on the display output ----
+ *
+ * The driver's display output (the monitor a display agent mirrors the
+ * macOS desktop to) commits every frame itself. A client attaches to it
+ * and presents framebuffers it created on its primary-node file (ADDFB2);
+ * the output's worker puts each on a plane in its next commit, on vblank,
+ * with no copy:
+ *
+ *   MLG_LX_LAYER_PRIMARY  the client's image replaces the desktop on the
+ *                         primary plane (fullscreen). Desktop frames that
+ *                         arrive meanwhile wait, newest only, and are
+ *                         shown once the client leaves the primary plane.
+ *   MLG_LX_LAYER_OVERLAY  the image is on an overlay plane at dst over the
+ *                         mirrored desktop (a window).
+ *
+ * ATTACH   connector: the output's connector name ("DP-1"), or empty for
+ *          whichever connector the output drives. -ENOENT when there is
+ *          no output (or not on that connector), -EBUSY when another
+ *          client is attached. Reserves an overlay plane of the output's
+ *          CRTC when one is free (state.overlay_plane_id, 0 if none).
+ * TEST     an atomic check of fd's framebuffer fb_id on layer with
+ *          src/dst, nothing committed: 0 or the driver's -errno.
+ * PRESENT  queue fb_id (a framebuffer of fd's file) on layer with
+ *          src/dst. syncobj (a handle of fd's file) is reset now and gets
+ *          the flip's fence when the frame is committed: it signals at the
+ *          vblank that shows the frame. -EBUSY while the previous present
+ *          is not committed yet; the output's worker error otherwise.
+ * DETACH   the desktop back on the primary plane, the overlay off; returns
+ *          once that flip happened. Closing the client does the same.
+ * STATE    the output and this client's attachment.
+ *
+ * src is in framebuffer pixels, dst in CRTC pixels; a zero width or height
+ * means the whole framebuffer or the whole mode. */
+#define MLG_LX_SCANOUT_ATTACH	1u
+#define MLG_LX_SCANOUT_TEST	2u
+#define MLG_LX_SCANOUT_PRESENT	3u
+#define MLG_LX_SCANOUT_DETACH	4u
+#define MLG_LX_SCANOUT_STATE	5u
+
+#define MLG_LX_LAYER_PRIMARY	1u
+#define MLG_LX_LAYER_OVERLAY	2u
+
+#define MLG_LX_SCANOUT_NAME_BYTES	32u
+#define MLG_LX_SCANOUT_VERSION	1u
+
+struct mlg_lx_scanout {
+	uint32_t version;	/* MLG_LX_SCANOUT_VERSION */
+	uint32_t op;		/* MLG_LX_SCANOUT_* */
+	int32_t fd;		/* a primary-node descriptor of the client */
+	uint32_t layer;		/* MLG_LX_LAYER_* */
+	uint32_t fb_id;
+	uint32_t syncobj;
+	uint32_t src_x, src_y, src_w, src_h;
+	int32_t dst_x, dst_y;
+	uint32_t dst_w, dst_h;
+	char connector[MLG_LX_SCANOUT_NAME_BYTES];
+	uint64_t reserved[2];	/* zero */
+};
+
+struct mlg_lx_scanout_state {
+	uint32_t version;	/* MLG_LX_SCANOUT_VERSION */
+	int32_t error;		/* the output's worker error, 0 */
+	uint32_t output;	/* an output is running */
+	uint32_t attached;	/* this client is attached */
+	uint32_t connector_id, crtc_id, primary_plane_id, overlay_plane_id;
+	uint32_t width, height, refresh_mhz;	/* the output's mode */
+	uint32_t layer;		/* the layer this client's last present used, 0 */
+	uint64_t presents;	/* this client's presents taken */
+	uint64_t flips;		/* ... that reached the screen */
+	uint64_t desktop_held;	/* desktop frames that waited while the client had the primary plane */
+	char connector[MLG_LX_SCANOUT_NAME_BYTES];
+	uint64_t reserved[2];
+};
+#ifdef __cplusplus
+static_assert(sizeof(struct mlg_lx_scanout) == 104, "mlg_lx_scanout layout");
+static_assert(sizeof(struct mlg_lx_scanout_state) == 120, "mlg_lx_scanout_state layout");
+#else
+_Static_assert(sizeof(struct mlg_lx_scanout) == 104, "mlg_lx_scanout layout");
+_Static_assert(sizeof(struct mlg_lx_scanout_state) == 120, "mlg_lx_scanout_state layout");
+#endif
 
 /* Linux open(2)/mmap(2) flag values the transport accepts. */
 #define MLG_LX_O_ACCMODE	00000003u

@@ -95,6 +95,7 @@ struct rt_lx_client {
 	struct lx_map *maps;
 	uint64_t next_map;
 	uint64_t pending_va;
+	const struct rt_lx_display_hooks *display;	/* primary node and LX_SCANOUT */
 };
 
 /* ---- client ---- */
@@ -169,6 +170,9 @@ static uint32_t file_device(struct rt_lx_client *c, struct file *file)
 	if (MAJOR(inode->i_rdev) == DRM_MAJOR &&
 	    MINOR(inode->i_rdev) == (unsigned int)c->ddev->render->index)
 		return MLG_LX_DEV_RENDER;
+	if (MAJOR(inode->i_rdev) == DRM_MAJOR && c->ddev->primary &&
+	    MINOR(inode->i_rdev) == (unsigned int)c->ddev->primary->index)
+		return MLG_LX_DEV_PRIMARY;
 	if (c->have_kfd && MAJOR(inode->i_rdev) == c->kfd_major)
 		return MLG_LX_DEV_KFD;
 	return 0;
@@ -197,6 +201,13 @@ int rt_lx_open(struct rt_lx_client *c, uint32_t dev, uint32_t flags)
 	case MLG_LX_DEV_RENDER:
 		devt = MKDEV(DRM_MAJOR, c->ddev->render->index);
 		break;
+	case MLG_LX_DEV_PRIMARY:
+		/* Only with the display's hooks, which keep the file from
+		 * being DRM master. */
+		if (!c->display || !c->ddev->primary)
+			return -ENODEV;
+		devt = MKDEV(DRM_MAJOR, c->ddev->primary->index);
+		break;
 	case MLG_LX_DEV_KFD: {
 		unsigned int major;
 
@@ -222,9 +233,23 @@ int rt_lx_open(struct rt_lx_client *c, uint32_t dev, uint32_t flags)
 		if (fd < 0) {
 			r = fd;
 		} else {
+			if (dev == MLG_LX_DEV_PRIMARY)
+				c->display->primary_lock();
 			r = linuxu_chrdev_open(devt, O_RDWR | O_CLOEXEC |
 					       ((flags & MLG_LX_O_NONBLOCK) ? O_NONBLOCK : 0),
 					       &file);
+			/* drm_open made the first opener master; give it up
+			 * before anything else can see it. */
+			if (!r && dev == MLG_LX_DEV_PRIMARY) {
+				int dropped = c->display->primary_opened(c->ddev, file);
+
+				if (dropped) {
+					fput(file);
+					r = dropped;
+				}
+			}
+			if (dev == MLG_LX_DEV_PRIMARY)
+				c->display->primary_unlock();
 			if (r) {
 				put_unused_fd(fd);
 			} else {
@@ -260,6 +285,56 @@ int rt_lx_close(struct rt_lx_client *c, int fd)
 unsigned int rt_lx_open_files(struct rt_lx_client *c)
 {
 	return c ? linuxu_files_count(linuxu_process_files(c->proc)) : 0;
+}
+
+void rt_lx_client_set_display(struct rt_lx_client *c, const struct rt_lx_display_hooks *hooks)
+{
+	if (c)
+		c->display = hooks;
+}
+
+int rt_lx_scanout(struct rt_lx_client *c, const struct mlg_lx_scanout *req,
+		  struct mlg_lx_scanout_state *state)
+{
+	struct linuxu_process_saved saved;
+	struct mlg_lx_scanout copy;
+	struct file *file = NULL;
+	int r;
+
+	if (!c || !req || !state)
+		return -EINVAL;
+	memset(state, 0, sizeof(*state));
+	state->version = MLG_LX_SCANOUT_VERSION;
+	/* The request may live in memory the client can still write. */
+	memcpy(&copy, req, sizeof(copy));
+	if (copy.version != MLG_LX_SCANOUT_VERSION || copy.reserved[0] || copy.reserved[1] ||
+	    !memchr(copy.connector, 0, sizeof(copy.connector)))
+		return -EINVAL;
+	if (!c->display)
+		return -ENODEV;
+	r = call_begin(c);
+	if (r)
+		return r;
+	r = linuxu_process_enter(c->proc, &saved);
+	if (r) {
+		call_end(c);
+		return r;
+	}
+	/* Framebuffers and syncobjs are named in the client's primary file. */
+	if (copy.op == MLG_LX_SCANOUT_TEST || copy.op == MLG_LX_SCANOUT_PRESENT) {
+		file = fget(copy.fd);
+		if (!file)
+			r = -EBADF;
+		else if (file_device(c, file) != MLG_LX_DEV_PRIMARY)
+			r = -EINVAL;
+	}
+	if (!r)
+		r = c->display->scanout(c->pdev, c, file, &copy, state);
+	if (file)
+		fput(file);
+	linuxu_process_leave(&saved);
+	call_end(c);
+	return (int)lx_errno(r);
 }
 
 /* ---- argument pages ---- */
@@ -1091,6 +1166,10 @@ void rt_lx_client_destroy(struct rt_lx_client *c)
 {
 	if (!c)
 		return;
+	/* Whatever the client shows goes off the screen while its
+	 * framebuffers still exist. */
+	if (c->display)
+		c->display->client_gone(c->pdev, c);
 	pthread_mutex_lock(&c->lock);
 	c->dying = true;
 	pthread_mutex_unlock(&c->lock);

@@ -435,11 +435,36 @@ static int t_identity(void *ctx, struct mlg_pci_identity *out)
 	return r;
 }
 
+/* ---- LX_SCANOUT ---- */
+
+static int t_scanout(void *ctx, const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state,
+		     int64_t *result)
+{
+	uint64_t out[1] = { 0 };
+	uint32_t nout = 1;
+	size_t bytes = sizeof(*state);
+	io_connect_t c;
+	int r = conn(&c);
+
+	(void)ctx;
+	if (r)
+		return r;
+	r = from_ioreturn(IOConnectCallMethod(c, MLG_SELECTOR_LX_SCANOUT, NULL, 0, req, sizeof(*req),
+					      out, &nout, state, &bytes));
+	if (r)
+		return r;
+	if (nout < 1 || bytes != sizeof(*state))
+		return -MLG_LX_EINVAL;
+	*result = (int64_t)out[0];
+	return 0;
+}
+
 int mlg_default_transport(struct mlg_transport *out)
 {
 	*out = (struct mlg_transport){
 		.open = t_open, .close = t_close, .ioctl = t_ioctl,
 		.mmap = t_mmap, .munmap = t_munmap, .identity = t_identity,
+		.scanout = t_scanout,
 	};
 	return 0;
 }

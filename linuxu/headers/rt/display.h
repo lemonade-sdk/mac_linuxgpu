@@ -213,6 +213,13 @@ int rt_display_stats(struct pci_dev *pdev, struct rt_display_present_stats *stat
 /* Whether a pattern is showing (cached; takes no lock). */
 int rt_display_showing(void);
 
+/* What a Linux-file client's primary-node files and LX_SCANOUT need from
+ * the display (rt_lx_client_set_display): clients open the primary node
+ * without becoming DRM master and show their framebuffers on the output
+ * through its worker (display.c, rt/lx_abi.h). */
+struct rt_lx_display_hooks;
+extern const struct rt_lx_display_hooks rt_display_lx_hooks;
+
 #ifdef __cplusplus
 }
 #endif

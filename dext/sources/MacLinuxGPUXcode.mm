@@ -2239,6 +2239,8 @@ static kern_return_t lx_state(MacLinuxGPUUserClient *client, struct rt_lx_client
     struct rt_lx_client *lx = nullptr;
     if (rt_lx_client_create(static_cast<struct pci_dev *>(pdev), pid, name[0] ? name : nullptr, &lx))
         return kIOReturnNoMemory;
+    // The primary node and LX_SCANOUT go through the display output.
+    rt_lx_client_set_display(lx, &rt_display_lx_hooks);
     lx_registry_acquire();
     iv->lx = lx;
     iv->nextLinuxFile = s_linuxFiles;
@@ -2491,6 +2493,23 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
     }
 }
 
+// LX_SCANOUT: structure in, scalar result and structure out (rt/lx_abi.h).
+static kern_return_t lx_scanout_call(struct rt_lx_client *lx, IOUserClientMethodArguments *a)
+{
+    if (!a->scalarOutput || a->scalarOutputCount < 1 || !a->structureInput ||
+        a->structureInput->getLength() != sizeof(struct mlg_lx_scanout) ||
+        a->structureOutputMaximumSize < sizeof(struct mlg_lx_scanout_state))
+        return kIOReturnBadArgument;
+    struct mlg_lx_scanout req;
+    memcpy(&req, a->structureInput->getBytesNoCopy(), sizeof(req));
+    struct mlg_lx_scanout_state state = {};
+    const int r = rt_lx_scanout(lx, &req, &state);
+    a->scalarOutput[0] = (uint64_t)(int64_t)r;
+    a->scalarOutputCount = 1;
+    a->structureOutput = OSData::withBytes(&state, sizeof(state));
+    return a->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
 static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t selector,
                                         IOUserClientMethodArguments *arguments)
 {
@@ -2498,7 +2517,8 @@ static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t 
     kern_return_t ret = lx_state(client, &lx);
     if (ret != kIOReturnSuccess) return ret;
     if (!s_lxCalls.enter()) return kIOReturnNotReady;
-    ret = lx_call(client, lx, selector, arguments);
+    ret = selector == MLG_SELECTOR_LX_SCANOUT ? lx_scanout_call(lx, arguments) :
+                                                lx_call(client, lx, selector, arguments);
     s_lxCalls.leave();
     return ret;
 }
@@ -3126,7 +3146,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         // HostWindow comes with InitDevice: the probe maps the GART at the
         // host window the client placed (libmlg_drm/src/mlg_init.c).
         if (ivars->stopping) return kIOReturnNotAttached;
-        if (selector >= MLG_SELECTOR_LX_OPEN && selector <= MLG_SELECTOR_LX_MUNMAP)
+        if (selector >= MLG_SELECTOR_LX_OPEN && selector <= MLG_SELECTOR_LX_SCANOUT)
             return lx_external_method(this, selector, arguments);
         if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
             selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice &&

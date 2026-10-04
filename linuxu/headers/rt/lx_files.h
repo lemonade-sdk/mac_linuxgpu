@@ -9,10 +9,11 @@
  * the calling thread (linuxu_process_enter), so upstream sees `current`,
  * `current->mm` and `current->files` as it would on Linux.
  *
- * Descriptors. rt_lx_open opens the GPU's render node or /dev/kfd as
- * chrdev_open does and installs the file in the process's table; the
- * descriptor is what the client names in later calls. Descriptors an ioctl
- * creates (syncobj and dma-buf fds) live in the same table.
+ * Descriptors. rt_lx_open opens the GPU's render node, its primary node
+ * (never as DRM master) or /dev/kfd as chrdev_open does and installs the
+ * file in the process's table; the descriptor is what the client names in
+ * later calls. Descriptors an ioctl creates (syncobj and dma-buf fds) live
+ * in the same table.
  *
  * ioctl. The request frame's segments become user memory of the process
  * for the call: each page a segment touches is mapped at the client's
@@ -58,6 +59,16 @@ int rt_lx_client_create(struct pci_dev *pdev, int pid, const char *comm,
 			struct rt_lx_client **out);
 void rt_lx_client_destroy(struct rt_lx_client *c);
 int rt_lx_client_pid(const struct rt_lx_client *c);
+
+/* The display hooks for the client's primary-node files and LX_SCANOUT
+ * (lx_internal.h; the driver's are rt_display_lx_hooks). Without them the
+ * primary node does not open and LX_SCANOUT is -ENODEV. Set once, before
+ * the client's first call. */
+struct rt_lx_display_hooks;
+void rt_lx_client_set_display(struct rt_lx_client *c, const struct rt_lx_display_hooks *hooks);
+/* LX_SCANOUT (rt/lx_abi.h): 0 or -errno, with *state filled. */
+int rt_lx_scanout(struct rt_lx_client *c, const struct mlg_lx_scanout *req,
+		  struct mlg_lx_scanout_state *state);
 
 /* open(2): the descriptor or -errno. */
 int rt_lx_open(struct rt_lx_client *c, uint32_t dev, uint32_t flags);

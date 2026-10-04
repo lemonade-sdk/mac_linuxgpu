@@ -194,7 +194,8 @@ int main(void)
 	CHECK(!mlg_drm_set_transport(&recording));
 
 	/* open(2): paths and flags. */
-	CHECK(mlg_open("/dev/dri/card0", O_RDWR) == -1 && errno == ENOENT);
+	CHECK(mlg_open("/dev/dri/card64", O_RDWR) == -1 && errno == ENOENT);
+	CHECK(mlg_open("/dev/dri/cardX", O_RDWR) == -1 && errno == ENOENT);
 	CHECK(mlg_open("/dev/dri/renderD12", O_RDWR) == -1 && errno == ENOENT);
 	fd = mlg_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	CHECK(fd == 0 && rec.open_dev == MLG_LX_DEV_RENDER &&
@@ -349,6 +350,45 @@ int main(void)
 	struct mlg_pci_identity id;
 	CHECK(mlg_pci_identity(&id) == 0 && id.vendor_id == 0x1002 && id.device_id == 0x7551 &&
 	      id.bus == 0xc3 && id.subvendor_id == 0x1002);
+
+	/* The primary node: KMS queries with their arrays OUT, framebuffer
+	 * requests; nothing that changes the display. */
+	{
+		int card = mlg_open("/dev/dri/card0", O_RDWR | O_CLOEXEC);
+		uint32_t crtcs[4], connectors[3];
+		struct drm_mode_card_res res = {
+			.crtc_id_ptr = (uint64_t)(uintptr_t)crtcs, .count_crtcs = 4,
+			.connector_id_ptr = (uint64_t)(uintptr_t)connectors, .count_connectors = 3,
+		};
+		struct drm_mode_crtc set = { 0 };
+		struct mlg_lx_segment seg[8];
+		uint32_t n;
+
+		CHECK(card == 2 && rec.open_dev == MLG_LX_DEV_PRIMARY);
+		rec.result = 0;
+		CHECK(mlg_ioctl(card, DRM_IOCTL_MODE_GETRESOURCES, &res) == 0 &&
+		      rec.cmd == DRM_IOCTL_MODE_GETRESOURCES);
+		n = segments(seg, 8);
+		CHECK(n == 3);
+		for (uint32_t i = 0; i < n; i++) {
+			if (seg[i].va == (uint64_t)(uintptr_t)crtcs)
+				CHECK(seg[i].size == sizeof(crtcs) && seg[i].dir == MLG_LX_SEG_OUT);
+			else if (seg[i].va == (uint64_t)(uintptr_t)connectors)
+				CHECK(seg[i].size == sizeof(connectors) && seg[i].dir == MLG_LX_SEG_OUT);
+			else
+				CHECK(seg[i].va == (uint64_t)(uintptr_t)&res && seg[i].dir == MLG_LX_SEG_INOUT);
+		}
+		CHECK(mlg_ioctl(card, DRM_IOCTL_MODE_SETCRTC, &set) == -1 && errno == ENOTTY);
+		CHECK(mlg_ioctl(card, DRM_IOCTL_AMDGPU_INFO, &info) == -1 && errno == ENOTTY);
+		/* LX_SCANOUT needs a transport that carries it. */
+		struct mlg_lx_scanout req = { .version = MLG_LX_SCANOUT_VERSION,
+					      .op = MLG_LX_SCANOUT_PRESENT, .fd = fd };
+		struct mlg_lx_scanout_state st;
+		CHECK(mlg_scanout(&req, &st) == -1 && errno == EBADF);	/* a render file */
+		req.fd = card;
+		CHECK(mlg_scanout(&req, &st) == -1 && errno == ENODEV);
+		CHECK(mlg_close(card) == 0);
+	}
 
 	CHECK(mlg_close(kfd) == 0 && rec.closed == kfd);
 	CHECK(mlg_ioctl(kfd, AMDKFD_IOC_GET_VERSION, &apn) == -1 && errno == EBADF);

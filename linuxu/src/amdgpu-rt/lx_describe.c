@@ -4,6 +4,10 @@
  * client library (which builds frames from it), the in-dext self-test and
  * the dext's command admission (mlg_lx_cmd_known).
  *
+ * Primary-node clients get the DRM core requests and the KMS queries and
+ * framebuffer requests (kms_known); render-node clients the DRM core and
+ * amdgpu ones.
+ *
  * Built against the Linux uapi headers in both worlds: linuxu's verbatim
  * copies in the dext, the upstream include/uapi tree with Linux ioctl
  * encodings in the client library (MLG_LX_CLIENT_BUILD, libmlg_drm/compat). */
@@ -134,11 +138,39 @@ static int kfd_known(uint32_t cmd)
 	       nr != _IOC_NR(AMDKFD_IOC_DBG_TRAP);
 }
 
+/* The KMS requests of a primary-node client that is never DRM master: it
+ * reads the mode objects and creates and removes framebuffers. Everything
+ * that changes the display (SETCRTC, SETPLANE, ATOMIC, cursors, gamma,
+ * properties, leases, master) belongs to the driver's display output and is
+ * not carried. */
+static int kms_known(uint32_t cmd)
+{
+	switch (cmd) {
+	case DRM_IOCTL_MODE_GETRESOURCES:
+	case DRM_IOCTL_MODE_GETCRTC:
+	case DRM_IOCTL_MODE_GETENCODER:
+	case DRM_IOCTL_MODE_GETCONNECTOR:
+	case DRM_IOCTL_MODE_GETPLANERESOURCES:
+	case DRM_IOCTL_MODE_GETPLANE:
+	case DRM_IOCTL_MODE_OBJ_GETPROPERTIES:
+	case DRM_IOCTL_MODE_GETPROPERTY:
+	case DRM_IOCTL_MODE_GETPROPBLOB:
+	case DRM_IOCTL_MODE_ADDFB2:
+	case DRM_IOCTL_MODE_RMFB:
+	case DRM_IOCTL_MODE_CLOSEFB:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 int mlg_lx_cmd_known(uint32_t dev, uint32_t cmd)
 {
 	switch (dev) {
 	case MLG_LX_DEV_RENDER:
 		return drm_core_known(cmd) || amdgpu_known(cmd);
+	case MLG_LX_DEV_PRIMARY:
+		return drm_core_known(cmd) || kms_known(cmd);
 	case MLG_LX_DEV_KFD:
 		return kfd_known(cmd);
 	default:
@@ -150,7 +182,7 @@ int mlg_lx_cmd_blocks(uint32_t dev, uint32_t cmd)
 {
 	if (dev == MLG_LX_DEV_KFD)
 		return cmd == AMDKFD_IOC_WAIT_EVENTS;
-	if (dev != MLG_LX_DEV_RENDER)
+	if (dev != MLG_LX_DEV_RENDER && dev != MLG_LX_DEV_PRIMARY)
 		return 0;
 	switch (cmd) {
 	case DRM_IOCTL_AMDGPU_WAIT_CS:
@@ -367,6 +399,79 @@ static void amdgpu_nested(struct span_list *l, uint32_t cmd, uint64_t arg,
 	}
 }
 
+/* What each KMS query writes: arrays the caller sized with the counts it
+ * passed (the kernel fills at most that many entries and reports the
+ * total, so a first call with zero counts asks only for the counts). */
+static void kms_nested(struct span_list *l, uint32_t cmd, uint64_t arg)
+{
+	switch (cmd) {
+	case DRM_IOCTL_MODE_GETRESOURCES: {
+		struct drm_mode_card_res r;
+
+		get(l, arg, &r, sizeof(r));
+		add(l, r.fb_id_ptr, (uint64_t)r.count_fbs * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		add(l, r.crtc_id_ptr, (uint64_t)r.count_crtcs * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		add(l, r.connector_id_ptr, (uint64_t)r.count_connectors * sizeof(uint32_t),
+		    MLG_LX_SEG_OUT);
+		add(l, r.encoder_id_ptr, (uint64_t)r.count_encoders * sizeof(uint32_t),
+		    MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_GETCONNECTOR: {
+		struct drm_mode_get_connector c;
+
+		get(l, arg, &c, sizeof(c));
+		add(l, c.encoders_ptr, (uint64_t)c.count_encoders * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		add(l, c.modes_ptr, (uint64_t)c.count_modes * sizeof(struct drm_mode_modeinfo),
+		    MLG_LX_SEG_OUT);
+		add(l, c.props_ptr, (uint64_t)c.count_props * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		add(l, c.prop_values_ptr, (uint64_t)c.count_props * sizeof(uint64_t), MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_GETPLANERESOURCES: {
+		struct drm_mode_get_plane_res r;
+
+		get(l, arg, &r, sizeof(r));
+		add(l, r.plane_id_ptr, (uint64_t)r.count_planes * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_GETPLANE: {
+		struct drm_mode_get_plane p;
+
+		get(l, arg, &p, sizeof(p));
+		add(l, p.format_type_ptr, (uint64_t)p.count_format_types * sizeof(uint32_t),
+		    MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_OBJ_GETPROPERTIES: {
+		struct drm_mode_obj_get_properties o;
+
+		get(l, arg, &o, sizeof(o));
+		add(l, o.props_ptr, (uint64_t)o.count_props * sizeof(uint32_t), MLG_LX_SEG_OUT);
+		add(l, o.prop_values_ptr, (uint64_t)o.count_props * sizeof(uint64_t), MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_GETPROPERTY: {
+		struct drm_mode_get_property p;
+
+		get(l, arg, &p, sizeof(p));
+		add(l, p.values_ptr, (uint64_t)p.count_values * sizeof(uint64_t), MLG_LX_SEG_OUT);
+		add(l, p.enum_blob_ptr,
+		    (uint64_t)p.count_enum_blobs * sizeof(struct drm_mode_property_enum), MLG_LX_SEG_OUT);
+		break;
+	}
+	case DRM_IOCTL_MODE_GETPROPBLOB: {
+		struct drm_mode_get_blob b;
+
+		get(l, arg, &b, sizeof(b));
+		add(l, b.data, b.length, MLG_LX_SEG_OUT);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
 static void kfd_nested(struct span_list *l, uint32_t cmd, uint64_t arg)
 {
 	switch (cmd) {
@@ -448,6 +553,8 @@ int mlg_lx_describe(uint32_t dev, uint32_t cmd, uint64_t arg,
 			kfd_nested(&l, cmd, arg);
 		else if (drm_core_known(cmd))
 			drm_core_nested(&l, cmd, arg, &timeout);
+		else if (dev == MLG_LX_DEV_PRIMARY)
+			kms_nested(&l, cmd, arg);
 		else
 			amdgpu_nested(&l, cmd, arg, &timeout);
 	}
