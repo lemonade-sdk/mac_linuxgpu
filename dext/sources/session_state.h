@@ -424,8 +424,10 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		case MLG_DISPLAY_OP_VERIFY:
 			return (input[1] >> 32) != 0;
 		case MLG_DISPLAY_OP_RELEASE:
-		case MLG_DISPLAY_OP_PRESENT:
 			return input[1] && input[1] <= UINT32_MAX;
+		case MLG_DISPLAY_OP_PRESENT:
+			/* Handle 0 with no rectangle reads the statistics. */
+			return input[1] <= UINT32_MAX;
 		case MLG_DISPLAY_OP_OUTPUT:
 			return input[1] && input[1] <= 1000000;
 		default:

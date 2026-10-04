@@ -31,6 +31,7 @@
  * linuxu DART layer's host path is byte-identical and unit-testable on the
  * desktop without DriverKit. */
 #include <stdint.h>
+#include <time.h>
 #include <stdlib.h>
 #include <rt/dext_dma.h>
 

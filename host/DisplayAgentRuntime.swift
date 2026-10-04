@@ -100,8 +100,12 @@ extension MacLinuxGPUHost {
         return (kr, Int64(bitPattern: status), PresentStats(data))
     }
 
-    func displayStats() -> PresentStats? {
-        let (kr, status, stats) = displayPresent(handle: 0, rects: [], captureNs: 0)
+    /// The worker's statistics: PRESENT with no rectangle. Drivers through
+    /// build 235 admit PRESENT only with an imported surface's handle, so
+    /// one is passed (the driver does not use it for a read).
+    func displayStats(handle: UInt32) -> PresentStats? {
+        guard handle != 0 else { return nil }
+        let (kr, status, stats) = displayPresent(handle: handle, rects: [], captureNs: 0)
         return kr == kIOReturnSuccess && status == 0 ? stats : nil
     }
 }
@@ -639,8 +643,9 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
             print("display-agent: nothing measured (the run ended within --warmup)")
             return
         }
-        guard let end = observer.displayStats() else {
-            print("display-agent: the driver's statistics could not be read at the end")
+        guard let handle = mirror.queue.sync(execute: { mirror.handles.values.first }),
+              let end = observer.displayStats(handle: handle) else {
+            print("display-agent: the driver's statistics could not be read at the end; nothing reported")
             return
         }
         let seconds = Double(uptimeNs() - started.at) / 1e9
@@ -713,16 +718,22 @@ func runDisplayAgentCreate(_ options: [String]) -> Int32 {
     let begin = Date()
     let deadline = seconds > 0 ? begin.addingTimeInterval(seconds) : Date.distantFuture
     var lastReport = Date()
+    var measurementSkipped = false
     while !interrupted && Date() < deadline {
         RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         if mirror.queue.sync(execute: { mirror.failure }) != nil { break }
-        if started == nil && Date().timeIntervalSince(begin) >= warmup {
-            guard let stats = observer.displayStats() else {
-                mirror.failure = "the driver's statistics could not be read"
-                break
+        // The measured window opens once a surface is imported (statistics
+        // are read through one). A failed read skips the measurement; it
+        // never stops the mirroring.
+        if started == nil && !measurementSkipped && Date().timeIntervalSince(begin) >= warmup,
+           let handle = mirror.queue.sync(execute: { mirror.handles.values.first }) {
+            if let stats = observer.displayStats(handle: handle) {
+                mirror.queue.sync { mirror.measurement = PresentMeasurement(); mirror.measurement.lastFlipped = stats.flipped }
+                started = (stats, ProcessUsage.current(), dextPID.flatMap { ProcessUsage.sampled(pid: $0) }, uptimeNs())
+            } else {
+                print("display-agent: the driver's statistics could not be read; mirroring continues unmeasured")
+                measurementSkipped = true
             }
-            mirror.queue.sync { mirror.measurement = PresentMeasurement(); mirror.measurement.lastFlipped = stats.flipped }
-            started = (stats, ProcessUsage.current(), dextPID.flatMap { ProcessUsage.sampled(pid: $0) }, uptimeNs())
         }
         // A mode chosen in System Settings › Displays: relight at it.
         if let now = mirror.currentMode(), now != mirror.mode {

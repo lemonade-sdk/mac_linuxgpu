@@ -527,6 +527,11 @@ static void checkObserverPolicy() {
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayVerifyBad, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayPresent, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayPresentBad, 3));
+    {
+        /* Handle 0: PRESENT with no rectangle reads the statistics. */
+        const uint64_t displayStats[] = {MLG_DISPLAY_OP_PRESENT, 0, MLG_DISPLAY_CONFIRM};
+        assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayStats, 3));
+    }
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOutput, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayOutputBad, 3));
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, displayStatus, 3));
