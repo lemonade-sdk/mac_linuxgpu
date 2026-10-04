@@ -14,6 +14,6 @@ clang -w -std=gnu11 -D__KERNEL__ -include linux/autoconf.h \
   -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
   -ffunction-sections -fdata-sections "${includes[@]}" \
   linuxu/tests/test_compute_lifetime.c linuxu/src/sync.c linuxu/src/shims/printk.c \
-  linuxu/src/refcount.c linuxu/src/bug.c \
+  linuxu/src/refcount.c linuxu/src/bug.c linuxu/src/shims/task.c \
   -Wl,-dead_strip -lpthread -o "$test_dir/test_compute_lifetime"
 "$test_dir/test_compute_lifetime"
