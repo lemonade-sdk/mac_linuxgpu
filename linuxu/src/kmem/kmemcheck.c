@@ -35,6 +35,7 @@ struct kmemcheck_hdr {
 	uint64_t  magic;         /* KMEMCHECK_MAGIC if live               */
 	uint64_t  canary_lo_pat; /* expected lo pattern                   */
 	void     *allocation;   /* original backing allocation           */
+	size_t    slot;          /* table index + 1, 0 when not tracked   */
 };
 
 #define KMEMCHECK_MAGIC   0xc0ffee00c0ffee00ULL
@@ -42,7 +43,12 @@ struct kmemcheck_hdr {
 #define KMEMCHECK_HI_0    0x22ULL
 #define KMEMCHECK_HDR_ALIGN 8
 
-/* ---- live allocation table ---- */
+/* ---- live allocation table ----
+ *
+ * Tracking is O(1): a header remembers its table slot, and freed slots go
+ * on a stack for reuse. Scans walk only the slots ever used. Every
+ * kmalloc/kfree of the driver pays this, so it must not grow with the
+ * object's size or with the number of live objects. */
 struct kmemcheck_rec {
 	struct kmemcheck_hdr *hdr;
 	int live;
@@ -50,18 +56,20 @@ struct kmemcheck_rec {
 
 #define KMEMCHECK_MAX_RECS 65536
 static struct kmemcheck_rec kmemcheck_recs[KMEMCHECK_MAX_RECS];
+static uint32_t kmemcheck_free_slots[KMEMCHECK_MAX_RECS];
+static uint32_t kmemcheck_nfree;	/* entries on the free stack       */
+static uint32_t kmemcheck_used;		/* slots ever handed out           */
 static pthread_mutex_t kmemcheck_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* simple FNV-1a over (size, hdr addr) — enough to vary the pattern */
+/* The canary pattern for a payload size: a 64-bit mix of the size
+ * (splitmix64), so sizes differ in every byte of their canaries. */
 static uint64_t kmemcheck_pattern(size_t size)
 {
-	uint64_t h = 0xcbf29ce484222325ULL;
+	uint64_t h = (uint64_t)size + 0x9e3779b97f4a7c15ULL;
 
-	for (size_t i = 0; i < size; i++) {
-		h ^= (uint8_t)(i * 31u);
-		h *= 0x100000001b3ULL;
-	}
-	return h;
+	h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+	return h ^ (h >> 31);
 }
 
 /* kmemcheck_enabled: defined in kmemalloc.c (single definition point). */
@@ -71,27 +79,30 @@ static uint64_t kmemcheck_pattern(size_t size)
 int kmemcheck_track(struct kmemcheck_hdr *hdr, size_t user_size)
 {
 	uint64_t pat = kmemcheck_pattern(user_size);
-	int i;
+	uint64_t lo = pat ^ KMEMCHECK_LO_0, hi = pat ^ KMEMCHECK_HI_0;
+	uint32_t i;
 
 	hdr->size = user_size;
 	hdr->magic = KMEMCHECK_MAGIC;
-	hdr->canary_lo_pat = pat ^ KMEMCHECK_LO_0;
+	hdr->canary_lo_pat = lo;
+	hdr->slot = 0;
 
 	/* paint canaries */
-	memset((void *)hdr->user_ptr - sizeof(uint64_t),
-	       (int)(pat ^ KMEMCHECK_LO_0) & 0xff, sizeof(uint64_t));
-	uint64_t lo = pat ^ KMEMCHECK_LO_0, hi = pat ^ KMEMCHECK_HI_0;
 	memcpy((void *)(hdr->user_ptr - sizeof(uint64_t)), &lo, sizeof(lo));
 	/* The trailing canary follows arbitrary-sized payloads and can be unaligned. */
 	memcpy((void *)(hdr->user_ptr + user_size), &hi, sizeof(hi));
 	/* Publish only initialized metadata to concurrent heap scans. */
 	pthread_mutex_lock(&kmemcheck_lock);
-	for (i = 0; i < KMEMCHECK_MAX_RECS; i++) {
-		if (!kmemcheck_recs[i].live) {
-			kmemcheck_recs[i].hdr = hdr;
-			kmemcheck_recs[i].live = 1;
-			break;
-		}
+	if (kmemcheck_nfree)
+		i = kmemcheck_free_slots[--kmemcheck_nfree];
+	else if (kmemcheck_used < KMEMCHECK_MAX_RECS)
+		i = kmemcheck_used++;
+	else
+		i = UINT32_MAX;	/* table full: this object goes unchecked */
+	if (i != UINT32_MAX) {
+		kmemcheck_recs[i].hdr = hdr;
+		kmemcheck_recs[i].live = 1;
+		hdr->slot = (size_t)i + 1;
 	}
 	pthread_mutex_unlock(&kmemcheck_lock);
 	return 0;
@@ -101,7 +112,7 @@ int kmemcheck_track(struct kmemcheck_hdr *hdr, size_t user_size)
  * intact (normal free), 0 if corruption was detected. */
 int kmemcheck_untrack(struct kmemcheck_hdr *hdr)
 {
-	int i, corrupt = 1;
+	int corrupt = 1;
 
 	pthread_mutex_lock(&kmemcheck_lock);
 	if (hdr->magic != KMEMCHECK_MAGIC) {
@@ -118,12 +129,16 @@ int kmemcheck_untrack(struct kmemcheck_hdr *hdr)
 		corrupt = 0;
 
 	hdr->magic = 0;
-	for (i = 0; i < KMEMCHECK_MAX_RECS; i++) {
+	if (hdr->slot && hdr->slot <= kmemcheck_used) {
+		const uint32_t i = (uint32_t)(hdr->slot - 1);
+
 		if (kmemcheck_recs[i].live && kmemcheck_recs[i].hdr == hdr) {
 			kmemcheck_recs[i].live = 0;
-			break;
+			kmemcheck_recs[i].hdr = NULL;
+			kmemcheck_free_slots[kmemcheck_nfree++] = i;
 		}
 	}
+	hdr->slot = 0;
 	pthread_mutex_unlock(&kmemcheck_lock);
 	return corrupt;
 }
@@ -135,7 +150,7 @@ int kmemcheck_scan(void)
 	int corrupt = 0, i;
 
 	pthread_mutex_lock(&kmemcheck_lock);
-	for (i = 0; i < KMEMCHECK_MAX_RECS; i++) {
+	for (i = 0; i < (int)kmemcheck_used; i++) {
 		struct kmemcheck_hdr *hdr = kmemcheck_recs[i].hdr;
 
 		if (!kmemcheck_recs[i].live || !hdr)
@@ -165,7 +180,7 @@ size_t kmemcheck_live_bytes(void)
 	size_t total = 0, i;
 
 	pthread_mutex_lock(&kmemcheck_lock);
-	for (i = 0; i < KMEMCHECK_MAX_RECS; i++)
+	for (i = 0; i < kmemcheck_used; i++)
 		if (kmemcheck_recs[i].live && kmemcheck_recs[i].hdr)
 			total += kmemcheck_recs[i].hdr->size;
 	pthread_mutex_unlock(&kmemcheck_lock);
