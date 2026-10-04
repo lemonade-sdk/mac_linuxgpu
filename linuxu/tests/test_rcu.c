@@ -83,6 +83,84 @@ static void *producer(void *opaque)
 	return NULL;
 }
 
+/* Lockless readers against grace periods: readers dereference the
+ * published object while writers replace it and free the old one after a
+ * grace period (call_rcu or synchronize_rcu), poisoning it first. A reader
+ * that ever sees poison held a reference across a grace period. */
+struct boxed {
+	struct rcu_head head;
+	uint64_t value;
+};
+#define BOX_POISON 0xdeaddeaddeaddeadull
+static struct boxed *published_box;
+static int stress_stop;
+static uint64_t stress_reads;
+
+static void box_free(struct rcu_head *head)
+{
+	struct boxed *b = container_of(head, struct boxed, head);
+
+	__atomic_store_n(&b->value, BOX_POISON, __ATOMIC_SEQ_CST);
+	free(b);
+}
+
+static void *stress_reader(void *unused)
+{
+	(void)unused;
+	while (!__atomic_load_n(&stress_stop, __ATOMIC_SEQ_CST)) {
+		rcu_read_lock();
+		struct boxed *b = rcu_dereference(published_box);
+		for (int spin = 0; spin < 64; spin++)
+			assert(__atomic_load_n(&b->value, __ATOMIC_SEQ_CST) != BOX_POISON);
+		rcu_read_lock();	/* nested sections keep the outer epoch */
+		assert(__atomic_load_n(&b->value, __ATOMIC_SEQ_CST) != BOX_POISON);
+		rcu_read_unlock();
+		rcu_read_unlock();
+		__atomic_add_fetch(&stress_reads, 1, __ATOMIC_RELAXED);
+	}
+	return NULL;
+}
+
+static void *stress_writer(void *arg)
+{
+	const int synchronous = (int)(intptr_t)arg;
+
+	for (int i = 0; i < 2000; i++) {
+		struct boxed *b = calloc(1, sizeof(*b));
+		assert(b);
+		b->value = (uint64_t)i;
+		struct boxed *old = __atomic_exchange_n(&published_box, b, __ATOMIC_SEQ_CST);
+		if (synchronous) {
+			synchronize_rcu();
+			box_free(&old->head);
+		} else {
+			call_rcu(&old->head, box_free);
+		}
+	}
+	return NULL;
+}
+
+static void stress_lockless_readers(void)
+{
+	pthread_t readers[6], writers[2];
+	struct boxed *first = calloc(1, sizeof(*first));
+
+	assert(first);
+	rcu_assign_pointer(published_box, first);
+	for (int i = 0; i < 6; i++)
+		assert(pthread_create(&readers[i], NULL, stress_reader, NULL) == 0);
+	for (int i = 0; i < 2; i++)
+		assert(pthread_create(&writers[i], NULL, stress_writer, (void *)(intptr_t)i) == 0);
+	for (int i = 0; i < 2; i++)
+		assert(pthread_join(writers[i], NULL) == 0);
+	__atomic_store_n(&stress_stop, 1, __ATOMIC_SEQ_CST);
+	for (int i = 0; i < 6; i++)
+		assert(pthread_join(readers[i], NULL) == 0);
+	rcu_barrier();
+	assert(__atomic_load_n(&stress_reads, __ATOMIC_RELAXED) > 0);
+	free(published_box);
+}
+
 int main(void)
 {
 	pthread_t r, s, producers[4];
@@ -134,5 +212,6 @@ int main(void)
 	assert(__atomic_load_n(&freed, __ATOMIC_SEQ_CST) == 801);
 	rcu_barrier();
 	synchronize_rcu();
+	stress_lockless_readers();
 	return 0;
 }

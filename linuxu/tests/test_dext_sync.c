@@ -77,6 +77,7 @@ static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 static bool queue_missing;
 static atomic_int queue_sleeps;
+static atomic_int queue_wakes;
 extern unsigned long dext_cond_polled;
 int dext_cond_block(void **sleepers, bool (*still)(void *), void (*release)(void *), void *arg,
 		    uint64_t deadline_ns)
@@ -115,6 +116,7 @@ int dext_cond_wake(void **sleepers, bool all)
 {
 	if (queue_missing)
 		return ENOTSUP;
+	atomic_fetch_add(&queue_wakes, 1);
 	pthread_mutex_lock(&queue_lock);
 	while (*sleepers) {
 		struct mock_sleeper *sleeper = *sleepers;
@@ -300,6 +302,18 @@ int main(void)
 	test_condition();
 	/* Waits slept on the queue: none polled. */
 	assert(dext_cond_polled == 0 && atomic_load(&queue_sleeps) > 0);
+	{
+		/* Signals with nobody waiting do not hop onto the sleep queue. */
+		pthread_cond_t idle = PTHREAD_COND_INITIALIZER;
+		const int wakes = atomic_load(&queue_wakes);
+
+		for (int i = 0; i < 100; i++) {
+			assert(DK(pthread_cond_signal)(&idle) == 0);
+			assert(DK(pthread_cond_broadcast)(&idle) == 0);
+		}
+		assert(atomic_load(&queue_wakes) == wakes);
+		assert(DK(pthread_cond_destroy)(&idle) == 0);
+	}
 	/* Repeat the real wait/signal/broadcast/timeout test using embedded
 	 * condition state after its first IOMalloc fails. */
 	ready_lock = (pthread_mutex_t)PTHREAD_MUTEX_INITIALIZER;
