@@ -9,9 +9,10 @@
 #      path to the Apple GPU), with the SDL2 it bundles for macOS.
 #   3. Puts quake3e.aarch64 and its libSDL2-2.0.0.dylib in build/quake3e.
 #
-# Game data is not fetched: put baseq3/pak*.pk3 from a Quake III Arena
-# installation (or the demo's) where the game looks, or pass
-# +set fs_basepath <directory that holds baseq3>.
+# Game data is not fetched and never goes in the repository: Quake III
+# Arena's baseq3 from an installation, or OpenArena 0.8.8 (free, from
+# openarena.ws / SourceForge) unpacked outside the tree, which Quake3e runs
+# as fs_basegame baseoa (mlg-run --basepath DIR --basegame baseoa).
 #
 # Options:
 #   --clean   build from scratch
@@ -72,4 +73,4 @@ codesign --force --sign - "$OUT/libSDL2-2.0.0.dylib" "$OUT/quake3e.aarch64" 2>/d
 
 step "Quake3e built"
 echo "    $OUT/quake3e.aarch64"
-echo "    run: build/mlg-run --quake3 --mode fullscreen -- $OUT/quake3e.aarch64 +set fs_basepath <dir with baseq3>"
+echo "    run: build/mlg-run --quake3 --mode fullscreen --basepath <dir with baseoa> --basegame baseoa -- $OUT/quake3e.aarch64"

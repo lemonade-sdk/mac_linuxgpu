@@ -291,9 +291,16 @@ screen. `--quake3` adds Quake3e's settings: the Vulkan renderer, vsync, and
 full screen at the desktop's mode or a window three quarters of the
 monitor's screen, placed on that screen. `--dry-run` prints the plan.
 
+`--basepath DIR` and `--basegame NAME` name Quake3e's game data
+(`fs_basepath`, `fs_basegame`); mlg-run checks that DIR/NAME holds .pk3
+files. OpenArena 0.8.8 (free data, from openarena.ws / SourceForge, kept
+outside the repository) runs as `--basegame baseoa`:
+
 ```sh
-build/mlg-run --quake3 --mode fullscreen -- ./quake3e.aarch64
-build/mlg-run --quake3 --mode windowed -- ./quake3e.aarch64 +map q3dm17
+build/mlg-run --quake3 --mode fullscreen --basepath ~/Games/OpenArena/openarena-0.8.8 \
+    --basegame baseoa -- build/quake3e/quake3e.aarch64
+build/mlg-run --quake3 --mode windowed --basepath ~/Games/OpenArena/openarena-0.8.8 \
+    --basegame baseoa -- build/quake3e/quake3e.aarch64 +map oa_dm1
 ```
 
 ## Remaining gaps
