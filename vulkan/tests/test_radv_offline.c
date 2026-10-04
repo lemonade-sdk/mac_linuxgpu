@@ -116,6 +116,13 @@ int main(int argc, char **argv)
 
 	VkPhysicalDeviceMemoryProperties mp;
 	vkGetPhysicalDeviceMemoryProperties(phys, &mp);
+#if defined(__APPLE__) && defined(__aarch64__)
+	/* A CPU mapping of VRAM is Device memory on Apple silicon: no memory
+	 * type may be both (patches/mesa/radv-apple-silicon-vram.patch). */
+	for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+		CHECK(!((mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+			(mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)));
+#endif
 	for (uint32_t i = 0; i < mp.memoryHeapCount; ++i)
 		printf("heap %u: %llu MiB%s\n", i, (unsigned long long)(mp.memoryHeaps[i].size >> 20),
 		       mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT ? " device-local" : "");
