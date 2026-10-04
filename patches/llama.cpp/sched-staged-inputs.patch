@@ -1,0 +1,686 @@
+ggml: queue user inputs in the backend stream; Vulkan synchronizes without empty submits
+
+The scheduler copied each graph input from the user synchronously: it waited
+for the split's backend and then wrote the input with a blocking set_tensor.
+On Vulkan without host-visible VRAM, each write was its own queue submission,
+fence wait and fence reset, six per decoded token with Qwen3.6 27B.
+
+A new optional backend function, set_tensor_async_staged, queues a write of
+host data after the backend's pending work and copies the data before it
+returns, so the user may overwrite it at once, which is what the scheduler
+needs for inputs. The scheduler uses it when the backend has it and falls
+back to the synchronous copy otherwise. Vulkan implements it with host
+staging memory owned by the backend context and a copy in the compute stream,
+freed once the backend has synchronized.
+
+ggml_vk_synchronize no longer adds an empty queue submission to signal its
+fence: the fence (and the wait for transfer-queue work) goes with the last
+compute submission, and when only transfer-queue work is outstanding the host
+waits for its timeline semaphore. Small host-to-device copies go into the
+compute stream instead of a transfer-queue submission of their own.
+
+test-backend-sched-inputs checks that inputs are taken when the graph is
+queued and ordered against the work already queued on the device.
+
+diff --git a/ggml/src/ggml-backend-impl.h b/ggml/src/ggml-backend-impl.h
+index dc7367d..d2db106 100644
+--- a/ggml/src/ggml-backend-impl.h
++++ b/ggml/src/ggml-backend-impl.h
+@@ -154,6 +154,11 @@ extern "C" {
+ 
+         // (optional) sort/optimize the nodes in the graph
+         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
++
++        // (optional) queue a write of host data to a tensor, ordered after the work already queued on the backend
++        // unlike set_tensor_async, the data is copied before the call returns, so the caller may reuse it at once
++        // returns false if the backend cannot do this for the tensor; the caller then writes it synchronously
++        bool (*set_tensor_async_staged)(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+     };
+ 
+     struct ggml_backend {
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 0394433..fdc702a 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2494,6 +2494,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
+     /* .event_record            = */ nullptr,
+     /* .event_wait              = */ nullptr,
+     /* .graph_optimize          = */ nullptr,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ bool ggml_backend_is_meta(ggml_backend_t backend) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 5bdade6..36facdb 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1832,12 +1832,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+-                } else {
+-                    ggml_backend_synchronize(split_backend);
++                // a backend that stages the data when the write is queued orders it after its pending work, without a wait
++                const bool staged = split_backend->iface.set_tensor_async_staged != NULL && ggml_backend_buffer_is_host(input->buffer) &&
++                    split_backend->iface.set_tensor_async_staged(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++                if (!staged) {
++                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
++                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
++                    } else {
++                        ggml_backend_synchronize(split_backend);
++                    }
++                    ggml_backend_tensor_copy(input, input_cpy);
+                 }
+-                ggml_backend_tensor_copy(input, input_cpy);
+             } else {
+                 // wait for the split backend to finish using the input before overwriting it
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+diff --git a/ggml/src/ggml-blas/ggml-blas.cpp b/ggml/src/ggml-blas/ggml-blas.cpp
+index 6feb370..22034a0 100644
+--- a/ggml/src/ggml-blas/ggml-blas.cpp
++++ b/ggml/src/ggml-blas/ggml-blas.cpp
+@@ -276,6 +276,7 @@ static struct ggml_backend_i blas_backend_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_blas_guid(void) {
+diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
+index 28e17f3..a428291 100644
+--- a/ggml/src/ggml-cann/ggml-cann.cpp
++++ b/ggml/src/ggml-cann/ggml-cann.cpp
+@@ -2769,6 +2769,7 @@ static const ggml_backend_i ggml_backend_cann_interface = {
+     /* .event_record            = */ ggml_backend_cann_event_record,
+     /* .event_wait              = */ ggml_backend_cann_event_wait,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ /**
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 81ff5d7..2fac98a 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -207,6 +207,7 @@ static const struct ggml_backend_i ggml_backend_cpu_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_cpu_guid(void) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 303c9f4..6931aba 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4969,6 +4969,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
+     /* .event_record            = */ ggml_backend_cuda_event_record,
+     /* .event_wait              = */ ggml_backend_cuda_event_wait,
+     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_cuda_guid() {
+diff --git a/ggml/src/ggml-et/ggml-et.cpp b/ggml/src/ggml-et/ggml-et.cpp
+index 54a6d16..182df11 100644
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -1613,6 +1613,7 @@ static const struct ggml_backend_i ggml_backend_et_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static const char * ggml_backend_et_device_get_name(ggml_backend_dev_t dev) {
+diff --git a/ggml/src/ggml-hexagon/ggml-hexagon.cpp b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+index 4545944..e392b78 100644
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -7887,6 +7887,7 @@ static struct ggml_backend_i hexagon_backend_i = {
+     /* .event_record            = */ ggml_backend_hexagon_event_record,
+     /* .event_wait              = */ ggml_backend_hexagon_event_wait,
+     /* .graph_optimize          = */ ggml_backend_hexagon_graph_optimize,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_hexagon_guid() {
+diff --git a/ggml/src/ggml-metal/ggml-metal.cpp b/ggml/src/ggml-metal/ggml-metal.cpp
+index 344882e..ccb2ede 100644
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -604,6 +604,7 @@ static ggml_backend_i ggml_backend_metal_i = {
+     /* .event_record            = */ ggml_backend_metal_event_record,
+     /* .event_wait              = */ ggml_backend_metal_event_wait,
+     /* .graph_optimize          = */ ggml_backend_metal_graph_optimize,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_metal_guid(void) {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 4f1f937..a418064 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9320,6 +9320,7 @@ static ggml_backend_i ggml_backend_opencl_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ ggml_backend_t ggml_backend_opencl_init(void) {
+diff --git a/ggml/src/ggml-openvino/ggml-openvino.cpp b/ggml/src/ggml-openvino/ggml-openvino.cpp
+index 87ee096..c24aaa8 100644
+--- a/ggml/src/ggml-openvino/ggml-openvino.cpp
++++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
+@@ -896,6 +896,7 @@ static const ggml_backend_i ggml_backend_openvino_interface = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ int ggml_backend_openvino_get_device_count() {
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 158a15b..6d9dea4 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1086,6 +1086,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .event_record            = */ ggml_backend_rpc_event_record,
+     /* .event_wait              = */ ggml_backend_rpc_event_wait,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {
+diff --git a/ggml/src/ggml-sycl/ggml-sycl.cpp b/ggml/src/ggml-sycl/ggml-sycl.cpp
+index 49148d7..9f66b49 100644
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6360,6 +6360,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
+     /* .event_record            = */ ggml_backend_sycl_event_record,
+     /* .event_wait              = */ ggml_backend_sycl_event_wait,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_sycl_guid() {
+diff --git a/ggml/src/ggml-virtgpu/ggml-backend.cpp b/ggml/src/ggml-virtgpu/ggml-backend.cpp
+index 996c57e..00f5c4a 100644
+--- a/ggml/src/ggml-virtgpu/ggml-backend.cpp
++++ b/ggml/src/ggml-virtgpu/ggml-backend.cpp
+@@ -47,6 +47,7 @@ static ggml_backend_i ggml_backend_remoting_interface = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ ggml_backend_remoting_graph_optimize,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_remoting_guid() {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index 4158ff7..f26e858 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -1250,6 +1250,10 @@ struct ggml_backend_vk_context {
+     ggml_vk_garbage_collector gc;
+     size_t prealloc_size_x, prealloc_size_y, prealloc_size_split_k, prealloc_size_add_rms_partials, prealloc_size_add_rms_partials_offset;
+     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
++    // Host memory that writes queued with set_tensor_async_staged copy their data into, in use
++    // until the backend's work completes (ggml_vk_synchronize)
++    std::vector<vk_buffer> input_staging;
++    size_t input_staging_used {};
+     vk::Fence fence, almost_ready_fence;
+     bool submit_pending {};
+     bool almost_ready_fence_pending {};
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index bfc65be..fed3d8a 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -12849,6 +12849,11 @@ void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+     ggml_vk_destroy_buffer(ctx->prealloc_split_k);
+     ggml_vk_destroy_buffer(ctx->prealloc_add_rms_partials);
+     ggml_vk_destroy_buffer(ctx->sync_staging);
++    for (auto & buf : ctx->input_staging) {
++        ggml_vk_destroy_buffer(buf);
++    }
++    ctx->input_staging.clear();
++    ctx->input_staging_used = 0;
+ 
+     ctx->prealloc_y_last_pipeline_used = nullptr;
+     ctx->prealloc_y_last_tensor_used = nullptr;
+@@ -13158,6 +13163,44 @@ static ggml_backend_buffer_type_t ggml_backend_vk_get_default_buffer_type(ggml_b
+     return &ctx->device->buffer_type;
+ }
+ 
++// Space for @size bytes in the context's input staging memory, until the next ggml_vk_input_staging_reset.
++static void ggml_vk_input_staging_alloc(ggml_backend_vk_context * ctx, size_t size, vk_buffer & buf, size_t & offset) {
++    constexpr size_t align = 64;
++    if (!ctx->input_staging.empty()) {
++        const size_t at = ggml_vk_align_size(ctx->input_staging_used, align);
++        if (at + size <= ctx->input_staging.back()->size) {
++            buf = ctx->input_staging.back();
++            offset = at;
++            ctx->input_staging_used = at + size;
++            return;
++        }
++    }
++    // the buffers in use stay until the reset: add a larger one
++    const size_t prev = ctx->input_staging.empty() ? 0 : ctx->input_staging.back()->size;
++    const size_t new_size = std::max({ size, 2 * prev, (size_t) 1024 * 1024 });
++    VK_LOG_MEMORY("ggml_vk_input_staging_alloc(" << new_size << ")");
++    buf = ggml_vk_create_buffer_check(ctx->device, new_size,
++        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
++        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
++    ctx->input_staging.push_back(buf);
++    offset = 0;
++    ctx->input_staging_used = size;
++}
++
++// The backend's queued work has completed: the input staging memory is free again (the largest buffer is kept).
++static void ggml_vk_input_staging_reset(ggml_backend_vk_context * ctx) {
++    if (ctx->input_staging.size() > 1) {
++        vk_buffer keep = ctx->input_staging.back();
++        ctx->input_staging.pop_back();
++        for (auto & buf : ctx->input_staging) {
++            ggml_vk_destroy_buffer(buf);
++        }
++        ctx->input_staging.clear();
++        ctx->input_staging.push_back(keep);
++    }
++    ctx->input_staging_used = 0;
++}
++
+ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset,
+                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     VK_LOG_DEBUG("ggml_backend_vk_set_tensor_2d_async(" << size << ", " << n_copies << ")");
+@@ -13221,6 +13264,34 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
+     ggml_backend_vk_set_tensor_2d_async(backend, tensor, data, offset, size, 1, size, size);
+ }
+ 
++// The data goes into the context's input staging memory now and is copied to the tensor in the
++// compute stream: the caller may reuse it at once, and the write needs no queue submission of its own.
++static bool ggml_backend_vk_set_tensor_async_staged(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
++    VK_LOG_DEBUG("ggml_backend_vk_set_tensor_async_staged(" << size << ")");
++    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
++
++    if (tensor->buffer->buft != ggml_backend_vk_get_default_buffer_type(backend)) {
++        return false;
++    }
++    if (size == 0) {
++        return true;
++    }
++
++    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
++    vk_buffer staging;
++    size_t staging_offset;
++    ggml_vk_input_staging_alloc(ctx, size, staging, staging_offset);
++    memcpy((uint8_t *)staging->ptr + staging_offset, data, size);
++
++    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
++    const vk::BufferCopy copy{ staging_offset, vk_tensor_offset(tensor) + tensor->view_offs + offset, size };
++    // after earlier work that uses the tensor, and before later work that reads it
++    ggml_vk_sync_buffers(ctx, compute_ctx);
++    compute_ctx->s->buffer->buf.copyBuffer(staging->buffer, buf_ctx->dev_buffer->buffer, { copy });
++    ggml_vk_sync_buffers(ctx, compute_ctx);
++    return true;
++}
++
+ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset,
+                                                 size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+     VK_LOG_DEBUG("ggml_backend_vk_get_tensor_2d_async(" << size << ", " << n_copies << ")");
+@@ -13333,16 +13404,26 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
+             return true;
+         }
+ 
++        // A small copy goes into the compute stream: a transfer queue submission of its own, and the
++        // semaphore wait the compute queue then needs, cost more than the copy could overlap.
++        static constexpr size_t max_compute_stream_copy_size = 1024 * 1024;
++        const bool use_transfer_queue = ctx->device->async_use_transfer_queue && ggml_nbytes(src) > max_compute_stream_copy_size;
++
+         vk_context cpy_ctx;
+-        if (ctx->device->async_use_transfer_queue) {
++        if (use_transfer_queue) {
+             cpy_ctx = ggml_vk_get_transfer_ctx(ctx);
+         } else {
+             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
+         }
+ 
+-        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
+-                                          vk_tensor_offset(dst) + dst->view_offs,
+-                                          src->data, ggml_nbytes(src));
++        const bool ret = ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
++                                                    vk_tensor_offset(dst) + dst->view_offs,
++                                                    src->data, ggml_nbytes(src));
++        if (ret && !use_transfer_queue) {
++            // before later work in the stream reads it
++            ggml_vk_sync_buffers(ctx, cpy_ctx);
++        }
++        return ret;
+     }
+ 
+     return false;
+@@ -13352,10 +13433,15 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+     VK_LOG_DEBUG("ggml_vk_synchronize()");
+ 
+     bool do_transfer = !ctx->compute_ctx.expired();
++    const bool compute_pending = ctx->submit_pending;
+ 
+     if (ggml_vk_submit_transfer_ctx(ctx)) {
+         ctx->submit_pending = true;
+     }
++    // transfers the compute queue has not been made to wait for yet
++    const bool transfer_wait = ctx->device->async_use_transfer_queue &&
++                               ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value;
++    bool fence_submitted = false;
+ 
+     vk_context compute_ctx;
+     vk_command_buffer* cmd_buf = nullptr;
+@@ -13375,16 +13461,32 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+             ggml_vk_submit(compute_ctx, ctx->fence);
+             VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "synchronize waitForFences", ctx->device);
+             ctx->device->device.resetFences({ ctx->fence });
+-        } else {
+-            ggml_vk_submit(compute_ctx, {});
++            ctx->submit_pending = true;
++        } else if (!compute_ctx->seqs.empty()) {
++            // the last submission waits for the transfers and carries the fence: no empty submission follows it
++            if (transfer_wait) {
++                compute_ctx->seqs.back().back().wait_semaphores.push_back(ctx->transfer_semaphore);
++                ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
++            }
++            ggml_vk_submit(compute_ctx, ctx->fence);
++            fence_submitted = true;
++            ctx->submit_pending = true;
+         }
+-        ctx->submit_pending = true;
+     }
+ 
+     if (ctx->submit_pending) {
++        bool wait_fence = !ctx->device->serialize_submissions;
+         if (ctx->device->serialize_submissions) {
+             ctx->submit_pending = false;
+-        } else if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
++        } else if (fence_submitted) {
++            // the fence went with the compute submission
++        } else if (transfer_wait && !compute_pending) {
++            // only transfers are outstanding: wait for them on the host
++            vk::SemaphoreWaitInfo swi{vk::SemaphoreWaitFlags{}, ctx->transfer_semaphore.s, ctx->transfer_semaphore.value};
++            VK_CHECK(ctx->device->device.waitSemaphores(swi, UINT64_MAX), "synchronize waitSemaphores", ctx->device);
++            ctx->transfer_semaphore_last_submitted = ctx->transfer_semaphore.value;
++            wait_fence = false;
++        } else if (transfer_wait) {
+             vk::TimelineSemaphoreSubmitInfo tl_info{
+                 1, &ctx->transfer_semaphore.value,
+                 0, nullptr,
+@@ -13401,7 +13503,7 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+         } else {
+             ctx->device->compute_queue->handle->submit({}, ctx->fence);
+         }
+-        if (!ctx->device->serialize_submissions) {
++        if (wait_fence) {
+             ggml_vk_wait_for_fence(ctx);
+         }
+         ctx->submit_pending = false;
+@@ -13417,6 +13519,10 @@ void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+         }
+         ctx->compute_ctx.reset();
+     }
++
++    if (ctx->compute_ctx.expired() && !ctx->submit_pending) {
++        ggml_vk_input_staging_reset(ctx);
++    }
+ }
+ 
+ static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
+@@ -15133,6 +15239,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
+     /* .event_record            = */ ggml_backend_vk_event_record,
+     /* .event_wait              = */ ggml_backend_vk_event_wait,
+     /* .graph_optimize          = */ ggml_vk_graph_optimize,
++    /* .set_tensor_async_staged = */ ggml_backend_vk_set_tensor_async_staged,
+ };
+ 
+ static ggml_guid_t ggml_backend_vk_guid() {
+diff --git a/ggml/src/ggml-webgpu/ggml-webgpu.cpp b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+index 3feefd4..a28ec63 100644
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -3707,6 +3707,7 @@ static ggml_backend_i ggml_backend_webgpu_i = {
+     /* .event_record            = */ ggml_backend_webgpu_event_record,
+     /* .event_wait              = */ ggml_backend_webgpu_event_wait,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ /* End GGML Backend Interface */
+diff --git a/ggml/src/ggml-zdnn/ggml-zdnn.cpp b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
+index 5d12093..7f47cbf 100644
+--- a/ggml/src/ggml-zdnn/ggml-zdnn.cpp
++++ b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
+@@ -468,6 +468,7 @@ static ggml_backend_i ggml_backend_zdnn_i = {
+     /* .event_record           = */ NULL,
+     /* .event_wait             = */ NULL,
+     /* .graph_optimize         = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_zdnn_guid(void) {
+diff --git a/ggml/src/ggml-zendnn/ggml-zendnn.cpp b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
+index ec7ce23..e16eaa3 100644
+--- a/ggml/src/ggml-zendnn/ggml-zendnn.cpp
++++ b/ggml/src/ggml-zendnn/ggml-zendnn.cpp
+@@ -583,6 +583,7 @@ static struct ggml_backend_i ggml_backend_zendnn_i = {
+     /* .event_record            = */ NULL,
+     /* .event_wait              = */ NULL,
+     /* .graph_optimize          = */ NULL,
++    /* .set_tensor_async_staged = */ NULL,
+ };
+ 
+ static ggml_guid_t ggml_backend_zendnn_guid(void) {
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 96d910a..0449272 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -279,6 +279,7 @@ endif()
+ 
+ # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
+ llama_build(test-backend-ops.cpp)
++llama_build_and_test(test-backend-sched-inputs.cpp)
+ 
+ llama_build_and_test(test-tiled-mulmat.cpp)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+diff --git a/tests/test-backend-sched-inputs.cpp b/tests/test-backend-sched-inputs.cpp
+new file mode 100644
+index 0000000..c04d99a
+--- /dev/null
++++ b/tests/test-backend-sched-inputs.cpp
+@@ -0,0 +1,186 @@
++// Graph inputs through the backend scheduler: the scheduler copies user inputs to the device
++// of the split that reads them. Checks that
++//  - the copy is taken when the graph is queued: the caller overwrites its input data right
++//    after ggml_backend_sched_graph_compute_async, and the result must not change,
++//  - the copy is ordered against the device's queued work: a second evaluation queued before
++//    the first one completed overwrites the same device copy of the inputs, and both results,
++//    the first read back asynchronously before the second is queued, must be right.
++// Run for each GPU device, with the CPU inputs in plain host memory and in the device's host
++// buffer type when it has one.
++
++#include <ggml.h>
++#include <ggml-alloc.h>
++#include <ggml-backend.h>
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
++static constexpr int64_t n = 1 << 20;    // elements per input: enough work to still be running
++static constexpr int     n_layers = 8;   // weight multiplications per evaluation
++
++struct model {
++    ggml_context * ctx_w = nullptr;
++    ggml_backend_buffer_t buf_w = nullptr;
++    ggml_tensor * w = nullptr;
++    std::vector<float> w_data;
++};
++
++// out = (... ((x * w + y) * w + y) ...) with the weights on the device, so the scheduler runs it there
++static ggml_cgraph * build_graph(ggml_context * ctx, const model & m, ggml_tensor ** x, ggml_tensor ** y, ggml_tensor ** out) {
++    *x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    *y = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    ggml_set_name(*x, "x");
++    ggml_set_name(*y, "y");
++    ggml_set_input(*x);
++    ggml_set_input(*y);
++    ggml_tensor * cur = *x;
++    for (int l = 0; l < n_layers; l++) {
++        cur = ggml_add(ctx, ggml_mul(ctx, cur, m.w), *y);
++    }
++    *out = cur;
++    ggml_set_name(*out, "out");
++    ggml_set_output(*out);
++    ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, *out);
++    return gf;
++}
++
++static std::vector<float> reference(const model & m, const std::vector<float> & x, const std::vector<float> & y) {
++    std::vector<float> r(n);
++    for (int64_t i = 0; i < n; i++) {
++        float cur = x[i];
++        for (int l = 0; l < n_layers; l++) {
++            cur = cur * m.w_data[i] + y[i];
++        }
++        r[i] = cur;
++    }
++    return r;
++}
++
++static bool check(const char * what, const std::vector<float> & got, const std::vector<float> & want) {
++    for (int64_t i = 0; i < n; i++) {
++        if (std::fabs(got[i] - want[i]) > 1e-4f * (1.0f + std::fabs(want[i]))) {
++            fprintf(stderr, "  FAIL %s: element %lld is %f, expected %f\n", what, (long long) i, got[i], want[i]);
++            return false;
++        }
++    }
++    return true;
++}
++
++static std::vector<float> values(int seed) {
++    std::vector<float> v(n);
++    for (int64_t i = 0; i < n; i++) {
++        v[i] = 0.25f * (float) ((i * 7 + seed * 13) % 9) - 1.0f;
++    }
++    return v;
++}
++
++static bool run(ggml_backend_dev_t dev, bool host_buffer) {
++    ggml_backend_t gpu = ggml_backend_dev_init(dev, nullptr);
++    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
++    if (!gpu || !cpu) {
++        fprintf(stderr, "  cannot initialize the backends\n");
++        return false;
++    }
++    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
++    if (host_buffer && !host_buft) {
++        printf("  %s: no host buffer type, skipped\n", ggml_backend_dev_name(dev));
++        ggml_backend_free(gpu);
++        ggml_backend_free(cpu);
++        return true;
++    }
++
++    model m;
++    ggml_init_params wp = { ggml_tensor_overhead() * 2, nullptr, true };
++    m.ctx_w = ggml_init(wp);
++    m.w = ggml_new_tensor_1d(m.ctx_w, GGML_TYPE_F32, n);
++    m.buf_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, gpu);
++    ggml_backend_buffer_set_usage(m.buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    m.w_data.resize(n);
++    for (int64_t i = 0; i < n; i++) {
++        m.w_data[i] = 0.5f + 0.125f * (float) (i % 5);
++    }
++    ggml_backend_tensor_set(m.w, m.w_data.data(), 0, n * sizeof(float));
++
++    ggml_backend_t backends[2] = { gpu, cpu };
++    ggml_backend_buffer_type_t bufts[2] = { ggml_backend_get_default_buffer_type(gpu),
++                                            host_buffer ? host_buft : ggml_backend_get_default_buffer_type(cpu) };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, bufts, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
++
++    ggml_init_params gp = { ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead(), nullptr, true };
++    ggml_context * ctx = ggml_init(gp);
++    ggml_tensor * x, * y, * out;
++    ggml_cgraph * gf = build_graph(ctx, m, &x, &y, &out);
++
++    bool ok = ggml_backend_sched_alloc_graph(sched, gf);
++    if (!ok) {
++        fprintf(stderr, "  cannot allocate the graph\n");
++    }
++    if (ok && ggml_backend_sched_get_tensor_backend(sched, out) != gpu) {
++        fprintf(stderr, "  the graph does not run on %s\n", ggml_backend_dev_name(dev));
++        ok = false;
++    }
++
++    const std::vector<float> garbage(n, NAN);
++    std::vector<float> got_a(n), got_b(n);
++    for (int iter = 0; ok && iter < 4; iter++) {
++        const std::vector<float> xa = values(4 * iter), ya = values(4 * iter + 1);
++        const std::vector<float> xb = values(4 * iter + 2), yb = values(4 * iter + 3);
++
++        // A: queue it, then overwrite the inputs at once
++        ggml_backend_tensor_set(x, xa.data(), 0, n * sizeof(float));
++        ggml_backend_tensor_set(y, ya.data(), 0, n * sizeof(float));
++        ok = ggml_backend_sched_graph_compute_async(sched, gf) == GGML_STATUS_SUCCESS;
++        ggml_backend_tensor_set(x, garbage.data(), 0, n * sizeof(float));
++        ggml_backend_tensor_set(y, garbage.data(), 0, n * sizeof(float));
++        ggml_backend_tensor_get_async(gpu, out, got_a.data(), 0, n * sizeof(float));
++
++        // B: queued behind A, into the same device copies of the inputs
++        ggml_backend_tensor_set(x, xb.data(), 0, n * sizeof(float));
++        ggml_backend_tensor_set(y, yb.data(), 0, n * sizeof(float));
++        ok = ok && ggml_backend_sched_graph_compute_async(sched, gf) == GGML_STATUS_SUCCESS;
++        ggml_backend_tensor_set(x, garbage.data(), 0, n * sizeof(float));
++        ggml_backend_tensor_set(y, garbage.data(), 0, n * sizeof(float));
++        ggml_backend_sched_synchronize(sched);
++        ggml_backend_tensor_get(out, got_b.data(), 0, n * sizeof(float));
++
++        ok = ok && check("first evaluation", got_a, reference(m, xa, ya));
++        ok = ok && check("second evaluation", got_b, reference(m, xb, yb));
++    }
++
++    printf("  %s, inputs in %s: %s\n", ggml_backend_dev_name(dev),
++           host_buffer ? ggml_backend_buft_name(host_buft) : "host memory", ok ? "OK" : "FAIL");
++
++    ggml_free(ctx);
++    ggml_backend_sched_free(sched);
++    ggml_backend_buffer_free(m.buf_w);
++    ggml_free(m.ctx_w);
++    ggml_backend_free(gpu);
++    ggml_backend_free(cpu);
++    return ok;
++}
++
++int main() {
++    ggml_backend_load_all();
++
++    int tested = 0;
++    bool ok = true;
++    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
++        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
++            continue;
++        }
++        for (bool host_buffer : { false, true }) {
++            ok = run(dev, host_buffer) && ok;
++        }
++        tested++;
++    }
++    if (!tested) {
++        printf("no GPU device: skipped\n");
++        return 0;
++    }
++    printf("%s\n", ok ? "OK" : "FAIL");
++    return ok ? 0 : 1;
++}

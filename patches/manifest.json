@@ -152,13 +152,43 @@
     "tag": "b11379",
     "pin": "1537a0a8b2f8711d840878b0a0677ab2213c882c",
     "optional": true,
-    "reason": "llama.cpp, the first application of the Vulkan path: its Vulkan backend on RADV (scripts/build-llama-vulkan.sh). Fetched only for that build: scripts/bootstrap.sh --llama-only. Unmodified.",
+    "reason": "llama.cpp, the first application of the Vulkan path: its Vulkan backend on RADV (scripts/build-llama-vulkan.sh). Fetched only for that build: scripts/bootstrap.sh --llama-only. Patched as declared below.",
     "sparse_checkout": [
       "/*",
       "!/models/",
       "!/docs/",
       "!/media/"
     ],
-    "patches": []
+    "patches": [
+      {
+        "patch": "patches/llama.cpp/sched-staged-inputs.patch",
+        "sha256": "29aefc57926d097399d77b1a2624ebc49890703ec7ac930dff2d4fc9b4542262",
+        "files": [
+          "ggml/src/ggml-backend-impl.h",
+          "ggml/src/ggml-backend-meta.cpp",
+          "ggml/src/ggml-backend.cpp",
+          "ggml/src/ggml-blas/ggml-blas.cpp",
+          "ggml/src/ggml-cann/ggml-cann.cpp",
+          "ggml/src/ggml-cpu/ggml-cpu.cpp",
+          "ggml/src/ggml-cuda/ggml-cuda.cu",
+          "ggml/src/ggml-et/ggml-et.cpp",
+          "ggml/src/ggml-hexagon/ggml-hexagon.cpp",
+          "ggml/src/ggml-metal/ggml-metal.cpp",
+          "ggml/src/ggml-opencl/ggml-opencl.cpp",
+          "ggml/src/ggml-openvino/ggml-openvino.cpp",
+          "ggml/src/ggml-rpc/ggml-rpc.cpp",
+          "ggml/src/ggml-sycl/ggml-sycl.cpp",
+          "ggml/src/ggml-virtgpu/ggml-backend.cpp",
+          "ggml/src/ggml-vulkan/ggml-vulkan-types.h",
+          "ggml/src/ggml-vulkan/ggml-vulkan.cpp",
+          "ggml/src/ggml-webgpu/ggml-webgpu.cpp",
+          "ggml/src/ggml-zdnn/ggml-zdnn.cpp",
+          "ggml/src/ggml-zendnn/ggml-zendnn.cpp",
+          "tests/CMakeLists.txt",
+          "tests/test-backend-sched-inputs.cpp"
+        ],
+        "reason": "Every request to the GPU is a round trip to the driver process (about 100 us for a trivial request on the R9700), so Vulkan's per-token synchronous work dominates decode. The scheduler wrote each graph input with a blocking set_tensor (a queue submission, a fence wait and a reset on a device without host-visible VRAM, as on Apple silicon), and ggml_vk_synchronize signalled its fence with an empty submission, which RADV turns into eight syncobj requests when it also waits for the transfer queue. Inputs are now staged in host memory and copied in the compute stream (a new optional backend function the scheduler uses for user inputs), the fence goes with the last compute submission, transfer-only work is waited for on the host, and small host copies stay in the compute stream. test-backend-sched-inputs covers input capture and ordering."
+      }
+    ]
   }
 }

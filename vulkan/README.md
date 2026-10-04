@@ -99,7 +99,20 @@ once Mesa is checked out. `lib-dext` verifies only the Linux tree
 (`make verify-linux`), so local Mesa work cannot block a driver build.
 
 `third_party/llama.cpp` is pinned the same way at **b11379**
-(`1537a0a8b2f8711d840878b0a0677ab2213c882c`), unpatched.
+(`1537a0a8b2f8711d840878b0a0677ab2213c882c`), with one patch in
+`patches/llama.cpp/` (`scripts/bootstrap.sh --reset-llama` re-applies it):
+
+- **sched-staged-inputs.patch**: each request to the GPU is a round trip to
+  the driver process, so ggml's per-token synchronous work dominated decode.
+  The scheduler wrote every graph input with a blocking write (on a device
+  without CPU-visible VRAM: a submission, a fence wait and a reset each), and
+  `ggml_vk_synchronize` signalled its fence with an empty submission, which
+  RADV turns into eight syncobj requests when it also waits for the transfer
+  queue. Inputs are now staged in host memory and copied in the compute
+  stream through a new optional backend function, the fence goes with the
+  last compute submission, and small host copies stay in the compute stream.
+  `test-backend-sched-inputs` checks that inputs are taken when the graph is
+  queued and ordered against the device's queued work.
 
 ## VRAM and the CPU on Apple silicon
 

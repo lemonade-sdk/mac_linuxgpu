@@ -8,8 +8,8 @@
 #   2. Builds RADV first when build/radv/install has no driver.
 #   3. Configures llama.cpp with CMake: GGML_VULKAN on; Metal, BLAS and
 #      libcurl off, so every GPU operation goes through Vulkan.
-#   4. Builds llama-bench, llama-completion and test-backend-ops into
-#      build/llama.cpp/bin.
+#   4. Builds llama-bench, llama-completion, test-backend-ops and
+#      test-backend-sched-inputs into build/llama.cpp/bin.
 #
 # Run them on RADV with scripts/llama-radv.sh, which selects the RADV ICD
 # alone (not MoltenVK):
@@ -77,12 +77,12 @@ if [[ ! -f "$BUILD/CMakeCache.txt" ]] || (( reconfigure )); then
     "${vk_args[@]}"
 fi
 
-step "Building llama-bench, llama-completion and test-backend-ops"
+step "Building llama-bench, llama-completion, test-backend-ops and test-backend-sched-inputs"
 cmake --build "$BUILD" --config Release -j "$(sysctl -n hw.ncpu)" \
-  --target llama-bench llama-completion test-backend-ops
+  --target llama-bench llama-completion test-backend-ops test-backend-sched-inputs
 
 step "llama.cpp built"
-for bin in llama-bench llama-completion test-backend-ops; do
+for bin in llama-bench llama-completion test-backend-ops test-backend-sched-inputs; do
   [[ -x "$BUILD/bin/$bin" ]] || die "$bin was not built"
   echo "    $BUILD/bin/$bin"
 done

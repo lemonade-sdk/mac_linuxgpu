@@ -22,7 +22,7 @@ Checks, against patches/manifest.json:
     go stale.
 
 For the optional upstreams, Mesa (manifest "mesa", patches/mesa/) and
-llama.cpp (manifest "llama_cpp", unpatched): the gitlink, pin and
+llama.cpp (manifest "llama_cpp", patches/llama.cpp/): the gitlink, pin and
 .gitmodules agree; once checked out, the sparse set, the declared patches
 and the working tree are checked as Linux's are.
 
@@ -121,6 +121,11 @@ def patch_paths(text):
     return {m.group(1) for m in re.finditer(r"^diff --git a/(\S+) b/\S+$", text, re.M)}
 
 
+def patch_new_paths(text):
+    """The files a patch adds (they are not in the pinned tree)."""
+    return {m.group(1) for m in re.finditer(r"^diff --git a/(\S+) b/\S+\nnew file mode", text, re.M)}
+
+
 def check_patches(sub, patches, present, tree="linux"):
     declared = {}
     for item in patches:
@@ -140,7 +145,8 @@ def check_patches(sub, patches, present, tree="linux"):
         touched = patch_paths(data.decode())
         if touched != set(files):
             raise Failure(f"{patch} touches {sorted(touched)}, declared {sorted(files)}")
-        outside = touched - present
+        item = dict(item, added=sorted(patch_new_paths(data.decode())))
+        outside = touched - present - set(item["added"])
         if outside:
             raise Failure(f"{patch} touches files outside the sparse checkout: {sorted(outside)}")
         declared[patch] = item
@@ -162,9 +168,13 @@ def check_working_tree(sub, declared):
     for entry in filter(None, status.split("\0")):
         code, path = entry[:2], entry[3:]
         (untracked if code == "??" else changed).add(path)
-    expected = set()
+    expected, added = set(), set()
     for item in declared.values():
         expected |= set(item["files"])
+        added |= set(item.get("added", []))
+    # the files the patches add show as untracked
+    changed |= untracked & added
+    untracked -= added
     if untracked:
         report("untracked file in submodule", untracked)
     stray = changed - expected
@@ -179,7 +189,7 @@ def check_working_tree(sub, declared):
     # patched file carries no edits beyond its patch.
     scratch = Path(tempfile.mkdtemp(prefix="verify-upstream."))
     try:
-        for path in expected:
+        for path in expected - added:
             target = scratch / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(git("show", f"HEAD:{path}", cwd=sub, binary=True))

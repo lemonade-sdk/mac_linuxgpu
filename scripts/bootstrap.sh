@@ -26,6 +26,7 @@
 #   --llama-only      only set up the pinned llama.cpp (third_party/llama.cpp,
 #                     scripts/build-llama-vulkan.sh), likewise
 #   --reset-mesa      as --reset-linux, for third_party/mesa
+#   --reset-llama     as --reset-linux, for third_party/llama.cpp
 #   --from-make       quieter tool check; used by the Makefile
 #   -h, --help        show this help
 
@@ -39,6 +40,7 @@ with_mesa=0
 mesa_only=0
 llama_only=0
 reset_mesa=0
+reset_llama=0
 from_make=0
 for arg in "$@"; do
   case "$arg" in
@@ -48,6 +50,7 @@ for arg in "$@"; do
     --mesa-only) with_mesa=1; mesa_only=1 ;;
     --llama-only) llama_only=1 ;;
     --reset-mesa) reset_mesa=1 ;;
+    --reset-llama) reset_llama=1 ;;
     --from-make) from_make=1 ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap: unknown argument: $arg (see --help)" >&2; exit 2 ;;
@@ -112,7 +115,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # An upstream submodule, pinned, partial, sparse and patched: set up with
-# setup_upstream KEY (a manifest section: linux or mesa).
+# setup_upstream KEY (a manifest section: linux, mesa or llama_cpp).
 # ---------------------------------------------------------------------------
 sparse_file="$(mktemp)"
 trap 'rm -f "$sparse_file"' EXIT
@@ -167,6 +170,17 @@ for p in (m["patches"] if sys.argv[1] == "linux" else m[sys.argv[1]]["patches"])
 PY
 }
 
+created_files() { # KEY -> the files the declared patches add, one per line
+  python3 - "$1" <<'PY'
+import json, re, sys
+m = json.load(open("patches/manifest.json"))
+for p in (m["patches"] if sys.argv[1] == "linux" else m[sys.argv[1]]["patches"]):
+    text = open(p["patch"]).read()
+    for path in re.findall(r"^diff --git a/(\S+) b/\S+\nnew file mode", text, re.M):
+        print(path)
+PY
+}
+
 setup_upstream() { # KEY RESET SIZE
   local key="$1" reset="$2"
   SUB="$(manifest "$key.path")"
@@ -215,6 +229,10 @@ setup_upstream() { # KEY RESET SIZE
       say "discarding working-tree changes in $SUB (patches are re-applied below)"
     fi
     git -C "$SUB" reset --quiet --hard
+    # The reset keeps the files the patches added: remove them, the patches add them again.
+    while IFS= read -r added; do
+      [[ -n "$added" ]] && rm -f "$SUB/$added"
+    done < <(created_files "$key")
   fi
   if [[ "$head" != "$PIN" ]]; then
     say "moving $SUB from ${head:-nothing} to $PIN"
@@ -235,7 +253,7 @@ setup_upstream() { # KEY RESET SIZE
     elif git -C "$SUB" apply --check --reverse "$ROOT/$patch" 2>/dev/null; then
       already=$((already + 1))
     else
-      die "$patch neither applies nor is already applied; run scripts/bootstrap.sh --reset-$key"
+      die "$patch neither applies nor is already applied; run scripts/bootstrap.sh --reset-${key%_cpp}"
     fi
   done < <(declared_patches "$key")
   say "patches: $applied applied, $already already present"
@@ -245,7 +263,7 @@ if (( llama_only )); then
   # ---------------------------------------------------------------------------
   step "Upstream llama.cpp submodule ($(manifest llama_cpp.path) @ $(manifest llama_cpp.tag))"
   # ---------------------------------------------------------------------------
-  setup_upstream llama_cpp 0 "40 MB"
+  setup_upstream llama_cpp "$reset_llama" "40 MB"
   python3 scripts/verify-upstream.py --only llama_cpp
   exit 0
 fi
