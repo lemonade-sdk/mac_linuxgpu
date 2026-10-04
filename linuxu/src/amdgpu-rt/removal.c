@@ -8,6 +8,7 @@
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <rt/removal.h>
+#include <rt/device_string.h>
 
 #include "amdgpu.h"
 
@@ -52,6 +53,10 @@ int rt_removal_begin(struct pci_dev *pdev)
 
 	if (!pdev)
 		return -EINVAL;
+	/* First, before anything else can store through it: the VRAM aperture
+	 * the CPU maps (rt/device_string.h), as amdgpu_device_unmap_mmio
+	 * takes it away on Linux. */
+	linuxu_aperture_gone("the device was removed from the bus");
 	linuxu_pci_mark_removed(pdev);
 	ddev = pci_get_drvdata(pdev);
 	if (!ddev)

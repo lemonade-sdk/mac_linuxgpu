@@ -34,6 +34,10 @@
 #include <time.h>
 #include <stdlib.h>
 #include <rt/dext_dma.h>
+/* rt/device_string.h's aperture gate (not the header: it redefines memcpy). */
+extern "C" void linuxu_aperture_set(uintptr_t base, uint64_t size);
+extern "C" void linuxu_aperture_gone(const char *why);
+extern "C" int linuxu_aperture_is_gone(void);
 
 #ifdef LINUXU_DEXT
 
@@ -587,6 +591,7 @@ void *dext_bar0_cpu_map(uint64_t offset, uint64_t size)
 	g_bar0_cpu_base = map->GetAddress();
 	g_bar0_cpu_size = visible_size;
 	g_bar0_cpu_refs = 1;
+	linuxu_aperture_set((uintptr_t)g_bar0_cpu_base, g_bar0_cpu_size);
 	void *address = reinterpret_cast<void *>(g_bar0_cpu_base + offset);
 	dext_dma_release();
 	return address;
@@ -609,6 +614,7 @@ int dext_bar0_cpu_unmap(const void *address)
 		g_bar0_cpu_map = nullptr;
 		g_bar0_cpu_base = 0;
 		g_bar0_cpu_size = 0;
+		linuxu_aperture_set(0, 0);
 	}
 	dext_dma_release();
 	if (map) map->release();

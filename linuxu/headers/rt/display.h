@@ -197,7 +197,8 @@ struct rt_display_present_stats {
 	uint64_t last_bytes, last_copy_gpu_ns, last_latency_ns;	/* the last flipped frame */
 	int32_t error;			/* the worker's first error, 0 */
 	uint32_t full_frames;		/* frames copied whole */
-	uint64_t reserved;
+	uint64_t aperture_ops;		/* CPU string operations on the VRAM aperture
+					 * (rt/device_string.h), all users, since boot */
 };
 
 int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t width,

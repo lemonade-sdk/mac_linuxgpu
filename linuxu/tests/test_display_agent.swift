@@ -171,9 +171,9 @@ let big = presentStats(flipped: 10, bytes: 7680 + 8_294_400, lastBytes: 8_294_40
 m.observe(big)
 check(m.bucketFrames == [1, 0, 0, 1] && m.bucketBytes[3] == 8_294_400 && m.callWallMaxNs == 80_000)
 let measured = m.lines(start: ps, end: big, seconds: 1, refreshHz: 60)
-check(measured.count == 6 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
-      measured[2].contains("8294.4 KB copied") && measured[3].contains("10.00 ms on average") &&
-      measured[5].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
+check(measured.count == 7 && measured[1].contains("PRESENT 25.0 us CPU, 60.0 us wall (max 80.0)") &&
+      measured[2].contains("8294.4 KB copied") && measured[4].contains("10.00 ms on average") &&
+      measured[6].hasPrefix("copy >=4M: 1 frame(s)"), measured.joined(separator: "\n"))
 // Damage: whole pixels, clipped, empty dropped, too many become the frame.
 let r = presentRects([CGRect(x: 10.5, y: 20.2, width: 5, height: 5), CGRect(x: -10, y: -10, width: 20, height: 20),
                       CGRect(x: 3000, y: 0, width: 5, height: 5)], width: 2560, height: 1440)

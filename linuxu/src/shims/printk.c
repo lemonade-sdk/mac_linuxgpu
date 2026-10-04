@@ -517,3 +517,9 @@ void linuxu_wait_report(const char *message)
 {
 	printk(KERN_WARNING "%s", message);
 }
+
+/* rt/device_string.h: the VRAM aperture gated, in the kernel log. */
+void linuxu_aperture_report(const char *why)
+{
+	printk(KERN_WARNING "linuxu: VRAM aperture closed to CPU access: %s\n", why);
+}

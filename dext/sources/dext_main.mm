@@ -7,6 +7,11 @@
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
 #include <rt/fatal.h>
+/* rt/device_string.h's aperture gate (not the header: it redefines memcpy). */
+extern "C" void linuxu_aperture_set(uintptr_t base, uint64_t size);
+extern "C" void linuxu_aperture_gone(const char *why);
+extern "C" int linuxu_aperture_is_gone(void);
+#include <time.h>
 #include "pci_reset_policy.h"
 #include "pci_access_gate.h"
 
@@ -319,6 +324,7 @@ extern "C" int dext_pci_device_present(void)
 
 extern "C" void dext_pci_mark_removed(void)
 {
+	linuxu_aperture_gone("the device was removed from the bus");
 	__atomic_store_n(&g_pci_removed, true, __ATOMIC_RELEASE);
 	g_pci_access.block();
 }
@@ -838,6 +844,26 @@ int dext_mem_write16(uint32_t token, uint64_t offset, uint16_t val)
 	return 0;
 }
 
+/* A register read of all ones may be a device that left the bus (a
+ * Thunderbolt power-off): ask its configuration space, through the kernel,
+ * at most every 10 ms. Gone, the VRAM aperture is gated at once
+ * (rt/device_string.h), before the removal notification arrives: a CPU
+ * store through that mapping to a vanished device panics the Mac. */
+static void dext_mmio_all_ones(IOPCIDevice *pci)
+{
+	static uint64_t last_check;
+	const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+	const uint64_t last = __atomic_load_n(&last_check, __ATOMIC_RELAXED);
+	if (linuxu_aperture_is_gone() || (last && now - last < 10000000ULL))
+		return;
+	__atomic_store_n(&last_check, now, __ATOMIC_RELAXED);
+	uint32_t identity = UINT32_MAX;
+	pci->ConfigurationRead32(0, &identity);
+	const uint16_t vendor = (uint16_t)identity;
+	if (vendor == 0xffff || vendor == 0)
+		linuxu_aperture_gone("a register read all ones and the device no longer answers configuration reads");
+}
+
 int dext_mem_read32(uint32_t token, uint64_t offset, uint32_t *val)
 {
 	dext_pci_operation operation;
@@ -847,8 +873,10 @@ int dext_mem_read32(uint32_t token, uint64_t offset, uint32_t *val)
 		return dext_mem_failure(offset);
 	*val = UINT32_MAX;
 	g_pci->MemoryRead32(mi, offset, val);
-	if (*val == UINT32_MAX)
+	if (*val == UINT32_MAX) {
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
+		dext_mmio_all_ones(g_pci);
+	}
 	return 0;
 }
 
@@ -861,8 +889,10 @@ int dext_mem_read64(uint32_t token, uint64_t offset, uint64_t *val)
 		return dext_mem_failure(offset);
 	*val = UINT64_MAX;
 	g_pci->MemoryRead64(mi, offset, val);
-	if (*val == UINT64_MAX)
+	if (*val == UINT64_MAX) {
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
+		dext_mmio_all_ones(g_pci);
+	}
 	return 0;
 }
 

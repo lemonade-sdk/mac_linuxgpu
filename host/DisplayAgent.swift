@@ -396,6 +396,9 @@ struct PresentStats: Equatable {
     let lastBytes, lastCopyGPUNs, lastLatencyNs: UInt64
     let error: Int32
     let fullFrames: UInt32
+    /// CPU accesses to the VRAM aperture (all users): what a power-off
+    /// could catch in flight (the driver gates them once it knows).
+    let apertureOps: UInt64
 
     init?(_ data: Data) {
         guard data.count >= PresentStats.bytes else { return nil }
@@ -407,6 +410,7 @@ struct PresentStats: Equatable {
         copySubmitNs = u64(48); copyGPUNs = u64(56); latencyNs = u64(64); latencyMaxNs = u64(72)
         lastBytes = u64(80); lastCopyGPUNs = u64(88); lastLatencyNs = u64(96)
         error = Int32(bitPattern: le32(b, 104)); fullFrames = le32(b, 108)
+        apertureOps = u64(112)
     }
 }
 
@@ -462,6 +466,8 @@ struct PresentMeasurement {
                           Double(bytes) / f / 1e3, Double(end.copyJobs - start.copyJobs) / f,
                           Double(end.copySubmitNs - start.copySubmitNs) / f / 1e3,
                           Double(end.copyGPUNs - start.copyGPUNs) / f / 1e6))
+        out.append(String(format: "CPU accesses to the VRAM aperture: %.1f per flipped frame",
+                          Double(end.apertureOps &- start.apertureOps) / f))
         out.append(String(format: "capture to scanout: %.2f ms on average, %.2f ms at most (since OUTPUT); %.2f frame(s) at %.3f Hz",
                           Double(end.latencyNs - start.latencyNs) / f / 1e6, Double(end.latencyMaxNs) / 1e6,
                           Double(end.latencyNs - start.latencyNs) / f / 1e9 * refreshHz, refreshHz))

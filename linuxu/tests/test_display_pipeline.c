@@ -27,6 +27,8 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_mode_config.h>
 #include <rt/dart.h>
 #include <rt/display.h>
+#include <rt/device_string.h>
+#include <rt/removal.h>
 #include <rt/surface.h>
 
 #include "amdgpu.h"
@@ -344,6 +346,84 @@ int main(void)
 	for (int i = 0; i < 5000 && !surf.releases; i++)
 		usleep(1000);
 	CHECK(surf.releases == 1);
+	/* The GPU powered off while the display is live: from the removal on,
+	 * nothing reaches the hardware. No register write, no SDMA copy, no
+	 * store into the CPU's VRAM aperture; presents fail, the output stops
+	 * and nothing is committed. */
+	{
+		struct fake_surface live;
+		struct rt_surface *lsurf;
+		struct cs_fixture_stats at_removal, later;
+		struct linuxu_aperture_stats ap0, ap1;
+		static uint8_t aperture[1 << 16];
+		const struct rt_surface_rect win = { 64, 64, 256, 128 };
+		unsigned long regs;
+		uint32_t lhandle;
+		uint64_t flipped;
+
+		r = rt_display_output(pdev, "HDMI-A-1", W, H, 60000, &report);
+		CHECK(r == 0 && report.showing);
+		fake_init(&live);
+		fake_fill(&live, 0x00e00000u, NULL);
+		CHECK(rt_surface_import(pdev, live.segment, 3, live.size, W, H, PITCH, &provider, &lsurf) == 0);
+		lhandle = rt_surface_add(1, lsurf);
+		CHECK(lhandle);
+		linuxu_aperture_set((uintptr_t)aperture, sizeof(aperture));
+		regs = __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED);
+		cs_fixture_stats(&at_removal);
+		for (int f = 0; f < 4; f++) {
+			CHECK(rt_display_stats(pdev, &st) == 0);
+			flipped = st.frames_flipped;
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+						 ktime_get_ns(), &st) == 0);
+			st = wait_flipped(pdev, flipped + 1);
+		}
+		/* A frame queued and the device leaves the bus. */
+		CHECK(rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+					 ktime_get_ns(), &st) == 0);
+		/* Live: flips write registers and the copies run on SDMA. */
+		cs_fixture_stats(&later);
+		CHECK(__atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED) > regs);
+		CHECK(later.copies > at_removal.copies);
+		CHECK(!rt_removal_begin(pdev));
+		CHECK(linuxu_aperture_is_gone());
+		usleep(20000);	/* a copy or commit already past its check finishes */
+		regs = __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED);
+		cs_fixture_stats(&at_removal);
+		linuxu_aperture_stats(&ap0);
+		memset(aperture, 0x5a, sizeof(aperture));
+		for (int f = 0; f < 8; f++) {
+			/* DMUB commands and kmap'd VRAM writes go through these. */
+			linuxu_device_memcpy(aperture + 64, &win, sizeof(win));
+			linuxu_device_memset(aperture + 4096, 0, 256);
+			r = rt_display_present(pdev, rt_surface_get_hold(1, lhandle), &win, 1,
+					       ktime_get_ns(), &st);
+			CHECK(r == 0 || r == -ENODEV);
+			usleep(17000);
+		}
+		{
+			uint32_t word = 0;
+
+			linuxu_device_memcpy(&word, aperture, sizeof(word));
+			CHECK(word == UINT32_MAX);	/* a vanished device reads all ones */
+		}
+		CHECK(rt_display_off(pdev, &report) == 0);
+		CHECK(rt_surface_remove(1, lhandle) == 0);
+		usleep(50000);
+		cs_fixture_stats(&later);
+		linuxu_aperture_stats(&ap1);
+		for (size_t i = 0; i < sizeof(aperture); i++)
+			CHECK(aperture[i] == 0x5a);
+		printf("pipeline: after removal: %lu register writes, %lu SDMA copies, %llu aperture "
+		       "operations refused\n", __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED) - regs,
+		       later.copies - at_removal.copies, ap1.skipped - ap0.skipped);
+		CHECK(__atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED) == regs);
+		CHECK(later.copies == at_removal.copies && later.sdma_ibs == at_removal.sdma_ibs);
+		CHECK(ap1.skipped - ap0.skipped >= 17);
+		linuxu_aperture_set(0, 0);
+		rt_removal_end();
+	}
+
 	vblank_run = 0;
 	pthread_join(vblank, NULL);
 	cs_fixture_stats(&after);

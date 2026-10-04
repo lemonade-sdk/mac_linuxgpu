@@ -32,6 +32,7 @@
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <rt/display.h>
+#include <rt/device_string.h>
 #include <rt/surface.h>
 #include <rt/removal.h>
 
@@ -1719,6 +1720,12 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 	if (stats)
 		*stats = o->stats;
 	spin_unlock_irqrestore(&o->lock, flags);
+	if (stats) {
+		struct linuxu_aperture_stats ap;
+
+		linuxu_aperture_stats(&ap);
+		stats->aperture_ops = ap.stores + ap.loads;
+	}
 	if (!surface)
 		output_kick(o);	/* under rt_display_lock: o cannot go meanwhile */
 	mutex_unlock(&rt_display_lock);
@@ -1740,9 +1747,13 @@ int rt_display_stats(struct pci_dev *pdev, struct rt_display_present_stats *stat
 	mutex_lock(&rt_display_lock);
 	o = dev && rt_display.dev == dev ? rt_display.output : NULL;
 	if (o) {
+		struct linuxu_aperture_stats ap;
+
 		spin_lock_irqsave(&o->lock, flags);
 		*stats = o->stats;
 		spin_unlock_irqrestore(&o->lock, flags);
+		linuxu_aperture_stats(&ap);
+		stats->aperture_ops = ap.stores + ap.loads;
 		ret = 0;
 	}
 	mutex_unlock(&rt_display_lock);
