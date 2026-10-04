@@ -21,6 +21,7 @@
 #include <drm/drm_file.h>
 #include <drm/drm_ioctl.h>
 #include <rt/chrdev.h>
+#include <rt/lx_timing.h>
 #include <rt/lx_files.h>
 #include <rt/process.h>
 #include "lx_internal.h"
@@ -62,16 +63,17 @@ struct lx_map {
 
 struct lx_async {
 	struct lx_async *next;
+	struct lx_async *queued_next;	/* waiting for a worker */
 	struct rt_lx_client *c;
 	uint64_t token;
 	int fd;
 	uint32_t cmd;
 	void *frame;
 	size_t frame_bytes;
+	uint64_t queued_ns;	/* when the request arrived (rt/lx_timing.h) */
 	rt_lx_done_fn done;
 	void *ctx;
-	pthread_t thread;
-	bool started, finished, joined;
+	bool finished;
 	int64_t result;
 	void *rep;
 	size_t reply_bytes;
@@ -91,6 +93,15 @@ struct rt_lx_client {
 	unsigned int calls;		/* calls inside the process */
 	struct lx_async *async;
 	unsigned int async_count;
+	/* The workers that run async calls: they stay for the client's next
+	 * calls (starting a thread per wait costs more than the wait's round
+	 * trip), at most MLG_LX_MAX_ASYNC, as many as calls ever overlapped. */
+	struct lx_async *queued, **queued_tail;
+	unsigned int queued_count;	/* calls no worker took yet */
+	unsigned int idle_workers;	/* workers waiting for a call */
+	unsigned int workers;
+	pthread_t worker_threads[MLG_LX_MAX_ASYNC];
+	pthread_cond_t work;
 	uint64_t next_token;
 	struct lx_map *maps;
 	uint64_t next_map;
@@ -120,15 +131,19 @@ int rt_lx_client_create(struct pci_dev *pdev, int pid, const char *comm,
 	c->pending_va = LX_PENDING_VA;
 	pthread_mutex_init(&c->lock, NULL);
 	pthread_cond_init(&c->changed, NULL);
+	pthread_cond_init(&c->work, NULL);
+	c->queued_tail = &c->queued;
 	pthread_mutex_init(&c->arena, NULL);
 	c->proc = linuxu_process_create(pid, comm && comm[0] ? comm : "lx-client");
 	if (!c->proc) {
 		pthread_mutex_destroy(&c->arena);
+		pthread_cond_destroy(&c->work);
 		pthread_cond_destroy(&c->changed);
 		pthread_mutex_destroy(&c->lock);
 		kfree(c);
 		return -ENOMEM;
 	}
+	rt_lx_timing_register(&pdev->dev);
 	*out = c;
 	return 0;
 }
@@ -540,11 +555,15 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 	uint8_t *out;
 	long ret;
 	int r;
+	uint64_t t0 = rt_lx_time_ns(), t1;
 
 	(void)frame_bytes;
 	r = pages_acquire(c, segs, head->nsegs, &pages);
 	if (r)
 		return r;
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_PAGES, t1 - t0);
+	t0 = t1;
 	for (uint32_t i = 0; i < head->nsegs; ++i)
 		if (segs[i].dir & MLG_LX_SEG_IN)
 			pages_copy(&pages, segs[i].va,
@@ -556,12 +575,18 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 			(uint64_t)INT64_MAX : now + head->timeout_ns;
 		pages_copy(&pages, head->timeout_va, &deadline, sizeof(deadline), true);
 	}
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_COPYIN, t1 - t0);
+	t0 = t1;
 	r = linuxu_process_enter(c->proc, &saved);
 	if (r) {
 		pages_release(c, &pages);
 		return r;
 	}
 	file = fget(fd);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_ENTER, t1 - t0);
+	t0 = t1;
 	if (!file) {
 		ret = -EBADF;
 	} else {
@@ -573,10 +598,16 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 			ret = -ENOTTY;
 		else
 			ret = file->f_op->unlocked_ioctl(file, cmd, (unsigned long)head->arg);
+		t1 = rt_lx_time_ns();
+		rt_lx_timing_add(cmd, RT_LX_HOP_IOCTL, t1 - t0);
+		t0 = t1;
 		fput(file);
 	}
 	linuxu_process_leave(&saved);
 	ret = lx_errno(ret);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_LEAVE, t1 - t0);
+	t0 = t1;
 
 	/* Linux leaves whatever the call wrote in user memory, failed or
 	 * not: every OUT segment goes back. */
@@ -595,7 +626,11 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 		rh.out_segments++;
 	}
 	memcpy(rep, &rh, sizeof(rh));
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_COPYOUT, t1 - t0);
+	t0 = t1;
 	pages_release(c, &pages);
+	rt_lx_timing_add(cmd, RT_LX_HOP_RELEASE, rt_lx_time_ns() - t0);
 	*reply_bytes = rh.total_bytes;
 	*result = ret;
 	return 0;
@@ -605,7 +640,7 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 		const void *frame, size_t frame_bytes, void *rep,
 		size_t rep_cap, size_t *reply_bytes, int64_t *result)
 {
-	uint64_t out_bytes = 0;
+	uint64_t out_bytes = 0, t0 = rt_lx_time_ns(), t1;
 	void *copy;
 	int r;
 
@@ -627,22 +662,27 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 		r = -ENOSPC;
 	if (!r)
 		r = call_begin(c);
+	t1 = rt_lx_time_ns();
+	rt_lx_timing_add(cmd, RT_LX_HOP_FRAME, t1 - t0);
 	if (!r) {
 		r = run_ioctl(c, fd, cmd, copy, frame_bytes, out_bytes, rep, reply_bytes, result);
+		t1 = rt_lx_time_ns();
 		call_end(c);
 	}
 	kvfree(copy);
+	rt_lx_timing_add(cmd, RT_LX_HOP_FINISH, rt_lx_time_ns() - t1);
 	return r;
 }
 
 /* ---- async ---- */
 
-static void *async_main(void *arg)
+static void async_run(struct lx_async *a)
 {
-	struct lx_async *a = arg;
 	struct rt_lx_client *c = a->c;
 	uint64_t out_bytes = 0;
 	int consumed = 0;
+
+	rt_lx_timing_add(a->cmd, RT_LX_HOP_SPAWN, rt_lx_time_ns() - a->queued_ns);
 
 	a->status = mlg_lx_frame_check(a->frame, a->frame_bytes, a->cmd, &out_bytes);
 	if (!a->status) {
@@ -682,37 +722,49 @@ static void *async_main(void *arg)
 	c->calls--;
 	pthread_cond_broadcast(&c->changed);
 	pthread_mutex_unlock(&c->lock);
+}
+
+/* A worker: runs queued calls until the client goes away. */
+static void *async_worker(void *arg)
+{
+	struct rt_lx_client *c = arg;
+
+	pthread_mutex_lock(&c->lock);
+	for (;;) {
+		struct lx_async *a = c->queued;
+
+		if (a) {
+			c->queued = a->queued_next;
+			if (!c->queued)
+				c->queued_tail = &c->queued;
+			c->queued_count--;
+			pthread_mutex_unlock(&c->lock);
+			async_run(a);
+			pthread_mutex_lock(&c->lock);
+			continue;
+		}
+		if (c->dying)
+			break;
+		c->idle_workers++;
+		pthread_cond_wait(&c->work, &c->lock);
+		c->idle_workers--;
+	}
+	pthread_mutex_unlock(&c->lock);
 	return NULL;
 }
 
-/* Join finished workers and drop delivered results. Caller holds c->lock;
- * the lock is dropped around joins. */
+/* Drop finished calls whose results were delivered. Caller holds c->lock. */
 static void async_reap_locked(struct rt_lx_client *c)
 {
-	for (bool again = true; again;) {
-		again = false;
-		for (struct lx_async **link = &c->async; *link; link = &(*link)->next) {
-			struct lx_async *a = *link;
+	for (struct lx_async **link = &c->async; *link;) {
+		struct lx_async *a = *link;
 
-			if (!a->finished)
-				continue;
-			if (!a->joined) {
-				pthread_t thread = a->thread;
-
-				a->joined = true;
-				pthread_mutex_unlock(&c->lock);
-				pthread_join(thread, NULL);
-				pthread_mutex_lock(&c->lock);
-				again = true;
-				break;
-			}
-			if (!a->rep && !a->done) {
-				*link = a->next;
-				c->async_count--;
-				kfree(a);
-				again = true;
-				break;
-			}
+		if (a->finished && !a->rep && !a->done) {
+			*link = a->next;
+			c->async_count--;
+			kfree(a);
+		} else {
+			link = &a->next;
 		}
 	}
 }
@@ -740,6 +792,7 @@ int rt_lx_ioctl_async(struct rt_lx_client *c, int fd, uint32_t cmd,
 	}
 	memcpy(a->frame, frame, frame_bytes);
 	a->frame_bytes = frame_bytes;
+	a->queued_ns = rt_lx_time_ns();
 	a->c = c;
 	a->fd = fd;
 	a->cmd = cmd;
@@ -751,19 +804,26 @@ int rt_lx_ioctl_async(struct rt_lx_client *c, int fd, uint32_t cmd,
 		r = -ESRCH;
 	} else if (c->async_count >= MLG_LX_MAX_ASYNC) {
 		r = -EAGAIN;
+	} else if (c->queued_count + 1 > c->idle_workers &&
+		   (c->workers >= MLG_LX_MAX_ASYNC ||
+		    pthread_create(&c->worker_threads[c->workers], NULL, async_worker, c))) {
+		/* Every worker is busy and no other can start. Not reached while
+		 * fewer than MLG_LX_MAX_ASYNC calls are out (one worker each). */
+		r = -EAGAIN;
 	} else {
+		if (c->queued_count + 1 > c->idle_workers)
+			c->workers++;	/* the one just started takes it */
+		else
+			pthread_cond_signal(&c->work);
 		a->token = c->next_token++;
 		c->calls++;
-		r = pthread_create(&a->thread, NULL, async_main, a) ? -EAGAIN : 0;
-		if (r) {
-			c->calls--;
-		} else {
-			a->started = true;
-			a->next = c->async;
-			c->async = a;
-			c->async_count++;
-			*token = a->token;
-		}
+		*c->queued_tail = a;
+		c->queued_tail = &a->queued_next;
+		c->queued_count++;
+		a->next = c->async;
+		c->async = a;
+		c->async_count++;
+		*token = a->token;
 	}
 	pthread_mutex_unlock(&c->lock);
 	if (r) {
@@ -816,6 +876,18 @@ unsigned int rt_lx_async_outstanding(struct rt_lx_client *c)
 	pthread_mutex_lock(&c->lock);
 	async_reap_locked(c);
 	n = c->async_count;
+	pthread_mutex_unlock(&c->lock);
+	return n;
+}
+
+unsigned int rt_lx_async_workers(struct rt_lx_client *c)
+{
+	unsigned int n;
+
+	if (!c)
+		return 0;
+	pthread_mutex_lock(&c->lock);
+	n = c->workers;
 	pthread_mutex_unlock(&c->lock);
 	return n;
 }
@@ -1185,6 +1257,16 @@ void rt_lx_client_destroy(struct rt_lx_client *c)
 		a->done = NULL;
 	}
 	async_reap_locked(c);
+	/* No call is queued (calls counts them): the workers leave. */
+	pthread_cond_broadcast(&c->work);
+	for (unsigned int i = 0; i < c->workers; i++) {
+		pthread_t thread = c->worker_threads[i];
+
+		pthread_mutex_unlock(&c->lock);
+		pthread_join(thread, NULL);
+		pthread_mutex_lock(&c->lock);
+	}
+	c->workers = 0;
 	while (c->maps) {
 		struct lx_map *m = c->maps;
 
@@ -1198,6 +1280,7 @@ void rt_lx_client_destroy(struct rt_lx_client *c)
 	linuxu_process_exit(c->proc);
 	mmu_notifier_synchronize();
 	pthread_mutex_destroy(&c->arena);
+	pthread_cond_destroy(&c->work);
 	pthread_cond_destroy(&c->changed);
 	pthread_mutex_destroy(&c->lock);
 	kfree(c);

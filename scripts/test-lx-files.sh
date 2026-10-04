@@ -10,7 +10,7 @@ trap 'rm -rf "$test_dir"' EXIT
 flags=(-w -std=gnu11 -g -O1 -fsanitize=address,undefined
   -fno-sanitize-recover=all -ffunction-sections -fdata-sections -Ilinuxu/headers)
 clang "${flags[@]}" linuxu/tests/test_lx_files.c \
-  linuxu/src/amdgpu-rt/{lx_files,lx_frame,lx_describe}.c \
+  linuxu/src/amdgpu-rt/{lx_files,lx_frame,lx_describe,lx_timing}.c \
   linuxu/src/shims/{process,task,kthread,fd,chrdev,module,dma_fence,timekeeping,printk}.c \
   third_party/linux/lib/rbtree.c \
   linuxu/src/mm/{mm,mmu_notifier,uaccess,page}.c linuxu/src/kmem/slab.c linuxu/src/dart/dart.c \

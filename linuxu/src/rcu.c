@@ -1,6 +1,7 @@
 /* Cross-thread RCU grace periods for the one-device DriverKit runtime. */
 #include <pthread.h>
 #include <stdint.h>
+#include <time.h>
 #include <linux/rcupdate.h>
 #include <rt/fatal.h>
 
@@ -33,34 +34,62 @@ static uintptr_t rcu_tls_get(void) { return rcu_tls_state; }
 static void rcu_tls_set(uintptr_t value) { rcu_tls_state = value; }
 #endif
 
-/* TLS state packs nesting in bits 1.. and the reader epoch in bit 0. */
+/* TLS state packs nesting in bits 1.. and the reader epoch in bit 0.
+ *
+ * Readers take no lock: an outermost rcu_read_lock counts itself in its
+ * epoch's counter and checks the epoch did not flip meanwhile (else it
+ * moves to the new one), and rcu_read_unlock uncounts itself. A grace
+ * period flips the epoch and waits for the old epoch's counter to drain;
+ * a reader that empties a counter wakes it only when one is waiting.
+ * With sequentially consistent atomics on both sides, a reader the grace
+ * period's check missed sees the flip in its own recheck. Readers are on
+ * every fence, syncobj and scheduler path, so they must not serialize on a
+ * mutex or signal a condition per call. */
 static pthread_mutex_t rcu_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t rcu_changed = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t rcu_pending = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t rcu_gp_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int rcu_epoch;
 static uint64_t rcu_readers[2];
+static unsigned int rcu_gp_waiting;
 static struct rcu_head *rcu_first;
 static struct rcu_head *rcu_last;
 static uint64_t rcu_enqueued;
 static uint64_t rcu_completed;
 static int rcu_worker_started;
+static int rcu_worker_idle;
 static pthread_t rcu_worker;
+
+/* Callbacks wait this long before their grace period, so the ones queued
+ * meanwhile share it (and the worker's wakeup). Linux batches the same. */
+#define RCU_BATCH_NS 1000000ull
 
 void rcu_read_lock(void)
 {
 	uintptr_t state = rcu_tls_get();
 	uintptr_t nesting = state >> 1;
+	unsigned int epoch;
+
 	if (nesting) {
 		if (nesting == (UINTPTR_MAX >> 1))
 			LINUXU_FATAL("rcu_read_lock nesting overflow");
 		rcu_tls_set(((nesting + 1) << 1) | (state & 1));
 		return;
 	}
-	pthread_mutex_lock(&rcu_lock);
-	rcu_readers[rcu_epoch]++;
-	rcu_tls_set(((uintptr_t)1 << 1) | rcu_epoch);
-	pthread_mutex_unlock(&rcu_lock);
+	for (;;) {
+		epoch = __atomic_load_n(&rcu_epoch, __ATOMIC_SEQ_CST);
+		__atomic_add_fetch(&rcu_readers[epoch], 1, __ATOMIC_SEQ_CST);
+		if (__atomic_load_n(&rcu_epoch, __ATOMIC_SEQ_CST) == epoch)
+			break;
+		/* Flipped meanwhile: count in the new epoch instead. */
+		if (!__atomic_sub_fetch(&rcu_readers[epoch], 1, __ATOMIC_SEQ_CST) &&
+		    __atomic_load_n(&rcu_gp_waiting, __ATOMIC_SEQ_CST)) {
+			pthread_mutex_lock(&rcu_lock);
+			pthread_cond_broadcast(&rcu_changed);
+			pthread_mutex_unlock(&rcu_lock);
+		}
+	}
+	rcu_tls_set(((uintptr_t)1 << 1) | epoch);
 }
 
 void rcu_read_unlock(void)
@@ -68,6 +97,8 @@ void rcu_read_unlock(void)
 	uintptr_t state = rcu_tls_get();
 	uintptr_t nesting = state >> 1;
 	unsigned int epoch = (unsigned int)(state & 1);
+	uint64_t left;
+
 	if (!nesting)
 		LINUXU_FATAL("rcu_read_unlock without rcu_read_lock");
 	if (nesting > 1) {
@@ -75,16 +106,14 @@ void rcu_read_unlock(void)
 		return;
 	}
 	rcu_tls_set(0);
-	pthread_mutex_lock(&rcu_lock);
-	if (!rcu_readers[epoch]) {
-		/* Do not park with the grace-period lock held. */
-		pthread_mutex_unlock(&rcu_lock);
+	left = __atomic_sub_fetch(&rcu_readers[epoch], 1, __ATOMIC_SEQ_CST);
+	if (left == UINT64_MAX)
 		LINUXU_FATAL("rcu reader count underflow");
-	}
-	rcu_readers[epoch]--;
-	if (!rcu_readers[epoch])
+	if (!left && __atomic_load_n(&rcu_gp_waiting, __ATOMIC_SEQ_CST)) {
+		pthread_mutex_lock(&rcu_lock);
 		pthread_cond_broadcast(&rcu_changed);
-	pthread_mutex_unlock(&rcu_lock);
+		pthread_mutex_unlock(&rcu_lock);
+	}
 }
 
 int rcu_read_lock_count(void) { return (int)(rcu_tls_get() >> 1); }
@@ -100,10 +129,15 @@ static void rcu_grace_period(void)
 	pthread_mutex_lock(&rcu_lock);
 	head = rcu_first;
 	rcu_first = rcu_last = NULL;
-	old = rcu_epoch;
-	rcu_epoch ^= 1;
-	while (rcu_readers[old])
+	old = __atomic_load_n(&rcu_epoch, __ATOMIC_SEQ_CST);
+	__atomic_store_n(&rcu_epoch, old ^ 1, __ATOMIC_SEQ_CST);
+	/* Before the check below: a reader that drains the counter after it
+	 * sees this and wakes the wait (it takes rcu_lock, held until the
+	 * wait releases it). */
+	__atomic_store_n(&rcu_gp_waiting, 1, __ATOMIC_SEQ_CST);
+	while (__atomic_load_n(&rcu_readers[old], __ATOMIC_SEQ_CST))
 		pthread_cond_wait(&rcu_changed, &rcu_lock);
+	__atomic_store_n(&rcu_gp_waiting, 0, __ATOMIC_SEQ_CST);
 	pthread_mutex_unlock(&rcu_lock);
 	while (head) {
 		next = head->next;
@@ -121,9 +155,17 @@ static void *rcu_worker_main(void *unused)
 {
 	(void)unused;
 	for (;;) {
+		struct timespec batch = { 0, (long)RCU_BATCH_NS };
+
 		pthread_mutex_lock(&rcu_lock);
-		while (!rcu_first)
+		while (!rcu_first) {
+			rcu_worker_idle = 1;
 			pthread_cond_wait(&rcu_pending, &rcu_lock);
+			rcu_worker_idle = 0;
+		}
+		/* Let the callbacks queued in the next moment share this grace
+		 * period. A barrier or synchronize_rcu runs its own. */
+		(void)pthread_cond_timedwait_relative_np(&rcu_pending, &rcu_lock, &batch);
 		pthread_mutex_unlock(&rcu_lock);
 		rcu_grace_period();
 	}
@@ -164,7 +206,9 @@ void call_rcu(struct rcu_head *head, void (*func)(struct rcu_head *head))
 	rcu_enqueued++;
 	/* Startup failure leaves callbacks queued for a later retry or barrier. */
 	(void)rcu_start_worker_locked();
-	pthread_cond_signal(&rcu_pending);
+	/* Only an idle worker needs the wake; a busy one takes this batch next. */
+	if (rcu_worker_idle)
+		pthread_cond_signal(&rcu_pending);
 	pthread_mutex_unlock(&rcu_lock);
 }
 
