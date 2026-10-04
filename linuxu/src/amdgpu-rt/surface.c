@@ -17,6 +17,7 @@
 
 #include "amdgpu.h"
 #include "amdgpu_dma_buf.h"
+#include "sdma_v6_0_0_pkt_open.h"	/* the packet sdma_v7_0.c builds with too */
 
 /* The exporter's state: the platform's mapping, released with the dma-buf. */
 struct surface_buffer {
@@ -260,6 +261,15 @@ uint64_t rt_surface_gpu_address(const struct rt_surface *surface)
  * for a range longer than copy_max_bytes), so a frame's damage is a few
  * jobs, not one per row. */
 #define COPY_PACKETS_PER_JOB	1024u
+/* SDMA's linear sub-window copy (COPY sub-opcode 4): a rectangle between
+ * two pitched buffers in one 13-dword packet rather than a copy per row.
+ * The fields as Mesa's ac_emit_sdma_copy_linear_sub_window writes them:
+ * element size log2, x and y in elements, pitch - 1 in elements (shifted
+ * by 16 from SDMA 7.0), slice pitch - 1, width - 1 and height - 1. */
+#define SUBWIN_DW		13u
+#define SUBWIN_DIM_MAX		16384u	/* x, y, width, height: 14 bits */
+#define SUBWIN_PITCH_MAX	65536u	/* SDMA 7: 16 bits of pitch - 1, in elements */
+#define COPY_JOB_DW		(COPY_PACKETS_PER_JOB * SUBWIN_DW)
 
 struct copy_batch {
 	struct amdgpu_device *adev;
@@ -290,6 +300,38 @@ static int batch_submit(struct copy_batch *b)
 	return 0;
 }
 
+/* A job with room for @dwords more (and the padding): the current one, or
+ * a new one once it is full. */
+static int batch_room(struct copy_batch *b, uint32_t dwords)
+{
+	int r;
+
+	if (b->job && (b->packets == COPY_PACKETS_PER_JOB ||
+		       b->job->ibs[0].length_dw + dwords + 8 > COPY_JOB_DW))
+		batch_submit(b);
+	if (b->job)
+		return 0;
+	r = amdgpu_job_alloc_with_ib(b->adev, b->entity ? b->entity : &b->adev->mman.default_entity.base,
+				     AMDGPU_FENCE_OWNER_UNDEFINED, COPY_JOB_DW * 4, AMDGPU_IB_POOL_DELAYED,
+				     &b->job, AMDGPU_KERNEL_JOB_ID_TTM_COPY_BUFFER);
+	if (r) {
+		b->job = NULL;
+		return r;
+	}
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+		if (!b->deps[i])
+			continue;
+		/* The reference is the job's, even on failure. */
+		r = drm_sched_job_add_dependency(&b->job->base, dma_fence_get(b->deps[i]));
+		if (r) {
+			amdgpu_job_free(b->job);
+			b->job = NULL;
+			return r;
+		}
+	}
+	return 0;
+}
+
 static int batch_copy(struct copy_batch *b, uint64_t src, uint64_t dst, uint64_t bytes)
 {
 	const struct amdgpu_buffer_funcs *funcs = b->adev->mman.buffer_funcs;
@@ -298,38 +340,77 @@ static int batch_copy(struct copy_batch *b, uint64_t src, uint64_t dst, uint64_t
 	while (bytes) {
 		uint32_t chunk = bytes > funcs->copy_max_bytes ? funcs->copy_max_bytes : (uint32_t)bytes;
 
-		if (!b->job) {
-			r = amdgpu_job_alloc_with_ib(b->adev, b->entity ? b->entity :
-						     &b->adev->mman.default_entity.base,
-						     AMDGPU_FENCE_OWNER_UNDEFINED,
-						     ALIGN(COPY_PACKETS_PER_JOB * funcs->copy_num_dw, 8) * 4,
-						     AMDGPU_IB_POOL_DELAYED, &b->job,
-						     AMDGPU_KERNEL_JOB_ID_TTM_COPY_BUFFER);
-			if (r) {
-				b->job = NULL;
-				return r;
-			}
-			for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
-				if (!b->deps[i])
-					continue;
-				/* The reference is the job's, even on failure. */
-				r = drm_sched_job_add_dependency(&b->job->base, dma_fence_get(b->deps[i]));
-				if (r) {
-					amdgpu_job_free(b->job);
-					b->job = NULL;
-					return r;
-				}
-			}
-		}
+		r = batch_room(b, funcs->copy_num_dw);
+		if (r)
+			return r;
 		amdgpu_emit_copy_buffer(b->adev, &b->job->ibs[0], src, dst, chunk, 0);
 		b->stats->bytes += chunk;
 		src += chunk;
 		dst += chunk;
 		bytes -= chunk;
-		if (++b->packets == COPY_PACKETS_PER_JOB)
-			batch_submit(b);
+		b->packets++;
 	}
 	return 0;
+}
+
+/* Whether the engines take sub-window copies of @w x @h pixels between
+ * pitches @src_pitch and @dst_pitch (bytes) at these addresses: SDMA 7.0
+ * and later (the packet layout this emits; earlier engines get a copy per
+ * row), within the packet's fields. */
+static bool subwindow_fits(struct amdgpu_device *adev, uint64_t src, uint32_t src_pitch, uint64_t dst,
+			   uint32_t dst_pitch, uint32_t w, uint32_t h)
+{
+	return amdgpu_ip_version(adev, SDMA0_HWIP, 0) >= IP_VERSION(7, 0, 0) && !(src & 3) && !(dst & 3) &&
+	       !(src_pitch & 3) && !(dst_pitch & 3) && w && h && w <= SUBWIN_DIM_MAX && h <= SUBWIN_DIM_MAX &&
+	       src_pitch / 4 <= SUBWIN_PITCH_MAX && dst_pitch / 4 <= SUBWIN_PITCH_MAX && w <= src_pitch / 4 &&
+	       w <= dst_pitch / 4;
+}
+
+/* @w x @h pixels (4 bytes) from @src to @dst, rows @src_pitch and @dst_pitch
+ * bytes apart, in one sub-window packet (subwindow_fits). */
+static int batch_rect(struct copy_batch *b, uint64_t src, uint32_t src_pitch, uint64_t dst,
+		      uint32_t dst_pitch, uint32_t w, uint32_t h)
+{
+	struct amdgpu_ib *ib;
+	int r = batch_room(b, SUBWIN_DW);
+
+	if (r)
+		return r;
+	ib = &b->job->ibs[0];
+	ib->ptr[ib->length_dw++] = SDMA_PKT_COPY_LINEAR_SUBWIN_HEADER_OP(SDMA_OP_COPY) |
+				   SDMA_PKT_COPY_LINEAR_SUBWIN_HEADER_SUB_OP(SDMA_SUBOP_COPY_LINEAR_SUB_WIND) |
+				   SDMA_PKT_COPY_LINEAR_SUBWIN_HEADER_ELEMENTSIZE(2);
+	ib->ptr[ib->length_dw++] = lower_32_bits(src);
+	ib->ptr[ib->length_dw++] = upper_32_bits(src);
+	ib->ptr[ib->length_dw++] = 0;					/* x, y */
+	ib->ptr[ib->length_dw++] = (src_pitch / 4 - 1) << 16;		/* z, pitch - 1 */
+	ib->ptr[ib->length_dw++] = src_pitch / 4 * h - 1;		/* slice pitch - 1 */
+	ib->ptr[ib->length_dw++] = lower_32_bits(dst);
+	ib->ptr[ib->length_dw++] = upper_32_bits(dst);
+	ib->ptr[ib->length_dw++] = 0;
+	ib->ptr[ib->length_dw++] = (dst_pitch / 4 - 1) << 16;
+	ib->ptr[ib->length_dw++] = dst_pitch / 4 * h - 1;
+	ib->ptr[ib->length_dw++] = (w - 1) | (h - 1) << 16;		/* width - 1, height - 1 */
+	ib->ptr[ib->length_dw++] = 0;					/* depth - 1, cache policies */
+	b->stats->bytes += (uint64_t)w * 4 * h;
+	b->packets++;
+	return 0;
+}
+
+/* A rectangle of @w x @h pixels: one sub-window packet when the engine
+ * takes it, else a range per row (whole rows of equal pitch as one range). */
+static int batch_pixels(struct copy_batch *b, uint64_t src, uint32_t src_pitch, uint64_t dst,
+			uint32_t dst_pitch, uint32_t w, uint32_t h, uint32_t frame_width)
+{
+	int r = 0;
+
+	if (w == frame_width && src_pitch == dst_pitch)
+		return batch_copy(b, src, dst, (uint64_t)(h - 1) * src_pitch + (uint64_t)w * 4);
+	if (subwindow_fits(b->adev, src, src_pitch, dst, dst_pitch, w, h))
+		return batch_rect(b, src, src_pitch, dst, dst_pitch, w, h);
+	for (uint32_t row = 0; !r && row < h; row++)
+		r = batch_copy(b, src + (uint64_t)row * src_pitch, dst + (uint64_t)row * dst_pitch, (uint64_t)w * 4);
+	return r;
 }
 
 int rt_surface_copy(struct rt_surface *src, struct drm_gem_object *dst, uint32_t dst_pitch,
@@ -695,10 +776,7 @@ void rt_surface_engines_fini(struct rt_surface_engines *e)
 	memset(e, 0, sizeof(*e));
 }
 
-/* Rows of one rectangle as copy ranges: whole rows with equal pitches in
- * bands of up to 64 rows, else one range per row. */
-#define COPY_BAND_ROWS	64u
-
+/* A rectangle's bytes, clipped to the surface. */
 static uint64_t rect_bytes(const struct rt_surface *src, uint32_t dst_pitch,
 			   const struct rt_surface_rect *r, uint32_t *x, uint32_t *y,
 			   uint32_t *w, uint32_t *h)
@@ -786,18 +864,9 @@ int rt_surface_frame_submit(struct rt_surface *src, struct drm_gem_object *dst, 
 
 		if (stats)
 			stats->rows += d->height;
-		if (!d->x && d->width == src->width) {
-			r = batch_copy(&batch[0], plan->prev_address + (u64)plan->vram[i].src_y * dst_pitch,
-				       dst_address + (u64)d->y * dst_pitch,
-				       (u64)(d->height - 1) * dst_pitch + (u64)d->width * 4);
-		} else {
-			for (uint32_t row = 0; !r && row < d->height; row++)
-				r = batch_copy(&batch[0],
-					       plan->prev_address + (u64)(plan->vram[i].src_y + row) * dst_pitch +
-					       (u64)d->x * 4,
-					       dst_address + (u64)(d->y + row) * dst_pitch + (u64)d->x * 4,
-					       (u64)d->width * 4);
-		}
+		r = batch_pixels(&batch[0], plan->prev_address + (u64)plan->vram[i].src_y * dst_pitch + (u64)d->x * 4,
+				 dst_pitch, dst_address + (u64)d->y * dst_pitch + (u64)d->x * 4, dst_pitch,
+				 d->width, d->height, src->width);
 		local[0].vram_bytes += local[0].bytes - before;
 		local[0].bytes = before;
 	}
@@ -819,17 +888,18 @@ int rt_surface_frame_submit(struct rt_surface *src, struct drm_gem_object *dst, 
 		if (stats)
 			stats->rows += h;
 		for (uint32_t row = y; !r && row < y + h;) {
-			uint32_t rows = 1;
-			uint64_t bytes = (uint64_t)w * 4;
+			uint32_t rows = y + h - row;
 
-			if (!x && w == src->width && src->pitch == dst_pitch) {
-				rows = min_t(u32, COPY_BAND_ROWS, y + h - row);
-				bytes = (uint64_t)(rows - 1) * src->pitch + (uint64_t)w * 4;
-			}
 			if (e + 1 < use && local[e].bytes >= half)
 				e++;
-			r = batch_copy(&batch[e], src->gpu_address + (u64)row * src->pitch + (u64)x * 4,
-				       dst_address + (u64)row * dst_pitch + (u64)x * 4, bytes);
+			if (e + 1 < use) {
+				/* This engine takes rows up to about its half. */
+				const uint64_t room = half - local[e].bytes;
+
+				rows = (uint32_t)min_t(u64, rows, room / ((u64)w * 4) + 1);
+			}
+			r = batch_pixels(&batch[e], src->gpu_address + (u64)row * src->pitch + (u64)x * 4, src->pitch,
+					 dst_address + (u64)row * dst_pitch + (u64)x * 4, dst_pitch, w, rows, src->width);
 			row += rows;
 		}
 	}

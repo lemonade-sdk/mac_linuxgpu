@@ -465,12 +465,19 @@ static void pm4_run(struct engine *e, const uint32_t *dw, uint64_t count, uint32
 /* -- SDMA: the fixture's packets -- */
 
 static void sdma_run(struct engine *e, const uint32_t *dw, uint64_t count, uint32_t vmid, int depth);
+static uint64_t sdma7_packet(struct engine *e, const uint32_t *dw, uint64_t avail, uint32_t vmid);
 
 static uint64_t sdma_packet(struct engine *e, const uint32_t *dw, uint64_t avail, uint32_t vmid,
 			    int depth)
 {
 	uint32_t op = dw[0] >> 24, n = dw[0] & 0xffffff;
 
+	/* The display's rectangle copies (surface.c batch_rect) are written
+	 * as SDMA 7 COPY_LINEAR_SUB_WINDOW packets, beside the buffer
+	 * functions' (fixture) packets: their header's top byte (element
+	 * size 4) is no fixture opcode. */
+	if ((dw[0] & 0xffff) == 0x0401 && (dw[0] >> 29) == 2 && depth)
+		return sdma7_packet(e, dw, avail, vmid);
 	if (n + 1 > avail)
 		FX_ABORT("SDMA packet 0x%08x past the end", dw[0]);
 	switch (op) {
@@ -591,6 +598,36 @@ static uint64_t sdma7_packet(struct engine *e, const uint32_t *dw, uint64_t avai
 		break;
 	case FX_SDMA7_OP_COPY: {
 		/* COPY_LINEAR: count - 1, parameters, source, destination. */
+		if (sub == 4) {
+			/* COPY_LINEAR_SUB_WINDOW (SDMA 7: pitch - 1 at bit 16):
+			 * element size, source address, x | y << 16, pitch,
+			 * slice pitch, destination likewise, width - 1 |
+			 * height - 1 << 16, depth - 1. */
+			NEED(13);
+			const uint32_t esize = 1u << ((dw[0] >> 29) & 7);
+			const uint64_t src = ((uint64_t)dw[2] << 32) | dw[1], dst = ((uint64_t)dw[7] << 32) | dw[6];
+			const uint32_t sx = dw[3] & 0x3fff, sy = (dw[3] >> 16) & 0x3fff;
+			const uint32_t dx = dw[8] & 0x3fff, dy = (dw[8] >> 16) & 0x3fff;
+			const uint64_t spitch = (uint64_t)((dw[4] >> 16) & 0xffff) + 1, dpitch = (uint64_t)((dw[9] >> 16) & 0xffff) + 1;
+			const uint32_t w = (dw[11] & 0x3fff) + 1, h = ((dw[11] >> 16) & 0x3fff) + 1;
+			uint8_t row[4 * 16384];
+
+			if ((dw[12] & 0x1fff) != 0 || (dw[4] & 0x1fff) != 0 || (dw[9] & 0x1fff) != 0)
+				FX_ABORT("SDMA sub-window copy with depth (0x%08x 0x%08x 0x%08x)", dw[12], dw[4], dw[9]);
+			if ((uint64_t)w * esize > sizeof(row) || sx + w > spitch || dx + w > dpitch)
+				FX_ABORT("SDMA sub-window copy %ux%u at %u,%u / %u,%u past its pitches %llu / %llu",
+					 w, h, sx, sy, dx, dy, (unsigned long long)spitch, (unsigned long long)dpitch);
+			STAT(copies);
+			for (uint32_t y = 0; y < h; y++) {
+				const uint64_t s_at = src + ((sy + y) * spitch + sx) * esize;
+				const uint64_t d_at = dst + ((dy + y) * dpitch + dx) * esize;
+
+				if (!gpu_access(e, vmid, s_at, row, (uint64_t)w * esize, false) ||
+				    !gpu_access(e, vmid, d_at, row, (uint64_t)w * esize, true))
+					break;
+			}
+			break;
+		}
 		NEED(7);
 		if (sub != 0)
 			FX_ABORT("SDMA copy sub-opcode %u", sub);

@@ -263,7 +263,9 @@ int main(void)
 
 		for (int f = 0; f < 3; f++) {
 			const uint64_t vram_before = st.vram_bytes;
+			struct cs_fixture_stats packets_before, packets_after;
 
+			cs_fixture_stats(&packets_before);
 			fake_fill(&surf, 0x00b00000u + (uint32_t)f, &box[f]);
 			r = rt_display_present(pdev, rt_surface_get_hold(1, handle), &box[f], 1, NULL, 0, ktime_get_ns(), &st);
 			CHECK(r == 0);
@@ -274,6 +276,15 @@ int main(void)
 			CHECK(!st.error && st.frames_flipped == 2 + (uint64_t)f);
 			CHECK(st.last_bytes == (uint64_t)box[f].width * 4 * box[f].height);
 			CHECK(st.vram_bytes - vram_before == vram[f]);
+			/* A rectangle is one packet (a sub-window copy, or one range
+			 * for whole rows, in copy_max_bytes pieces), not one per
+			 * row: what the buffer missed and the frame's own. */
+			cs_fixture_stats(&packets_after);
+			{
+				const uint64_t max = adev->mman.buffer_funcs->copy_max_bytes;
+
+				CHECK(packets_after.copies - packets_before.copies == (vram[f] + max - 1) / max + 1);
+			}
 		}
 		CHECK(st.full_frames == 1);
 		CHECK(screen_pixel(150, 120) == ((0x00b00000u) ^ (150u << 12) ^ 120u));
