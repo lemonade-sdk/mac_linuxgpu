@@ -1086,23 +1086,23 @@ static void output_kick(struct display_output *o)
  * (0: none). */
 static void output_sleep(struct display_output *o, unsigned int timeout_ms)
 {
-	struct timespec deadline;
+	/* Relative timed wait: DriverKit's arm64 libsystem_pthread exports
+	 * pthread_cond_timedwait_relative_np but not pthread_cond_timedwait
+	 * (timer.c sleeps the same way). One wait per call: a spurious wakeup
+	 * only ends the sleep early, which the worker tolerates. */
+	struct timespec rel = {
+		.tv_sec = timeout_ms / 1000,
+		.tv_nsec = (long)(timeout_ms % 1000) * 1000000L,
+	};
 
-	if (timeout_ms) {
-		clock_gettime(CLOCK_REALTIME, &deadline);
-		deadline.tv_sec += timeout_ms / 1000;
-		deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
-		if (deadline.tv_nsec >= 1000000000L) {
-			deadline.tv_sec++;
-			deadline.tv_nsec -= 1000000000L;
-		}
-	}
 	pthread_mutex_lock(&o->sleep_lock);
 	while (o->kicks == o->kicks_seen && !o->stop) {
 		if (!timeout_ms)
 			pthread_cond_wait(&o->sleep_cond, &o->sleep_lock);
-		else if (pthread_cond_timedwait(&o->sleep_cond, &o->sleep_lock, &deadline))
+		else {
+			pthread_cond_timedwait_relative_np(&o->sleep_cond, &o->sleep_lock, &rel);
 			break;
+		}
 	}
 	o->kicks_seen = o->kicks;
 	pthread_mutex_unlock(&o->sleep_lock);
