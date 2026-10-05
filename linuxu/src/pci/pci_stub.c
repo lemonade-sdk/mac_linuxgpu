@@ -494,6 +494,53 @@ static pthread_mutex_t pci_state_lock = PTHREAD_MUTEX_INITIALIZER;
 struct pci_saved_state { struct linuxu_pci_state state; };
 static const int pci_control_offsets[4] = { 0x08, 0x10, 0x28, 0x30 };
 
+/* The MSI-X capability as DriverKit programmed it: its control word, and
+ * the table entries (in the BAR the capability names), the vectors in use
+ * first. Linux restores MSI-X from its own descriptors after a reset
+ * (pci_restore_msi_state); here DriverKit owns them, so the device's own
+ * values are what a reset must put back. */
+static int pci_capture_msix(struct pci_dev *dev, struct linuxu_pci_state *state)
+{
+#ifdef LINUXU_DEXT_DK
+	int cap, r = pci_dk_find_capability(dev, PCI_CAP_ID_MSIX, &cap);
+	u16 control;
+	u32 table;
+
+	if (r)
+		return r;
+	if (!cap)
+		return 0;
+	r = pci_read_config_word(dev, cap + PCI_MSIX_FLAGS, &control);
+	if (!r)
+		r = pci_read_config_dword(dev, cap + PCI_MSIX_TABLE, &table);
+	if (r || control == UINT16_MAX || (table & PCI_MSIX_TABLE_BIR) > 5)
+		return r ? r : -ENODEV;
+	state->msix_cap = (u16)cap;
+	state->msix_control = control;
+	state->msix_table = table;
+	if (!(control & PCI_MSIX_FLAGS_ENABLE))
+		return 0;	/* nothing routed through it */
+	unsigned int size = (control & PCI_MSIX_FLAGS_QSIZE) + 1;
+	unsigned int n = size < LINUXU_PCI_MSIX_SAVED ? size : LINUXU_PCI_MSIX_SAVED;
+	const unsigned int bir = table & PCI_MSIX_TABLE_BIR;
+	const u64 base = table & PCI_MSIX_TABLE_OFFSET;
+	for (unsigned int i = 0; i < n; ++i)
+		for (unsigned int w = 0; w < 4; ++w)
+			if (dext_pci_bar_read32(bir, base + i * PCI_MSIX_ENTRY_SIZE + w * 4,
+						&state->msix_entry[i][w]))
+				return -EIO;
+	state->msix_entries = (u16)n;
+#else
+	(void)dev; (void)state;
+#endif
+	return 0;
+}
+
+/* The header's dwords a restore writes back, the BARs among them (after a
+ * device-internal reset they read back cleared): cache line size and
+ * latency timer, BAR0-5, the expansion ROM, the interrupt line. */
+static const u8 pci_header_restored[] = { 3, 4, 5, 6, 7, 8, 9, 12, 15 };
+
 static int pci_capture_state(struct pci_dev *dev, struct linuxu_pci_state *state)
 {
 	int r, cap;
@@ -530,7 +577,7 @@ static int pci_capture_state(struct pci_dev *dev, struct linuxu_pci_state *state
 	/* Do not cache a transient FLR/retrain request for later replay. */
 	if ((state->control[0] & 0x8000) || (state->control[1] & 0x20))
 		return -EBUSY;
-	return 0;
+	return pci_capture_msix(dev, state);
 }
 
 int pci_save_state(struct pci_dev *dev)
@@ -547,23 +594,87 @@ int pci_save_state(struct pci_dev *dev)
 	return r;
 }
 
+/* MSI-X back as it was saved: function masked while the table is written,
+ * then the saved control word (enable, and the mask as it was). */
+static int pci_restore_msix(struct pci_dev *dev, const struct linuxu_pci_state *saved)
+{
+#ifdef LINUXU_DEXT_DK
+	const int cap = saved->msix_cap;
+	const unsigned int bir = saved->msix_table & PCI_MSIX_TABLE_BIR;
+	const u64 base = saved->msix_table & PCI_MSIX_TABLE_OFFSET;
+	u16 control;
+	u32 table;
+	int r;
+
+	if (!cap)
+		return 0;
+	r = pci_read_config_dword(dev, cap + PCI_MSIX_TABLE, &table);
+	if (r || table != saved->msix_table)
+		return r ? r : -ESTALE;	/* a different device behind it */
+	r = pci_write_config_word(dev, cap + PCI_MSIX_FLAGS,
+				  saved->msix_control | PCI_MSIX_FLAGS_MASKALL |
+				  PCI_MSIX_FLAGS_ENABLE);
+	for (unsigned int i = 0; !r && i < saved->msix_entries; ++i)
+		for (unsigned int w = 0; !r && w < 4; ++w) {
+			const u64 at = base + i * PCI_MSIX_ENTRY_SIZE + w * 4;
+			u32 after;
+
+			if (dext_pci_bar_write32(bir, at, saved->msix_entry[i][w]) ||
+			    dext_pci_bar_read32(bir, at, &after) || after != saved->msix_entry[i][w])
+				r = -EIO;
+		}
+	if (!r)
+		r = pci_write_config_word(dev, cap + PCI_MSIX_FLAGS, saved->msix_control);
+	if (!r)
+		r = pci_read_config_word(dev, cap + PCI_MSIX_FLAGS, &control);
+	if (!r && (control & (PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL)) !=
+		  (saved->msix_control & (PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL)))
+		r = -EIO;
+	return r;
+#else
+	(void)dev; (void)saved;
+	return 0;
+#endif
+}
+
 static int pci_restore_state_locked(struct pci_dev *dev,
 				     const struct linuxu_pci_state *saved)
 {
 	struct linuxu_pci_state observed;
 	int r = pci_capture_state(dev, &observed);
 	if (r) return r;
-	/* DriverKit Reset restores the host's PCI assignment itself. Refuse a
-	 * changed aperture instead of writing BARs behind the host bridge. */
+	/* The same function, the same capability layout. */
 	if (observed.header[0] != saved->header[0] ||
 	    observed.pcie_cap != saved->pcie_cap ||
 	    observed.pcie_flags != saved->pcie_flags ||
-	    memcmp(observed.header + 4, saved->header + 4, 6 * sizeof(u32)))
+	    observed.msix_cap != saved->msix_cap)
 		return -ESTALE;
 #ifdef LINUXU_DEXT_DK
 	r = pci_dk_force_d0(dev);
 	if (r) return r;
 #endif
+	/* The header as the host assigned it. A device-internal reset (mode1)
+	 * clears the BARs, and nothing in macOS writes them again: the same
+	 * values go back, with memory decode off until they read back (the
+	 * host bridge's windows still route them; nothing moves). A BAR that
+	 * does not take its value fails the restore. */
+	if (memcmp(observed.header + 3, saved->header + 3, 13 * sizeof(u32))) {
+		r = pci_write_config_word(dev, PCI_COMMAND, (u16)observed.header[1] &
+					  ~(PCI_COMMAND_MEMORY | PCI_COMMAND_IO | PCI_COMMAND_MASTER));
+		for (unsigned int i = 0; !r && i < sizeof(pci_header_restored); ++i) {
+			const unsigned int d = pci_header_restored[i];
+			u32 after;
+
+			if (observed.header[d] == saved->header[d])
+				continue;
+			r = pci_write_config_dword(dev, d * 4, saved->header[d]);
+			if (!r)
+				r = pci_read_config_dword(dev, d * 4, &after);
+			if (!r && after != saved->header[d])
+				r = d >= 4 && d <= 9 ? -ESTALE : -EIO;
+		}
+		if (r) return r;
+	}
 	unsigned n = !saved->pcie_cap ? 0 : (saved->pcie_flags & 15) > 1 ? 4 : 2;
 	for (unsigned i = 0; i < n; ++i) {
 		if (observed.control[i] == saved->control[i]) continue;
@@ -573,13 +684,15 @@ static int pci_restore_state_locked(struct pci_dev *dev,
 		if (!r) r = pci_read_config_word(dev, where, &after);
 		if (r || after != saved->control[i]) return r ? r : -EIO;
 	}
+	r = pci_restore_msix(dev, saved);
+	if (r) return r;
 	/* Write only the command half; the adjacent status is write-one-clear.
 	 * Command is restored last, after aperture/control validation. */
 	u16 command = (u16)saved->header[1], after;
-	if ((u16)observed.header[1] != command) {
+	r = pci_read_config_word(dev, PCI_COMMAND, &after);
+	if (!r && after != command)
 		r = pci_write_config_word(dev, PCI_COMMAND, command);
-		if (r) return r;
-	}
+	if (r) return r;
 	r = pci_read_config_word(dev, PCI_COMMAND, &after);
 	return r ? r : after == command ? 0 : -EIO;
 }

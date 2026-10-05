@@ -66,6 +66,10 @@ int dext_pci_config_read32(uint64_t offset, uint32_t *value);
 int dext_pci_config_write8(uint64_t offset, uint8_t value);
 int dext_pci_config_write16(uint64_t offset, uint16_t value);
 int dext_pci_config_write32(uint64_t offset, uint32_t value);
+/* A dword of BAR @bar (a BAR register index, 0-5) at @offset, through the
+ * kernel's MemoryRead32/MemoryWrite32 (the MSI-X table). 0 or -1. */
+int dext_pci_bar_read32(unsigned int bar, uint64_t offset, uint32_t *value);
+int dext_pci_bar_write32(unsigned int bar, uint64_t offset, uint32_t value);
 /* First definite local transport failure for the current PCI session.
  * DriverKit accessors return void, so write completion cannot be confirmed
  * through their return value.  All-ones reads are recorded separately: the

@@ -281,6 +281,18 @@ int dext_pci_config_read8(uint64_t offset, uint8_t *value)
 	*value = 0;
 	return 0;
 }
+/* No MSI-X capability in this configuration: the table is never read. */
+int dext_pci_bar_read32(unsigned int bar, uint64_t offset, uint32_t *value)
+{
+	(void)bar; (void)offset;
+	*value = UINT32_MAX;
+	return -1;
+}
+int dext_pci_bar_write32(unsigned int bar, uint64_t offset, uint32_t value)
+{
+	(void)bar; (void)offset; (void)value;
+	return -1;
+}
 int dext_pci_config_write32(uint64_t offset, uint32_t value)
 {
 	(void)offset; (void)value;
