@@ -145,6 +145,9 @@ int dext_compute_query_info(uint64_t tag, uint64_t *out, int out_cap);
  * (-ENOTREADY_L before the device is up, -EINVAL_L for room under the
  * header). */
 int dext_compute_device_spec(void *out, size_t cap);
+/* Whether @client uses the legacy path (its session ends with it: the GART
+ * host window is in its address space). */
+bool dext_compute_client_legacy(uint64_t client);
 
 /* BOAlloc (16): in size/domain/alignment/flags, out handle/gpu_va/cpu_addr. */
 int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,

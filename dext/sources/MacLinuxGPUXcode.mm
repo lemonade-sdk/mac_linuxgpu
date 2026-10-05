@@ -2205,6 +2205,7 @@ IMPL(MacLinuxGPUUserClient, Start)
     return kIOReturnSuccess;
 }
 
+static bool session_leave_closes(bool participant, bool legacyClient);
 // A Linux-file client's session membership ends on the owner's queue, as a
 // session client's does (it holds no compute handles to release).
 static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
@@ -2219,7 +2220,7 @@ static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
         iv->sessionGeneration = 0;
         if (s_participants) --s_participants;
     }
-    if (s_sessionClosing || (participant && (!s_participants || s_dmaQuarantined))) {
+    if (session_leave_closes(participant, false)) {
         iv->nextStopping = s_stoppingClients;
         s_stoppingClients = client;
         close_session(iv->ownerDriver);
@@ -2312,11 +2313,39 @@ IMPL(MacLinuxGPUUserClient, Stop)
     return kIOReturnSuccess;
 }
 
+// Whether a client leaving the session closes it. The device stays up
+// across clients, as amdgpu stays probed on Linux while programs open and
+// close their files: a leaving client releases only what it owned. The
+// session closes when a close already runs, when it is tainted (a failed
+// release or an uncertain GPU: s_dmaQuarantined), or when the last client
+// leaves a session that must end with it (last_leave_closes).
+//
+// The last client's leaving ends the session when the device left the bus,
+// when a raw BAR mapping's revocation is not proved, or when what the
+// session set up was that client's own: a session that never brought the
+// GPU up, or one whose client used the legacy (non-KFD) path, whose host
+// window is the GART window placed in that client's address space before
+// the probe (the iPad, where Studio is the only client: each launch places
+// its window again, as before).
+static bool last_leave_closes(bool legacyClient)
+{
+    return s_deviceRemoved || s_rawBARLease.hasMappings() || !s_modulesRunning || legacyClient;
+}
+static bool session_leave_closes(bool participant, bool legacyClient)
+{
+    return s_sessionClosing ||
+           (participant && (s_dmaQuarantined || (!s_participants && last_leave_closes(legacyClient))));
+}
+
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
 {
     auto *ivars = client->ivars;
     const bool participant = ivars->sessionGeneration == s_sessionGeneration;
-    if (participant && s_participants > 1 && !s_sessionClosing) {
+    const bool legacyClient = dext_compute_client_legacy(ivars->clientID);
+    // What the client owned goes now, unless the session closes with it
+    // (which releases everything).
+    if (participant && !s_sessionClosing && !s_dmaQuarantined &&
+        !(s_participants == 1 && last_leave_closes(legacyClient))) {
         // IRQ delivery stays active while this client's queues are removed.
         const int released = dext_compute_release_client(ivars->clientID);
         if (released != 0 && s_deviceRemoved) {
@@ -2331,7 +2360,7 @@ static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provid
         ivars->sessionGeneration = 0;
         if (s_participants) --s_participants;
     }
-    if (s_sessionClosing || (participant && (!s_participants || s_dmaQuarantined))) {
+    if (session_leave_closes(participant, legacyClient)) {
         ivars->nextStopping = s_stoppingClients;
         s_stoppingClients = client;
         close_session(ivars->ownerDriver);

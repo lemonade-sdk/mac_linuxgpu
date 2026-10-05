@@ -192,6 +192,12 @@ static struct production_client *selected_session(void)
     return rec;
 }
 
+bool dext_compute_client_legacy(uint64_t client)
+{
+    const struct production_client *rec = client_record(client, false);
+    return rec && rec->mode == PRODUCTION_LEGACY;
+}
+
 static struct dext_kfd_client *selected_kfd(void)
 {
     struct production_client *rec = selected_session();

@@ -149,6 +149,8 @@ static int dext_set_pci(void *, void *);
 static int dext_open(uint32_t *);
 static int dext_compute_query_info(uint64_t, uint64_t *, int);
 static int dext_compute_release_client(uint64_t);
+static uint64_t legacyClientID;  // a client on the legacy (non-KFD) path
+static bool dext_compute_client_legacy(uint64_t client) { return client && client == legacyClientID; }
 // Surprise removal (rt/removal.h, dext_pci_* and dext_dma_device_removed).
 struct pci_dev;
 static bool devicePresent = true, dmaRemoved;
@@ -180,6 +182,11 @@ static bool lx_teardown_all() {
 }
 static unsigned rt_cs_selftest_parked() { return lxParked; }
 static void lx_client_stop(MacLinuxGPUUserClient *, IOService *) { assert(false); }
+// A Linux-file client's process (rt/lx_files.h): taken and retired by its
+// Stop's thread before lx_finish_stop runs; none left for it here.
+struct rt_lx_client;
+static rt_lx_client *lx_take(MacLinuxGPUUserClient *) { return nullptr; }
+static int rt_lx_client_retire(rt_lx_client *, void (*)(void *), void *) { assert(false); return 0; }
 // The display test (rt/display.h): a showing pattern is turned off while
 // the driver runs, after observer admission drained, never in quarantine.
 static bool displayShowing;
@@ -368,7 +375,14 @@ static int dext_open(uint32_t *token) { ++pciOpens; *token = 9; return 0; }
 static int dext_compute_query_info(uint64_t tag, uint64_t *out, int) {
     assert(tag == 4); out[0] = 2; return 1;
 }
-static int dext_compute_release_client(uint64_t) { assert(false); return 0; }
+static int releaseError;
+static std::vector<uint64_t> releasedClients;
+static int dext_compute_release_client(uint64_t client) {
+    events.push_back("release_client");
+    releasedClients.push_back(client);
+    // A client's KFD close fails as the compute stop would (computeError).
+    return releaseError ? releaseError : (computeError ? -16 : 0);
+}
 
 static int dext_pci_close_removed() {
     // Nothing left that could touch the device: interrupts drained,
@@ -385,8 +399,10 @@ void MacLinuxGPU::FinishStop(IOService *provider) {
     provider->release(); release();
 }
 void MacLinuxGPUUserClient::FinishStop(IOService *provider) {
+    // A client finishes once the session that it ended is closed, or, the
+    // device staying up across clients, with the session still open.
     if (!ivars->observer)
-        assert(!s_dmaQuarantined && !s_sessionClosing && dmaCompleted);
+        assert(!s_dmaQuarantined && !s_sessionClosing && (dmaCompleted || s_pciOpen));
     events.push_back(ivars->observer ? "observer_stop" : "super_client_stop");
     if (!ivars->observer) ++clientStops;
     auto owner = ivars->ownerDriver;
@@ -643,8 +659,11 @@ static void checkObserverPolicy() {
     assert(!mlg_call_is_synchronous(MLG_SELECTOR_DISPLAY, output, 3));
 }
 
-// Successful probe and compute start, then the only client exits without
-// destroying anything: no quarantine, and a new client opens a new session.
+// The device stays up across clients (Linux keeps amdgpu probed while
+// programs open and close their files). Successful probe and compute start,
+// then the only client exits without destroying anything: it releases what
+// it owned and finishes; nothing closes, and the next client joins the same
+// session without opening PCI or probing again.
 static void clientExitReopen(bool queueExhausted) {
     MacLinuxGPU driver;
     IOPCIDevice provider;
@@ -660,54 +679,204 @@ static void clientExitReopen(bool queueExhausted) {
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
                    nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
     driver.retain(); s_participants = 1;
-    // A second queue found every slot held. The runtime refused it before
-    // any allocation (or the driver did, with -ENOSPC before reserving), so
-    // compute stop sees only the first queue and its BOs.
+    // A second queue found every slot held; the client's release covers
+    // what it had.
     if (queueExhausted) computeError = 0;
+    const uint64_t generation = s_sessionGeneration;
     assert(client.Stop(&driver) == kIOReturnSuccess);
-    assert(s_sessionClosing && s_participants == 0 && !clientStops);
-    {
-        assert(irqCompletion);
-        auto callback = irqCompletion; auto context = irqContext;
-        irqCompletion = nullptr; irqContext = nullptr;
-        irqDrained = true; events.push_back("irq_drained");
-        callback(context);
-        queue.drain();
-    }
-    const std::vector<std::string> expected{
-        "hold_dma", "compute_stop", "upstream_shutdown", "cancel_irqs",
-        "irq_drained", "enqueue_finish", "device_free", "release_bar0",
-        "endpoint_reset", "complete_dma", "dma_fini", "pci_close", "gart_reset",
-        "super_client_stop"};
-    assert(events == expected);
-    // The power hook ran once, ahead of upstream removal.
-    assert(powerRemovalHooks == 1);
-    assert(displayUnpublishes == 1);
-    assert(!s_dmaQuarantined && !s_sessionClosing && !s_quarantineRetained);
-    assert(s_sessionGeneration == 2 && clientStops == 1 && client.superStops == 1);
-    assert(driver.references == 1 && provider.references == 1);
+    assert(!s_sessionClosing && s_participants == 0 && clientStops == 1 && client.superStops == 1);
+    assert(events == std::vector<std::string>({"release_client", "super_client_stop"}));
+    assert(releasedClients == std::vector<uint64_t>({1}));
+    assert(s_pciOpen && s_modulesRunning && s_rtDevice == &device && s_token == 7 && !irqCompletion);
+    assert(s_sessionGeneration == generation && powerRemovalHooks == 0 && displayUnpublishes == 0);
+    assert(!s_dmaQuarantined && driver.references == 1);
     const auto snapshot = state();
     assert(!(snapshot[1] & (MLG_SESSION_FLAG_QUARANTINED | MLG_SESSION_FLAG_CLOSING)));
-    assert(snapshot[2] == MLG_QUARANTINE_NONE && snapshot[6] == MLG_RELEASE_NOT_QUARANTINED);
-    expectLog("released 1 orphaned BAR0 CPU mapping reference(s) after upstream removal");
-    expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
-    // The dext is reusable: a new client opens a new PCI session.
+    assert(snapshot[1] & MLG_SESSION_FLAG_MODULES_RUNNING);
+    // The next client joins the running device: no PCI open, no probe.
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
                  nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
-    pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
-    assert(s_pciOpen && s_participants == 1 && pciOpens == 1 && saw("pci_open"));
+    assert(s_pciOpen && s_participants == 1 && pciOpens == 0 && !saw("pci_open"));
     assert(nextIvars.sessionGeneration == s_sessionGeneration);
     std::printf("PASS production session shutdown: %s\n",
                 queueExhausted ? "queue-exhaustion-exit" : "client-exit-reopen");
 }
 
+// The device's real close points still close it when the last client
+// leaves: a session that never brought the GPU up (what was set before the
+// probe was that client's), a release that failed (tainted), a raw BAR
+// mapping nothing proves revoked, and a client on the legacy (non-KFD) path
+// (the iPad's Studio: its host window is the GART window in its address
+// space, so its next launch places a window again).
+static void clientExitCloses(const std::string &kind) {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    MacLinuxGPUUserClient client;
+    MacLinuxGPUUserClient_IVars clientIvars{};
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
+    const bool probed = kind != "client-exit-unprobed";
+    if (kind == "client-exit-legacy") legacyClientID = 1;
+    s_rtDevice = probed ? &device : nullptr; s_modulesRunning = probed; s_probeAttempted = probed;
+    s_irqReady = s_irqDeliver = true; s_pciOpen = true; s_token = 7;
+    bar0Aliases = probed ? 1 : 0;
+    client.ivars = &clientIvars;
+    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+    driver.retain(); s_participants = 1;
+    if (kind == "client-exit-release-failure") releaseError = -16;
+    if (kind == "client-exit-raw-mapped") {
+        assert(s_rawBARLease.claim(1, true, 1));
+        (void)s_rawBARLease.markMapped(1);
+    }
+    assert(client.Stop(&driver) == kIOReturnSuccess);
+    assert(s_sessionClosing && s_participants == 0 && !clientStops);
+    // The client's release runs unless the close takes everything at once.
+    assert(saw("release_client") == (kind == "client-exit-release-failure"));
+    if (kind == "client-exit-legacy") assert(saw("upstream_shutdown"));
+    if (kind == "client-exit-unprobed") assert(!saw("upstream_shutdown"));
+    if (kind == "client-exit-release-failure" || kind == "client-exit-raw-mapped") {
+        // Tainted: the close keeps what it cannot prove released.
+        assert(s_dmaQuarantined);
+        std::printf("PASS production session shutdown: %s\n", kind.c_str());
+        return;
+    }
+    if (irqCompletion) {
+        auto callback = irqCompletion; auto context = irqContext;
+        irqCompletion = nullptr; irqContext = nullptr;
+        irqDrained = true; events.push_back("irq_drained");
+        callback(context);
+    }
+    queue.drain();
+    assert(!s_sessionClosing && !s_pciOpen && clientStops == 1 && saw("pci_close"));
+    std::printf("PASS production session shutdown: %s\n", kind.c_str());
+}
+
+// Two to four programs at once, as on Linux: HSA session clients and
+// Linux-file (RADV) clients join the running device, work, and leave in
+// overlapping orders; one leaving never closes the device under the others
+// or blocks one that joins meanwhile. An observer (the display agent's
+// reader) comes and goes throughout. The device closes only at the driver's
+// Stop, with every Stop finished.
+static void concurrentClients() {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
+    s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
+    s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
+    bar0Aliases = 1;
+    const uint64_t generation = s_sessionGeneration;
+    struct Program {
+        MacLinuxGPUUserClient client;
+        MacLinuxGPUUserClient_IVars ivars{};
+        bool joined = false;
+    };
+    static Program programs[8];
+    unsigned next = 0;
+    const auto start = [&](bool linuxFile) -> Program & {
+        Program &p = programs[next];
+        p.ivars = {};
+        p.ivars.ownerDriver = &driver;
+        p.ivars.clientID = 10 + next++;
+        p.ivars.ownerQueue = &s_ownerQueueAtOnce;
+        p.ivars.linuxFile = linuxFile;
+        p.client.ivars = &p.ivars;
+        driver.retain();
+        assert(ensure_open(&p.client) == kIOReturnSuccess);
+        p.joined = true;
+        return p;
+    };
+    const auto leave = [&](Program &p) {
+        const unsigned before = s_participants, stops = clientStops;
+        if (p.ivars.linuxFile) {
+            // Its Stop's thread retired its process; the membership ends on
+            // the owner's queue.
+            // (Its Stop retained the client and the provider.)
+            p.ivars.stopping = true;
+            p.client.retain(); driver.retain();
+            lx_finish_stop(&p.client, &driver);
+        } else {
+            assert(p.client.Stop(&driver) == kIOReturnSuccess);
+        }
+        assert(s_participants == before - 1 && clientStops == stops + 1);
+        assert(!s_sessionClosing && s_pciOpen && s_modulesRunning && s_sessionGeneration == generation);
+        p.joined = false;
+    };
+    // The display agent's observer, attached throughout.
+    MacLinuxGPUUserClient observer;
+    MacLinuxGPUUserClient_IVars observerIvars{};
+    observerIvars.ownerDriver = &driver; observerIvars.clientID = 99; observerIvars.observer = true;
+    observerIvars.ownerQueue = &s_ownerQueueAtOnce;
+    observer.ivars = &observerIvars;
+
+    // Two HSA programs and a RADV program; the first HSA one leaves while
+    // the others work and a fourth (RADV) joins; then the rest leave in a
+    // different order than they came, and a new HSA program starts after
+    // all of them left (no cold start: no PCI open, no probe).
+    Program &hsa1 = start(false), &hsa2 = start(false), &radv1 = start(true);
+    assert(s_participants == 3);
+    leave(hsa1);
+    Program &radv2 = start(true);
+    assert(s_participants == 3);
+    leave(radv1);
+    leave(hsa2);
+    leave(radv2);
+    assert(s_participants == 0 && pciOpens == 0 && !saw("pci_open") && !saw("upstream_shutdown"));
+    Program &hsa3 = start(false);
+    assert(s_participants == 1 && pciOpens == 0);
+    // Each HSA program released what it owned; Linux-file programs hold no
+    // compute handles (their files closed with their process).
+    assert(releasedClients == std::vector<uint64_t>({10, 11}));
+    leave(hsa3);
+    assert(releasedClients.size() == 3);
+
+    // The join/leave soak: many programs, two at a time, overlapping.
+    for (unsigned round = 0; round < 1000; ++round) {
+        MacLinuxGPUUserClient a, b;
+        MacLinuxGPUUserClient_IVars ai{}, bi{};
+        ai.ownerDriver = bi.ownerDriver = &driver;
+        ai.clientID = 1000 + 2 * round; bi.clientID = 1001 + 2 * round;
+        ai.ownerQueue = bi.ownerQueue = &s_ownerQueueAtOnce;
+        bi.linuxFile = round % 2;
+        a.ivars = &ai; b.ivars = &bi;
+        driver.retain(); driver.retain();
+        assert(ensure_open(&a) == kIOReturnSuccess && ensure_open(&b) == kIOReturnSuccess);
+        assert(s_participants == 2);
+        assert(a.Stop(&driver) == kIOReturnSuccess);
+        if (bi.linuxFile) { bi.stopping = true; b.retain(); driver.retain(); lx_finish_stop(&b, &driver); }
+        else assert(b.Stop(&driver) == kIOReturnSuccess);
+        assert(s_participants == 0 && !s_sessionClosing && s_sessionGeneration == generation);
+    }
+    assert(pciOpens == 0 && !saw("pci_open") && !saw("upstream_shutdown") && !s_dmaQuarantined);
+    assert(clientStops == 5 + 2000 && driver.references == 1);
+
+    // The driver's Stop closes the device, once.
+    driver.retain(); provider.retain();
+    assert(driver.Stop(&provider) == kIOReturnSuccess);
+    assert(s_sessionClosing);
+    auto callback = irqCompletion; auto context = irqContext;
+    irqCompletion = nullptr; irqContext = nullptr;
+    irqDrained = true; events.push_back("irq_drained");
+    callback(context);
+    queue.drain();
+    assert(driverStops == 1 && !s_pciOpen && !s_sessionClosing && s_sessionGeneration == generation + 1);
+    assert(std::count(events.begin(), events.end(), "upstream_shutdown") == 1);
+    std::puts("PASS production concurrent clients: HSA and Linux-file programs join and leave in overlapping "
+              "orders without closing the device or blocking each other; 1000 join/leave rounds of two at a "
+              "time; the driver's Stop closes it once");
+}
+
 // Surprise removal: the GPU leaves the bus with a client's session open.
 // The client is stopped first (IOKit terminates the clients, then the
-// provider). With "quarantined", the session was already quarantined (its
-// compute stop failed while the device was still there) when the provider
-// stop sees the device gone. Either way no reset, isolation or quarantine
+// provider). With "quarantined", the session was already quarantined (the
+// client's release failed while the device was still there, and the close
+// kept every owner, the display's included) when the provider stop sees the
+// device gone. Either way no reset, isolation or quarantine
 // follows: everything is released, the provider closes, every Stop
 // finishes, and the next client opens a new session.
 static void surpriseRemoval(bool quarantined, bool held = false) {
@@ -740,14 +909,8 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     if (quarantined) {
         assert(s_dmaQuarantined && !s_deviceRemoved);
         assert(saw("pci_quarantine") && saw("dma_quarantine"));
-        if (held) {
-            // Retained with every other owner while quarantined.
-            assert(displayShowing && surfacesImported == 2 && !saw("display_off"));
-        } else {
-            // The close began before anything quarantined: the display went
-            // off and its imports were released first, with the device there.
-            assert(!displayShowing && !surfacesImported && saw("display_off") && saw("surfaces_release"));
-        }
+        // Retained with every other owner while quarantined.
+        assert(displayShowing && surfacesImported == 2 && !saw("display_off"));
     } else {
         assert(!s_dmaQuarantined && s_deviceRemoved);
     }
@@ -791,9 +954,9 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     assert(!displayShowing && !surfacesImported);
     {
         auto at = [](const char *e) { return std::find(events.begin(), events.end(), e) - events.begin(); };
-        const char *off = quarantined && !held ? "display_off" : "display_off_removed";
+        const char *off = "display_off_removed";
         assert(at(off) < at("surfaces_release") && at("surfaces_release") < at("upstream_shutdown"));
-        if (!quarantined || held) assert(at("removal_begin") < at(off) && !saw("display_off"));
+        assert(at("removal_begin") < at(off) && !saw("display_off"));
     }
     expectLog("released 2 imported surface(s)");
     if (!quarantined) {
@@ -931,12 +1094,21 @@ static void upgradeStop(const std::string &kind) {
         std::puts("PASS production upgrade stop: idle driver with an observer stops at once");
         return;
     }
-    // The client's Stop began the close; the driver's Stop joined it.
-    assert(s_stopping && s_stopProvider == &rig.provider && s_stoppingClients == &rig.client);
-    assert(!driverStops && !clientStops);
+    if (kind == "quarantined-held") {
+        // The client's release failed: its Stop began the close, which the
+        // driver's Stop joined.
+        assert(s_stopping && s_stopProvider == &rig.provider && s_stoppingClients == &rig.client);
+        assert(!driverStops && !clientStops);
+    } else {
+        // The client released what it owned and finished: the device stays
+        // up across clients. The driver's Stop closes the session.
+        assert(s_stopping && s_stopProvider == &rig.provider && !s_stoppingClients);
+        assert(!driverStops && clientStops == 1);
+    }
     rig.deliverIRQDrain();
     if (kind == "session") {
-        assert(events == concat({"observer_stop"}, concat(kNormalClose, {"super_client_stop", "super_driver_stop"})));
+        assert(events == concat({"observer_stop", "release_client", "super_client_stop"},
+                                concat(kNormalClose, {"super_driver_stop"})));
         assert(!saw("pci_quarantine") && clientStops == 1);
         rig.assertReleased();
         expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
@@ -1075,6 +1247,15 @@ int main(int argc, char **argv) {
     alarm(15);
     assert(argc == 2);
     const std::string scenario = argv[1];
+    if (scenario == "concurrent-clients") {
+        concurrentClients();
+        return 0;
+    }
+    if (scenario == "client-exit-unprobed" || scenario == "client-exit-release-failure" ||
+        scenario == "client-exit-raw-mapped" || scenario == "client-exit-legacy") {
+        clientExitCloses(scenario);
+        return 0;
+    }
     if (scenario == "client-exit-reopen" || scenario == "queue-exhaustion-exit") {
         clientExitReopen(scenario == "queue-exhaustion-exit");
         return 0;

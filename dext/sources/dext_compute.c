@@ -242,6 +242,8 @@ int dext_compute_quiescent(void)
 
 void dext_compute_device_removed(void) {}
 
+bool dext_compute_client_legacy(uint64_t client) { (void)client; return false; }
+
 /* The device spec needs the upstream device: none in the host build. */
 int dext_compute_device_spec(void *out, size_t cap)
 {
