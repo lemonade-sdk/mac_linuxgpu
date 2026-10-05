@@ -4,8 +4,9 @@
 # check (no debug instrumentation in release objects), the HSA runtime's
 # unit tests, and unsigned Xcode builds of the dext and the host app. No
 # signing: the signed build and installer stay on a developer Mac. Both jobs
-# select Xcode 26: the dext targets DriverKit 25.2, and the image's default
-# Xcode 16 (DriverKit 24.5) lacks APIs it uses (IOSysCtlByName).
+# run on the macOS 26 image with its newest Xcode 26: the driver calls
+# IOSysCtlByName, which DriverKit SDKs before 25.4 (Xcode 26.4) do not
+# export; the step fails loudly on an image without one.
 #
 # Not run here: the Vulkan offline tests need RADV and llama.cpp built
 # (make radv, make llama-vulkan; about an hour more), so test-radv-offline,
@@ -25,22 +26,27 @@ concurrency:
 jobs:
   tests:
     name: Offline tests
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
-      - name: Xcode 26 (DriverKit 25, as the project targets)
+      - name: Xcode 26 (a DriverKit SDK with IOSysCtlByName)
         run: |
           xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           if [ -z "$xcode" ]; then
-            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25"
+            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25.4 or later"
             ls -d /Applications/Xcode*.app
             exit 1
           fi
           sudo xcode-select -s "$xcode"
           xcodebuild -version
           xcrun --sdk driverkit --show-sdk-version
+          lib="$(xcrun --sdk driverkit --show-sdk-path)/System/DriverKit/System/Library/Frameworks/DriverKit.framework/DriverKit.tbd"
+          if ! grep -q _IOSysCtlByName "$lib"; then
+            echo "::error::$xcode's DriverKit SDK does not export IOSysCtlByName (DriverKit 25.4 or later does)"
+            exit 1
+          fi
 
       - name: Tools
         run: brew install ripgrep cmake
@@ -68,22 +74,27 @@ jobs:
 
   xcode:
     name: Unsigned Xcode build
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
-      - name: Xcode 26 (DriverKit 25, as the project targets)
+      - name: Xcode 26 (a DriverKit SDK with IOSysCtlByName)
         run: |
           xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           if [ -z "$xcode" ]; then
-            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25"
+            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25.4 or later"
             ls -d /Applications/Xcode*.app
             exit 1
           fi
           sudo xcode-select -s "$xcode"
           xcodebuild -version
           xcrun --sdk driverkit --show-sdk-version
+          lib="$(xcrun --sdk driverkit --show-sdk-path)/System/DriverKit/System/Library/Frameworks/DriverKit.framework/DriverKit.tbd"
+          if ! grep -q _IOSysCtlByName "$lib"; then
+            echo "::error::$xcode's DriverKit SDK does not export IOSysCtlByName (DriverKit 25.4 or later does)"
+            exit 1
+          fi
 
       - name: Upstream checkouts (cached)
         uses: actions/cache@v4
