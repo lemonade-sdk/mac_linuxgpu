@@ -1500,12 +1500,25 @@ extension MacLinuxGPUHost {
             io_user_reference_t(UInt(bitPattern: Unmanaged.passUnretained(completion).toOpaque()))
         var out = [UInt64](repeating: 0, count: 2)
         var outCount: UInt32 = 2
+        // The call carries the op's structure output capacity: the driver
+        // checks it (structureOutputMaximumSize) against the report before
+        // it starts PROBE, SHOW, OFF, STATUS or MODES, and refuses a call
+        // without one (kIOReturnBadArgument). The output itself comes later,
+        // with RESULT.
+        var reply = [UInt8](repeating: 0, count: max(outSize, 1))
+        var replySize = outSize
         let kr = scalars.withUnsafeBufferPointer { s in
             out.withUnsafeMutableBufferPointer { o in
-                reference.withUnsafeMutableBufferPointer { r in
-                    IOConnectCallAsyncMethod(ucConn, kSelDisplay, IONotificationPortGetMachPort(port), r.baseAddress,
-                                             UInt32(kIOAsyncCalloutCount), s.baseAddress, UInt32(scalars.count),
-                                             input, inputLength, o.baseAddress, &outCount, nil, nil)
+                reply.withUnsafeMutableBytes { b in
+                    withUnsafeMutablePointer(to: &replySize) { size in
+                        reference.withUnsafeMutableBufferPointer { r in
+                            IOConnectCallAsyncMethod(ucConn, kSelDisplay, IONotificationPortGetMachPort(port),
+                                                     r.baseAddress, UInt32(kIOAsyncCalloutCount), s.baseAddress,
+                                                     UInt32(scalars.count), input, inputLength, o.baseAddress,
+                                                     &outCount, outSize > 0 ? b.baseAddress : nil,
+                                                     outSize > 0 ? size : nil)
+                        }
+                    }
                 }
             }
         }

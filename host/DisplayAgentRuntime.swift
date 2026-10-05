@@ -1505,9 +1505,26 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
             continue
         }
-        guard kr == kIOReturnSuccess, let report else { closeClients(); continue }
+        guard kr == kIOReturnSuccess, let report else {
+            // Never silently: a refused STATUS once looped here reopening
+            // the session every pass with nothing in the log.
+            let lost = kr == kIOReturnNotAttached || kr == kIOReturnNoDevice || kr == kIOReturnNotOpen ||
+                kr == kern_return_t(MACH_SEND_INVALID_DEST)
+            agentLog("display-agent: " + (kr == kIOReturnSuccess ? "STATUS: the driver's report is unreadable"
+                                                                 : callFailure(kr, "STATUS")) +
+                     (lost ? "; reconnecting to the driver" : "; trying again in 10 s"))
+            if lost { closeClients() }
+            let until = Date().addingTimeInterval(lost ? 2 : 10)
+            while !agentInterrupted && watch.present && Date() < until {
+                _ = RunLoop.main.run(mode: .default, before: until)
+            }
+            continue
+        }
         if report.hotplugEpoch != epoch {
             let (pkr, _, probed) = observer!.display(.probe)
+            if pkr != kIOReturnSuccess {
+                agentLog("display-agent: " + callFailure(pkr, "PROBE") + "; using the cached connector state")
+            }
             let current = (pkr == kIOReturnSuccess ? probed : nil) ?? report
             // A monitor's key comes from its EDID; a bounded read that
             // overran leaves the epoch unseen, so the next poll reads again
