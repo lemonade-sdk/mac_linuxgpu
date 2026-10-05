@@ -159,6 +159,11 @@ fi
 if [[ $install_hsa -eq 1 ]]; then
   echo "==> building HSA runtime dylib (make hsa)"
   make -C "$PROJECT_ROOT" hsa
+  # The Linux-file libraries Vulkan and other DRM clients load (libmlg_drm,
+  # libdrm_mlg): installed beside the HSA runtime so each driver update
+  # brings the matching ones.
+  echo "==> building libmlg_drm and libdrm_mlg (make libdrm-mlg)"
+  make -C "$PROJECT_ROOT" libdrm-mlg
   for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib"; do
     [[ -f "$source" ]] || {
       echo "error: missing HSA runtime: $source" >&2
@@ -329,7 +334,9 @@ stage_runtime_payload() {
   }
   rm -rf "$payload"
   mkdir -p "$payload"
-  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib"; do
+  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libmlg_drm.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libdrm_mlg.dylib"; do
     [[ -f "$source" && ! -L "$source" ]] || {
       echo "error: expected a regular runtime library: $source" >&2
       return 1

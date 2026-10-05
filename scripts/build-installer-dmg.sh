@@ -150,10 +150,11 @@ validate_runtime_payload() {
     [[ -e "$entry" || -L "$entry" ]] || continue
     case "${entry##*/}" in
       libhsa-runtime64.0.1.0.dylib|libhsa-runtime64.1.dylib|libhsa-runtime64.dylib) ;;
+      libmlg_drm.dylib|libdrm_mlg.dylib) ;;
       *) echo "error: unexpected runtime payload entry: $entry" >&2; return 1 ;;
     esac
   done
-  for name in libhsa-runtime64.0.1.0.dylib; do
+  for name in libhsa-runtime64.0.1.0.dylib libmlg_drm.dylib libdrm_mlg.dylib; do
     [[ -f "$runtime/$name" && ! -L "$runtime/$name" ]] || {
       echo "error: required runtime library is missing or linked: $name" >&2
       return 1
