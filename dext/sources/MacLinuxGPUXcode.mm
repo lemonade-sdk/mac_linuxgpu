@@ -359,6 +359,11 @@ struct MacLinuxGPUUserClient_IVars {
     bool linuxFile; // type 2: a Linux process of its own (lx_files)
     struct rt_lx_client *lx; // created on the first Linux-file call
     MacLinuxGPUUserClient *nextLinuxFile; // s_linuxFiles registry
+    // The client's display ops (display_call): the last token issued, and
+    // the last op's result for RESULT, in a slot its op's thread shares
+    // (the op may finish after the client stopped).
+    uint64_t displayToken;
+    struct DisplayResultSlot *displayResults;
 };
 
 class ComputeClientScope {
@@ -1653,6 +1658,9 @@ static bool power_device_change(MacLinuxGPU *driver, uint32_t powerFlags, uint32
     return true;
 }
 
+// Stopped display clients still to clean up (display_stops_kick).
+static IOLock *s_displayStopsLock;
+
 kern_return_t
 IMPL(MacLinuxGPU, Start)
 {
@@ -1667,6 +1675,8 @@ IMPL(MacLinuxGPU, Start)
         MACLINUXGPU_LOG("provider is not an IOPCIDevice");
         return kIOReturnUnsupported;
     }
+    if (!s_displayStopsLock) s_displayStopsLock = IOLockAlloc();
+    if (!s_displayStopsLock) return kIOReturnNoMemory;
 
     // Optional embedded fallback; may be empty and is never assumed complete.
     int fw_result = fw_table_register_embedded();
@@ -2018,6 +2028,10 @@ MacLinuxGPU::free()
 // dispatches the UserClient lifecycle + the ExternalMethod to these.
 // ----------------------------------------------------------------
 
+// A client's display result slot (defined with the display calls).
+static DisplayResultSlot *display_slot_new();
+static void display_slot_put(DisplayResultSlot *slot);
+
 kern_return_t
 IMPL(MacLinuxGPUUserClient, Start)
 {
@@ -2060,6 +2074,12 @@ IMPL(MacLinuxGPUUserClient, Start)
     }
     ivars = IONewZero(MacLinuxGPUUserClient_IVars, 1);
     if (!ivars) { ownerQueue->release(); return kIOReturnNoMemory; }
+    ivars->displayResults = display_slot_new();
+    if (!ivars->displayResults) {
+        IOSafeDeleteNULL(ivars, MacLinuxGPUUserClient_IVars, 1);
+        ownerQueue->release();
+        return kIOReturnNoMemory;
+    }
     ivars->ownerQueue = ownerQueue;
     driver->retain();
     ivars->ownerDriver = driver;
@@ -2171,6 +2191,7 @@ MacLinuxGPUUserClient::FinishStop(IOService *provider)
     // An observer never holds a lease, and stops on its own queue.
     if (!ivars->observer) s_rawBARLease.release(ivars->clientID);
     if (ivars->ownerQueue) ivars->ownerQueue->release();
+    display_slot_put(ivars->displayResults);
     IOSafeDeleteNULL(ivars, MacLinuxGPUUserClient_IVars, 1);
     Stop(provider, SUPERDISPATCH);
     provider->release();
@@ -2867,7 +2888,57 @@ static void display_import_release(void *context)
     IOFree(import, sizeof(*import));
 }
 
+/* Stopped clients whose imports and output are still to release: on a
+ * driver thread, under the display gate, so after any op of theirs still
+ * finishing (display_stops_kick, from the stop and from each op's end). */
+static void observer_display_client_stop_now(uint64_t clientID);
+static bool display_try_acquire();
+static void display_release();
+static constexpr unsigned kDisplayStopsMax = 32;
+static uint64_t s_displayStops[kDisplayStopsMax];
+static unsigned s_displayStopCount;
+
+static void display_stops_main(void *)
+{
+    for (;;) {
+        IOLockLock(s_displayStopsLock);
+        const uint64_t clientID = s_displayStopCount ? s_displayStops[--s_displayStopCount] : 0;
+        IOLockUnlock(s_displayStopsLock);
+        if (!clientID) break;
+        observer_display_client_stop_now(clientID);
+    }
+    display_release(); // and kicks again, for a stop that came meanwhile
+}
+
+static void display_stops_kick()
+{
+    if (!s_displayStopsLock) return;
+    IOLockLock(s_displayStopsLock);
+    const bool pending = s_displayStopCount != 0;
+    IOLockUnlock(s_displayStopsLock);
+    if (!pending || !display_try_acquire()) return; // the op running kicks at its end
+    const int started = rt_wait_pool_run(display_stops_main, nullptr);
+    if (started) {
+        MACLINUXGPU_LOG("display: stopped clients' imports and output not released: no driver thread (%d); "
+                        "the session close releases them", started);
+        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+    }
+}
+
 static void observer_display_client_stop(uint64_t clientID)
+{
+    if (!s_displayStopsLock) return; // allocated at Start
+    IOLockLock(s_displayStopsLock);
+    const bool queued = s_displayStopCount < kDisplayStopsMax;
+    if (queued) s_displayStops[s_displayStopCount++] = clientID;
+    IOLockUnlock(s_displayStopsLock);
+    if (!queued)
+        MACLINUXGPU_LOG("display: client %llu's imports and output not released: %u stops pending; "
+                        "the session close releases them", (unsigned long long)clientID, kDisplayStopsMax);
+    display_stops_kick();
+}
+
+static void observer_display_client_stop_now(uint64_t clientID)
 {
     if (!s_observerReads.enter()) return; // a session close released everything
     const unsigned released = rt_surface_remove_owner(clientID);
@@ -3024,64 +3095,96 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
     }
 }
 
-static kern_return_t observer_display_frames(uint64_t clientID, IOUserClientMethodArguments *arguments)
+// A client's last display op result (MacLinuxGPUUserClient_IVars::displayResults).
+struct DisplayResultSlot {
+    uint32_t refs;
+    IOLock *lock;
+    uint64_t token;
+    kern_return_t result;
+    uint64_t out[2];
+    OSData *data;
+};
+static DisplayResultSlot *display_slot_new()
 {
-    if (!arguments->scalarInput || arguments->scalarInputCount != 3 || !arguments->scalarOutput ||
-        arguments->scalarOutputCount < MLG_DISPLAY_WORDS || arguments->structureOutputDescriptor ||
-        !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, arguments->scalarInput, 3))
-        return kIOReturnBadArgument;
-    if (__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
-    if (!s_observerReads.enter()) {
-        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
-        return kIOReturnNotReady;
-    }
+    auto *slot = static_cast<DisplayResultSlot *>(IOMallocZero(sizeof(DisplayResultSlot)));
+    if (!slot) return nullptr;
+    slot->lock = IOLockAlloc();
+    if (!slot->lock) { IOFree(slot, sizeof(*slot)); return nullptr; }
+    slot->refs = 1;
+    return slot;
+}
+static void display_slot_put(DisplayResultSlot *slot)
+{
+    if (!slot || __atomic_sub_fetch(&slot->refs, 1, __ATOMIC_ACQ_REL)) return;
+    if (slot->data) slot->data->release();
+    IOLockFree(slot->lock);
+    IOFree(slot, sizeof(*slot));
+}
+
+// The display gate: one op that can sleep at a time. A call that finds it
+// taken is answered kIOReturnBusy at once; nothing waits for it. Releasing
+// it runs any stopped clients' cleanup (display_stops_kick).
+static void display_stops_kick();
+static bool display_try_acquire()
+{
+    return !__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL);
+}
+static void display_release()
+{
+    __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
+    display_stops_kick();
+}
+
+// PRESENT, synchronous: it never sleeps (rt_display_present returns -EBUSY
+// rather than wait for an op that holds the display), so it takes no
+// display gate, only the observer admission.
+static kern_return_t observer_display_present(uint64_t clientID, IOUserClientMethodArguments *arguments)
+{
+    if (arguments->scalarOutputCount < MLG_DISPLAY_WORDS) return kIOReturnBadArgument;
+    if (!s_observerReads.enter()) return kIOReturnNotReady;
     const kern_return_t ret = display_frames(clientID, arguments,
         static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
     s_observerReads.leave();
-    __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
     return ret;
 }
 
-static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
+// PROBE, SHOW, OFF, STATUS and MODES: their arguments, and the connector
+// name of SHOW and MODES in @name.
+static bool observer_display_valid(IOUserClientMethodArguments *arguments, char name[RT_DISPLAY_NAME_BYTES])
 {
     const uint64_t *in = arguments->scalarInput;
-    uint64_t *out = arguments->scalarOutput;
     const OSData *nameData = arguments->structureInput;
-    // One status word for these ops (callers from before IMPORT ask for one).
-    if (!in || arguments->scalarInputCount != 3 || !out || arguments->scalarOutputCount < 1 ||
-        arguments->structureInputDescriptor || arguments->structureOutputDescriptor ||
-        arguments->structureOutputMaximumSize < sizeof(struct rt_display_report) ||
-        !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, in, arguments->scalarInputCount))
-        return kIOReturnBadArgument;
-    char name[RT_DISPLAY_NAME_BYTES] = {};
+    memset(name, 0, RT_DISPLAY_NAME_BYTES);
+    if (arguments->structureInputDescriptor ||
+        arguments->structureOutputMaximumSize < sizeof(struct rt_display_report))
+        return false;
     if (nameData && nameData->getLength()) {
         const char *bytes = static_cast<const char *>(nameData->getBytesNoCopy());
         size_t length = nameData->getLength();
         if ((in[0] != MLG_DISPLAY_OP_SHOW && in[0] != MLG_DISPLAY_OP_MODES) || !bytes)
-            return kIOReturnBadArgument;
+            return false;
         if (bytes[length - 1] == '\0') --length;
-        if (!length || length > MLG_DISPLAY_NAME_MAX) return kIOReturnBadArgument;
+        if (!length || length > MLG_DISPLAY_NAME_MAX) return false;
         for (size_t i = 0; i < length; ++i) {
-            if (bytes[i] <= ' ' || bytes[i] > '~') return kIOReturnBadArgument;
+            if (bytes[i] <= ' ' || bytes[i] > '~') return false;
             name[i] = bytes[i];
         }
     }
-    if (in[0] == MLG_DISPLAY_OP_MODES && !name[0]) return kIOReturnBadArgument;
-    if (__atomic_exchange_n(&s_displayRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
-    if (!s_observerReads.enter()) {
-        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
-        return kIOReturnNotReady;
-    }
-    auto *pdev = static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice));
+    return in[0] != MLG_DISPLAY_OP_MODES || name[0];
+}
+
+// PROBE, SHOW, OFF, STATUS and MODES, on a driver thread, admitted.
+static kern_return_t observer_display_run(IOUserClientMethodArguments *arguments, const char *name,
+                                          struct pci_dev *pdev)
+{
+    const uint64_t *in = arguments->scalarInput;
+    uint64_t *out = arguments->scalarOutput;
     if (in[0] == MLG_DISPLAY_OP_MODES) {
         struct rt_display_modes modes;
         const int r = rt_display_modes(pdev, name, &modes);
-        s_observerReads.leave();
-        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
         arguments->structureOutput = OSData::withBytes(&modes, sizeof(modes));
         if (!arguments->structureOutput) return kIOReturnNoMemory;
         out[0] = (uint64_t)(int64_t)r;
-        arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
     struct rt_display_report report;
@@ -3090,12 +3193,9 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         // Polled by a display agent: cached state only, not logged.
         r = rt_display_status(pdev, &report);
         if (r == 0) displays_publish(pdev, report);
-        s_observerReads.leave();
-        __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
         arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
         if (!arguments->structureOutput) return kIOReturnNoMemory;
         out[0] = (uint64_t)(int64_t)r;
-        arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
     if (in[0] == MLG_DISPLAY_OP_PROBE) {
@@ -3109,8 +3209,6 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
         __atomic_store_n(&s_displayOwner, 0, __ATOMIC_RELEASE);
     }
     if (r == 0) displays_publish(pdev, report);
-    s_observerReads.leave();
-    __atomic_store_n(&s_displayRunning, 0u, __ATOMIC_RELEASE);
     unsigned connected = 0, lit = 0;
     for (uint32_t i = 0; i < report.connectors && i < RT_DISPLAY_CONNECTORS_MAX; ++i) {
         connected += report.connector[i].status == 1;
@@ -3125,7 +3223,158 @@ static kern_return_t observer_display(IOUserClientMethodArguments *arguments)
     arguments->structureOutput = OSData::withBytes(&report, sizeof(report));
     if (!arguments->structureOutput) return kIOReturnNoMemory;
     out[0] = (uint64_t)(int64_t)r;
-    arguments->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
+// An op that can sleep, on a wait-pool thread: run, keep the result for
+// RESULT, then complete the client's call.
+struct DisplayJob {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+    uint64_t clientID;
+    uint64_t token;
+    uint64_t in[3];
+    char name[RT_DISPLAY_NAME_BYTES];
+    OSData *input;                  // a copy of the structure input
+    IOMemoryDescriptor *descriptor; // IMPORT's memory, retained
+    uint64_t outputMax;
+    DisplayResultSlot *results;     // the client's, referenced
+};
+
+static void display_job_free(DisplayJob *job)
+{
+    if (job->input) job->input->release();
+    if (job->descriptor) job->descriptor->release();
+    display_slot_put(job->results);
+    job->action->release();
+    job->client->release();
+    IOFree(job, sizeof(*job));
+}
+
+static void display_job_main(void *arg)
+{
+    auto *job = static_cast<DisplayJob *>(arg);
+    IOUserClientMethodArguments a{};
+    uint64_t out[MLG_DISPLAY_WORDS] = {};
+    a.scalarInput = job->in;
+    a.scalarInputCount = 3;
+    a.structureInput = job->input;
+    a.structureInputDescriptor = job->descriptor;
+    a.scalarOutput = out;
+    a.scalarOutputCount = MLG_DISPLAY_WORDS;
+    a.structureOutputMaximumSize = job->outputMax;
+    auto *pdev = static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice));
+    const kern_return_t kr = job->in[0] >= MLG_DISPLAY_OP_IMPORT ? display_frames(job->clientID, &a, pdev)
+                                                                 : observer_display_run(&a, job->name, pdev);
+    s_observerReads.leave();
+    display_release();
+    OSData *output = a.structureOutput;
+    DisplayResultSlot *slot = job->results;
+    IOLockLock(slot->lock);
+    if (slot->data) slot->data->release();
+    slot->token = job->token;
+    slot->result = kr;
+    slot->out[0] = out[0];
+    slot->out[1] = out[1];
+    slot->data = output; // the reference structureOutput held
+    if (output) output->retain(); // and the completion's length below
+    IOLockUnlock(slot->lock);
+    IOUserClientAsyncArgumentsArray data = {};
+    data[0] = job->token;
+    data[1] = (uint64_t)(int64_t)kr;
+    data[2] = out[0];
+    data[3] = out[1];
+    data[4] = output ? output->getLength() : 0;
+    if (output) output->release();
+    job->client->AsyncCompletion(job->action, kIOReturnSuccess, data, MLG_DISPLAY_ASYNC_WORDS);
+    display_job_free(job);
+}
+
+// RESULT: the structure output of the client's last op, once.
+static kern_return_t display_result(MacLinuxGPUUserClient *client, IOUserClientMethodArguments *a)
+{
+    DisplayResultSlot *slot = client->ivars->displayResults;
+    if (a->scalarOutputCount < MLG_DISPLAY_WORDS) return kIOReturnBadArgument;
+    IOLockLock(slot->lock);
+    if (slot->token != a->scalarInput[1]) {
+        IOLockUnlock(slot->lock);
+        return kIOReturnNotFound;
+    }
+    const kern_return_t kr = slot->result;
+    a->scalarOutput[0] = slot->out[0];
+    a->scalarOutput[1] = slot->out[1];
+    a->scalarOutputCount = MLG_DISPLAY_WORDS;
+    OSData *data = slot->data;
+    slot->data = nullptr;
+    slot->token = 0;
+    IOLockUnlock(slot->lock);
+    if (data && data->getLength() > a->structureOutputMaximumSize) {
+        data->release();
+        return kIOReturnNoSpace;
+    }
+    a->structureOutput = data; // its reference passes to the reply
+    return kr;
+}
+
+// The display selector, from an observer's call: PRESENT and RESULT answer
+// at once; everything else is queued for a driver thread (display_job_main)
+// and completes through the call's async completion. Nothing that can
+// sleep runs on the call: a GPU that stops answering would otherwise hold
+// every client's calls with it (build 241: an OUTPUT waiting for a hung
+// ring froze the driver).
+static kern_return_t display_call(MacLinuxGPUUserClient *client, uint64_t clientID,
+                                  IOUserClientMethodArguments *a)
+{
+    const uint64_t *in = a->scalarInput;
+    if (!in || a->scalarInputCount != 3 || !a->scalarOutput || a->scalarOutputCount < 1 ||
+        a->structureOutputDescriptor || !mlg_observer_selector_allowed(MLG_SELECTOR_DISPLAY, in, 3))
+        return kIOReturnBadArgument;
+    if (in[0] == MLG_DISPLAY_OP_PRESENT) return observer_display_present(clientID, a);
+    if (in[0] == MLG_DISPLAY_OP_RESULT) return display_result(client, a);
+    if (!a->completion || a->scalarOutputCount < MLG_DISPLAY_WORDS) return kIOReturnBadArgument;
+    char name[RT_DISPLAY_NAME_BYTES] = {};
+    if (in[0] < MLG_DISPLAY_OP_IMPORT && !observer_display_valid(a, name)) return kIOReturnBadArgument;
+    auto *job = static_cast<DisplayJob *>(IOMallocZero(sizeof(DisplayJob)));
+    if (!job) return kIOReturnNoMemory;
+    if (a->structureInput && a->structureInput->getLength()) {
+        job->input = OSData::withBytes(a->structureInput->getBytesNoCopy(), a->structureInput->getLength());
+        if (!job->input) { IOFree(job, sizeof(*job)); return kIOReturnNoMemory; }
+    }
+    if (!display_try_acquire()) {
+        if (job->input) job->input->release();
+        IOFree(job, sizeof(*job));
+        return kIOReturnBusy;
+    }
+    if (!s_observerReads.enter()) {
+        display_release();
+        if (job->input) job->input->release();
+        IOFree(job, sizeof(*job));
+        return kIOReturnNotReady;
+    }
+    job->client = client;
+    job->action = a->completion;
+    job->clientID = clientID;
+    job->token = ++client->ivars->displayToken;
+    memcpy(job->in, in, sizeof(job->in));
+    memcpy(job->name, name, sizeof(job->name));
+    job->descriptor = a->structureInputDescriptor;
+    job->outputMax = a->structureOutputMaximumSize;
+    job->results = client->ivars->displayResults;
+    __atomic_add_fetch(&job->results->refs, 1, __ATOMIC_ACQ_REL);
+    client->retain();
+    job->action->retain();
+    if (job->descriptor) job->descriptor->retain();
+    const int started = rt_wait_pool_run(display_job_main, job);
+    if (started) {
+        s_observerReads.leave();
+        display_release();
+        display_job_free(job);
+        MACLINUXGPU_LOG("display: op %llu not started: no driver thread (%d)", (unsigned long long)in[0], started);
+        return kIOReturnNoResources;
+    }
+    a->scalarOutput[0] = 0;
+    a->scalarOutput[1] = job->token;
+    a->scalarOutputCount = MLG_DISPLAY_WORDS;
     return kIOReturnSuccess;
 }
 
@@ -3158,10 +3407,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (selector == MLG_SELECTOR_SYSFS_READ) return observer_sysfs_read(arguments);
         if (selector == MLG_SELECTOR_DRM_INFO) return observer_drm_info(arguments);
         if (selector == MLG_SELECTOR_DRM_SELFTEST) return observer_drm_selftest(arguments);
-        if (selector == MLG_SELECTOR_DISPLAY && arguments->scalarInput &&
-            arguments->scalarInputCount == 3 && arguments->scalarInput[0] >= MLG_DISPLAY_OP_IMPORT)
-            return observer_display_frames(ivars->clientID, arguments);
-        if (selector == MLG_SELECTOR_DISPLAY) return observer_display(arguments);
+        if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
         __block kern_return_t result = kIOReturnNotAttached;
         ivars->onOwnerQueue = true;
         ivars->ownerQueue->DispatchSync(^{

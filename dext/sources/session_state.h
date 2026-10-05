@@ -306,6 +306,21 @@ static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_c
 #define MLG_DISPLAY_OP_RELEASE  7u
 #define MLG_DISPLAY_OP_OUTPUT   8u
 #define MLG_DISPLAY_OP_PRESENT  9u
+/* Every op but PRESENT can sleep (a probe's AUX transfers, allocations,
+ * evictions, fence waits, a modeset), so none runs on the call: the call
+ * must carry an async completion (IOConnectCallAsyncMethod), returns at
+ * once with out[0] = 0 and out[1] = a token, and the op runs on a driver
+ * thread (rt_wait_pool). A synchronous call of one is refused
+ * (kIOReturnBadArgument); one while another runs is kIOReturnBusy. The
+ * completion's async data: [0] token, [1] the op's IOReturn, [2] its out[0]
+ * (status), [3] its out[1] (IMPORT's handle), [4] bytes of its structure
+ * output, which
+ *   RESULT  [1] token: returns, once, as struct out (with out[0] and out[1]
+ *           again); the client's last op's result only.
+ * PRESENT never sleeps (rt_display_present): it is a synchronous call, and
+ * returns -EBUSY in out[0] while an op that can sleep holds the display. */
+#define MLG_DISPLAY_OP_RESULT   10u
+#define MLG_DISPLAY_ASYNC_WORDS 5u
 #define MLG_DISPLAY_PRESENT_RECTS_MAX 255u
 
 struct mlg_display_output {
@@ -440,6 +455,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		case MLG_DISPLAY_OP_PRESENT:
 			/* Handle 0 with no rectangle reads the statistics. */
 			return input[1] <= UINT32_MAX;
+		case MLG_DISPLAY_OP_RESULT:
+			return input[1] != 0;
 		case MLG_DISPLAY_OP_OUTPUT:
 			return input[1] && input[1] <= 1000000;
 		default:

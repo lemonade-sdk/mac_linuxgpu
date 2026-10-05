@@ -1329,6 +1329,23 @@ final class MacLinuxGPUHost {
 // ----------------------------------------------------------------
 let kSelSysfsRead: UInt32 = 80
 let kSelDisplay: UInt32 = 84
+
+/// An async display op's completion (session_state.h): [0] token, [1] the
+/// op's IOReturn, [2] status, [3] IMPORT's handle, [4] output bytes.
+final class DisplayCompletion {
+    var done = false
+    var status: IOReturn = kIOReturnSuccess
+    var args: [UInt64] = []
+}
+let displayCompleted: IOAsyncCallback = { refcon, result, args, count in
+    guard let refcon else { return }
+    let completion = Unmanaged<DisplayCompletion>.fromOpaque(refcon).takeUnretainedValue()
+    completion.status = result
+    if let args {
+        completion.args = (0..<Int(count)).map { UInt64(UInt(bitPattern: args[$0])) }
+    }
+    completion.done = true
+}
 let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
 let kDisplayReportMax = 1024
 
@@ -1359,18 +1376,79 @@ extension MacLinuxGPUHost {
     func display(_ op: DisplayOp, pattern: UInt64 = 0, connector: String? = nil)
         -> (kern_return_t, Int64, DisplayReport?) {
         let name = Data((connector ?? "").utf8)
-        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [op.rawValue, pattern, kDisplayConfirm],
-                                            inData: name, outScalars: 2, outSize: kDisplayReportMax)
+        let (kr, values, data) = name.withUnsafeBytes { bytes in
+            callDisplayAsync([op.rawValue, pattern, kDisplayConfirm], input: name.isEmpty ? nil : bytes.baseAddress,
+                             inputLength: name.count, outSize: kDisplayReportMax)
+        }
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), DisplayReport(data))
     }
 
     /// One connector's probed modes (op MODES).
     func displayModes(_ connector: String) -> (kern_return_t, Int64, DisplayModes?) {
-        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [DisplayOp.modes.rawValue, 0, kDisplayConfirm],
-                                            inData: Data(connector.utf8), outScalars: 2, outSize: kDisplayReportMax)
+        let name = Data(connector.utf8)
+        let (kr, values, data) = name.withUnsafeBytes { bytes in
+            callDisplayAsync([DisplayOp.modes.rawValue, 0, kDisplayConfirm], input: bytes.baseAddress,
+                             inputLength: name.count, outSize: kDisplayReportMax)
+        }
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), DisplayModes(data))
+    }
+
+    /// A display op that can sleep (every op but PRESENT; session_state.h):
+    /// the driver runs it on a thread of its own and completes the call
+    /// asynchronously, so no driver call waits on the GPU. This thread
+    /// waits for the completion (up to @timeout), then fetches the op's
+    /// structure output (RESULT). Returns the op's IOReturn, its two
+    /// scalars and its output.
+    func callDisplayAsync(_ scalars: [UInt64], input: UnsafeRawPointer?, inputLength: Int, outSize: Int,
+                          timeout: TimeInterval = 60) -> (kern_return_t, [UInt64], Data) {
+        guard isOpen, let port = IONotificationPortCreate(kIOMainPortDefault) else { return (kIOReturnError, [], Data()) }
+        defer { IONotificationPortDestroy(port) }
+        let completion = DisplayCompletion()
+        var reference = [io_user_reference_t](repeating: 0, count: Int(kIOAsyncCalloutCount))
+        reference[Int(kIOAsyncCalloutFuncIndex)] =
+            io_user_reference_t(UInt(bitPattern: unsafeBitCast(displayCompleted, to: UnsafeRawPointer.self)))
+        reference[Int(kIOAsyncCalloutRefconIndex)] =
+            io_user_reference_t(UInt(bitPattern: Unmanaged.passUnretained(completion).toOpaque()))
+        var out = [UInt64](repeating: 0, count: 2)
+        var outCount: UInt32 = 2
+        let kr = scalars.withUnsafeBufferPointer { s in
+            out.withUnsafeMutableBufferPointer { o in
+                reference.withUnsafeMutableBufferPointer { r in
+                    IOConnectCallAsyncMethod(ucConn, kSelDisplay, IONotificationPortGetMachPort(port), r.baseAddress,
+                                             UInt32(kIOAsyncCalloutCount), s.baseAddress, UInt32(scalars.count),
+                                             input, inputLength, o.baseAddress, &outCount, nil, nil)
+                }
+            }
+        }
+        guard kr == kIOReturnSuccess, outCount >= 2 else { return (kr, [], Data()) }
+        let token = out[1]
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: 4096, alignment: 16)
+        defer { buffer.deallocate() }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !completion.done {
+            let left = deadline.timeIntervalSinceNow
+            if left <= 0 { return (kIOReturnTimeout, [], Data()) }
+            let header = buffer.bindMemory(to: mach_msg_header_t.self, capacity: 1)
+            header.pointee = mach_msg_header_t()
+            let received = mach_msg(header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 4096,
+                                    IONotificationPortGetMachPort(port), mach_msg_timeout_t(left * 1000), mach_port_t(MACH_PORT_NULL))
+            if received == MACH_RCV_TIMED_OUT { continue }
+            if received != MACH_MSG_SUCCESS { return (kIOReturnError, [], Data()) }
+            IODispatchCalloutFromMessage(nil, header, UnsafeMutableRawPointer(port))
+        }
+        let a = completion.args
+        guard completion.status == kIOReturnSuccess, a.count >= 5, a[0] == token else { return (kIOReturnError, [], Data()) }
+        let result = kern_return_t(truncatingIfNeeded: Int64(bitPattern: a[1]))
+        var data = Data()
+        if a[4] > 0 {
+            let (rkr, _, output) = callMethod(kSelDisplay, inScalars: [DisplayOp.result.rawValue, token, kDisplayConfirm],
+                                              inData: Data(), outScalars: 2, outSize: outSize)
+            if rkr != result { return (rkr == kIOReturnSuccess ? kIOReturnError : rkr, [], Data()) }
+            data = output
+        }
+        return (result, [a[2], a[3]], data)
     }
 
     /// A sysfs file under the device directory (selector 80), read whole.

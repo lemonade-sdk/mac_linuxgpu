@@ -18,7 +18,7 @@ let kDisplayModesBytes = 24 + 56 * 16
 
 enum DisplayOp: UInt64 {
     case probe = 0, show = 1, off = 2, status = 3, modes = 4
-    case importSurface = 5, verify = 6, release = 7, output = 8, present = 9
+    case importSurface = 5, verify = 6, release = 7, output = 8, present = 9, result = 10
 }
 let displayPatterns: [String: UInt64] = ["bars": 0, "white": 1, "gradient": 2]
 
@@ -435,6 +435,8 @@ struct PresentMeasurement {
     static let bucketLimits: [UInt64] = [64 << 10, 1 << 20, 4 << 20, .max]
     static let bucketNames = ["<64K", "64K-1M", "1M-4M", ">=4M"]
     var frames = 0, idleFrames = 0, presented = 0
+    /// Frames PRESENT answered busy for (their damage went with the next).
+    var busyFrames = 0
     var callCPUNs: UInt64 = 0, callWallNs: UInt64 = 0, callWallMaxNs: UInt64 = 0, handlerCPUNs: UInt64 = 0
     var bucketFrames = [Int](repeating: 0, count: 4)
     var bucketBytes = [UInt64](repeating: 0, count: 4)
@@ -498,8 +500,8 @@ struct PresentMeasurement {
         let replaced = end.replaced - start.replaced, bytes = end.bytesCopied - start.bytesCopied
         let f = Double(max(flipped, 1)), p = Double(max(presented, 1))
         var out: [String] = []
-        out.append(String(format: "frames: %d captured (%d without damage), %d presented, %llu received by the driver, %llu flipped, %llu replaced before a flip; %.1f flips/s at %.3f Hz",
-                          frames, idleFrames, presented, received, flipped, replaced,
+        out.append(String(format: "frames: %d captured (%d without damage, %d while the driver was busy), %d presented, %llu received by the driver, %llu flipped, %llu replaced before a flip; %.1f flips/s at %.3f Hz",
+                          frames, idleFrames, busyFrames, presented, received, flipped, replaced,
                           Double(flipped) / max(seconds, 0.001), refreshHz))
         out.append(String(format: "agent per presented frame: PRESENT %.1f us CPU, %.1f us wall (max %.1f); whole frame handler %.1f us CPU",
                           Double(callCPUNs) / p / 1e3, Double(callWallNs) / p / 1e3,

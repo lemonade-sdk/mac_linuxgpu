@@ -34,31 +34,23 @@ extension MacLinuxGPUHost {
         -> (kern_return_t, Int64, UInt32) {
         guard isOpen else { return (kIOReturnError, 0, 0) }
         let geometry = UInt64(width) << 48 | UInt64(height) << 32 | UInt64(UInt32(pitch))
-        let scalars: [UInt64] = [DisplayOp.importSurface.rawValue, geometry, kDisplayConfirm]
-        var out = [UInt64](repeating: 0, count: 2)
-        var outCount: UInt32 = 2
-        var outSize = 0
-        let kr = scalars.withUnsafeBufferPointer { s in
-            out.withUnsafeMutableBufferPointer { o in
-                IOConnectCallMethod(ucConn, kSelDisplay, s.baseAddress, 3, base, length,
-                                    o.baseAddress, &outCount, nil, &outSize)
-            }
-        }
-        guard kr == kIOReturnSuccess, outCount >= 2 else { return (kr, 0, 0) }
-        return (kr, Int64(bitPattern: out[0]), UInt32(truncatingIfNeeded: out[1]))
+        let (kr, values, _) = callDisplayAsync([DisplayOp.importSurface.rawValue, geometry, kDisplayConfirm],
+                                               input: base, inputLength: length, outSize: 0)
+        guard kr == kIOReturnSuccess, values.count >= 2 else { return (kr, 0, 0) }
+        return (kr, Int64(bitPattern: values[0]), UInt32(truncatingIfNeeded: values[1]))
     }
 
     func displayVerify(handle: UInt32, seed: UInt32) -> (kern_return_t, Int64, SurfaceVerifyResult?) {
-        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [DisplayOp.verify.rawValue,
-                                            UInt64(handle) << 32 | UInt64(seed), kDisplayConfirm],
-                                            inData: Data(), outScalars: 2, outSize: kDisplayReportMax)
+        let (kr, values, data) = callDisplayAsync([DisplayOp.verify.rawValue, UInt64(handle) << 32 | UInt64(seed),
+                                                   kDisplayConfirm], input: nil, inputLength: 0,
+                                                  outSize: kDisplayReportMax)
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), SurfaceVerifyResult(data))
     }
 
     func displayRelease(handle: UInt32) -> (kern_return_t, Int64) {
-        let (kr, values, _) = callMethod(kSelDisplay, inScalars: [DisplayOp.release.rawValue, UInt64(handle),
-                                         kDisplayConfirm], inData: Data(), outScalars: 2, outSize: 0)
+        let (kr, values, _) = callDisplayAsync([DisplayOp.release.rawValue, UInt64(handle), kDisplayConfirm],
+                                               input: nil, inputLength: 0, outSize: 0)
         return (kr, values.first.map { Int64(bitPattern: $0) } ?? 0)
     }
 
@@ -71,9 +63,10 @@ extension MacLinuxGPUHost {
             raw.storeBytes(of: UInt32(width).littleEndian, toByteOffset: 32, as: UInt32.self)
             raw.storeBytes(of: UInt32(height).littleEndian, toByteOffset: 36, as: UInt32.self)
         }
-        let (kr, values, data) = callMethod(kSelDisplay, inScalars: [DisplayOp.output.rawValue,
-                                            UInt64(refreshMilliHz), kDisplayConfirm],
-                                            inData: request, outScalars: 2, outSize: kDisplayReportMax)
+        let (kr, values, data) = request.withUnsafeBytes { bytes in
+            callDisplayAsync([DisplayOp.output.rawValue, UInt64(refreshMilliHz), kDisplayConfirm],
+                             input: bytes.baseAddress, inputLength: request.count, outSize: kDisplayReportMax)
+        }
         guard kr == kIOReturnSuccess, let status = values.first else { return (kr, 0, nil) }
         return (kr, Int64(bitPattern: status), DisplayReport(data))
     }
@@ -344,6 +337,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
     /// What the driver was given, by tile: damage that changes nothing is
     /// dropped, rows that scrolled are moved (damageMode).
     var filter: DamageFilter?
+    /// Damage of frames PRESENT answered busy for, presented with the next.
+    var unpresented: [DamageFilter.Rect] = []
     enum DamageMode { case raw, filtered, scroll }
     var damageMode = DamageMode.scroll
     /// CGVirtualDisplaySettings.refreshDeadline (0: not set; --refresh-deadline)
@@ -596,9 +591,27 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         // The frame's composition time on the virtual display.
         let captureNs = (info[.displayTime] as? UInt64).map(machToNs) ?? 0
         let callCPU = threadCPUNs(), callWall = uptimeNs()
-        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: kept.rects, moves: kept.moves,
+        // Damage of frames the driver was busy for comes along (as rectangles).
+        var sendRects = kept.rects + unpresented
+        var sendMoves = kept.moves
+        if 16 + sendRects.count * 16 + sendMoves.count * 24 > DamageFilter.requestMax || sendRects.count > 255 {
+            sendRects = [(0, 0, UInt32(mode.width), UInt32(mode.height))]
+            sendMoves = []
+        }
+        let (kr, status, stats) = observer.displayPresent(handle: handle!, rects: sendRects, moves: sendMoves,
                                                           captureNs: captureNs)
         let callWallNs = uptimeNs() - callWall, callCPUNs = threadCPUNs() - callCPU
+        if kr == kIOReturnSuccess && status == -16 {
+            // EBUSY: an op that can sleep holds the display (a STATUS poll,
+            // a probe). Never waited for; this frame's damage goes with the
+            // next one, and the filter forgets what it recorded as given
+            // (the driver drew none of it, so no later frame may move rows
+            // from it or skip them as unchanged).
+            unpresented = sendRects + sendMoves.map { ($0.x, $0.y, $0.w, $0.h) }
+            filter?.reset()
+            measurement.busyFrames += 1
+            return
+        }
         guard kr == kIOReturnSuccess, status == 0, let stats else {
             failure = kr == kIOReturnSuccess ?
                 "PRESENT: \(displayErrno(status))" + (stats.map { " (worker error \($0.error))" } ?? "") :
@@ -606,6 +619,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             return
         }
         last = stats
+        unpresented = []
         if !typeChanges.isEmpty, let probe = typeProbe {
             let returned = uptimeNs()
             for change in typeChanges where captureNs > change.ns { probe.composed.add(captureNs - change.ns) }
@@ -1433,6 +1447,11 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         }
         // The monitors: the cached hotplug state; probe when it moved.
         let (kr, _, report) = observer!.display(.status)
+        if kr == kern_return_t(bitPattern: 0xe00002d5) {
+            // kIOReturnBusy: a mirroring process's op holds the display; next poll.
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
+            continue
+        }
         guard kr == kIOReturnSuccess, let report else { closeClients(); continue }
         if report.hotplugEpoch != epoch {
             epoch = report.hotplugEpoch

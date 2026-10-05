@@ -2061,7 +2061,12 @@ int rt_display_present(struct pci_dev *pdev, struct rt_surface *surface,
 		rt_surface_release(surface);
 		return -EINVAL;
 	}
-	mutex_lock(&rt_display_lock);
+	/* As rt_display_stats: busy rather than wait behind an operation that
+	 * can sleep; the frame is the caller's to present again. */
+	if (!mutex_trylock(&rt_display_lock)) {
+		rt_surface_release(surface);
+		return -EBUSY;
+	}
 	o = rt_display.dev == dev ? rt_display.output : NULL;
 	if (!o) {
 		mutex_unlock(&rt_display_lock);
@@ -2138,7 +2143,10 @@ int rt_display_stats(struct pci_dev *pdev, struct rt_display_present_stats *stat
 	if (!stats)
 		return -EINVAL;
 	memset(stats, 0, sizeof(*stats));
-	mutex_lock(&rt_display_lock);
+	/* Called on a client's call: never waits for an operation that can
+	 * sleep (an OUTPUT stuck behind a hung GPU holds the lock forever). */
+	if (!mutex_trylock(&rt_display_lock))
+		return -EBUSY;
 	o = dev && rt_display.dev == dev ? rt_display.output : NULL;
 	if (o) {
 		struct linuxu_aperture_stats ap;

@@ -599,7 +599,7 @@ static void clientExitReopen(bool queueExhausted) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
-                   false, nullptr, nullptr};
+                   false, nullptr, nullptr, 0, nullptr};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held. The runtime refused it before
     // any allocation (or the driver did, with -ENOSPC before reserving), so
@@ -635,7 +635,7 @@ static void clientExitReopen(bool queueExhausted) {
     // The dext is reusable: a new client opens a new PCI session.
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
-                 false, nullptr, nullptr};
+                 false, nullptr, nullptr, 0, nullptr};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 1 && saw("pci_open"));
@@ -664,7 +664,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
-                   false, nullptr, nullptr};
+                   false, nullptr, nullptr, 0, nullptr};
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
@@ -754,7 +754,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     devicePresent = true;
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
-                 false, nullptr, nullptr};
+                 false, nullptr, nullptr, 0, nullptr};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));

@@ -176,7 +176,9 @@ int rt_display_monitor(struct pci_dev *pdev, const char *connector,
  * The worker copies into one of three framebuffers with SDMA and flips to
  * it with a nonblocking commit (display.c describes the pipeline). No
  * rectangle means nothing changed: only the statistics come back. A
- * worker error is returned by every later call.
+ * worker error is returned by every later call. It never sleeps: while
+ * an operation that can (OUTPUT, OFF, SHOW, a probe) holds the display,
+ * it returns -EBUSY at once, as rt_display_stats() does.
  *
  * @moves are rows that scrolled: each says that @width x @height pixels at
  * (@x, @y) of this frame are the pixels at (@x, @src_y) of the frame

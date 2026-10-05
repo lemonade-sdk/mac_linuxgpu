@@ -867,6 +867,13 @@ test-shmem-driverkit-alias:
 test-raw-bar-lease:
 	bash scripts/test-raw-bar-lease.sh
 
+# The dext's display calls: an op that can sleep never runs on the call.
+test-display-async:
+	bash scripts/test-display-async.sh
+
+test: test-display-async
+.PHONY: test-display-async
+
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh
 
