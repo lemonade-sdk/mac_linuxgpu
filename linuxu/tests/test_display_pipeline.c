@@ -27,6 +27,7 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_mode_config.h>
 #include <rt/dart.h>
 #include <rt/display.h>
+#include <rt/recovery.h>
 #include <rt/device_string.h>
 #include <rt/removal.h>
 #include <rt/surface.h>
@@ -533,6 +534,74 @@ int main(void)
 		printf("pipeline: moves past the frame refused; the whole frame up and down a row: %lu pixels differ\n", bad);
 		CHECK(bad == 0);
 		CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+	}
+
+	/* A GPU queue reset around a frame: half of its copy hangs (SDMA 0
+	 * holds), upstream's job timeout resets that queue, which completes
+	 * the copy with an error. The worker goes on: the frame is drawn
+	 * again in full from its surface, unasked. The whole surface changed
+	 * but only one row is reported, so a screen equal to the surface
+	 * proves the full redraw; the next frame copies nothing from a
+	 * buffer whose content is unknown. */
+	{
+		const struct rt_surface_rect row = { 0, 700, W, 1 }, box = { 640, 360, 32, 32 };
+		struct amdgpu_ring *rings[2] = { &adev->sdma.instance[0].ring, &adev->sdma.instance[1].ring };
+		long saved[2];
+		struct rt_recovery_state was, now;
+		uint64_t flipped, full_before;
+		unsigned long bad = 0;
+
+		CHECK(rt_display_stats(pdev, &st) == 0 && !st.error);
+		flipped = st.frames_flipped;
+		full_before = st.full_frames;
+		rt_recovery_state(&was);
+		for (int i = 0; i < 2; i++) {
+			saved[i] = rings[i]->sched.timeout;
+			rings[i]->sched.timeout = msecs_to_jiffies(300);
+		}
+		cs_fixture_hold_sdma(1);
+		fake_fill(&surf, 0x00e00000u, NULL);
+		/* Two rectangles far apart: a copy job on each engine. */
+		{
+			const struct rt_surface_rect two[2] = { { 0, 0, W, H / 2 }, { 0, H / 2, W, H - H / 2 } };
+
+			CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), two, 2, NULL, 0,
+						 ktime_get_ns(), &st) == 0);
+		}
+		/* The aborted frame flips, then the redraw does. */
+		st = wait_flipped(pdev, flipped + 2);
+		rt_recovery_state(&now);
+		cs_fixture_hold_sdma(0);
+		for (int i = 0; i < 2; i++)
+			rings[i]->sched.timeout = saved[i];
+		usleep(50000);
+		for (uint32_t py = 0; py < H; py++)
+			for (uint32_t px = 0; px < W; px++)
+				if (screen_pixel(px, py) != *pixel(&surf, px, py) && bad++ < 5)
+					printf("pipeline: queue reset: pixel %u,%u is %08x, the surface has %08x\n",
+					       px, py, screen_pixel(px, py), *pixel(&surf, px, py));
+		printf("pipeline: a copy caught in a queue reset (generation %llu -> %llu): %llu frames flipped, "
+		       "%u full, error %d, %lu pixels differ\n", (unsigned long long)was.generation,
+		       (unsigned long long)now.generation, (unsigned long long)(st.frames_flipped - flipped),
+		       st.full_frames - (uint32_t)full_before, st.error, bad);
+		CHECK(now.queue_resets == was.queue_resets + 1 && !(now.flags & RT_RECOVERY_WEDGED));
+		CHECK(!st.error && st.frames_flipped >= flipped + 2 && st.full_frames >= full_before + 2);
+		CHECK(bad == 0);
+		/* Later frames: the whole frame again (no buffer is trusted),
+		 * then only the damage, as before. */
+		(void)row;
+		flipped = st.frames_flipped;
+		fake_fill(&surf, 0x00e10000u, &box);
+		CHECK(rt_display_present(pdev, rt_surface_get_hold(1, handle), &box, 1, NULL, 0,
+					 ktime_get_ns(), &st) == 0);
+		st = wait_flipped(pdev, flipped + 1);
+		CHECK(!st.error);
+		usleep(50000);
+		for (uint32_t py = 0; py < H; py++)
+			for (uint32_t px = 0; px < W; px++)
+				if (screen_pixel(px, py) != *pixel(&surf, px, py))
+					bad++;
+		CHECK(bad == 0);
 	}
 
 	/* A frame of another size is refused; nothing breaks. */

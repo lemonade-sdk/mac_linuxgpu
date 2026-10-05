@@ -32,6 +32,7 @@
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_modes.h>
+#include <rt/recovery.h>
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 #include <drm/drm_auth.h>
@@ -90,6 +91,11 @@ struct display_snapshot {
 #define OUTPUT_DAMAGE_MAX	128u
 #define OUTPUT_FLIP_TIMEOUT_MS	200u
 #define OUTPUT_COPY_TIMEOUT_MS	2000u
+/* A copy that hangs is ended by upstream's job timeout (adev->sdma_timeout)
+ * and the queue reset that follows (bootstrap.c, rt/recovery.h), which
+ * completes it with an error; the wait for it covers both, plus this. */
+#define OUTPUT_RESET_MARGIN_MS	5000u
+#define OUTPUT_COPY_WAIT_MAX_MS	60000u
 
 extern struct dma_fence *drm_crtc_create_fence(struct drm_crtc *crtc);
 
@@ -102,7 +108,20 @@ struct output_damage {
 struct output_frame {
 	uint64_t capture_ns, received_ns, submitted_ns, bytes;
 	struct dma_fence *copy[RT_SURFACE_ENGINES_MAX];
+	/* GPU recovery's generation when the copies were submitted: one that
+	 * moved by the flip means a queue reset may have cut a copy short
+	 * (only each engine's last copy fence is kept, and the reset fails
+	 * only the job it caught). */
+	uint64_t generation;
 };
+
+static uint64_t recovery_generation(void)
+{
+	struct rt_recovery_state state;
+
+	rt_recovery_state(&state);
+	return state.generation;
+}
 
 /* A client's framebuffer for one commit (LX_SCANOUT PRESENT): the layer
  * (MLG_LX_LAYER_*), the framebuffer and the syncobj that gets the flip's
@@ -157,6 +176,10 @@ struct display_output {
 	 * scrolled, from it. */
 	int drawn;
 	struct dma_fence *drawn_copy[RT_SURFACE_ENGINES_MAX];
+	/* The last desktop frame's surface, held: drawn again in full when a
+	 * copy was aborted or a flip cancelled (output_abort) and no newer
+	 * frame is waiting. */
+	struct rt_surface *last;
 	struct rt_surface_vram_copy vram[OUTPUT_DAMAGE_MAX + RT_DISPLAY_MOVES_MAX];
 	struct task_struct *worker;
 	/* The worker sleeps on this until a kick (a frame, a flip, stop) or
@@ -1248,6 +1271,83 @@ static void output_error(struct display_output *o, int error)
 	drm_err(o->dev, "display output: worker stopped by error %d\n", error);
 }
 
+/* How long a copy may take: upstream's job timeout for SDMA and the queue
+ * reset after it, so a copy caught in a reset completes (with an error)
+ * inside the wait. */
+static unsigned int output_copy_wait_ms(const struct display_output *o)
+{
+	const long timeout = o->adev ? o->adev->sdma_timeout : 0;
+	unsigned long ms;
+
+	if (timeout <= 0 || timeout == MAX_SCHEDULE_TIMEOUT)
+		return OUTPUT_COPY_TIMEOUT_MS;
+	ms = jiffies_to_msecs(timeout) + OUTPUT_RESET_MARGIN_MS;
+	if (ms < OUTPUT_COPY_TIMEOUT_MS)
+		ms = OUTPUT_COPY_TIMEOUT_MS;
+	return ms > OUTPUT_COPY_WAIT_MAX_MS ? OUTPUT_COPY_WAIT_MAX_MS : (unsigned int)ms;
+}
+
+/* Upstream fails every later job of a scheduler entity whose last job
+ * failed (drm_sched_entity_error, amdgpu_job_prepare_job), as Linux ends
+ * a context a queue reset found guilty: an engine whose copy a reset cut
+ * short gets a new entity before the next frame. 0 or -errno. */
+static int output_engines_renew(struct display_output *o)
+{
+	struct rt_surface_engines fresh = { 0 };
+	bool poisoned = false;
+	int r;
+
+	for (unsigned int i = 0; i < o->engines.count; i++)
+		if (drm_sched_entity_error(o->engines.entity[i]))
+			poisoned = true;
+	if (!poisoned)
+		return 0;
+	r = rt_surface_engines_init(o->adev, &fresh);
+	if (r) {
+		drm_err(o->dev, "display output: no copy engines after a GPU queue reset (%d)\n", r);
+		return r;
+	}
+	rt_surface_engines_fini(&o->engines);
+	o->engines = fresh;
+	drm_info(o->dev, "display output: new copy engines after a GPU queue reset\n");
+	return 0;
+}
+
+/* A copy completed with an error or a flip was cancelled: a GPU queue
+ * reset ended them (the device itself is fine; a wedged one fails every
+ * later step with -ENODEV, which stops the worker). What every buffer
+ * holds is unknown now: each is drawn in full from the surface again,
+ * nothing is copied from the one drawn last, and the last frame is drawn
+ * again at once unless a newer one is waiting. */
+static void output_abort(struct display_output *o, int error, const char *what)
+{
+	unsigned long flags;
+
+	drm_warn(o->dev, "display output: %s (%d); every buffer is drawn again\n", what, error);
+	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
+		memset(&o->missed[i], 0, sizeof(o->missed[i]));
+		o->missed[i].full = true;
+	}
+	o->drawn = -1;
+	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
+		if (o->drawn_copy[i])
+			dma_fence_put(o->drawn_copy[i]);
+		o->drawn_copy[i] = NULL;
+	}
+	spin_lock_irqsave(&o->lock, flags);
+	if (!o->next && o->last) {
+		rt_surface_hold(o->last);
+		o->next = o->last;
+		o->next_move_count = 0;
+		o->next_capture_ns = 0;
+		o->next_received_ns = ktime_get_ns();
+	}
+	o->next_damage.full = true;
+	o->next_damage.count = 0;
+	spin_unlock_irqrestore(&o->lock, flags);
+	output_kick(o);
+}
+
 /* The pending flip happened: account it, its buffers are on screen. */
 static void output_flip_account(struct display_output *o)
 {
@@ -1255,10 +1355,14 @@ static void output_flip_account(struct display_output *o)
 	uint64_t flip_ns = ktime_to_ns(o->pending_flip->timestamp);
 	uint64_t gpu_ns = 0, latency = 0;
 	unsigned long flags;
+	int copy_error = 0, flip_error = dma_fence_get_status(o->pending_flip);
+	const bool reset_since = o->pending_desktop && f->generation != recovery_generation();
 
 	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++) {
 		if (!f->copy[i])
 			continue;
+		if (!copy_error && dma_fence_get_status(f->copy[i]) < 0)
+			copy_error = dma_fence_get_status(f->copy[i]);
 		if (dma_fence_is_signaled(f->copy[i]) &&
 		    test_bit(DMA_FENCE_FLAG_TIMESTAMP_BIT, &f->copy[i]->flags)) {
 			uint64_t done = ktime_to_ns(f->copy[i]->timestamp);
@@ -1291,6 +1395,12 @@ static void output_flip_account(struct display_output *o)
 	o->front = o->pending;
 	o->pending = -1;
 	o->pending_desktop = o->pending_client = false;
+	if (copy_error)
+		output_abort(o, copy_error, "a copy for the frame on screen was aborted");
+	else if (flip_error < 0)
+		output_abort(o, flip_error, "the flip was cancelled");
+	else if (reset_since)
+		output_abort(o, -ECANCELED, "a GPU queue reset came while the frame on screen was copied");
 }
 
 /* Wait (bounded) for the pending flip; 0 when it happened. */
@@ -1307,10 +1417,10 @@ static int output_flip_wait(struct display_output *o)
 
 		if (!copy)
 			continue;
-		left = dma_fence_wait_timeout(copy, false, msecs_to_jiffies(OUTPUT_COPY_TIMEOUT_MS));
+		left = dma_fence_wait_timeout(copy, false, msecs_to_jiffies(output_copy_wait_ms(o)));
 		if (left <= 0) {
 			pr_err("display: the copy for the pending flip did not complete in %u ms (%ld)\n",
-			       OUTPUT_COPY_TIMEOUT_MS, left);
+			       output_copy_wait_ms(o), left);
 			return left < 0 ? (int)left : -ETIME;
 		}
 	}
@@ -1561,6 +1671,12 @@ static int output_frame(struct display_output *o, struct rt_surface *surface,
 		uint64_t moved_rows = 0, dropped = 0;
 		uint32_t n = 0;
 
+		frame.generation = recovery_generation();
+		r = output_engines_renew(o);
+		if (r) {
+			rt_surface_release(surface);
+			return r;
+		}
 		b = 0;
 		while (b == o->front || b == o->pending)
 			b++;
@@ -1607,7 +1723,12 @@ static int output_frame(struct display_output *o, struct rt_surface *surface,
 		plan.count = copy.full ? 1 : copy.count;
 		r = rt_surface_frame_submit(surface, o->fb[b]->fb->obj[0], o->fb_address[b],
 					    o->fb[b]->fb->pitches[0], &plan, &o->engines, frame.copy, &cs);
-		rt_surface_release(surface);
+		if (o->last != surface) {
+			rt_surface_release(o->last);
+			o->last = surface;	/* the worker's reference, kept */
+		} else {
+			rt_surface_release(surface);
+		}
 		if (r)
 			return r;
 		frame.submitted_ns = ktime_get_ns();
@@ -1868,6 +1989,8 @@ static void output_free(struct display_output *o)
 	for (unsigned int i = 0; i < RT_SURFACE_ENGINES_MAX; i++)
 		if (o->drawn_copy[i])
 			dma_fence_put(o->drawn_copy[i]);
+	rt_surface_release(o->last);
+	o->last = NULL;
 	if (o->engines.count)
 		rt_surface_engines_fini(&o->engines);
 	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
