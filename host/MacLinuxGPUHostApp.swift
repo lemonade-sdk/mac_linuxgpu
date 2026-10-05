@@ -2398,7 +2398,7 @@ struct AppMain {
         // Cached-state commands use an observer client, which works while a
         // session closes or stays quarantined and never joins a session.
         let observerCommands: Set<String> = ["status", "session", "release", "power", "power-watch",
-                                             "power-hold", "pcie"]
+                                             "power-hold", "pcie", "rebar"]
 
         if !host.openUserClient(observer: observerCommands.contains(args[1]),
                                 bundledOnly: args[1] == "ping-bundled") {
@@ -2419,6 +2419,34 @@ case "pcie":
             commandStatus = 0
         } else {
             print("ERROR: no PCI Express capability in \(config.count) bytes of configuration space")
+            commandStatus = 1
+        }
+    case .file(let status, _):
+        print("ERROR: reading the configuration space: Linux errno \(-status)")
+        commandStatus = 1
+    case .overran(let kr):
+        print(String(format: "ERROR: the driver's bounded sysfs read overran (kr=%#x): the GPU did not answer within 250 ms", kr))
+        commandStatus = 1
+    case .failed(let kr):
+        print(String(format: "ERROR: the driver did not answer the sysfs read (kr=%#x; is the GPU initialized?)", kr))
+        commandStatus = 1
+    }
+case "rebar":
+    // The GPU's Resizable BAR capability, from its configuration space (the
+    // sysfs "config" file); read only. macOS sizes every BAR, and the bridge
+    // windows above it, once, when it enumerates the device: IOPCIFamily
+    // never programs this capability, takes no BAR above 1 GB
+    // (IOPCIConfigurator MAX_BAR_SIZE), and DriverKit has no call to
+    // resize one. So the size shown as "now" is the one the driver has.
+    switch host.readSysfs("config") {
+    case .file(0, let config):
+        if let rebar = ResizableBARCapability(config: config) {
+            rebar.lines.forEach { print($0) }
+            print("  macOS assigns BAR sizes when it enumerates the GPU and does not resize them;"
+                  + " a DriverKit driver cannot, so the driver uses the sizes shown as now.")
+            commandStatus = 0
+        } else {
+            print("ERROR: no valid Resizable BAR capability in \(config.count) bytes of configuration space")
             commandStatus = 1
         }
     case .file(let status, _):

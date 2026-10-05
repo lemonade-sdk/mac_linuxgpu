@@ -122,3 +122,49 @@ do {
     precondition(PCIeCapability(config: Data(b.prefix(0x64 + 20))) == nil)
     print("PASS PCIe capability: list walk, payload, read request, tags, link, refusals")
 }
+
+// The Resizable BAR capability from a configuration space: the R9700's, as
+// read on the Thunderbolt 5 eGPU (VSEC 0x100 -> AER 0x150 -> ReBAR 0x200
+// -> power budget 0x240): BAR0 256 MB of 256 MB-32 GB, BAR2 2 MB of 2-256 MB.
+do {
+    var b = [UInt8](repeating: 0, count: 4096)
+    func put32(_ at: Int, _ v: UInt32) { for i in 0..<4 { b[at + i] = UInt8((v >> (8 * UInt32(i))) & 0xff) } }
+    put32(0x100, 0x1501000b)
+    put32(0x150, 0x20020001)
+    put32(0x200, 0x24010015)
+    put32(0x204, 0x000ff000); put32(0x208, 0x00000840)
+    put32(0x20c, 0x00001fe0); put32(0x210, 0x00000102)
+    put32(0x240, 0x00010004)
+    guard let rebar = ResizableBARCapability(config: Data(b)) else { print("no Resizable BAR"); exit(1) }
+    precondition(rebar.offset == 0x200 && rebar.entries.count == 2)
+    let bar0 = rebar.entry(bar: 0)!, bar2 = rebar.entry(bar: 2)!
+    precondition(bar0.currentBytes == 256 << 20 && bar0.largestBytes == UInt64(32) << 30)
+    precondition(bar0.supportedBytes.count == 8 && bar0.supportedBytes.first == 256 << 20)
+    precondition(bar2.currentBytes == 2 << 20 && bar2.largestBytes == 256 << 20)
+    precondition(rebar.entry(bar: 1) == nil)
+    precondition(rebar.lines == [
+        "Resizable BAR capability at 0x200:",
+        "  BAR0: 256 MB now (supports 256 MB, 512 MB, 1 GB, 2 GB, 4 GB, 8 GB, 16 GB, 32 GB)",
+        "  BAR2: 2 MB now (supports 2 MB, 4 MB, 8 MB, 16 MB, 32 MB, 64 MB, 128 MB, 256 MB)",
+    ], rebar.lines.joined(separator: "\n"))
+    // Refusals: no capability, a looping list, a list leaving the space, a
+    // second version, a size not supported, the same BAR twice, no entries,
+    // a short space.
+    var none = b; none[0x152] = 0x02; none[0x153] = 0x00      // AER ends the list
+    precondition(ResizableBARCapability(config: Data(none)) == nil)
+    var loop = b; loop[0x152] = 0x02; loop[0x153] = 0x15      // AER's next -> 0x150
+    precondition(ResizableBARCapability(config: Data(loop)) == nil)
+    var wild = b; wild[0x152] = 0x02; wild[0x153] = 0x02      // AER's next -> 0x020
+    precondition(ResizableBARCapability(config: Data(wild)) == nil)
+    var v2 = b; v2[0x202] = 0x02
+    precondition(ResizableBARCapability(config: Data(v2)) == nil)
+    var unsupported = b; unsupported[0x209] = 7               // BAR0 at 128 MB
+    precondition(ResizableBARCapability(config: Data(unsupported)) == nil)
+    var twice = b; twice[0x210] = 0x00                        // second entry names BAR0
+    precondition(ResizableBARCapability(config: Data(twice)) == nil)
+    var empty = b; empty[0x208] = 0x00
+    precondition(ResizableBARCapability(config: Data(empty)) == nil)
+    precondition(ResizableBARCapability(config: Data(b.prefix(0x20c))) == nil)
+    precondition(ResizableBARCapability(config: Data(b.prefix(256))) == nil)
+    print("PASS Resizable BAR capability: list walk, sizes, refusals")
+}

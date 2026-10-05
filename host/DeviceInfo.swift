@@ -265,3 +265,76 @@ struct PCIeCapability: Equatable {
         ]
     }
 }
+
+/// The Resizable BAR extended capability (ID 0x15, version 1) of a device,
+/// from its configuration space (the sysfs "config" file): for each
+/// resizable BAR, the sizes it can decode and the size it decodes now.
+/// Validated as linuxu's pci_rebar_read validates it (linuxu/src/pci/
+/// pci_stub.c): one to six entries inside the space, each naming a distinct
+/// BAR whose selected size is one it supports. Sizes above 128 TB (the
+/// Control register's upper bits) are not read.
+struct ResizableBARCapability: Equatable {
+    struct Entry: Equatable {
+        let bar: Int
+        let supported: UInt32      // bit n: 1 MB << n
+        let selected: Int          // the size now decoded, 1 MB << selected
+
+        var supportedBytes: [UInt64] { (0..<28).filter { supported & (1 << $0) != 0 }.map { UInt64(1) << ($0 + 20) } }
+        var currentBytes: UInt64 { UInt64(1) << (selected + 20) }
+        var largestBytes: UInt64 { supportedBytes.last ?? 0 }
+    }
+
+    let offset: Int
+    let entries: [Entry]
+
+    /// Walks the extended capability list from 0x100 for capability 0x15;
+    /// nil when the space is too short, the list loops or leaves the space,
+    /// there is no such capability, or the capability is malformed.
+    init?(config: Data) {
+        let b = [UInt8](config)
+        func u32(_ at: Int) -> UInt32? {
+            guard at >= 0, at + 4 <= b.count else { return nil }
+            return UInt32(b[at]) | UInt32(b[at + 1]) << 8 | UInt32(b[at + 2]) << 16 | UInt32(b[at + 3]) << 24
+        }
+        var at = 0x100, seen = 0
+        var header: UInt32 = 0
+        while true {
+            guard seen < (4096 - 0x100) / 4, let h = u32(at), h != 0, h != UInt32.max else { return nil }
+            if h & 0xffff == 0x15 { header = h; break }
+            let next = Int(h >> 20)
+            guard next >= 0x100, next & 3 == 0, next != at else { return nil }
+            at = next
+            seen += 1
+        }
+        guard (header >> 16) & 0xf == 1, let first = u32(at + 8) else { return nil }
+        let count = Int((first >> 5) & 7)
+        guard count >= 1, count <= 6, at + 4 + count * 8 <= b.count else { return nil }
+        var entries: [Entry] = []
+        var bars: UInt32 = 0
+        for i in 0..<count {
+            guard let capability = u32(at + 4 + i * 8), let control = u32(at + 8 + i * 8),
+                  capability != UInt32.max, control != UInt32.max else { return nil }
+            let bar = Int(control & 7), selected = Int((control >> 8) & 0x3f)
+            let supported = capability >> 4
+            guard bar < 6, bars & (1 << bar) == 0, selected < 28,
+                  supported & (1 << selected) != 0 else { return nil }
+            bars |= 1 << bar
+            entries.append(Entry(bar: bar, supported: supported, selected: selected))
+        }
+        offset = at
+        self.entries = entries
+    }
+
+    func entry(bar: Int) -> Entry? { entries.first { $0.bar == bar } }
+
+    static func sizeText(_ bytes: UInt64) -> String {
+        bytes >= UInt64(1) << 30 ? "\(bytes >> 30) GB" : "\(bytes >> 20) MB"
+    }
+
+    var lines: [String] {
+        [String(format: "Resizable BAR capability at 0x%03x:", offset)] + entries.map { e in
+            "  BAR\(e.bar): \(Self.sizeText(e.currentBytes)) now (supports "
+                + e.supportedBytes.map(Self.sizeText).joined(separator: ", ") + ")"
+        }
+    }
+}
