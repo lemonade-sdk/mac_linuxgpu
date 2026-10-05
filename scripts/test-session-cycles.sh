@@ -67,4 +67,73 @@ clang "${common[@]}" "${sanitizers[@]}" "${heap_aliases[@]}" -DLINUXU_DEXT_DK=1 
   linuxu/tests/test_session_cycles.c "$work_dir/dext_alloc.o" "$work_dir/heap_backend.o" \
   "$work_dir/libmacamgdu-cycles.a" \
   -Wl,-dead_strip -lpthread -o build/tests/test_session_cycles
-UBSAN_OPTIONS=halt_on_error=1:abort_on_error=0 build/tests/test_session_cycles "${SESSION_CYCLES:-300}"
+export UBSAN_OPTIONS=halt_on_error=1:abort_on_error=0
+build/tests/test_session_cycles "${SESSION_CYCLES:-300}"
+
+# The deep mode: the card's IP discovery binary and VBIOS take the probe past
+# IP discovery into the IPs' initialization (linuxu/tests/test_session_cycles.c).
+# deep_run FIXTURES CYCLES: the sizes it needs come from the capture's JSON.
+deep_run() {
+  local args
+  args=$(python3 - "$1/ip_discovery.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+bars = d["bar_sizes"]
+print(d["vram_total_bytes"] >> 20, bars["0"], bars["2"], bars["5"])
+PY
+)
+  # shellcheck disable=SC2086
+  build/tests/test_session_cycles --deep "$1" build/firmware/amdgpu $args "$2"
+}
+
+# Self-check of the deep harness on every run (CI included), with a synthetic
+# description shaped like an RDNA4 card (made-up base addresses) and a ROM
+# that has a valid header but no ATOM tables: upstream must read the
+# discovery binary, find SMUIO, read the whole ROM through it and then refuse
+# it, the same way every cycle, with every resource back at its baseline.
+synthetic="$work_dir/synthetic"
+mkdir -p "$synthetic"
+python3 - "$synthetic" <<'PY'
+import json, os, sys
+sys.path.insert(0, "scripts")
+import ip_discovery_builder as b
+out = sys.argv[1]
+ips = []
+def ip(hw_id, version, instance=0, bases=None):
+    base = 0x1000 + 0x400 * len(ips)
+    ips.append({"hw_id": hw_id, "instance": instance, "major": version[0], "minor": version[1],
+                "revision": version[2], "harvest": 0,
+                "base_addresses": bases or [base, base + 0x100, base + 0x200]})
+ip(11, (12, 0, 1))                    # GC
+ip(42, (7, 0, 1)); ip(42, (7, 0, 1), 1)  # SDMA0, two instances
+ip(34, (4, 1, 0)); ip(35, (4, 1, 0))  # MMHUB, ATHUB
+ip(108, (6, 3, 1))                    # NBIF
+ip(255, (14, 0, 3)); ip(1, (14, 0, 3))  # MP0, MP1
+ip(40, (7, 0, 0)); ip(41, (7, 0, 0))  # OSSSYS, HDP
+ip(4, (14, 0, 2))                     # SMUIO
+ip(271, (4, 0, 1))                    # DMU
+ip(12, (5, 0, 0))                     # VCN
+desc = {"format": 1, "dies": [{"die_id": 0, "ips": ips}],
+        "gc_info": {"num_se": 4, "num_wgp0_per_sa": 4, "num_wgp1_per_sa": 0, "num_rb_per_se": 4,
+                    "num_gl2c": 16, "num_gprs": 1536, "num_max_gs_thds": 32, "gs_table_depth": 32,
+                    "gsprim_buff_depth": 1792},
+        "vram_total_bytes": 16 << 30,
+        "bar_sizes": {"0": 256 << 20, "2": 2 << 20, "5": 512 << 10}}
+json.dump(desc, open(os.path.join(out, "ip_discovery.json"), "w"))
+open(os.path.join(out, "ip_discovery.bin"), "wb").write(b.build(desc))
+rom = bytearray(64 << 10)
+rom[0:2] = b"\x55\xaa"
+rom[2] = len(rom) // 512                    # AMD_VBIOS_LENGTH
+rom[0x30:0x3a] = b" 761295520"             # AMD_VBIOS_SIGNATURE
+open(os.path.join(out, "vbios.rom"), "wb").write(rom)
+PY
+deep_run "$synthetic" 20
+
+fixtures=${R9700_FIXTURES:-tests/fixtures/local/r9700}
+if [[ -f "$fixtures/ip_discovery.bin" && -f "$fixtures/vbios.rom" && -f "$fixtures/ip_discovery.json" ]]; then
+  deep_run "$fixtures" "${SESSION_CYCLES_DEEP:-200}"
+else
+  echo "SKIP deep session cycles: no card capture in $fixtures (ip_discovery.json, ip_discovery.bin," \
+       "vbios.rom); scripts/capture-r9700-fixtures.py records them from a running driver," \
+       "see tests/fixtures/local/README.md"
+fi
