@@ -899,8 +899,12 @@ test-selector-call:
 		-o $(BUILD)/tests/test_selector_call
 	$(BUILD)/tests/test_selector_call
 
-test: test-owner-call test-bounded test-selector-call
-.PHONY: test-owner-call test-bounded test-selector-call
+# libmlg_drm's IOKit transport against the dext's Linux-file dispatch.
+test-lx-transport:
+	bash scripts/test-lx-transport.sh
+
+test: test-owner-call test-bounded test-selector-call test-lx-transport
+.PHONY: test-owner-call test-bounded test-selector-call test-lx-transport
 
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh
