@@ -14,6 +14,8 @@ OWNER_RESULT = 88       # session_state.h MLG_SELECTOR_OWNER_RESULT
 OWNER_HEADER = 4        # MLG_OWNER_ASYNC_HEADER
 OWNER_SCALARS = 12      # MLG_OWNER_ASYNC_SCALARS
 PING = 0
+RUNTIME_BUILD = 43
+SESSION_CALLS_ASYNC_BUILD = 243   # MLG_SESSION_CALLS_ASYNC_BUILD
 CALLOUT_FUNC, CALLOUT_REFCON, CALLOUT_COUNT = 1, 2, 3   # IOKit's kIOAsyncCallout* indices
 MACH_RCV_MSG, MACH_RCV_TIMEOUT, MACH_RCV_TIMED_OUT = 0x2, 0x100, 0x10004003
 NOT_ATTACHED, IPC_ERROR = 0xe00002d8, 0xe00002c3
@@ -44,6 +46,17 @@ class OwnerCall:
         system.mach_msg.argtypes = [c.c_void_p, c.c_int, c.c_uint, c.c_uint, c.c_uint,
                                     c.c_uint, c.c_uint]
         system.mach_msg.restype = c.c_int
+        # An older driver answers such calls synchronously and never
+        # completes them: refuse it now rather than wait forever.
+        build = (c.c_uint64 * 4)()
+        count = c.c_uint(4)
+        result = io.IOConnectCallMethod(connection, RUNTIME_BUILD, None, 0, None, 0, build,
+                                        c.byref(count), None, None)
+        if result:
+            raise RuntimeError(f"RuntimeBuild failed: {result & 0xffffffff:#x}")
+        if count.value < 4 or build[3] < SESSION_CALLS_ASYNC_BUILD:
+            raise RuntimeError("the installed MacLinuxGPU driver is older than build "
+                               f"{SESSION_CALLS_ASYNC_BUILD}; install the matching driver")
 
     def __call__(self, selector, scalars, data=b"", outputs=0, capacity=0):
         io, system = self.io, self.system

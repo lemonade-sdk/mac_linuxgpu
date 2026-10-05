@@ -2,6 +2,7 @@
  * MLG_USER_CLIENT_LINUX_FILE) of the MacLinuxGPU DriverKit extension, and
  * the selectors of rt/lx_abi.h. */
 #include <errno.h>
+#include <stdio.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -106,9 +107,19 @@ static int scalar(uint32_t selector, const uint64_t *in, uint32_t nin, uint64_t 
 
 	if (r)
 		return r;
-	/* HostWindow and InitDevice can sleep: async session calls. */
-	return from_ioreturn(mlg_selector_call(c, selector, in, nin, NULL, 0, out,
-					       out ? &n : NULL, NULL, NULL));
+	/* HostWindow and InitDevice can sleep: async session calls, which a
+	 * driver older than build 243 does not serve (refused at once). */
+	{
+		static int protocol;	/* one driver connection per process */
+		kern_return_t kr = mlg_selector_call_on(c, &protocol, selector, in, nin, NULL, 0, out,
+							 out ? &n : NULL, NULL, NULL);
+
+		if (kr == kIOReturnUnsupported && protocol < 0)
+			fprintf(stderr, "libmlg_drm: the installed MacLinuxGPU driver is older than build "
+				"%u, which this library needs: install the matching driver\n",
+				MLG_SESSION_CALLS_ASYNC_BUILD);
+		return from_ioreturn(kr);
+	}
 }
 
 static int scalar_call(void *ctx, uint32_t selector, const uint64_t *in, uint32_t nin,

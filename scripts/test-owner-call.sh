@@ -31,10 +31,15 @@ for driver, mirror in (("MLG_SELECTOR_OWNER_RESULT", "MLG_OWNER_CALL_SELECTOR_RE
                        ("MLG_OWNER_ASYNC_SCALARS", "MLG_OWNER_CALL_SCALARS")):
     if number(state, driver) != number(client, mirror):
         raise SystemExit(f"host/owner_call.h {mirror} differs from session_state.h {driver}")
+backend = pathlib.Path("dext/sources/dext_compute_backend.inc").read_text()
+runtime = re.search(r"#define DEXT_RUNTIME_BUILD (\d+)u", backend)
+if not runtime or int(runtime.group(1)) < int(number(state, "MLG_SESSION_CALLS_ASYNC_BUILD")):
+    raise SystemExit("DEXT_RUNTIME_BUILD predates MLG_SESSION_CALLS_ASYNC_BUILD: clients would refuse this driver")
 python = pathlib.Path("scripts/mlg_owner_call.py").read_text()
 for driver, mirror in (("MLG_SELECTOR_OWNER_RESULT", "OWNER_RESULT"),
                        ("MLG_OWNER_ASYNC_HEADER", "OWNER_HEADER"),
-                       ("MLG_OWNER_ASYNC_SCALARS", "OWNER_SCALARS")):
+                       ("MLG_OWNER_ASYNC_SCALARS", "OWNER_SCALARS"),
+                       ("MLG_SESSION_CALLS_ASYNC_BUILD", "SESSION_CALLS_ASYNC_BUILD")):
     found = re.search(r"^" + mirror + r"\s*=\s*(\d+)", python, re.M)
     if not found or found.group(1) != number(state, driver):
         raise SystemExit(f"scripts/mlg_owner_call.py {mirror} differs from session_state.h {driver}")
