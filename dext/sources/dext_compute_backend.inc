@@ -1496,10 +1496,13 @@ int dext_compute_host_window(uint64_t configure, uint64_t *out)
     if (production_ready()) {
         /* A KFD-aware client's own window inside its process's GPUVM: query
          * reports it (base 0 until set) and the size to reserve; a nonzero
-         * value sets it, once, before any shared buffer exists. */
-        struct production_client *rec;
-        if ((r = selected_session_error())) return r;
-        rec = selected_session();
+         * value sets it, once, before any shared buffer exists. Only a
+         * session the client already has: asking for the window never
+         * decides one (tag 12 or a compute call does), so a client that
+         * only brings the GPU up (the display agent, a Linux-file client)
+         * never becomes a KFD process. */
+        struct production_client *rec = client_record(production.selected_client, false);
+        if (rec && rec->open_error) return rec->open_error;
         if (rec && rec->mode == PRODUCTION_KFD && rec->aware) {
             struct dext_kfd_info info;
             if (configure) {

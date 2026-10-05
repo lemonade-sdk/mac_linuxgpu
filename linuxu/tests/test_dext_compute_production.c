@@ -672,6 +672,23 @@ int main(int argc, char **argv)
         kfd_session(id);
         dext_compute_select_client(0);
         assert(dext_compute_stop()==0 && !dext_compute_client_records());
+    } else if (!strcmp(argv[1],"host-window-no-session")) {
+        /* A client that only brings the GPU up asks for the host window: it
+         * gets the GART window and stays undecided; no KFD process opens
+         * until it asks for its compute session. */
+        uint64_t window[3], words[8];
+        kfd_supported_error=0;
+        assert(!dext_compute_client_identity(21,7100,"MacLinuxGPUHost"));
+        dext_compute_select_client(21);
+        assert(!dext_compute_host_window(0,window) && window[0]==0x100000000ULL &&
+               window[1]==1ULL<<29 && !kfd_opens);
+        assert(!dext_compute_client_owns(21) && !dext_compute_client_legacy(21));
+        /* A client that does ask (HSA: tag 12, then the window). */
+        assert(dext_compute_query_info(12,words,8)==8 && words[1]==2 && kfd_opens==1);
+        assert(!dext_compute_host_window(0,window) && window[1]==1ULL<<37);
+        dext_compute_select_client(0);
+        assert(!dext_compute_release_client(21) && !dext_compute_forget_client(21));
+        assert(dext_compute_stop()==0);
     } else if (!strcmp(argv[1],"client-records-full")) {
         /* No record for a client (every slot held) is said: its identity
          * and its compute session fail with "no memory". */
