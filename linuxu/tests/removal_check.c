@@ -26,6 +26,7 @@
 #include "amdgpu.h"
 #include "amdgpu_ttm.h"
 #include "cs_fixture.h"
+#include "blocked_call_check.h"
 
 extern int usleep(unsigned int usec);
 
@@ -70,6 +71,8 @@ void removal_check(struct pci_dev *pdev)
 	r = rt_cs_selftest_run(pdev, &res);
 	CHECK(r == -62 && res.status[RT_CS_STEP_TEARDOWN] == RT_CS_PARKED);
 	CHECK(rt_cs_selftest_parked() == 1);
+	/* A client's submission blocked behind that work. */
+	blocked_call_park(pdev);
 
 	/* A kernel copy on an engine that never runs it, waited for. */
 	CHECK(!amdgpu_bo_create_kernel(adev, 1 << 20, PAGE_SIZE, AMDGPU_GEM_DOMAIN_GTT,
@@ -101,6 +104,8 @@ void removal_check(struct pci_dev *pdev)
 	for (int i = 0; i < 200 && rt_cs_selftest_reap(); ++i)
 		usleep(5000);
 	CHECK(rt_cs_selftest_parked() == 0);
+	/* The blocked submission ended; its client's exit completes. */
+	blocked_call_after_removal();
 	/* The open client exits; a new one cannot open the render node. */
 	rt_lx_client_destroy(open_client);
 	CHECK(!rt_lx_client_create(pdev, 0, "late-client", &late));

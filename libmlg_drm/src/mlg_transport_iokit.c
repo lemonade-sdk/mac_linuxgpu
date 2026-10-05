@@ -115,35 +115,6 @@ static int scalar_call(void *ctx, uint32_t selector, const uint64_t *in, uint32_
 	return scalar(selector, in, nin, out, nout);
 }
 
-static int t_open(void *ctx, uint32_t dev, uint32_t flags)
-{
-	uint64_t in[2] = { dev, flags }, out[1] = { 0 };
-	int r;
-
-	(void)ctx;
-	r = scalar(MLG_SELECTOR_LX_OPEN, in, 2, out, 1);
-	if (r == -MLG_LX_ENODEV) {
-		/* The driver is attached but the GPU is not initialized yet:
-		 * initialize it, as a session client does (host window, then
-		 * InitDevice), then retry; the open fails with the reason the
-		 * initialization did. */
-		r = mlg_init_device(scalar_call, NULL);
-		if (!r)
-			r = scalar(MLG_SELECTOR_LX_OPEN, in, 2, out, 1);
-	}
-	return r ? r : (int)(int64_t)out[0];
-}
-
-static int t_close(void *ctx, int fd)
-{
-	uint64_t in[1] = { (uint64_t)(int64_t)fd }, out[1] = { 0 };
-	int r;
-
-	(void)ctx;
-	r = scalar(MLG_SELECTOR_LX_CLOSE, in, 1, out, 1);
-	return r ? r : (int)(int64_t)out[0];
-}
-
 /* ---- async completions ---- */
 
 struct waiter {
@@ -223,6 +194,65 @@ static int wait_completion(io_connect_t c, IONotificationPortRef port, struct wa
 	return 0;
 }
 
+/* The driver admits MLG_LX_MAX_ASYNC async calls per client; a call holds
+ * its place until its completion arrives with the result inline, or until
+ * LX_RESULT fetches it. Threads beyond that wait here, on their own
+ * thread, for one to finish. */
+static pthread_mutex_t slots_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t slots_free = PTHREAD_COND_INITIALIZER;
+static unsigned int slots_used;
+
+static void slot_take(void)
+{
+	pthread_mutex_lock(&slots_lock);
+	while (slots_used >= MLG_LX_MAX_ASYNC)
+		pthread_cond_wait(&slots_free, &slots_lock);
+	slots_used++;
+	pthread_mutex_unlock(&slots_lock);
+}
+
+static void slot_put(void)
+{
+	pthread_mutex_lock(&slots_lock);
+	slots_used--;
+	pthread_cond_signal(&slots_free);
+	pthread_mutex_unlock(&slots_lock);
+}
+
+/* One async call (@selector with @in and an optional request frame) up to
+ * its completion, in @w. 0, or -errno when it did not start or the driver
+ * went away; *token is its token. The caller holds a slot. */
+static int call_async(io_connect_t c, uint32_t selector, const uint64_t *in, uint32_t nin,
+		      const void *frame, size_t frame_bytes, struct waiter *w, uint64_t *token)
+{
+	IONotificationPortRef port = thread_port();
+	io_user_reference_t ref[kIOAsyncCalloutCount] = { 0 };
+	uint64_t out[2] = { 0, 0 };
+	uint32_t n = 2;
+	int r;
+
+	if (!port)
+		return -MLG_LX_ENOMEM;
+	ref[kIOAsyncCalloutFuncIndex] = (io_user_reference_t)(uintptr_t)completed;
+	ref[kIOAsyncCalloutRefconIndex] = (io_user_reference_t)(uintptr_t)w;
+	r = from_ioreturn(IOConnectCallAsyncMethod(c, selector, IONotificationPortGetMachPort(port),
+						   ref, kIOAsyncCalloutCount, in, nin, frame,
+						   frame_bytes, out, &n, NULL, NULL));
+	if (!r && (int64_t)out[0] < 0)
+		r = (int)(int64_t)out[0];	/* not started */
+	if (r)
+		return r;
+	*token = out[1];
+	r = wait_completion(c, port, w);
+	if (r)
+		return r;
+	if (w->status != kIOReturnSuccess)
+		return w->status == kIOReturnAborted ? -MLG_LX_EINTR : from_ioreturn(w->status);
+	if (w->nargs < 3 || w->args[0] != *token)
+		return -5;	/* EIO */
+	return 0;
+}
+
 static int t_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t frame_bytes,
 		   void *reply, size_t reply_cap, size_t *reply_bytes, int64_t *result, int async)
 {
@@ -236,6 +266,7 @@ static int t_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t fr
 	if (r)
 		return r;
 	if (!async) {
+		/* Only requests that cannot sleep (mlg_lx_cmd_sleeps). */
 		r = from_ioreturn(IOConnectCallMethod(c, MLG_SELECTOR_LX_IOCTL, in, 2, frame, frame_bytes,
 						      out, &n, reply, &size));
 		if (r)
@@ -245,42 +276,36 @@ static int t_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t fr
 		return *reply_bytes <= reply_cap ? 0 : -MLG_LX_EINVAL;
 	}
 
-	IONotificationPortRef port = thread_port();
 	struct waiter w = { 0 };
-	io_user_reference_t ref[kIOAsyncCalloutCount] = { 0 };
+	uint64_t token = 0;
 
-	if (!port)
-		return -MLG_LX_ENOMEM;
-	ref[kIOAsyncCalloutFuncIndex] = (io_user_reference_t)(uintptr_t)completed;
-	ref[kIOAsyncCalloutRefconIndex] = (io_user_reference_t)(uintptr_t)&w;
-	r = from_ioreturn(IOConnectCallAsyncMethod(c, MLG_SELECTOR_LX_IOCTL_ASYNC,
-						   IONotificationPortGetMachPort(port), ref,
-						   kIOAsyncCalloutCount, in, 2, frame, frame_bytes,
-						   out, &n, NULL, NULL));
-	if (!r && (int64_t)out[0] < 0)
-		r = (int)(int64_t)out[0];	/* not started */
-	if (r)
+	slot_take();
+	r = call_async(c, MLG_SELECTOR_LX_IOCTL_ASYNC, in, 2, frame, frame_bytes, &w, &token);
+	if (!r && w.args[2] > reply_cap)
+		r = -5;
+	if (r) {
+		slot_put();
 		return r;
-	r = wait_completion(c, port, &w);
-	if (r)
-		return r;
-	if (w.status != kIOReturnSuccess)
-		return w.status == kIOReturnAborted ? -MLG_LX_EINTR : from_ioreturn(w.status);
-	if (w.nargs < 3 || w.args[0] != out[1] || w.args[2] > reply_cap)
-		return -5;
+	}
 	*result = (int64_t)w.args[1];
 	*reply_bytes = (size_t)w.args[2];
-	if (*reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES && w.nargs >= 3 + (*reply_bytes + 7) / 8) {
+	if (*reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES) {
+		if (w.nargs < 3 + (*reply_bytes + 7) / 8) {
+			slot_put();
+			return -5;
+		}
 		memcpy(reply, &w.args[3], *reply_bytes);
+		slot_put();
 		return 0;
 	}
-	/* Too long for the completion: fetch it. */
-	uint64_t token[1] = { out[1] };
+	/* Too long for the completion: fetch it, which frees its place. */
+	uint64_t fetch[1] = { token };
 
 	n = 2;
 	size = reply_cap;
-	r = from_ioreturn(IOConnectCallMethod(c, MLG_SELECTOR_LX_RESULT, token, 1, NULL, 0, out, &n,
+	r = from_ioreturn(IOConnectCallMethod(c, MLG_SELECTOR_LX_RESULT, fetch, 1, NULL, 0, out, &n,
 					      reply, &size));
+	slot_put();
 	if (r)
 		return r;
 	*result = (int64_t)out[0];
@@ -288,12 +313,88 @@ static int t_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t fr
 	return 0;
 }
 
+/* LX_CALL_ASYNC: an open, close, mmap or munmap runs on a worker of the
+ * driver's process (each can sleep). *result is its result; an MMAP's
+ * reply words land in @words. */
+static int call_op(io_connect_t c, const uint64_t *in, uint32_t nin, int64_t *result,
+		   uint64_t *words)
+{
+	struct waiter w = { 0 };
+	uint64_t token = 0;
+	int r;
+
+	slot_take();
+	r = call_async(c, MLG_SELECTOR_LX_CALL_ASYNC, in, nin, NULL, 0, &w, &token);
+	slot_put();	/* an operation's reply always comes inline */
+	if (r)
+		return r;
+	*result = (int64_t)w.args[1];
+	if (words) {
+		if (*result == 0 && (w.args[2] != MLG_LX_OP_MMAP_WORDS * 8 ||
+				     w.nargs < 3 + MLG_LX_OP_MMAP_WORDS))
+			return -5;
+		memcpy(words, &w.args[3], MLG_LX_OP_MMAP_WORDS * 8);
+	}
+	return 0;
+}
+
+static int op(const uint64_t *in, uint32_t nin, int64_t *result, uint64_t *words)
+{
+	io_connect_t c;
+	int r = conn(&c);
+
+	return r ? r : call_op(c, in, nin, result, words);
+}
+
+static int t_open(void *ctx, uint32_t dev, uint32_t flags)
+{
+	uint64_t in[MLG_LX_OP_OPEN_ARGS] = { MLG_LX_OP_OPEN, dev, flags };
+	int64_t result = 0;
+	int r;
+
+	(void)ctx;
+	r = op(in, MLG_LX_OP_OPEN_ARGS, &result, NULL);
+	if (r == -MLG_LX_ENODEV) {
+		/* The driver is attached but the GPU is not initialized yet:
+		 * initialize it, as a session client does (host window, then
+		 * InitDevice), then retry; the open fails with the reason the
+		 * initialization did. */
+		r = mlg_init_device(scalar_call, NULL);
+		if (!r)
+			r = op(in, MLG_LX_OP_OPEN_ARGS, &result, NULL);
+	}
+	return r ? r : (int)result;
+}
+
+static int t_close(void *ctx, int fd)
+{
+	uint64_t in[MLG_LX_OP_CLOSE_ARGS] = { MLG_LX_OP_CLOSE, (uint64_t)(int64_t)fd };
+	int64_t result = 0;
+	int r;
+
+	(void)ctx;
+	r = op(in, MLG_LX_OP_CLOSE_ARGS, &result, NULL);
+	return r ? r : (int)result;
+}
+
 /* ---- mmap ---- */
+
+static int unmap_type(io_connect_t c, uint64_t type)
+{
+	uint64_t in[MLG_LX_OP_MUNMAP_ARGS] = { MLG_LX_OP_MUNMAP, type };
+	int64_t result = 0;
+	int r = call_op(c, in, MLG_LX_OP_MUNMAP_ARGS, &result, NULL);
+
+	return r ? r : (int)result;
+}
 
 static int t_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t prot,
 		  uint32_t flags, void **addr, uint64_t *handle)
 {
-	uint64_t in[5] = { (uint64_t)(int64_t)fd, offset, length, prot, flags }, out[4] = { 0 };
+	uint64_t in[MLG_LX_OP_MMAP_ARGS] = { MLG_LX_OP_MMAP, (uint64_t)(int64_t)fd, offset, length,
+					     prot, flags };
+	uint64_t words[MLG_LX_OP_MMAP_WORDS] = { 0 };
+	int64_t result = 0;
 	mach_vm_address_t at = 0;
 	mach_vm_size_t size = 0;
 	IOOptionBits options = kIOMapAnywhere;
@@ -303,42 +404,39 @@ static int t_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t 
 	(void)ctx;
 	if (r)
 		return r;
-	r = scalar(MLG_SELECTOR_LX_MMAP, in, 5, out, 4);
+	r = call_op(c, in, MLG_LX_OP_MMAP_ARGS, &result, words);
 	if (!r)
-		r = (int)(int64_t)out[0];
+		r = (int)result;
 	if (r)
 		return r;
-	if (out[3] == 1)
+	if (words[2] == 1)
 		options |= kIOMapWriteCombineCache;
-	else if (out[3] == 2)
+	else if (words[2] == 2)
 		options |= kIOMapInhibitCache;
 	else
 		options |= kIOMapDefaultCache;
-	r = from_ioreturn(IOConnectMapMemory64(c, (uint32_t)out[1], mach_task_self(), &at, &size,
+	r = from_ioreturn(IOConnectMapMemory64(c, (uint32_t)words[0], mach_task_self(), &at, &size,
 					       options));
 	if (r || size < length) {
-		uint64_t type[1] = { out[1] }, ignored[1];
-
 		if (!r)
-			IOConnectUnmapMemory64(c, (uint32_t)out[1], mach_task_self(), at);
-		(void)scalar(MLG_SELECTOR_LX_MUNMAP, type, 1, ignored, 1);
+			IOConnectUnmapMemory64(c, (uint32_t)words[0], mach_task_self(), at);
+		(void)unmap_type(c, words[0]);
 		return r ? r : -MLG_LX_EINVAL;
 	}
 	/* Place it at the same address in the driver's process too (best
 	 * effort: the mapping works either way). */
 	{
-		uint64_t commit[2] = { out[1], at }, ignored[1];
+		uint64_t commit[2] = { words[0], at }, ignored[1];
 
 		(void)scalar(MLG_SELECTOR_LX_MMAP_COMMIT, commit, 2, ignored, 1);
 	}
 	*addr = (void *)(uintptr_t)at;
-	*handle = out[1];
+	*handle = words[0];
 	return 0;
 }
 
 static int t_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 {
-	uint64_t type[1] = { handle }, out[1] = { 0 };
 	io_connect_t c;
 	int r = conn(&c);
 
@@ -350,8 +448,7 @@ static int t_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 						 (mach_vm_address_t)(uintptr_t)addr));
 	if (r)
 		return r;
-	r = scalar(MLG_SELECTOR_LX_MUNMAP, type, 1, out, 1);
-	return r ? r : (int)(int64_t)out[0];
+	return unmap_type(c, handle);
 }
 
 /* ---- identity: the IOPCIDevice the driver matched ---- */

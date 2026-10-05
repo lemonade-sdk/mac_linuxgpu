@@ -135,31 +135,63 @@ static void release_gathered(uint64_t type)
 	}
 }
 
-static int lb_open(void *ctx, uint32_t dev, uint32_t flags)
-{
-	(void)ctx;
-	return rt_lx_open(client, dev, flags);
-}
-
-static int lb_close(void *ctx, int fd)
-{
-	(void)ctx;
-	return rt_lx_close(client, fd);
-}
-
-static int lb_done(void *ctx, uint64_t token, int64_t result, const void *rbuf, size_t bytes)
+static void lb_done(void *ctx, uint64_t token, int64_t result, const void *rbuf, size_t bytes)
 {
 	struct waiter *w = ctx;
 
 	(void)token;
 	w->result = result;
 	w->bytes = bytes;
-	if (bytes <= w->cap)
+	if (!rbuf && bytes)
+		w->kept = 1;	/* longer than the completion carries */
+	else if (bytes && bytes <= w->cap)
 		memcpy(w->rbuf, rbuf, bytes);
-	else
-		w->kept = 1;
 	complete(&w->done);
-	return !w->kept;
+}
+
+/* LX_CALL_ASYNC, as the IOKit transport makes it: on a worker, the reply
+ * (an MMAP's words) in @words. */
+static int lb_op(const uint64_t *in, uint32_t nin, int64_t *result, uint64_t *words)
+{
+	uint64_t reply[MLG_LX_OP_MMAP_WORDS] = { 0 };
+	struct waiter w = { .rbuf = reply, .cap = sizeof(reply) };
+	uint64_t token = 0;
+	int r;
+
+	__atomic_add_fetch(&async_calls, 1, __ATOMIC_SEQ_CST);
+	init_completion(&w.done);
+	r = rt_lx_op_async(client, in, nin, lb_done, &w, &token);
+	if (r)
+		return r;
+	wait_for_completion(&w.done);
+	if (w.kept)
+		return -EIO;
+	*result = w.result;
+	if (words)
+		memcpy(words, reply, sizeof(reply));
+	return 0;
+}
+
+static int lb_open(void *ctx, uint32_t dev, uint32_t flags)
+{
+	uint64_t in[MLG_LX_OP_OPEN_ARGS] = { MLG_LX_OP_OPEN, dev, flags };
+	int64_t result = 0;
+	int r;
+
+	(void)ctx;
+	r = lb_op(in, MLG_LX_OP_OPEN_ARGS, &result, NULL);
+	return r ? r : (int)result;
+}
+
+static int lb_close(void *ctx, int fd)
+{
+	uint64_t in[MLG_LX_OP_CLOSE_ARGS] = { MLG_LX_OP_CLOSE, (uint64_t)(int64_t)fd };
+	int64_t result = 0;
+	int r;
+
+	(void)ctx;
+	r = lb_op(in, MLG_LX_OP_CLOSE_ARGS, &result, NULL);
+	return r ? r : (int)result;
 }
 
 static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t bytes, void *rbuf,
@@ -171,7 +203,8 @@ static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t b
 
 	(void)ctx;
 	if (!async)
-		return rt_lx_ioctl(client, fd, cmd, frame, bytes, rbuf, cap, reply_bytes, result);
+		return rt_lx_ioctl_nosleep(client, fd, cmd, frame, bytes, rbuf, cap, reply_bytes,
+					   result);
 	__atomic_add_fetch(&async_calls, 1, __ATOMIC_SEQ_CST);
 	init_completion(&w.done);
 	r = rt_lx_ioctl_async(client, fd, cmd, frame, bytes, lb_done, &w, &token);
@@ -188,22 +221,31 @@ static int lb_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t b
 static int lb_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t prot,
 		   uint32_t flags, void **addr, uint64_t *handle)
 {
+	uint64_t in[MLG_LX_OP_MMAP_ARGS] = { MLG_LX_OP_MMAP, (uint64_t)(int64_t)fd, offset, length,
+					     prot, flags };
+	uint64_t words[MLG_LX_OP_MMAP_WORDS];
 	struct rt_lx_map_info info;
 	uint64_t contiguous = 0;
+	int64_t result = 0;
 	void *cpu;
 	int r;
 
 	(void)ctx;
-	r = rt_lx_mmap(client, fd, offset, length, prot, flags, &info);
+	r = lb_op(in, MLG_LX_OP_MMAP_ARGS, &result, words);
+	if (!r)
+		r = (int)result;
 	if (r)
 		return r;
+	info.type = words[0];
 	cpu = rt_lx_map_cpu(client, info.type, 0, &contiguous);
 	if (!cpu || contiguous < length) {
 		/* A BAR range or scattered pages: the dext maps those as a
 		 * descriptor; the loopback gathers them with Mach VM. */
 		cpu = gather_mapping(info.type, length);
 		if (!cpu) {
-			rt_lx_munmap(client, info.type);
+			uint64_t un[MLG_LX_OP_MUNMAP_ARGS] = { MLG_LX_OP_MUNMAP, info.type };
+
+			(void)lb_op(un, MLG_LX_OP_MUNMAP_ARGS, &result, NULL);
 			return -ENODEV;
 		}
 	}
@@ -215,11 +257,16 @@ static int lb_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t
 
 static int lb_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
 {
+	uint64_t in[MLG_LX_OP_MUNMAP_ARGS] = { MLG_LX_OP_MUNMAP, handle };
+	int64_t result = 0;
+	int r;
+
 	(void)ctx;
 	(void)addr;
 	(void)length;
 	release_gathered(handle);
-	return rt_lx_munmap(client, handle);
+	r = lb_op(in, MLG_LX_OP_MUNMAP_ARGS, &result, NULL);
+	return r ? r : (int)result;
 }
 
 static int lb_scanout(void *ctx, const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *state,

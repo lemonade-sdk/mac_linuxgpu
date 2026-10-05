@@ -10,6 +10,7 @@
 extern int usleep(unsigned int usec);
 #include <rt/cs_selftest.h>
 #include "cs_fixture.h"
+#include "blocked_call_check.h"
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
 	__FILE__, __LINE__, #c); abort(); } } while (0)
@@ -90,6 +91,9 @@ int main(void)
 	for (int i = 0; i < 500 && rt_cs_selftest_reap(); ++i)
 		usleep(10000);
 	CHECK(rt_cs_selftest_parked() == 0);
+
+	/* A call blocked on a held queue holds only its own worker. */
+	blocked_call_check(pdev);
 
 	/* Last: the device leaves the bus with work outstanding. */
 	removal_check(pdev);

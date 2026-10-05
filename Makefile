@@ -1123,10 +1123,15 @@ $(MLG_DRM_BUILD)/%.o: linuxu/src/amdgpu-rt/%.c
 	@mkdir -p $(dir $@)
 	clang $(MLG_DRM_CFLAGS) -c $< -o $@
 
+# The transport revision (rt/lx_abi.h MLG_LX_ABI): the dylib's compatibility
+# version, so a libdrm_mlg linked against it refuses an older one at load.
+MLG_LX_ABI := $(shell sed -n 's/^\#define MLG_LX_ABI[[:space:]]*\([0-9][0-9]*\)$$/\1/p' linuxu/headers/rt/lx_abi.h)
+
 libmlg_drm: $(MLG_DRM_OBJS)
 	@rm -f $(MLG_DRM_BUILD)/libmlg_drm.a
 	ar rcs $(MLG_DRM_BUILD)/libmlg_drm.a $(MLG_DRM_OBJS)
 	clang -dynamiclib -install_name @rpath/libmlg_drm.dylib $(MLG_DRM_OBJS) \
+		-compatibility_version $(MLG_LX_ABI).0 -current_version $(MLG_LX_ABI).0 \
 		-framework IOKit -framework CoreFoundation -o $(MLG_DRM_BUILD)/libmlg_drm.dylib
 	@echo "libmlg_drm: OK ($(MLG_DRM_BUILD)/libmlg_drm.a, libmlg_drm.dylib)"
 

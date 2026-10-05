@@ -170,16 +170,16 @@ static_assert(kMacAMDGPUMethodReleaseQuarantine == MLG_SELECTOR_RELEASE_QUARANTI
 static_assert(MLG_SELECTOR_SYSFS_READ > kMacAMDGPUMethodReleaseQuarantine &&
               MLG_SELECTOR_DRM_INFO > kMacAMDGPUMethodReleaseQuarantine, "Linux read selectors");
 static_assert(MLG_SELECTOR_DISPLAY > MLG_SELECTOR_DRM_SELFTEST &&
-              MLG_SELECTOR_DISPLAY < MLG_SELECTOR_LX_OPEN, "display selector");
+              MLG_SELECTOR_DISPLAY < MLG_SELECTOR_LX_FIRST, "display selector");
 static_assert(MLG_SELECTOR_EVENT > MLG_SELECTOR_RETIRE &&
-              MLG_SELECTOR_EVENT_WAIT < MLG_SELECTOR_LX_OPEN &&
+              MLG_SELECTOR_EVENT_WAIT < MLG_SELECTOR_LX_FIRST &&
               MLG_EVENT_WAIT_IDS == RT_KFD_WAIT_EVENTS_MAX &&
               MLG_EVENT_WAIT_MAX_MS == RT_KFD_WAIT_MAX_MS &&
               DEXT_COMPUTE_EVENT_CREATE == MLG_EVENT_OP_CREATE &&
               DEXT_COMPUTE_EVENT_DESTROY == MLG_EVENT_OP_DESTROY &&
               DEXT_COMPUTE_EVENT_SET == MLG_EVENT_OP_SET, "event selectors");
 static_assert(MLG_SELECTOR_RETIRE > MLG_SELECTOR_DISPLAY &&
-              MLG_SELECTOR_RETIRE < MLG_SELECTOR_LX_OPEN, "retire selector");
+              MLG_SELECTOR_RETIRE < MLG_SELECTOR_LX_FIRST, "retire selector");
 static_assert(MLG_DISPLAY_PATTERNS == RT_DISPLAY_PATTERNS &&
               MLG_DISPLAY_PATTERN_BARS == RT_DISPLAY_PATTERN_BARS &&
               MLG_DISPLAY_PATTERN_WHITE == RT_DISPLAY_PATTERN_WHITE &&
@@ -249,12 +249,17 @@ extern "C" int   rt_pci_probe_cleanup_retained(void *pdev);
 extern "C" int   fw_table_register_embedded(void);
 
 #include "retained_log.h"
-static void maclinuxgpu_log_sink(const char *text)
+// The unified log takes only events (MACLINUXGPU_EVENT): a dext that logs
+// every routine line there gets its logging quarantined by the system for
+// high volume, and then the lines that matter after a hang are lost with
+// the rest. Routine lines stay in the retained ring (read-driver-log.py).
+static void maclinuxgpu_event_sink(const char *text)
 {
     os_log(OS_LOG_DEFAULT, "%{public}s", text);
 }
-#define MACLINUXGPU_LOG(...) \
-    maclinuxgpu::RetainedLog(maclinuxgpu_log_sink, __VA_ARGS__)
+#define MACLINUXGPU_LOG(...) maclinuxgpu::RetainedLog(nullptr, __VA_ARGS__)
+#define MACLINUXGPU_EVENT(...) \
+    maclinuxgpu::RetainedEvent(maclinuxgpu_event_sink, __VA_ARGS__)
 
 // ----------------------------------------------------------------
 // MacLinuxGPU (IOService) — the OSMetaClass method bodies.
@@ -494,6 +499,8 @@ static void lx_gate_close()
 static bool lx_teardown_all()
 {
     lx_gate_close();
+    // Clients a Stop handed to their own threads (lx_client_stop).
+    rt_lx_retire_drain();
     for (;;) {
         struct rt_lx_client *lx = nullptr;
         lx_registry_acquire();
@@ -542,7 +549,7 @@ static void note_quarantine(uint32_t cause, int code)
     } else {
         return;
     }
-    MACLINUXGPU_LOG("quarantine cause: step %u code %d (observed by step %u)",
+    MACLINUXGPU_EVENT("quarantine cause: step %u code %d (observed by step %u)",
         s_quarantineCause, s_quarantineCode, s_quarantineObserved);
 }
 
@@ -564,7 +571,7 @@ static void quarantine_session(MacLinuxGPU *driver)
     s_pciIsolation = isolated;
     s_pciIsolationAttempted = true;
     if (isolated != 0)
-        MACLINUXGPU_LOG("quarantine: PCI isolation unconfirmed (%d); retaining all owners", isolated);
+        MACLINUXGPU_EVENT("quarantine: PCI isolation unconfirmed (%d); retaining all owners", isolated);
 }
 
 // Why a quarantined session cannot be released yet, from cached state only.
@@ -641,7 +648,7 @@ static void request_termination(MacLinuxGPU *driver)
     const kern_return_t ret = driver->Terminate(0);
     if (ret != kIOReturnSuccess) {
         s_terminateRequested = false;
-        MACLINUXGPU_LOG("retire: Terminate failed (%#x); the idle instance stays until its "
+        MACLINUXGPU_EVENT("retire: Terminate failed (%#x); the idle instance stays until its "
                         "device leaves or the Mac restarts", ret);
     }
 }
@@ -652,7 +659,7 @@ static void complete_session_close(MacLinuxGPU *driver)
 {
     if (s_deviceRemoved) {
         const int closed = dext_pci_close_removed();
-        MACLINUXGPU_LOG("removal: provider %s (%d); the next device probes afresh",
+        MACLINUXGPU_EVENT("removal: provider %s (%d); the next device probes afresh",
                         closed ? "close deferred" : "closed", closed);
         s_deviceRemoved = false;
     } else {
@@ -693,7 +700,7 @@ static uint32_t release_quarantine(MacLinuxGPU *driver)
 {
     const uint32_t blocker = release_blocker();
     if (blocker != MLG_RELEASE_READY) {
-        MACLINUXGPU_LOG("quarantine release refused: blocker %u%s", blocker,
+        MACLINUXGPU_EVENT("quarantine release refused: blocker %u%s", blocker,
             mlg_release_blocker_permanent(blocker) ?
                 "; restart required, do not kill the driver" : "; retry after it clears");
         return blocker;
@@ -713,11 +720,11 @@ static uint32_t release_quarantine(MacLinuxGPU *driver)
     if (result) {
         s_releaseFailed = true;
         quarantine_session(driver);
-        MACLINUXGPU_LOG("quarantine release failed (%d); restart required, do not kill the driver", result);
+        MACLINUXGPU_EVENT("quarantine release failed (%d); restart required, do not kill the driver", result);
         return MLG_RELEASE_RESET_FAILED;
     }
     s_dmaQuarantined = false;
-    MACLINUXGPU_LOG("quarantine released after endpoint reset; provider closed");
+    MACLINUXGPU_EVENT("quarantine released after endpoint reset; provider closed");
     complete_session_close(driver);
     return MLG_RELEASE_READY;
 }
@@ -735,16 +742,16 @@ static void note_device_removed(const char *where)
 {
     if (s_deviceRemoved) return;
     s_deviceRemoved = true;
-    MACLINUXGPU_LOG("device removed from the bus (%s): no further hardware access; "
+    MACLINUXGPU_EVENT("device removed from the bus (%s): no further hardware access; "
                     "the session closes without waiting for the GPU", where);
     dext_pci_mark_removed();
     if (s_rtDevice != nullptr) {
         const int begun = rt_removal_begin(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
-        if (begun) MACLINUXGPU_LOG("removal: GPU work completion thread not started (%d)", begun);
+        if (begun) MACLINUXGPU_EVENT("removal: GPU work completion thread not started (%d)", begun);
     }
     dext_compute_device_removed();
     const int kept = dext_dma_device_removed();
-    if (kept) MACLINUXGPU_LOG("removal: %d DMA descriptor(s) could not be completed; backing retained", kept);
+    if (kept) MACLINUXGPU_EVENT("removal: %d DMA descriptor(s) could not be completed; backing retained", kept);
     power_device_removed();
 }
 
@@ -798,14 +805,14 @@ static void close_session(MacLinuxGPU *driver)
         s_dmaQuarantined = true;
         note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, -16);
     }
-    MACLINUXGPU_LOG("session close begin: probe=%d result=%d modules=%d pci=%d quarantine=%d participants=%u",
+    MACLINUXGPU_EVENT("session close begin: probe=%d result=%d modules=%d pci=%d quarantine=%d participants=%u",
         s_probeAttempted, s_probeResult, s_modulesRunning, s_pciOpen,
         s_dmaQuarantined, s_participants);
     // Stop is also reached through forced service termination. It provides
     // no proof that a client's raw BAR mappings have been revoked yet.
     if (s_rawBARLease.hasMappings() && s_deviceRemoved) {
         // The mapped BAR belongs to a device that is gone; it carries no DMA.
-        MACLINUXGPU_LOG("session close: a client still maps a BAR of the removed device");
+        MACLINUXGPU_EVENT("session close: a client still maps a BAR of the removed device");
     } else if (s_rawBARLease.hasMappings()) {
         s_dmaQuarantined = true;
         note_quarantine(MLG_QUARANTINE_RAW_BAR_MAPPING, 0);
@@ -826,7 +833,7 @@ static void close_session(MacLinuxGPU *driver)
     if (!s_dmaQuarantined) {
         const int stopped = dext_compute_stop();
         if (stopped != 0 && s_deviceRemoved) {
-            MACLINUXGPU_LOG("session close: compute stop after removal returned %d; nothing can run", stopped);
+            MACLINUXGPU_EVENT("session close: compute stop after removal returned %d; nothing can run", stopped);
         } else if (stopped != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_COMPUTE_UNCERTAIN, stopped);
@@ -860,7 +867,7 @@ static void close_session(MacLinuxGPU *driver)
         s_irqDrainFailed = true;
         note_quarantine(MLG_QUARANTINE_IRQ_CANCEL, drained);
         quarantine_session(driver);
-        MACLINUXGPU_LOG("session close blocked: interrupt cancellation failed (%d)", drained);
+        MACLINUXGPU_EVENT("session close blocked: interrupt cancellation failed (%d)", drained);
     }
 }
 
@@ -878,7 +885,7 @@ static void release_removed(MacLinuxGPU *driver)
         return;
     }
     if (s_irqDrainFailed) {
-        MACLINUXGPU_LOG("removal: interrupt sources still own callbacks; the session stays quarantined");
+        MACLINUXGPU_EVENT("removal: interrupt sources still own callbacks; the session stays quarantined");
         return;
     }
     s_dmaQuarantined = false;
@@ -901,10 +908,10 @@ static void release_removed(MacLinuxGPU *driver)
     (void)dext_dma_device_removed();
     const int released = dext_dma_fini();
     if (released)
-        MACLINUXGPU_LOG("removal: DMA backing still owned (%d) is kept; the provider closes", released);
+        MACLINUXGPU_EVENT("removal: DMA backing still owned (%d) is kept; the provider closes", released);
     dext_compute_set_pci_open(false);
     dext_compute_set_stage(DEXT_COMPUTE_STAGE_NONE);
-    MACLINUXGPU_LOG("removal: session released after the device left the bus");
+    MACLINUXGPU_EVENT("removal: session released after the device left the bus");
     complete_session_close(driver);
 }
 
@@ -1364,7 +1371,7 @@ static void power_fail(MacLinuxGPU *driver, uint32_t cause, int error)
         MACLINUXGPU_LOG("power: KFD suspend handed back before the close (%d)", resumed);
     }
     power_set(MLG_POWER_LOST, cause, error);
-    MACLINUXGPU_LOG("power: closing the compute session (cause %u, error %d); the next client re-probes",
+    MACLINUXGPU_EVENT("power: closing the compute session (cause %u, error %d); the next client re-probes",
                     cause, error);
     close_session(driver);
 }
@@ -1397,7 +1404,7 @@ static void power_quiesce(MacLinuxGPU *driver, uint32_t cause)
     // whether or not every queue came off MES.
     s_power.flags |= MLG_POWER_FLAG_KFD_QUIESCED;
     if (r && r != -37 /* EALREADY: already held */) {
-        MACLINUXGPU_LOG("power: upstream KFD suspend failed (%d): %u of %u queues mapped, "
+        MACLINUXGPU_EVENT("power: upstream KFD suspend failed (%d): %u of %u queues mapped, "
                         "%u processes marked for reset", r, report.active, report.queues,
                         report.reset_marked);
         power_fail(driver, MLG_POWER_CAUSE_QUIESCE_FAILED, r);
@@ -1667,18 +1674,23 @@ IMPL(MacLinuxGPU, Start)
         MACLINUXGPU_LOG("provider is not an IOPCIDevice");
         return kIOReturnUnsupported;
     }
+    {
+        uint64_t build[4] = {0, 0, 0, 0};
+        (void)dext_compute_runtime_build_cached(build);
+        MACLINUXGPU_EVENT("driver start (build %llu)", build[3]);
+    }
 
     // Optional embedded fallback; may be empty and is never assumed complete.
     int fw_result = fw_table_register_embedded();
     if (fw_result != 0) {
-        MACLINUXGPU_LOG("firmware registration failed: %d", fw_result);
+        MACLINUXGPU_EVENT("firmware registration failed: %d", fw_result);
         return kIOReturnNoMemory;
     }
 
     IODispatchQueue *bqueue = nullptr;
     kern_return_t qret = IODispatchQueue::Create("MacLinuxGPUBringup", 0, 0, &bqueue);
     if (qret != kIOReturnSuccess || bqueue == nullptr) {
-        MACLINUXGPU_LOG("IODispatchQueue::Create failed: %#x", qret);
+        MACLINUXGPU_EVENT("IODispatchQueue::Create failed: %#x", qret);
         return qret != kIOReturnSuccess ? qret : kIOReturnNoMemory;
     }
     s_bringupQueue = bqueue;
@@ -1823,7 +1835,7 @@ MacLinuxGPU::FinishSession()
         if (isolated != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_ENDPOINT_ISOLATION, isolated);
-            MACLINUXGPU_LOG("session close: endpoint isolation failed (%d); DMA backing retained", isolated);
+            MACLINUXGPU_EVENT("session close: endpoint isolation failed (%d); DMA backing retained", isolated);
         }
     }
     dext_compute_set_pci_open(false);
@@ -1833,7 +1845,7 @@ MacLinuxGPU::FinishSession()
         if (released != 0 && s_deviceRemoved) {
             // Nothing on the bus can use what is left: keep the backing,
             // but never the provider of a device that is gone.
-            MACLINUXGPU_LOG("removal: DMA backing still owned (%d) is kept; the provider closes", released);
+            MACLINUXGPU_EVENT("removal: DMA backing still owned (%d) is kept; the provider closes", released);
         } else if (released != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_DMA_RETAINED, released);
@@ -1842,14 +1854,14 @@ MacLinuxGPU::FinishSession()
     }
     if (s_dmaQuarantined) {
         quarantine_session(this);
-        MACLINUXGPU_LOG("session quarantined: retaining clients, provider and runtime owners");
+        MACLINUXGPU_EVENT("session quarantined: retaining clients, provider and runtime owners");
         // Superclass Stop invalidates the provider. Pending Stop requests
         // retain their objects until quiescence can actually be established;
         // a stopping driver releases at once when cached state proves it.
         if (s_stopping) (void)release_quarantine(this);
         return;
     }
-    MACLINUXGPU_LOG("session closed after upstream removal, interrupt drain and endpoint isolation");
+    MACLINUXGPU_EVENT("session closed after upstream removal, interrupt drain and endpoint isolation");
     complete_session_close(this);
 }
 
@@ -2091,12 +2103,49 @@ static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
     }
 }
 
-// On the client's own queue, so no call of its own is in flight: its process
-// exits first (async waits return, files close) while the driver runs.
+// The client's process exits (async calls return, files close through
+// upstream postclose) on a thread of its own, never on this one: a call of
+// the process that does not return (a wait on a GPU that stopped) would
+// otherwise hold the incoming-call thread, and with it every client's
+// calls and the driver's own Stop. On an unplug this Stop began removal
+// first (device_removed), which completes the GPU's fences, so the
+// process's calls return. Its session membership ends after it, on the
+// owner's queue.
+struct LxStop {
+    MacLinuxGPUUserClient *client;
+    IOService *provider;
+};
+static void lx_stop_finished(void *arg)
+{
+    auto *stop = static_cast<LxStop *>(arg);
+    MacLinuxGPUUserClient *client = stop->client;
+    IOService *provider = stop->provider;
+    IOFree(stop, sizeof(*stop));
+    s_lxCalls.leave();
+    client->ivars->ownerQueue->DispatchAsync(^{ lx_finish_stop(client, provider); });
+}
+
 static void lx_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
 {
     if (s_lxCalls.enter()) {
-        if (struct rt_lx_client *lx = lx_take(client)) rt_lx_client_destroy(lx);
+        struct rt_lx_client *lx = lx_take(client);
+        auto *stop = lx ? static_cast<LxStop *>(IOMallocZero(sizeof(LxStop))) : nullptr;
+        if (lx) {
+            if (stop) {
+                stop->client = client;
+                stop->provider = provider;
+            }
+            // Its exit runs on a thread of its own, or (no thread: logged)
+            // at the session's close (rt_lx_retire_drain); never here.
+            if (!rt_lx_client_retire(lx, stop ? lx_stop_finished : nullptr, stop)) {
+                if (stop) return;  // lx_stop_finished finishes the Stop
+            } else if (stop) {
+                IOFree(stop, sizeof(*stop));
+            }
+            if (!stop)
+                MACLINUXGPU_LOG("client %llu: no memory to follow its process's exit; "
+                                "its Stop finishes now", client->ivars->clientID);
+        }
         s_lxCalls.leave();
     }
     // Otherwise a session close owns the teardown (lx_teardown_all).
@@ -2132,11 +2181,11 @@ IMPL(MacLinuxGPUUserClient, Stop)
         // IRQ delivery stays active while this client's queues are removed.
         const int released = dext_compute_release_client(ivars->clientID);
         if (released != 0 && s_deviceRemoved) {
-            MACLINUXGPU_LOG("client close after removal: cleanup returned %d; nothing can run", released);
+            MACLINUXGPU_EVENT("client close after removal: cleanup returned %d; nothing can run", released);
         } else if (released != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_CLIENT_RELEASE, released);
-            MACLINUXGPU_LOG("client close: cleanup failed (%d); retaining uncertain shared-session backing", released);
+            MACLINUXGPU_EVENT("client close: cleanup failed (%d); retaining uncertain shared-session backing", released);
         }
     }
     if (participant) {
@@ -2263,6 +2312,7 @@ static kern_return_t lx_transport_error(int r)
     case -MLG_LX_ENOSPC: return kIOReturnNoSpace;
     case -MLG_LX_ESRCH: return kIOReturnNotAttached;
     case -MLG_LX_EAGAIN: return kIOReturnBusy;
+    case -MLG_LX_EDEADLK: return kIOReturnNotPermitted;  // can sleep: async only
     case -MLG_LX_EINVAL:
     case -MLG_LX_E2BIG:
     case -MLG_LX_EFAULT: return kIOReturnBadArgument;
@@ -2334,17 +2384,16 @@ struct LxAsync {
     MacLinuxGPUUserClient *client;
     OSAction *action;
 };
-static int lx_async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
-                         size_t reply_bytes)
+static void lx_async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
+                          size_t reply_bytes)
 {
     auto *a = static_cast<LxAsync *>(ctx);
     IOUserClientAsyncArgumentsArray data = {};
     uint32_t count = 3;
-    const bool inline_reply = reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES;
     data[0] = token;
     data[1] = (uint64_t)result;
     data[2] = reply_bytes;
-    if (inline_reply) {
+    if (rbuf && reply_bytes && reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES) {
         memcpy(&data[3], rbuf, reply_bytes);
         count += (uint32_t)((reply_bytes + 7) / 8);
     }
@@ -2352,7 +2401,25 @@ static int lx_async_done(void *ctx, uint64_t token, int64_t result, const void *
     a->action->release();
     a->client->release();
     IOFree(a, sizeof(*a));
-    return inline_reply;
+}
+
+// An async call's context: the client and its completion, retained until
+// the worker completes it (it may finish after the client stopped).
+static LxAsync *lx_async_begin(MacLinuxGPUUserClient *client, OSAction *action)
+{
+    auto *ctx = static_cast<LxAsync *>(IOMallocZero(sizeof(LxAsync)));
+    if (!ctx) return nullptr;
+    ctx->client = client;
+    ctx->action = action;
+    client->retain();
+    action->retain();
+    return ctx;
+}
+static void lx_async_abandon(LxAsync *ctx)
+{
+    ctx->action->release();
+    ctx->client->release();
+    IOFree(ctx, sizeof(*ctx));
 }
 
 // Interrupt-driven waits (selectors 86 and 87, session_state.h).
@@ -2402,18 +2469,28 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
     const uint32_t nin = a->scalarInputCount;
     if (!in || !out) return kIOReturnBadArgument;
     switch (selector) {
-    case MLG_SELECTOR_LX_OPEN:
-        if (nin != 2 || a->scalarOutputCount < 1 || in[0] > UINT32_MAX || in[1] > UINT32_MAX)
+    case MLG_SELECTOR_LX_RETIRED_OPEN:
+    case MLG_SELECTOR_LX_RETIRED_CLOSE:
+    case MLG_SELECTOR_LX_RETIRED_MMAP:
+    case MLG_SELECTOR_LX_RETIRED_MUNMAP:
+        MACLINUXGPU_LOG("client %llu: selector %llu (a synchronous open, close, mmap or munmap) "
+                        "is retired: those can sleep and go through LX_CALL_ASYNC; the client "
+                        "library is older than the driver and must be rebuilt",
+                        client->ivars->clientID, selector);
+        return kIOReturnUnsupported;
+    case MLG_SELECTOR_LX_CALL_ASYNC: {
+        if (!a->completion || nin < 1 || nin > MLG_LX_OP_MMAP_ARGS || a->scalarOutputCount < 2)
             return kIOReturnBadArgument;
-        out[0] = (uint64_t)(int64_t)rt_lx_open(lx, (uint32_t)in[0], (uint32_t)in[1]);
-        a->scalarOutputCount = 1;
+        LxAsync *ctx = lx_async_begin(client, a->completion);
+        if (!ctx) return kIOReturnNoMemory;
+        uint64_t token = 0;
+        const int r = rt_lx_op_async(lx, in, nin, lx_async_done, ctx, &token);
+        if (r) lx_async_abandon(ctx);
+        out[0] = (uint64_t)(int64_t)r;  // not started: nothing will complete
+        out[1] = token;
+        a->scalarOutputCount = 2;
         return kIOReturnSuccess;
-    case MLG_SELECTOR_LX_CLOSE:
-        if (nin != 1 || a->scalarOutputCount < 1 || in[0] > INT32_MAX)
-            return kIOReturnBadArgument;
-        out[0] = (uint64_t)(int64_t)rt_lx_close(lx, (int)in[0]);
-        a->scalarOutputCount = 1;
-        return kIOReturnSuccess;
+    }
     case MLG_SELECTOR_LX_IOCTL:
     case MLG_SELECTOR_LX_IOCTL_ASYNC: {
         if (nin != 2 || a->scalarOutputCount < 2 || in[0] > INT32_MAX || in[1] > UINT32_MAX)
@@ -2422,20 +2499,12 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
         if (!lx_input(a, frame)) return kIOReturnBadArgument;
         if (selector == MLG_SELECTOR_LX_IOCTL_ASYNC) {
             if (!a->completion) return kIOReturnBadArgument;
-            auto *ctx = static_cast<LxAsync *>(IOMallocZero(sizeof(LxAsync)));
+            LxAsync *ctx = lx_async_begin(client, a->completion);
             if (!ctx) return kIOReturnNoMemory;
-            ctx->client = client;
-            ctx->action = a->completion;
-            client->retain();
-            ctx->action->retain();
             uint64_t token = 0;
             const int r = rt_lx_ioctl_async(lx, (int)in[0], (uint32_t)in[1], frame.bytes,
                                             frame.length, lx_async_done, ctx, &token);
-            if (r) {
-                ctx->action->release();
-                client->release();
-                IOFree(ctx, sizeof(*ctx));
-            }
+            if (r) lx_async_abandon(ctx);
             out[0] = (uint64_t)(int64_t)r;  // not started: nothing will complete
             out[1] = token;
             a->scalarOutputCount = 2;
@@ -2449,8 +2518,10 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
         rt_lx_timing_add(cmd, RT_LX_HOP_ARGS, args_ns - admitted_ns);
         size_t bytes = 0;
         int64_t result = 0;
-        const int r = rt_lx_ioctl(lx, (int)in[0], cmd, frame.bytes, frame.length,
-                                  reply.bytes, reply.capacity, &bytes, &result);
+        // This thread is every client's: only requests that cannot sleep
+        // run on it (rt_lx_ioctl_nosleep refuses the rest, logged).
+        const int r = rt_lx_ioctl_nosleep(lx, (int)in[0], cmd, frame.bytes, frame.length,
+                                          reply.bytes, reply.capacity, &bytes, &result);
         if (r) return lx_transport_error(r);
         const uint64_t ran_ns = rt_lx_time_ns();
         out[0] = (uint64_t)result;
@@ -2477,28 +2548,9 @@ static kern_return_t lx_call(MacLinuxGPUUserClient *client, struct rt_lx_client 
         a->scalarOutputCount = 2;
         return lx_output_done(a, reply, bytes);
     }
-    case MLG_SELECTOR_LX_MMAP: {
-        if (nin != 5 || a->scalarOutputCount < 4 || in[0] > INT32_MAX || in[3] > UINT32_MAX ||
-            in[4] > UINT32_MAX)
-            return kIOReturnBadArgument;
-        struct rt_lx_map_info info = {};
-        const int r = rt_lx_mmap(lx, (int)in[0], in[1], in[2], (uint32_t)in[3], (uint32_t)in[4],
-                                 &info);
-        out[0] = (uint64_t)(int64_t)r;
-        out[1] = r ? 0 : info.type;
-        out[2] = r ? 0 : info.length;
-        out[3] = r ? 0 : info.cache;
-        a->scalarOutputCount = 4;
-        return kIOReturnSuccess;
-    }
     case MLG_SELECTOR_LX_MMAP_COMMIT:
         if (nin != 2 || a->scalarOutputCount < 1) return kIOReturnBadArgument;
         out[0] = (uint64_t)(int64_t)rt_lx_mmap_commit(lx, in[0], in[1]);
-        a->scalarOutputCount = 1;
-        return kIOReturnSuccess;
-    case MLG_SELECTOR_LX_MUNMAP:
-        if (nin != 1 || a->scalarOutputCount < 1) return kIOReturnBadArgument;
-        out[0] = (uint64_t)(int64_t)rt_lx_munmap(lx, in[0]);
         a->scalarOutputCount = 1;
         return kIOReturnSuccess;
     default:
@@ -3176,7 +3228,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         // HostWindow comes with InitDevice: the probe maps the GART at the
         // host window the client placed (libmlg_drm/src/mlg_init.c).
         if (ivars->stopping) return kIOReturnNotAttached;
-        if (selector >= MLG_SELECTOR_LX_OPEN && selector <= MLG_SELECTOR_LX_SCANOUT)
+        if (selector >= MLG_SELECTOR_LX_FIRST && selector <= MLG_SELECTOR_LX_LAST)
             return lx_external_method(this, selector, arguments);
         if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
             selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice &&
@@ -3366,13 +3418,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
 
         if (!s_rtDevice) s_rtDevice = rt_device_alloc();
         if (!s_rtDevice) {
-            MACLINUXGPU_LOG("initialization: runtime device allocation failed");
+            MACLINUXGPU_EVENT("initialization: runtime device allocation failed");
             close_session(ivars->ownerDriver);
             return kIOReturnNotReady;
         }
         ret = prepare_interrupts(ivars->ownerDriver);
         if (ret != kIOReturnSuccess) {
-            MACLINUXGPU_LOG("initialization: interrupt preparation failed (%#x)", ret);
+            MACLINUXGPU_EVENT("initialization: interrupt preparation failed (%#x)", ret);
             close_session(ivars->ownerDriver);
             return ret;
         }
@@ -3383,7 +3435,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (probeHeld != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_PROBE_HOLD, probeHeld);
-            MACLINUXGPU_LOG("initialization: cannot reserve probe DMA backing (%d)", probeHeld);
+            MACLINUXGPU_EVENT("initialization: cannot reserve probe DMA backing (%d)", probeHeld);
             close_session(ivars->ownerDriver);
             return kIOReturnNotReady;
         }
@@ -3395,16 +3447,16 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             s_probeResult = rt_pci_probe_result(rt_device_get_pdev(s_rtDevice));
         }
         if (s_probeResult != 0) {
-            MACLINUXGPU_LOG("upstream PCI probe failed: %d", s_probeResult);
+            MACLINUXGPU_EVENT("upstream PCI probe failed: %d", s_probeResult);
             if (rt_pci_probe_cleanup_retained(rt_device_get_pdev(s_rtDevice))) {
                 s_dmaQuarantined = true;
                 note_quarantine(MLG_QUARANTINE_PROBE_RETAINED, s_probeResult);
-                MACLINUXGPU_LOG("upstream failed-probe ownership retained; preserving modules, device and DMA backing");
+                MACLINUXGPU_EVENT("upstream failed-probe ownership retained; preserving modules, device and DMA backing");
             }
             close_session(ivars->ownerDriver);
             return kIOReturnError;
         }
-        MACLINUXGPU_LOG("upstream AMDGPU PCI probe completed");
+        MACLINUXGPU_EVENT("upstream AMDGPU PCI probe completed");
         identity_after_probe(ivars->ownerDriver,
                              static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         int computeResult = dext_compute_start(
@@ -3413,7 +3465,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             const char *failedStep = NULL;
             int failedError = 0;
             dext_compute_start_failure(&failedStep, &failedError);
-            MACLINUXGPU_LOG("compute initialization failed: %d (%s: %d)", computeResult,
+            MACLINUXGPU_EVENT("compute initialization failed: %d (%s: %d)", computeResult,
                             failedStep ? failedStep : "unknown", failedError);
             close_session(ivars->ownerDriver);
             return kIOReturnNotReady;
@@ -3422,7 +3474,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (probeCommitted != 0) {
             s_dmaQuarantined = true;
             note_quarantine(MLG_QUARANTINE_PROBE_COMMIT, probeCommitted);
-            MACLINUXGPU_LOG("probe DMA cleanup failed (%d); session quarantined", probeCommitted);
+            MACLINUXGPU_EVENT("probe DMA cleanup failed (%d); session quarantined", probeCommitted);
             close_session(ivars->ownerDriver);
             return kIOReturnError;
         }

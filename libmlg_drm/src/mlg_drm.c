@@ -17,6 +17,9 @@
 #include "mlg_uapi.h"
 #include <rt/lx_abi.h>
 
+/* The transport revision this library speaks, findable in the file. */
+__attribute__((used)) static const char abi_tag[] = MLG_LX_ABI_TAG;
+
 /* What each descriptor is: indexed by descriptor, MLG_LX_DEV_* or 0. */
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static struct mlg_transport transport;
@@ -372,15 +375,10 @@ int mlg_ioctl(int fd, unsigned long request, void *arg)
 		r = (int)len;
 		goto out;
 	}
-	/* A wait goes to a worker of the driver's process, unless it only
-	 * polls (a zero deadline). */
-	async = mlg_lx_cmd_blocks(dev, cmd);
-	if (async && timeout_va) {
-		int64_t deadline;
-
-		memcpy(&deadline, (const void *)(uintptr_t)timeout_va, sizeof(deadline));
-		async = deadline != 0;
-	}
+	/* Anything that can sleep goes to a worker of the driver's process;
+	 * the driver runs only the rest on the call itself (and refuses a
+	 * sleeping one there). */
+	async = mlg_lx_cmd_sleeps(dev, cmd, frame, (size_t)len);
 	r = t.ioctl(t.ctx, fd, cmd, frame, (size_t)len, reply, mlg_lx_reply_bytes(out_bytes),
 		    &reply_bytes, &result, async);
 	if (!r && mlg_lx_apply_reply(frame, (size_t)len, reply, reply_bytes, NULL))

@@ -66,6 +66,8 @@ struct lx_async {
 	struct lx_async *queued_next;	/* waiting for a worker */
 	struct rt_lx_client *c;
 	uint64_t token;
+	uint32_t op;		/* 0: an ioctl; else MLG_LX_OP_* */
+	uint64_t args[MLG_LX_OP_MMAP_ARGS];	/* the operation's scalars */
 	int fd;
 	uint32_t cmd;
 	void *frame;
@@ -73,9 +75,11 @@ struct lx_async {
 	uint64_t queued_ns;	/* when the request arrived (rt/lx_timing.h) */
 	rt_lx_done_fn done;
 	void *ctx;
-	bool finished;
+	bool finished;		/* its result is there */
+	bool completing;	/* its worker is still in done() */
+	bool slot;		/* counts in slots */
 	int64_t result;
-	void *rep;
+	void *rep;		/* kept for rt_lx_result */
 	size_t reply_bytes;
 	int status;	/* 0, or why the call did not run */
 };
@@ -92,7 +96,8 @@ struct rt_lx_client {
 	bool dying;
 	unsigned int calls;		/* calls inside the process */
 	struct lx_async *async;
-	unsigned int async_count;
+	unsigned int async_count;	/* entries of the async list */
+	unsigned int slots;		/* calls counting in MLG_LX_MAX_ASYNC */
 	/* The workers that run async calls: they stay for the client's next
 	 * calls (starting a thread per wait costs more than the wait's round
 	 * trip), at most MLG_LX_MAX_ASYNC, as many as calls ever overlapped. */
@@ -107,6 +112,12 @@ struct rt_lx_client {
 	uint64_t next_map;
 	uint64_t pending_va;
 	const struct rt_lx_display_hooks *display;	/* primary node and LX_SCANOUT */
+	/* rt_lx_client_retire, under retire_lock. */
+	struct rt_lx_client *retire_next;
+	pthread_t retire_thread;
+	void (*retire_then)(void *arg);
+	void *retire_arg;
+	bool retire_started, retire_finished;
 };
 
 /* ---- client ---- */
@@ -540,10 +551,12 @@ static void pages_copy(struct lx_call_pages *p, uint64_t va, void *bytes, uint64
 
 /* ---- ioctl ---- */
 
-/* Run one validated frame. Caller holds a call reference. */
+/* Run one validated frame. Caller holds a call reference. With @nosleep
+ * (the caller is the driver's incoming-call thread), a request that can
+ * sleep is refused with -EDEADLK and does not run. */
 static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *frame,
 		     size_t frame_bytes, uint64_t out_bytes, void *rep, size_t *reply_bytes,
-		     int64_t *result)
+		     int64_t *result, bool nosleep)
 {
 	const struct mlg_lx_frame *head = frame;
 	const struct mlg_lx_segment *segs =
@@ -555,9 +568,9 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 	uint8_t *out;
 	long ret;
 	int r;
+	bool refused = false;
 	uint64_t t0 = rt_lx_time_ns(), t1;
 
-	(void)frame_bytes;
 	r = pages_acquire(c, segs, head->nsegs, &pages);
 	if (r)
 		return r;
@@ -596,6 +609,8 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 			ret = -ENOTTY;
 		else if (!file->f_op || !file->f_op->unlocked_ioctl)
 			ret = -ENOTTY;
+		else if (nosleep && mlg_lx_cmd_sleeps(dev, cmd, frame, frame_bytes))
+			refused = true;
 		else
 			ret = file->f_op->unlocked_ioctl(file, cmd, (unsigned long)head->arg);
 		t1 = rt_lx_time_ns();
@@ -604,6 +619,13 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 		fput(file);
 	}
 	linuxu_process_leave(&saved);
+	if (refused) {
+		pages_release(c, &pages);
+		pr_err("lx: pid %d (%s): request 0x%08x can sleep and was sent synchronously; "
+		       "it did not run (a client library older than the driver: rebuild it)\n",
+		       rt_lx_client_pid(c), linuxu_process_leader(c->proc)->comm, cmd);
+		return -EDEADLK;
+	}
 	ret = lx_errno(ret);
 	t1 = rt_lx_time_ns();
 	rt_lx_timing_add(cmd, RT_LX_HOP_LEAVE, t1 - t0);
@@ -636,9 +658,9 @@ static int run_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd, const void *f
 	return 0;
 }
 
-int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
-		const void *frame, size_t frame_bytes, void *rep,
-		size_t rep_cap, size_t *reply_bytes, int64_t *result)
+static int lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
+		    const void *frame, size_t frame_bytes, void *rep,
+		    size_t rep_cap, size_t *reply_bytes, int64_t *result, bool nosleep)
 {
 	uint64_t out_bytes = 0, t0 = rt_lx_time_ns(), t1;
 	void *copy;
@@ -665,7 +687,8 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 	t1 = rt_lx_time_ns();
 	rt_lx_timing_add(cmd, RT_LX_HOP_FRAME, t1 - t0);
 	if (!r) {
-		r = run_ioctl(c, fd, cmd, copy, frame_bytes, out_bytes, rep, reply_bytes, result);
+		r = run_ioctl(c, fd, cmd, copy, frame_bytes, out_bytes, rep, reply_bytes, result,
+			      nosleep);
 		t1 = rt_lx_time_ns();
 		call_end(c);
 	}
@@ -674,15 +697,36 @@ int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
 	return r;
 }
 
-/* ---- async ---- */
+int rt_lx_ioctl(struct rt_lx_client *c, int fd, uint32_t cmd,
+		const void *frame, size_t frame_bytes, void *rep,
+		size_t rep_cap, size_t *reply_bytes, int64_t *result)
+{
+	return lx_ioctl(c, fd, cmd, frame, frame_bytes, rep, rep_cap, reply_bytes, result, false);
+}
 
-static void async_run(struct lx_async *a)
+int rt_lx_ioctl_nosleep(struct rt_lx_client *c, int fd, uint32_t cmd,
+			const void *frame, size_t frame_bytes, void *rep,
+			size_t rep_cap, size_t *reply_bytes, int64_t *result)
+{
+	return lx_ioctl(c, fd, cmd, frame, frame_bytes, rep, rep_cap, reply_bytes, result, true);
+}
+
+/* ---- async ----
+ *
+ * Every call that can sleep runs here, on a worker of the client, never on
+ * the thread the call arrived on. A call holds a slot (MLG_LX_MAX_ASYNC per
+ * client) from its admission until its result is delivered: inline with
+ * its completion (the slot is free before the completion is sent, so a
+ * client that waits for completions before calling again never finds the
+ * slots full), or by rt_lx_result. */
+
+/* A result of at most this many bytes goes with the completion. */
+#define LX_INLINE_BYTES	MLG_LX_ASYNC_INLINE_BYTES
+
+static void async_run_ioctl(struct lx_async *a)
 {
 	struct rt_lx_client *c = a->c;
 	uint64_t out_bytes = 0;
-	int consumed = 0;
-
-	rt_lx_timing_add(a->cmd, RT_LX_HOP_SPAWN, rt_lx_time_ns() - a->queued_ns);
 
 	a->status = mlg_lx_frame_check(a->frame, a->frame_bytes, a->cmd, &out_bytes);
 	if (!a->status) {
@@ -691,7 +735,7 @@ static void async_run(struct lx_async *a)
 	}
 	if (!a->status)
 		a->status = run_ioctl(c, a->fd, a->cmd, a->frame, a->frame_bytes, out_bytes,
-				      a->rep, &a->reply_bytes, &a->result);
+				      a->rep, &a->reply_bytes, &a->result, false);
 	if (a->status) {
 		/* The call did not run: report the transport error as its result. */
 		struct mlg_lx_reply rh = {
@@ -709,16 +753,86 @@ static void async_run(struct lx_async *a)
 	}
 	kvfree(a->frame);
 	a->frame = NULL;
-	if (a->done)
-		consumed = a->done(a->ctx, a->token, a->result, a->rep, a->reply_bytes);
+}
+
+static void async_run_op(struct lx_async *a)
+{
+	struct rt_lx_client *c = a->c;
+	const uint64_t *in = a->args;
+	struct rt_lx_map_info info;
+	uint64_t *words;
+
+	a->reply_bytes = 0;
+	switch (a->op) {
+	case MLG_LX_OP_OPEN:
+		a->result = rt_lx_open(c, (uint32_t)in[1], (uint32_t)in[2]);
+		break;
+	case MLG_LX_OP_CLOSE:
+		a->result = rt_lx_close(c, (int)in[1]);
+		break;
+	case MLG_LX_OP_MMAP:
+		a->result = rt_lx_mmap(c, (int)in[1], in[2], in[3], (uint32_t)in[4],
+				       (uint32_t)in[5], &info);
+		if (a->result)
+			break;
+		words = kvzalloc(MLG_LX_OP_MMAP_WORDS * sizeof(uint64_t), GFP_KERNEL);
+		if (!words) {
+			/* No reply to carry the mapping: undo it. */
+			rt_lx_munmap(c, info.type);
+			a->result = -ENOMEM;
+			break;
+		}
+		words[0] = info.type;
+		words[1] = info.length;
+		words[2] = info.cache;
+		a->rep = words;
+		a->reply_bytes = MLG_LX_OP_MMAP_WORDS * sizeof(uint64_t);
+		break;
+	case MLG_LX_OP_MUNMAP:
+		a->result = rt_lx_munmap(c, in[1]);
+		break;
+	default:
+		a->result = -EINVAL;	/* refused at admission */
+		break;
+	}
+}
+
+static void async_run(struct lx_async *a)
+{
+	struct rt_lx_client *c = a->c;
+	const void *inline_rep = NULL;
+	bool inline_result;
+
+	if (a->op) {
+		async_run_op(a);
+	} else {
+		rt_lx_timing_add(a->cmd, RT_LX_HOP_SPAWN, rt_lx_time_ns() - a->queued_ns);
+		async_run_ioctl(a);
+	}
+
+	/* The result is there before the completion goes out, so a fetch
+	 * that follows the completion finds it. */
+	inline_result = a->reply_bytes <= LX_INLINE_BYTES;
 	pthread_mutex_lock(&c->lock);
 	a->finished = true;
-	if (consumed) {
-		kvfree(a->rep);
+	a->completing = true;
+	if (inline_result) {
+		/* Delivered with the completion: the slot frees now, and
+		 * nothing can fetch the result. */
+		inline_rep = a->rep;
 		a->rep = NULL;
-		a->reply_bytes = 0;
-		a->done = NULL;	/* nothing left to fetch */
+		if (a->slot) {
+			a->slot = false;
+			c->slots--;
+		}
 	}
+	pthread_mutex_unlock(&c->lock);
+	if (a->done)
+		a->done(a->ctx, a->token, a->result, inline_result ? inline_rep : NULL,
+			a->reply_bytes);
+	kvfree((void *)inline_rep);
+	pthread_mutex_lock(&c->lock);
+	a->completing = false;
 	c->calls--;
 	pthread_cond_broadcast(&c->changed);
 	pthread_mutex_unlock(&c->lock);
@@ -759,7 +873,7 @@ static void async_reap_locked(struct rt_lx_client *c)
 	for (struct lx_async **link = &c->async; *link;) {
 		struct lx_async *a = *link;
 
-		if (a->finished && !a->rep && !a->done) {
+		if (a->finished && !a->completing && !a->rep) {
 			*link = a->next;
 			c->async_count--;
 			kfree(a);
@@ -767,6 +881,49 @@ static void async_reap_locked(struct rt_lx_client *c)
 			link = &a->next;
 		}
 	}
+}
+
+/* Admit @a (its request copied in) and hand it to a worker. */
+static int async_queue(struct rt_lx_client *c, struct lx_async *a, uint64_t *token)
+{
+	int r = 0;
+
+	a->queued_ns = rt_lx_time_ns();
+	a->c = c;
+	pthread_mutex_lock(&c->lock);
+	async_reap_locked(c);
+	if (c->dying) {
+		r = -ESRCH;
+	} else if (c->slots >= MLG_LX_MAX_ASYNC) {
+		r = -EAGAIN;
+	} else if (c->queued_count + 1 > c->idle_workers && c->workers < MLG_LX_MAX_ASYNC &&
+		   pthread_create(&c->worker_threads[c->workers], NULL, async_worker, c)) {
+		r = -ENOMEM;
+	} else {
+		/* An idle worker takes it, or the one just started, or, with
+		 * every worker made, the next to finish: at most
+		 * MLG_LX_MAX_ASYNC calls hold slots, and a worker still
+		 * completing a call holds none. */
+		if (c->queued_count + 1 > c->idle_workers) {
+			if (c->workers < MLG_LX_MAX_ASYNC)
+				c->workers++;
+		} else {
+			pthread_cond_signal(&c->work);
+		}
+		a->token = c->next_token++;
+		a->slot = true;
+		c->slots++;
+		c->calls++;
+		*c->queued_tail = a;
+		c->queued_tail = &a->queued_next;
+		c->queued_count++;
+		a->next = c->async;
+		c->async = a;
+		c->async_count++;
+		*token = a->token;
+	}
+	pthread_mutex_unlock(&c->lock);
+	return r;
 }
 
 int rt_lx_ioctl_async(struct rt_lx_client *c, int fd, uint32_t cmd,
@@ -792,44 +949,60 @@ int rt_lx_ioctl_async(struct rt_lx_client *c, int fd, uint32_t cmd,
 	}
 	memcpy(a->frame, frame, frame_bytes);
 	a->frame_bytes = frame_bytes;
-	a->queued_ns = rt_lx_time_ns();
-	a->c = c;
 	a->fd = fd;
 	a->cmd = cmd;
 	a->done = done;
 	a->ctx = ctx;
-	pthread_mutex_lock(&c->lock);
-	async_reap_locked(c);
-	if (c->dying) {
-		r = -ESRCH;
-	} else if (c->async_count >= MLG_LX_MAX_ASYNC) {
-		r = -EAGAIN;
-	} else if (c->queued_count + 1 > c->idle_workers &&
-		   (c->workers >= MLG_LX_MAX_ASYNC ||
-		    pthread_create(&c->worker_threads[c->workers], NULL, async_worker, c))) {
-		/* Every worker is busy and no other can start. Not reached while
-		 * fewer than MLG_LX_MAX_ASYNC calls are out (one worker each). */
-		r = -EAGAIN;
-	} else {
-		if (c->queued_count + 1 > c->idle_workers)
-			c->workers++;	/* the one just started takes it */
-		else
-			pthread_cond_signal(&c->work);
-		a->token = c->next_token++;
-		c->calls++;
-		*c->queued_tail = a;
-		c->queued_tail = &a->queued_next;
-		c->queued_count++;
-		a->next = c->async;
-		c->async = a;
-		c->async_count++;
-		*token = a->token;
-	}
-	pthread_mutex_unlock(&c->lock);
+	r = async_queue(c, a, token);
 	if (r) {
 		kvfree(a->frame);
 		kfree(a);
 	}
+	return r;
+}
+
+int rt_lx_op_async(struct rt_lx_client *c, const uint64_t *in, uint32_t nin,
+		   rt_lx_done_fn done, void *ctx, uint64_t *token)
+{
+	struct lx_async *a;
+	uint32_t want;
+	int r;
+
+	if (!c || !in || !nin || !token)
+		return -EINVAL;
+	switch (in[0]) {
+	case MLG_LX_OP_OPEN:
+		want = MLG_LX_OP_OPEN_ARGS;
+		break;
+	case MLG_LX_OP_CLOSE:
+		want = MLG_LX_OP_CLOSE_ARGS;
+		break;
+	case MLG_LX_OP_MMAP:
+		want = MLG_LX_OP_MMAP_ARGS;
+		break;
+	case MLG_LX_OP_MUNMAP:
+		want = MLG_LX_OP_MUNMAP_ARGS;
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (nin != want)
+		return -EINVAL;
+	/* The values each operation narrows to an int or a 32-bit field. */
+	if ((in[0] == MLG_LX_OP_OPEN && (in[1] > UINT32_MAX || in[2] > UINT32_MAX)) ||
+	    ((in[0] == MLG_LX_OP_CLOSE || in[0] == MLG_LX_OP_MMAP) && in[1] > INT32_MAX) ||
+	    (in[0] == MLG_LX_OP_MMAP && (in[4] > UINT32_MAX || in[5] > UINT32_MAX)))
+		return -EINVAL;
+	a = kzalloc(sizeof(*a), GFP_KERNEL);
+	if (!a)
+		return -ENOMEM;
+	a->op = (uint32_t)in[0];
+	memcpy(a->args, in, nin * sizeof(*in));
+	a->done = done;
+	a->ctx = ctx;
+	r = async_queue(c, a, token);
+	if (r)
+		kfree(a);
 	return r;
 }
 
@@ -857,7 +1030,10 @@ int rt_lx_result(struct rt_lx_client *c, uint64_t token, void *rep,
 			*result = a->result;
 			kvfree(a->rep);
 			a->rep = NULL;
-			a->done = NULL;
+			if (a->slot) {
+				a->slot = false;
+				c->slots--;
+			}
 			r = 0;
 		}
 		break;
@@ -1234,10 +1410,100 @@ unsigned int rt_lx_mappings(struct rt_lx_client *c)
 
 /* ---- teardown ---- */
 
-void rt_lx_client_destroy(struct rt_lx_client *c)
+/* Clients being destroyed on threads of their own (rt_lx_client_retire),
+ * linked through their retire fields. */
+static pthread_mutex_t retire_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t retire_changed = PTHREAD_COND_INITIALIZER;
+static struct rt_lx_client *retiring;
+
+static void client_teardown(struct rt_lx_client *c);
+
+static void *retire_main(void *p)
 {
+	struct rt_lx_client *c = p;
+
+	client_teardown(c);
+	if (c->retire_then)
+		c->retire_then(c->retire_arg);
+	pthread_mutex_lock(&retire_lock);
+	c->retire_finished = true;
+	pthread_cond_broadcast(&retire_changed);
+	pthread_mutex_unlock(&retire_lock);
+	return NULL;
+}
+
+/* Join the finished ones; with @all, also destroy those no thread took and
+ * wait for every one. Caller holds retire_lock. */
+static void retire_reap_locked(bool all)
+{
+	for (;;) {
+		struct rt_lx_client **link = &retiring, *done = NULL;
+
+		for (; *link; link = &(*link)->retire_next) {
+			if ((*link)->retire_finished || (all && !(*link)->retire_started)) {
+				done = *link;
+				*link = done->retire_next;
+				break;
+			}
+		}
+		if (done) {
+			pthread_mutex_unlock(&retire_lock);
+			if (done->retire_started)
+				pthread_join(done->retire_thread, NULL);
+			else
+				client_teardown(done);	/* on the drain's thread */
+			kfree(done);
+			pthread_mutex_lock(&retire_lock);
+			continue;
+		}
+		if (!all || !retiring)
+			return;
+		pthread_cond_wait(&retire_changed, &retire_lock);
+	}
+}
+
+int rt_lx_client_retire(struct rt_lx_client *c, void (*then)(void *arg), void *arg)
+{
+	int err;
+
 	if (!c)
-		return;
+		return -EINVAL;
+	c->retire_then = then;
+	c->retire_arg = arg;
+	pthread_mutex_lock(&retire_lock);
+	retire_reap_locked(false);
+	err = pthread_create(&c->retire_thread, NULL, retire_main, c) ? -EAGAIN : 0;
+	c->retire_started = !err;
+	c->retire_next = retiring;
+	retiring = c;
+	pthread_mutex_unlock(&retire_lock);
+	if (err)
+		pr_err("lx: pid %d: no thread for the process's exit; it exits when the session "
+		       "closes\n", rt_lx_client_pid(c));
+	return err;
+}
+
+void rt_lx_retire_drain(void)
+{
+	pthread_mutex_lock(&retire_lock);
+	retire_reap_locked(true);
+	pthread_mutex_unlock(&retire_lock);
+}
+
+unsigned int rt_lx_retiring(void)
+{
+	unsigned int n = 0;
+
+	pthread_mutex_lock(&retire_lock);
+	for (struct rt_lx_client *c = retiring; c; c = c->retire_next)
+		n += !c->retire_finished;
+	pthread_mutex_unlock(&retire_lock);
+	return n;
+}
+
+/* Everything rt_lx_client_destroy does but free @c. */
+static void client_teardown(struct rt_lx_client *c)
+{
 	/* Whatever the client shows goes off the screen while its
 	 * framebuffers still exist. */
 	if (c->display)
@@ -1283,5 +1549,12 @@ void rt_lx_client_destroy(struct rt_lx_client *c)
 	pthread_cond_destroy(&c->work);
 	pthread_cond_destroy(&c->changed);
 	pthread_mutex_destroy(&c->lock);
+}
+
+void rt_lx_client_destroy(struct rt_lx_client *c)
+{
+	if (!c)
+		return;
+	client_teardown(c);
 	kfree(c);
 }

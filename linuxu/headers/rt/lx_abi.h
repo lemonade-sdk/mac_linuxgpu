@@ -63,46 +63,86 @@ extern "C" {
  * >= 0 or a negative errno, sign-extended). Any other IOReturn is a
  * transport failure: the call did not run.
  *
- * LX_OPEN    in:  [0] MLG_LX_DEV_*, [1] Linux open flags (O_RDWR,
- *                 O_CLOEXEC, O_NONBLOCK; others are refused)
- *            out: [0] the descriptor or -errno
- * LX_CLOSE   in:  [0] fd                     out: [0] 0 or -errno
+ * No request that can sleep (wait for the GPU, a fence, a lock that is
+ * held across one, memory) runs on the driver's incoming-call thread: one
+ * that blocked there would block every client's calls and the driver's own
+ * Stop. Such requests are asynchronous and run on a worker of the
+ * client's process; only those mlg_lx_cmd_sleeps() calls non-sleeping
+ * take the synchronous LX_IOCTL.
+ *
+ * LX_CALL_ASYNC   called with IOConnectCallAsyncScalarMethod.
+ *            in:  [0] MLG_LX_OP_*, then the operation's arguments:
+ *                 OPEN   [1] MLG_LX_DEV_*, [2] Linux open flags (O_RDWR,
+ *                        O_CLOEXEC, O_NONBLOCK; others are refused)
+ *                 CLOSE  [1] fd
+ *                 MMAP   [1] fd, [2] offset (bytes, page aligned),
+ *                        [3] length, [4] PROT_* (Linux values),
+ *                        [5] MAP_SHARED (only)
+ *                 MUNMAP [1] memory type (after IOConnectUnmapMemory64)
+ *            out: [0] 0 or -errno (not started), [1] its token
+ *            Completion: async data [0] token, [1] the result (OPEN: the
+ *                 descriptor; others 0; or -errno), [2] reply bytes, [3...]
+ *                 the reply: for MMAP MLG_LX_OP_MMAP_WORDS words, the
+ *                 memory type for IOConnectMapMemory64, the mapped length
+ *                 and its RT_LX_CACHE_* mode; none for the others.
  * LX_IOCTL   in:  [0] fd, [1] cmd; struct in: the request frame
  *                 (structure input, or an input descriptor above 4096
  *                 bytes)
  *            out: [0] the ioctl's result, [1] reply bytes; struct out:
  *                 the reply frame (the client sizes its buffer to
  *                 mlg_lx_reply_bytes() of its request)
+ *                 Only for requests mlg_lx_cmd_sleeps() says do not sleep;
+ *                 any other is refused (kIOReturnNotPermitted, logged).
  * LX_IOCTL_ASYNC  as LX_IOCTL, called with IOConnectCallAsync*: the call
  *                 runs on a worker of the client's process and returns at
  *                 once with out [0] 0 or -errno (not started), [1] its
  *                 token. Completion: async data [0] token, [1] the ioctl's
  *                 result, [2] reply bytes, [3...] the reply frame when it
  *                 fits MLG_LX_ASYNC_INLINE_BYTES, else LX_RESULT fetches
- *                 it. Used for calls that block (waits).
+ *                 it. Every request that can sleep goes this way.
  * LX_RESULT  in:  [0] token; struct out: the reply frame
  *            out: [0] the ioctl's result, [1] reply bytes
- * LX_MMAP    in:  [0] fd, [1] offset (bytes, page aligned), [2] length,
- *                 [3] PROT_* (Linux values), [4] MAP_SHARED (only)
- *            out: [0] 0 or -errno, [1] memory type for
- *                 IOConnectMapMemory64, [2] mapped length
  * LX_MMAP_COMMIT  in: [0] memory type, [1] the client address the type
  *                 was mapped at                out: [0] 0 or -errno
  *                 (places the mapping in the Linux process's address
  *                 space at that address; optional)
- * LX_MUNMAP  in:  [0] memory type              out: [0] 0 or -errno
- *                 (after IOConnectUnmapMemory64)
  * LX_SCANOUT struct in: struct mlg_lx_scanout; out: [0] 0 or -errno;
- *                 struct out: struct mlg_lx_scanout_state (below) */
-#define MLG_SELECTOR_LX_OPEN		96u
-#define MLG_SELECTOR_LX_CLOSE		97u
+ *                 struct out: struct mlg_lx_scanout_state (below)
+ *
+ * Selectors 96 (LX_OPEN), 97 (LX_CLOSE), 101 (LX_MMAP) and 103 (LX_MUNMAP)
+ * were synchronous and can sleep; they are retired (kIOReturnUnsupported)
+ * in favour of LX_CALL_ASYNC and their numbers are not reused. */
+/* The transport's revision: 2 since every request that can sleep is
+ * asynchronous (LX_CALL_ASYNC, the synchronous LX_IOCTL refusing them).
+ * The client library carries it as its dylib compatibility version and as
+ * the text MLG_LX_ABI_TAG, which a launcher can look for in the file. */
+#define MLG_LX_ABI		2
+#define MLG_LX_ABI_TAG		"libmlg_drm Linux-file ABI 2"
+
+#define MLG_SELECTOR_LX_FIRST		96u	/* the range's first number */
+#define MLG_SELECTOR_LX_RETIRED_OPEN	96u
+#define MLG_SELECTOR_LX_RETIRED_CLOSE	97u
 #define MLG_SELECTOR_LX_IOCTL		98u
 #define MLG_SELECTOR_LX_IOCTL_ASYNC	99u
 #define MLG_SELECTOR_LX_RESULT		100u
-#define MLG_SELECTOR_LX_MMAP		101u
+#define MLG_SELECTOR_LX_RETIRED_MMAP	101u
 #define MLG_SELECTOR_LX_MMAP_COMMIT	102u
-#define MLG_SELECTOR_LX_MUNMAP		103u
+#define MLG_SELECTOR_LX_RETIRED_MUNMAP	103u
 #define MLG_SELECTOR_LX_SCANOUT		104u
+#define MLG_SELECTOR_LX_CALL_ASYNC	105u
+#define MLG_SELECTOR_LX_LAST		105u
+
+/* LX_CALL_ASYNC operations, and the scalar inputs each takes (the
+ * operation number included). */
+#define MLG_LX_OP_OPEN		1u
+#define MLG_LX_OP_CLOSE		2u
+#define MLG_LX_OP_MMAP		3u
+#define MLG_LX_OP_MUNMAP	4u
+#define MLG_LX_OP_OPEN_ARGS	3u
+#define MLG_LX_OP_CLOSE_ARGS	2u
+#define MLG_LX_OP_MMAP_ARGS	6u
+#define MLG_LX_OP_MUNMAP_ARGS	2u
+#define MLG_LX_OP_MMAP_WORDS	3u	/* type, length, cache */
 
 /* LX_OPEN devices. */
 #define MLG_LX_DEV_RENDER	1u	/* the GPU's DRM render node */
@@ -230,8 +270,10 @@ _Static_assert(sizeof(struct mlg_lx_scanout_state) == 120, "mlg_lx_scanout_state
 #define MLG_LX_INLINE_STRUCT_BYTES	4096u
 #define MLG_LX_ASYNC_WORDS		16u
 #define MLG_LX_ASYNC_INLINE_BYTES	((MLG_LX_ASYNC_WORDS - 3u) * 8u)
-/* Async calls in flight per client; LX_IOCTL_ASYNC beyond it is -EAGAIN.
- * Completed results not yet fetched with LX_RESULT count too. */
+/* Async calls in flight per client (LX_IOCTL_ASYNC and LX_CALL_ASYNC);
+ * beyond it a call is -EAGAIN. A call counts until its completion is sent
+ * with its result inline, or until LX_RESULT fetches it. The client library
+ * keeps its own calls within it. */
 #define MLG_LX_MAX_ASYNC	16u
 
 /* The Linux errno values the transport itself reports, spelled out so a
@@ -249,6 +291,7 @@ _Static_assert(sizeof(struct mlg_lx_scanout_state) == 120, "mlg_lx_scanout_state
 #define MLG_LX_EINVAL		22
 #define MLG_LX_ENOTTY		25
 #define MLG_LX_ENOSPC		28
+#define MLG_LX_EDEADLK		35	/* a request that can sleep, sent synchronously */
 
 /* Segment directions. */
 #define MLG_LX_SEG_IN		1u
@@ -335,8 +378,15 @@ struct mlg_lx_span {
  * (MLG_LX_DEV_*): the DRM core and amdgpu ioctls of a render-node client,
  * the KFD ioctls of a compute runtime. The dext admits nothing else. */
 int mlg_lx_cmd_known(uint32_t dev, uint32_t cmd);
-/* Whether @cmd may wait (sent through LX_IOCTL_ASYNC). */
-int mlg_lx_cmd_blocks(uint32_t dev, uint32_t cmd);
+/* Whether request @frame (@bytes, a frame mlg_lx_encode built, or one
+ * mlg_lx_frame_check accepted) of @cmd on device @dev can sleep: 1 for
+ * every request except the few that provably do not (no fence wait, no
+ * lock held across one, no allocation that can evict, no final buffer
+ * release), which take the synchronous LX_IOCTL; 0 for those. A syncobj
+ * wait that only polls (no deadline, or one already past) does not sleep.
+ * The client picks its selector with it and the driver refuses a sleeping
+ * request on LX_IOCTL with it, so both read the same table. */
+int mlg_lx_cmd_sleeps(uint32_t dev, uint32_t cmd, const void *frame, size_t bytes);
 /* The memory ioctl @cmd with argument @arg reads and writes: its argument
  * block and every range a pointer in it (or in the ranges it points to)
  * names, read from the caller's memory. *@timeout_va is set to the address

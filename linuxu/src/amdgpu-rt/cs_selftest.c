@@ -168,18 +168,18 @@ static long st_ioctl(struct st *s, uint32_t cmd, void *arg)
 	return r;
 }
 
-static int async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
-		      size_t reply_bytes)
+static void async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
+		       size_t reply_bytes)
 {
 	struct st *s = ctx;
 
 	(void)token;
 	s->async_result = result;
-	s->async_reply_bytes = reply_bytes <= sizeof(s->async_reply) ? reply_bytes : 0;
+	/* A reply too long for the completion is kept for rt_lx_result. */
+	s->async_reply_bytes = rbuf && reply_bytes <= sizeof(s->async_reply) ? reply_bytes : 0;
 	if (s->async_reply_bytes)
 		memcpy(s->async_reply, rbuf, reply_bytes);
 	complete(&s->done);
-	return 1;
 }
 
 /* A wait run as the async RPC runs it: on a worker of the process. */
@@ -201,6 +201,10 @@ static long st_ioctl_async(struct st *s, uint32_t cmd, void *arg)
 		if (!wait_for_completion_timeout(&s->done,
 				msecs_to_jiffies(RT_CS_SELFTEST_WAIT_MS * 4)))
 			r = -ETIME;
+		else if (!s->async_reply_bytes &&
+			 rt_lx_result(s->c, token, s->async_reply, sizeof(s->async_reply),
+				      &s->async_reply_bytes, &s->async_result))
+			r = -EPROTO;
 		else if (!s->async_reply_bytes ||
 			 mlg_lx_apply_reply(frame, bytes, s->async_reply, s->async_reply_bytes, NULL))
 			r = -EPROTO;

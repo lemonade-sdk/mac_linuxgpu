@@ -237,7 +237,8 @@ int main(void)
 	rec.out_fill = 0x5a;
 	CHECK(mlg_ioctl(fd, DRM_IOCTL_AMDGPU_INFO, &info) == 0);
 	n = segments(seg, 64);
-	CHECK(rec.cmd == DRM_IOCTL_AMDGPU_INFO && !rec.async);
+	/* INFO can sleep (SMU messages): a worker's. */
+	CHECK(rec.cmd == DRM_IOCTL_AMDGPU_INFO && rec.async);
 	CHECK(covered(seg, n, &info, sizeof(info), MLG_LX_SEG_IN));
 	CHECK(covered(seg, n, result, sizeof(result), MLG_LX_SEG_OUT));
 	CHECK(result[0] == 0x5a && result[39] == 0x5a);
@@ -263,6 +264,7 @@ int main(void)
 					   .chunks = (uint64_t)(uintptr_t)ptrs } };
 	rec.out_fill = 0;
 	CHECK(mlg_ioctl(fd, DRM_IOCTL_AMDGPU_CS, &cs) == 0);
+	CHECK(rec.async);	/* a submission can wait for its context's earlier jobs */
 	n = segments(seg, 64);
 	CHECK(covered(seg, n, &cs, sizeof(cs), MLG_LX_SEG_INOUT));
 	CHECK(covered(seg, n, ptrs, 3 * sizeof(*ptrs), MLG_LX_SEG_IN));
