@@ -461,6 +461,8 @@ private let kRetireConfirm:     UInt64 = 0x52455452 // "RETR"
 private let kUserClientSession:  UInt32 = 0
 private let kUserClientObserver: UInt32 = 1
 private let kQuerySessionState:  UInt64 = 0x4c534553
+private let kQueryResetState:    UInt64 = 0x4c525354 // "LRST"
+private let kResetStateWords = 6
 private let kSessionStateWords = 9
 private let kIOReturnNotPrivilegedValue = kern_return_t(bitPattern: 0xe00002c1)
 private let kIOReturnUnsupportedValue = kern_return_t(bitPattern: 0xe00002c7)
@@ -1295,6 +1297,17 @@ final class MacLinuxGPUHost {
                                  participants: values[8])
         append("session: \(state.summary)")
         return state
+    }
+
+    /// GPU recovery (QueryInfo "LRST", cached, never blocking; driver 243+).
+    /// Nil when the driver does not report it.
+    func resetState() -> ResetState? {
+        let (kr, values) = callScalar(kSelQueryInfo, inScalars: [kQueryResetState], outScalars: kResetStateWords)
+        guard kr == kIOReturnSuccess, values.count == kResetStateWords, values[0] == ResetState.version else {
+            return nil
+        }
+        return ResetState(generation: values[1], flags: values[2], queueResets: values[3],
+                          vramLost: values[4], lastResult: Int64(bitPattern: values[5]))
     }
 
     /// Device power (cached); a PREPARE or RESUME request needs the

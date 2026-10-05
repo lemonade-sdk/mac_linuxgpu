@@ -1314,11 +1314,18 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     var published: DisplayStatus?
     var session: MacLinuxGPUHost?, observer: MacLinuxGPUHost?
     var epoch: UInt32 = .max
+    // GPU recovery (LRST): the state last read from this driver instance,
+    // and whether the GPU is wedged (until it leaves the bus).
+    var lastReset: ResetState?
+    var wedged = false
+    // Until then a mirror that ends with an error starts again at once:
+    // it most likely ended in the reset just seen.
+    var restartNowUntil = Date.distantPast
 
     func publish() {
         var status = DisplayStatus(daemon: getpid(), driverAttached: watch.present, monitors: [],
                                    disconnected: prefs.disconnected && session == nil && observer == nil &&
-                                       children.isEmpty)
+                                       children.isEmpty, gpuWedged: wedged)
         for m in monitors {
             let child = children[m.connector]
             let on = prefs.isOn(m.key)
@@ -1402,6 +1409,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         _ = session?.closeUserClient(); session = nil
         epoch = .max
         monitors = []
+        lastReset = nil
     }
 
     while !agentInterrupted {
@@ -1409,6 +1417,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             for child in children.values { stop(child) }
             children = [:]
             closeClients()
+            wedged = false      // power-cycled: a new instance comes with the GPU
             if prefs.disconnected {
                 // Unplugged after "Disconnect GPU": the next GPU is connected.
                 prefs.disconnected = false
@@ -1453,6 +1462,42 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             }
             session = s; observer = o
         }
+        // GPU recovery, from the cached state at this poll's cadence.
+        if let reset = observer!.resetState() {
+            switch ResetAction.evaluate(previous: lastReset, current: reset) {
+            case .wedged:
+                agentLog("display-agent: the GPU is wedged (its reset failed: \(reset.lastResult), generation " +
+                         "\(reset.generation)); stopping the mirrors and letting go of the GPU until it is power-cycled")
+                wedged = true
+                for child in children.values { stop(child) }
+                children = [:]
+                closeClients()
+                if !prefs.disconnected {
+                    prefs.disconnected = true
+                    do { try prefs.save(to: DisplayControl.prefsURL) }
+                    catch { agentLog("display-agent: could not write \(DisplayControl.prefsURL.path): \(error)") }
+                    notify_post(DisplayControl.prefsChanged)
+                }
+                publish()
+                continue
+            case .remirror:
+                agentLog("display-agent: a GPU reset lost VRAM (generation \(reset.generation)); every mirror starts again")
+                for child in children.values { stop(child) }
+                children = [:]
+                retryAt = [:]
+                lastErrors = [:]
+                restartNowUntil = Date().addingTimeInterval(15)
+            case .restartEnded:
+                agentLog("display-agent: GPU queue reset (generation \(reset.generation), \(reset.queueResets) in all); " +
+                         "the outputs redraw, and a mirror that ended starts again now")
+                retryAt = [:]
+                restartNowUntil = Date().addingTimeInterval(15)
+            case .none:
+                break
+            }
+            wedged = false
+            lastReset = reset
+        }
         // The monitors: the cached hotplug state; probe when it moved.
         let (kr, _, report) = observer!.display(.status)
         if kr == kern_return_t(bitPattern: 0xe00002d5) {
@@ -1495,7 +1540,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             if !child.exited { stop(child) }
             if child.state == .error, let error = child.lastError {
                 lastErrors[connector] = error
-                retryAt[connector] = Date().addingTimeInterval(10)
+                retryAt[connector] = Date() < restartNowUntil ? nil : Date().addingTimeInterval(10)
             } else {
                 lastErrors[connector] = nil
             }
@@ -1765,6 +1810,9 @@ private final class MenuBarController: NSObject, NSMenuDelegate {
                          action: nil, keyEquivalent: "").isEnabled = false
         } else if !status.driverAttached {
             menu.addItem(withTitle: "No GPU attached", action: nil, keyEquivalent: "").isEnabled = false
+        } else if status.gpuWedged {
+            menu.addItem(withTitle: DisplayStatus.wedgedTitle, action: nil, keyEquivalent: "").isEnabled = false
+            menu.addItem(withTitle: "    " + DisplayStatus.wedgedAdvice, action: nil, keyEquivalent: "").isEnabled = false
         } else if status.monitors.isEmpty {
             menu.addItem(withTitle: "No monitor connected to the GPU", action: nil, keyEquivalent: "").isEnabled = false
         }

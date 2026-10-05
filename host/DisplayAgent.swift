@@ -904,6 +904,43 @@ enum DisconnectReadiness: Equatable {
     }
 }
 
+/// GPU recovery's state (QueryInfo "LRST", dext/sources/session_state.h).
+struct ResetState: Equatable {
+    static let version: UInt64 = 1
+    static let flagWedged: UInt64 = 1 << 0
+    static let flagLastVRAMLost: UInt64 = 1 << 1
+    var generation: UInt64      // queue resets that succeeded, device resets and the wedge
+    var flags: UInt64
+    var queueResets: UInt64
+    var vramLost: UInt64
+    var lastResult: Int64
+    var wedged: Bool { flags & ResetState.flagWedged != 0 }
+    var lastVRAMLost: Bool { flags & ResetState.flagLastVRAMLost != 0 }
+}
+
+/// What the daemon does about a change of the recovery state.
+enum ResetAction: Equatable {
+    case none
+    /// A wedged GPU: stop mirroring and let go of it until it is
+    /// power-cycled (it leaves the bus) or "Reconnect GPU".
+    case wedged
+    /// A queue reset: the output redraws by itself (display.c); mirrors
+    /// that ended around it start again now rather than after the retry
+    /// delay.
+    case restartEnded
+    /// A reset that lost VRAM: every mirror imports and lights again.
+    case remirror
+
+    /// @previous: the state last seen from this driver instance (nil on
+    /// the first read, which only records it).
+    static func evaluate(previous: ResetState?, current: ResetState) -> ResetAction {
+        if current.wedged { return .wedged }
+        guard let previous, current.generation != previous.generation else { return .none }
+        if current.lastVRAMLost || current.vramLost != previous.vramLost { return .remirror }
+        return .restartEnded
+    }
+}
+
 /// What the daemon reports for the menu bar.
 struct DisplayStatus: Codable, Equatable {
     enum State: String, Codable { case off, starting, mirroring, error }
@@ -921,12 +958,17 @@ struct DisplayStatus: Codable, Equatable {
     var monitors: [Monitor] = []
     /// The daemon has let go of the driver for "Disconnect GPU".
     var disconnected = false
+    /// The GPU stopped answering and its reset failed: it works again only
+    /// once power-cycled.
+    var gpuWedged = false
 
-    init(daemon: Int32 = 0, driverAttached: Bool = false, monitors: [Monitor] = [], disconnected: Bool = false) {
+    init(daemon: Int32 = 0, driverAttached: Bool = false, monitors: [Monitor] = [], disconnected: Bool = false,
+         gpuWedged: Bool = false) {
         self.daemon = daemon
         self.driverAttached = driverAttached
         self.monitors = monitors
         self.disconnected = disconnected
+        self.gpuWedged = gpuWedged
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -934,11 +976,16 @@ struct DisplayStatus: Codable, Equatable {
         driverAttached = try c.decodeIfPresent(Bool.self, forKey: .driverAttached) ?? false
         monitors = try c.decodeIfPresent([Monitor].self, forKey: .monitors) ?? []
         disconnected = try c.decodeIfPresent(Bool.self, forKey: .disconnected) ?? false
+        gpuWedged = try c.decodeIfPresent(Bool.self, forKey: .gpuWedged) ?? false
     }
+
+    static let wedgedTitle = "The GPU stopped answering and its reset failed"
+    static let wedgedAdvice = "Power-cycle the GPU (switch its enclosure off and on), then choose Reconnect GPU."
 
     /// The menu bar icon's state: an error on any monitor, else whether
     /// any is mirrored.
     var summary: State {
+        if gpuWedged { return .error }
         if monitors.contains(where: { $0.state == .error }) { return .error }
         if monitors.contains(where: { $0.state == .mirroring }) { return .mirroring }
         if monitors.contains(where: { $0.state == .starting }) { return .starting }

@@ -501,3 +501,32 @@ do {
     try? FileManager.default.removeItem(at: dir)
 }
 print("PASS disconnect GPU: the choice persists, readiness follows the daemon and the driver's clients")
+
+// GPU recovery: what the daemon does about a change of LRST.
+do {
+    let base = ResetState(generation: 0, flags: 0, queueResets: 0, vramLost: 0, lastResult: 0)
+    var queueReset = base
+    queueReset.generation = 1; queueReset.queueResets = 1
+    var vramLost = base
+    vramLost.generation = 1; vramLost.flags = ResetState.flagLastVRAMLost; vramLost.vramLost = 1
+    var wedged = base
+    wedged.generation = 1; wedged.flags = ResetState.flagWedged; wedged.lastResult = -110
+    check(ResetAction.evaluate(previous: nil, current: base) == .none, "the first read only records")
+    check(ResetAction.evaluate(previous: nil, current: queueReset) == .none, "a new instance's history is not ours")
+    check(ResetAction.evaluate(previous: base, current: base) == .none)
+    check(ResetAction.evaluate(previous: base, current: queueReset) == .restartEnded)
+    check(ResetAction.evaluate(previous: base, current: vramLost) == .remirror)
+    check(ResetAction.evaluate(previous: nil, current: wedged) == .wedged, "wedged on the first read too")
+    check(ResetAction.evaluate(previous: wedged, current: wedged) == .wedged, "wedged until power-cycled")
+    check(wedged.wedged && !wedged.lastVRAMLost && vramLost.lastVRAMLost)
+    // The status carries it to the menu bar; files from before read as not wedged.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlg-reset-\(getpid())")
+    let url = dir.appendingPathComponent("s.json")
+    let status = DisplayStatus(daemon: 7, driverAttached: true, monitors: [], disconnected: true, gpuWedged: true)
+    try? status.save(to: url)
+    check(DisplayStatus.load(from: url) == status && status.summary == .error)
+    try? Data(#"{"daemon": 7, "driverAttached": true, "monitors": []}"#.utf8).write(to: url)
+    check(DisplayStatus.load(from: url)?.gpuWedged == false)
+    try? FileManager.default.removeItem(at: dir)
+}
+print("PASS GPU recovery: first read records, a queue reset restarts ended mirrors, lost VRAM re-mirrors, wedged lets go; status round trip")
