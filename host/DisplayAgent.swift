@@ -872,14 +872,27 @@ struct DisplayPrefs: Codable, Equatable {
 /// asking process itself excluded); else the apps to quit.
 enum DisconnectReadiness: Equatable {
     case safe
+    /// Safe to unplug: the driver's session is closed. These programs still
+    /// have the driver open; any use of the GPU tells them it was
+    /// disconnected (the next program to start brings the GPU up again).
+    case safeWithClients([String])
     case waitingForDisplays
+    /// The GPU is up for these programs: Disconnect GPU closes it for them.
     case appsConnected([String])
-    /// No app left, but the driver is still closing its session (stopping
-    /// the GPU's work, releasing its memory).
+    /// The driver is closing its session (stopping the GPU's work,
+    /// releasing its memory).
     case driverClosing
 
+    /// Whether nothing touches the GPU any more: it can be unplugged.
+    var canUnplug: Bool {
+        if case .safeWithClients = self { return true }
+        return self == .safe
+    }
+
+    /// @sessionOpen: the driver's session is up (PCI open: the GPU is in
+    /// use, by programs or kept up between them); @sessionBusy: it closes.
     static func evaluate(status: DisplayStatus, clients: [String], selfPID: Int32,
-                         sessionBusy: Bool = false) -> DisconnectReadiness {
+                         sessionBusy: Bool = false, sessionOpen: Bool = false) -> DisconnectReadiness {
         if status.daemon != 0 && status.driverAttached && !status.disconnected { return .waitingForDisplays }
         let apps = clients.compactMap { creator -> String? in
             let parts = creator.split(separator: ",", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
@@ -887,19 +900,24 @@ enum DisconnectReadiness: Equatable {
             if Int32(parts[0].dropFirst(4)) == selfPID { return nil }
             return "\(parts[1]) (\(parts[0]))"
         }
-        if !apps.isEmpty { return .appsConnected(apps) }
-        return sessionBusy ? .driverClosing : .safe
+        if sessionBusy { return .driverClosing }
+        if sessionOpen { return .appsConnected(apps) }
+        return apps.isEmpty ? .safe : .safeWithClients(apps)
     }
 
     /// For the user.
     var message: String {
         switch self {
         case .safe: return "The GPU can be unplugged now."
+        case .safeWithClients(let apps):
+            return "The GPU can be unplugged now. Still connected to the driver, and told the GPU was " +
+                "disconnected if they use it: " + apps.joined(separator: ", ") + "."
         case .waitingForDisplays: return "Waiting for the displays on the GPU to stop…"
         case .driverClosing: return "Waiting for the driver to finish with the GPU…"
         case .appsConnected(let apps):
-            return "Still using the GPU: " + apps.joined(separator: ", ") + ". Quit " +
-                (apps.count == 1 ? "it" : "them") + ", then unplug the GPU."
+            return apps.isEmpty ? "The GPU is still up; disconnecting closes it." :
+                "Using the GPU: " + apps.joined(separator: ", ") + ". Disconnecting closes the GPU for " +
+                (apps.count == 1 ? "it" : "them") + "."
         }
     }
 }

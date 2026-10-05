@@ -453,6 +453,7 @@ private let kSelRetire:           UInt32 = 85 // entitled: hand the GPU to a new
 private let kRetireOpQuiesce:   UInt64 = 0
 private let kRetireOpTerminate: UInt64 = 1
 private let kRetireOpResume:    UInt64 = 2
+let kRetireOpDisconnect:        UInt64 = 3
 private let kRetireForce:       UInt64 = 1
 private let kRetireConfirm:     UInt64 = 0x52455452 // "RETR"
 
@@ -517,6 +518,7 @@ struct SessionState {
 
     var closing: Bool { flags & (1 << 0) != 0 }
     var quarantined: Bool { flags & (1 << 1) != 0 }
+    var pciOpen: Bool { flags & (1 << 3) != 0 }
     var releasable: Bool { flags & (1 << 6) != 0 }
     var restartRequired: Bool { flags & (1 << 7) != 0 }
     var retiring: Bool { flags & (1 << 12) != 0 }
@@ -1387,6 +1389,7 @@ final class MacLinuxGPUHost {
         case kRetireOpQuiesce: return "QUIESCE"
         case kRetireOpTerminate: return "TERMINATE"
         case kRetireOpResume: return "RESUME"
+        case kRetireOpDisconnect: return "DISCONNECT"
         default: return "op \(op)"
         }
     }
@@ -2331,7 +2334,7 @@ struct AppMain {
             // As the menu bar's Disconnect GPU: stop mirroring, let go of
             // the driver, report when the GPU can be unplugged.
             let result = GPUDisconnect.disconnect(timeout: 20) { print($0.message) }
-            exit(result == .safe ? 0 : 3)
+            exit(result.canUnplug ? 0 : 3)
         }
         if args[1] == "reconnect-gpu" {
             exit(GPUDisconnect.set(disconnected: false) ? 0 : 1)

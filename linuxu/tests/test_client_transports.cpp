@@ -220,6 +220,9 @@ struct MacLinuxGPUUserClient : OSObjectMock {
 
 // ---- the driver state the extracted code reads ----
 static uint64_t s_sessionGeneration = 1;
+// The session Disconnect GPU closed (none here: its NoDevice answer is a
+// session-shutdown check).
+static uint64_t s_disconnectedGeneration = 0;
 static bool s_stopping, s_sessionClosing, s_dmaQuarantined;
 static bool s_modulesRunning;           // set by InitDevice
 static void *s_rtDevice;                // set by InitDevice

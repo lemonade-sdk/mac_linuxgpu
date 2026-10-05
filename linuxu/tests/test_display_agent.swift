@@ -492,15 +492,26 @@ do {
     let released = DisplayStatus(daemon: 7, driverAttached: true, monitors: [], disconnected: true)
     check(DisconnectReadiness.evaluate(status: mirroring, clients: [], selfPID: 1) == .waitingForDisplays)
     check(DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost"], selfPID: 1) == .safe)
-    check(DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost", "pid 692, amdgpu_mtopg"],
-                                       selfPID: 1) == .appsConnected(["amdgpu_mtopg (pid 692)"]))
+    // The driver's session closed: safe, whatever programs keep the
+    // driver open (they are told the GPU was disconnected if they use it).
+    let lost = DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost", "pid 692, amdgpu_mtopg"],
+                                            selfPID: 1)
+    check(lost == .safeWithClients(["amdgpu_mtopg (pid 692)"]) && lost.canUnplug)
+    // The device stays up across programs: an open session is what
+    // Disconnect GPU closes, with programs on it or none.
+    let up = DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost", "pid 900, lse-server"],
+                                          selfPID: 1, sessionOpen: true)
+    check(up == .appsConnected(["lse-server (pid 900)"]) && !up.canUnplug)
+    check(DisconnectReadiness.evaluate(status: released, clients: [], selfPID: 1, sessionOpen: true) == .appsConnected([]))
     check(DisconnectReadiness.evaluate(status: DisplayStatus(), clients: [], selfPID: 1) == .safe, "no daemon running")
-    check(DisconnectReadiness.evaluate(status: released, clients: [], selfPID: 1, sessionBusy: true) == .driverClosing)
-    check(DisconnectReadiness.appsConnected(["amdgpu_mtopg (pid 692)"]).message ==
-          "Still using the GPU: amdgpu_mtopg (pid 692). Quit it, then unplug the GPU.")
+    check(DisconnectReadiness.evaluate(status: released, clients: [], selfPID: 1, sessionBusy: true,
+                                       sessionOpen: true) == .driverClosing)
+    check(!DisconnectReadiness.waitingForDisplays.canUnplug && !DisconnectReadiness.driverClosing.canUnplug)
+    check(up.message == "Using the GPU: lse-server (pid 900). Disconnecting closes the GPU for it.")
+    check(lost.message.hasPrefix("The GPU can be unplugged now. Still connected to the driver"))
     try? FileManager.default.removeItem(at: dir)
 }
-print("PASS disconnect GPU: the choice persists, readiness follows the daemon and the driver's clients")
+print("PASS disconnect GPU: the choice persists; readiness follows the daemon and the driver's session, naming the programs it closes for")
 
 // GPU recovery: what the daemon does about a change of LRST.
 do {

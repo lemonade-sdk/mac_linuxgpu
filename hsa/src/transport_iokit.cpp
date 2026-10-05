@@ -340,6 +340,13 @@ public:
                          unsigned(result), count, outputs);
         // The driver's session or the driver itself is gone (the GPU left
         // the bus, or the driver stopped): the device is lost, not busy.
+        // NoDevice is also Disconnect GPU closing this program's session.
+        if (result == kIOReturnNoDevice) {
+            static std::atomic_flag said = ATOMIC_FLAG_INIT;
+            if (!said.test_and_set())
+                std::fprintf(stderr, "mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
+                             "this program's GPU session is gone: restart it to use the GPU again\n");
+        }
         if (result == kIOReturnNoDevice || result == kIOReturnNotAttached ||
             result == MACH_SEND_INVALID_DEST) return kDeviceLostStatus;
         // The device is suspending, suspended or resuming (power.h): the

@@ -1760,29 +1760,50 @@ enum GPUDisconnect {
         if status.daemon == 0 || kill(status.daemon, 0) != 0 { status = DisplayStatus() }
         let instances = DriverInstances.list()
         let clients = instances.flatMap { $0.clients }
-        var busy = false
+        var busy = false, open = false
         if !instances.isEmpty {
             let host = MacLinuxGPUHost()
             host.quiet = true
             if host.openUserClient(observer: true) {
                 if let session = host.sessionState() {
-                    busy = session.participants > 0 || session.closing
+                    busy = session.closing
+                    open = session.pciOpen && !session.closing
                 }
                 _ = host.closeUserClient()
             }
         }
-        return DisconnectReadiness.evaluate(status: status, clients: clients, selfPID: getpid(), sessionBusy: busy)
+        return DisconnectReadiness.evaluate(status: status, clients: clients, selfPID: getpid(),
+                                            sessionBusy: busy, sessionOpen: open)
+    }
+
+    /// The driver closes its session for Disconnect GPU, whatever programs
+    /// it has (Retire DISCONNECT): they are told the GPU was disconnected.
+    /// False when the driver refused (a raw BAR mapping, a quarantine).
+    static func closeSession() -> Bool {
+        let host = MacLinuxGPUHost()
+        host.quiet = true
+        guard host.openUserClient(observer: true) else { return false }
+        defer { _ = host.closeUserClient() }
+        guard let result = host.retire(kRetireOpDisconnect) else { return false }
+        return result.status == kIOReturnSuccess || result.state == RetireResult.closing
     }
 
     /// Asks, then waits up to @timeout for the GPU to be free; the last look.
+    /// Once the displays let go, a session still up is closed for the
+    /// programs using it.
     static func disconnect(timeout: TimeInterval, progress: (DisconnectReadiness) -> Void) -> DisconnectReadiness {
         guard set(disconnected: true) else { return .waitingForDisplays }
         let deadline = Date().addingTimeInterval(timeout)
         var last: DisconnectReadiness?
+        var asked = false
         while true {
             let now = readiness()
             if now != last { progress(now); last = now }
-            if now == .safe || Date() >= deadline { return now }
+            if now.canUnplug || Date() >= deadline { return now }
+            if case .appsConnected = now, !asked {
+                asked = true
+                if !closeSession() { asked = false }
+            }
             Thread.sleep(forTimeInterval: 0.25)
         }
     }
@@ -1906,12 +1927,12 @@ private final class MenuBarController: NSObject, NSMenuDelegate {
 
     private func showDisconnect(_ result: DisconnectReadiness) {
         let alert = NSAlert()
-        alert.messageText = result == .safe ? "The GPU can be unplugged" : "The GPU is still in use"
+        alert.messageText = result.canUnplug ? "The GPU can be unplugged" : "The GPU is still in use"
         alert.informativeText = result == .safe ?
             "Displays on the GPU are off and nothing is using it. Choose Reconnect GPU in this menu to use it again." :
             result.message
         alert.addButton(withTitle: "OK")
-        if result != .safe { alert.addButton(withTitle: "Check Again") }
+        if !result.canUnplug { alert.addButton(withTitle: "Check Again") }
         NSApp.activate(ignoringOtherApps: true)
         if alert.runModal() == .alertSecondButtonReturn { disconnectGPU() }
     }

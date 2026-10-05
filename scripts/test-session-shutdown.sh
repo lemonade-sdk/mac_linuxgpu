@@ -16,7 +16,7 @@ def section(start, end, limit):
         raise SystemExit("shutdown fixture extraction exceeded its bounded section")
     return text
 state = section("static IODispatchQueue *s_bringupQueue", "class ComputeClientScope", 130)
-close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 600)
+close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 640)
 opening = section("static kern_return_t ensure_open(MacLinuxGPUUserClient *client)", "static kern_return_t prepare_interrupts", 50)
 driver_stop = section("kern_return_t\nIMPL(MacLinuxGPU, Stop)", "void\nMacLinuxGPU::FinishSession()", 50)
 finish = section("void\nMacLinuxGPU::FinishSession()", "void\nMacLinuxGPU::FinishStop(IOService *provider)", 100)
@@ -58,6 +58,6 @@ for scenario in log-format success large-mapped hold-failure compute-failure irq
   release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads \
   selftest-parked display-showing display-quarantined surprise-removal surprise-removal-quarantined surprise-removal-held \
   upgrade-stop-idle upgrade-stop-session upgrade-stop-quarantined upgrade-stop-quarantined-held \
-  retire-idle retire-quiesce-resume retire-session retire-raw-bar retire-quarantined retire-quarantined-held; do
+  retire-idle retire-quiesce-resume retire-session retire-raw-bar retire-quarantined retire-quarantined-held retire-disconnect retire-disconnect-raw-bar; do
   "$test_dir/test_session_shutdown" "$scenario"
 done

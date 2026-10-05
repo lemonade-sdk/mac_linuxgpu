@@ -317,6 +317,9 @@ static bool             s_deviceRemoved = false;
 // to terminate it once its session is gone, so its process exits.
 static bool             s_retiring = false;
 static bool             s_retireTerminate = false;
+// The session Disconnect GPU closed (retire_driver): its clients' calls fail
+// with kIOReturnNoDevice. 0 for none.
+static uint64_t         s_disconnectedGeneration = 0;
 // A definite PCI transport fault made this session's GPU unreachable
 // (transport_lost); cleared when the session's provider closes.
 static bool             s_deviceLost = false;
@@ -391,6 +394,7 @@ struct MacLinuxGPUUserClient_IVars {
     // The compute backend holds no record for it (every slot held): its
     // InitDevice and compute session fail (record_client_identity).
     int identityError;
+    bool disconnectLogged; // told once that Disconnect GPU closed its session
 };
 
 class ComputeClientScope {
@@ -1011,15 +1015,68 @@ static void release_removed(MacLinuxGPU *driver)
     complete_session_close(driver);
 }
 
+// Disconnect GPU (session_state.h's MLG_RETIRE_OP_DISCONNECT), on the owner's
+// queue: the session closes now through the normal close, whatever clients
+// it has, so nothing touches the GPU when it is unplugged. Sessions stay
+// admitted: the next program brings the GPU up. The closed session's
+// clients get kIOReturnNoDevice from then on (s_disconnectedGeneration).
+// Only a raw BAR mapping refuses (a close would quarantine), and a
+// quarantine is released only when provably quiescent, as for Retire.
+static void disconnect_driver(MacLinuxGPU *driver, uint32_t others, uint64_t out[MLG_RETIRE_WORDS])
+{
+    if (s_stopping) { out[1] = MLG_RETIRE_STOPPING; return; }
+    if (s_terminateRequested) { out[1] = MLG_RETIRE_TERMINATING; return; }
+    if (s_dmaQuarantined) {
+        const uint32_t blocker = release_quarantine(driver);
+        if (blocker != MLG_RELEASE_READY) {
+            out[0] = mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady;
+            out[1] = MLG_RETIRE_QUARANTINED;
+            out[2] = blocker;
+            return;
+        }
+    } else if (s_sessionClosing) {
+        out[0] = kIOReturnNotReady;
+        out[1] = MLG_RETIRE_CLOSING;
+        return;
+    } else if (s_pciOpen) {
+        if (s_rawBARLease.hasMappings()) {
+            out[0] = kIOReturnBusy;
+            out[1] = MLG_RETIRE_RAW_BAR;
+            return;
+        }
+        __atomic_store_n(&s_disconnectedGeneration, s_sessionGeneration, __ATOMIC_RELEASE);
+        MACLINUXGPU_EVENT("disconnect: closing the session for Disconnect GPU (%u client(s) lose the GPU)",
+                          others);
+        close_session(driver);
+        out[2] = others;
+        if (s_dmaQuarantined) {
+            const uint32_t blocker = release_blocker();
+            out[0] = mlg_release_blocker_permanent(blocker) ? kIOReturnError : kIOReturnNotReady;
+            out[1] = MLG_RETIRE_QUARANTINED;
+            out[2] = blocker;
+            return;
+        }
+        out[0] = kIOReturnNotReady;
+        out[1] = MLG_RETIRE_CLOSING;
+        return;
+    }
+    out[1] = MLG_RETIRE_IDLE;
+}
+
 // Retire (session_state.h): what an upgrade asks of the running driver. On
 // the owner's queue. @others counts session clients besides the caller.
 // Only the normal close runs; a step whose outcome is uncertain quarantines
 // as it would for any close, and nothing here adds a reason to.
+static void disconnect_driver(MacLinuxGPU *driver, uint32_t others, uint64_t out[MLG_RETIRE_WORDS]);
 static void retire_driver(MacLinuxGPU *driver, uint64_t op, bool force, uint32_t others,
                           uint64_t out[MLG_RETIRE_WORDS])
 {
     out[0] = kIOReturnSuccess;
     out[2] = 0;
+    if (op == MLG_RETIRE_OP_DISCONNECT) {
+        disconnect_driver(driver, others, out);
+        return;
+    }
     if (op == MLG_RETIRE_OP_RESUME) {
         if (s_stopping || s_terminateRequested) {
             out[0] = kIOReturnNotPermitted;
@@ -4216,6 +4273,12 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                 return bounded_read(selector, arguments);
             if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
         } else if (ivars->linuxFile) {
+            // Its session was closed by Disconnect GPU (as for session
+            // clients, on the owner's queue): its process is gone.
+            const uint64_t closed = __atomic_load_n(&s_disconnectedGeneration, __ATOMIC_ACQUIRE);
+            if (closed && __atomic_load_n(&ivars->sessionGeneration, __ATOMIC_RELAXED) == closed &&
+                selector != kMacAMDGPUMethodPing)
+                return kIOReturnNoDevice;
             // Its process's system calls, the GPU's initialization (with the
             // host window it needs) and the cached queries.
             if (selector >= MLG_SELECTOR_LX_FIRST && selector <= MLG_SELECTOR_LX_LAST)
@@ -4242,6 +4305,16 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (!mlg_observer_selector_allowed(selector, arguments->scalarInput,
                                            arguments->scalarInputCount))
             return kIOReturnNotPermitted;
+    } else if (s_disconnectedGeneration && ivars->sessionGeneration == s_disconnectedGeneration &&
+               selector != kMacAMDGPUMethodPing) {
+        // Its session was closed by Disconnect GPU: said, never rejoined
+        // behind its back (what it held is gone).
+        if (!ivars->disconnectLogged) {
+            ivars->disconnectLogged = true;
+            MACLINUXGPU_LOG("client %llu: the GPU was disconnected (Disconnect GPU); its calls fail",
+                            ivars->clientID);
+        }
+        return kIOReturnNoDevice;
     } else if (s_sessionClosing && selector != kMacAMDGPUMethodShutdownGPU &&
         selector != kMacAMDGPUMethodQueryInfo &&
         selector != kMacAMDGPUMethodRuntimeBuild && selector != kMacAMDGPUMethodPing &&

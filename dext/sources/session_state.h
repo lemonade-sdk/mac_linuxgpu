@@ -206,6 +206,12 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  *              Send it only once macOS accepted the replacement; otherwise
  *              the GPU stays without a driver until it is attached again.
  *   RESUME     undo QUIESCE (a replacement that failed or was deferred).
+ *   DISCONNECT "Disconnect GPU": close the session now, as QUIESCE with
+ *              MLG_RETIRE_FORCE, so the GPU is safe to unplug, whatever
+ *              clients it has; then admit sessions again, so the next
+ *              program brings the GPU up. The clients of the closed session
+ *              get kIOReturnNoDevice ("the GPU was disconnected") on every
+ *              further call; out[2] counts them. IDLE once closed.
  *
  * Nothing is forced into quarantine: a client holding a raw BAR mapping
  * refuses the close (RAW_BAR), and so do other session clients unless
@@ -227,6 +233,7 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_RETIRE_OP_QUIESCE   0u
 #define MLG_RETIRE_OP_TERMINATE 1u
 #define MLG_RETIRE_OP_RESUME    2u
+#define MLG_RETIRE_OP_DISCONNECT 3u
 #define MLG_RETIRE_FORCE        1u
 #define MLG_RETIRE_CONFIRM      0x52455452ULL /* "RETR" */
 #define MLG_RETIRE_WORDS        3u
@@ -244,7 +251,7 @@ enum mlg_retire_state {
 
 static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_count)
 {
-	return input && input_count == 3 && input[0] <= MLG_RETIRE_OP_RESUME &&
+	return input && input_count == 3 && input[0] <= MLG_RETIRE_OP_DISCONNECT &&
 	       !(input[1] & ~(uint64_t)MLG_RETIRE_FORCE) && input[2] == MLG_RETIRE_CONFIRM;
 }
 

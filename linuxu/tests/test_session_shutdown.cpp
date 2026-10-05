@@ -626,7 +626,8 @@ static void checkObserverPolicy() {
     const uint64_t retire[] = {MLG_RETIRE_OP_TERMINATE, MLG_RETIRE_FORCE, MLG_RETIRE_CONFIRM};
     const uint64_t retireQuiesce[] = {MLG_RETIRE_OP_QUIESCE, 0, MLG_RETIRE_CONFIRM};
     const uint64_t retireResume[] = {MLG_RETIRE_OP_RESUME, 0, MLG_RETIRE_CONFIRM};
-    const uint64_t retireBadOp[] = {MLG_RETIRE_OP_RESUME + 1, 0, MLG_RETIRE_CONFIRM};
+    const uint64_t retireBadOp[] = {MLG_RETIRE_OP_DISCONNECT + 1, 0, MLG_RETIRE_CONFIRM};
+    const uint64_t retireDisconnect[] = {MLG_RETIRE_OP_DISCONNECT, 0, MLG_RETIRE_CONFIRM};
     const uint64_t retireBadFlags[] = {MLG_RETIRE_OP_QUIESCE, 2, MLG_RETIRE_CONFIRM};
     const uint64_t retireNoConfirm[] = {MLG_RETIRE_OP_TERMINATE, 0, 0};
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retire, 3));
@@ -634,6 +635,7 @@ static void checkObserverPolicy() {
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireResume, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retire, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireBadOp, 3));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireDisconnect, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireBadFlags, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, retireNoConfirm, 3));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_RETIRE, nullptr, 0));
@@ -715,7 +717,7 @@ static void clientExitReopen(bool queueExhausted) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held; the client's release covers
     // what it had.
@@ -734,7 +736,7 @@ static void clientExitReopen(bool queueExhausted) {
     // The next client joins the running device: no PCI open, no probe.
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 0 && !saw("pci_open"));
     assert(nextIvars.sessionGeneration == s_sessionGeneration);
@@ -763,7 +765,7 @@ static void clientExitCloses(const std::string &kind) {
     bar0Aliases = probed ? 1 : 0;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
     driver.retain(); s_participants = 1;
     if (kind == "client-exit-release-failure") releaseError = -16;
     if (kind == "client-exit-raw-mapped") {
@@ -930,7 +932,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
@@ -1014,7 +1016,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     devicePresent = true;
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));
@@ -1238,6 +1240,44 @@ static void retireScenario(const std::string &kind) {
         assert(clientStops == 1 && !saw("pci_quarantine"));
         rig.assertReleased();
         std::puts("PASS production retire: open session closes, then the instance terminates and stops");
+        return;
+    }
+    if (kind == "disconnect") {
+        // Disconnect GPU with programs on the GPU (the device stays up
+        // across them): the session closes the normal way for all of them,
+        // nothing is refused for clients and new sessions stay admitted.
+        UpgradeRig rig(true);
+        const uint64_t closedGeneration = s_sessionGeneration;
+        assert(rig.clientIvars.sessionGeneration == closedGeneration);
+        rig.retire(MLG_RETIRE_OP_DISCONNECT, false, 2);
+        assert(rig.out[0] == kIOReturnNotReady && rig.out[1] == MLG_RETIRE_CLOSING && rig.out[2] == 2);
+        assert(s_sessionClosing && !s_retiring && s_disconnectedGeneration == closedGeneration);
+        rig.retire(MLG_RETIRE_OP_DISCONNECT);
+        assert(rig.out[0] == kIOReturnNotReady && rig.out[1] == MLG_RETIRE_CLOSING);
+        rig.deliverIRQDrain();
+        assert(events == kNormalClose && !terminations && !s_dmaQuarantined && !s_pciOpen);
+        // The programs of the closed session keep their clients, marked: the
+        // dispatch answers them kIOReturnNoDevice (never a silent rejoin).
+        assert(rig.client.ivars && rig.clientIvars.sessionGeneration == s_disconnectedGeneration);
+        assert(s_sessionGeneration == closedGeneration + 1 && !s_participants);
+        rig.retire(MLG_RETIRE_OP_DISCONNECT);
+        assert(rig.out[0] == kIOReturnSuccess && rig.out[1] == MLG_RETIRE_IDLE && !s_retiring);
+        assert(!(state()[1] & (MLG_SESSION_FLAG_PCI_OPEN | MLG_SESSION_FLAG_RETIRING)));
+        // The next program brings the GPU up again.
+        pciOpenExpected = true;
+        assert(ensure_open(&rig.next) == kIOReturnSuccess && pciOpens == 1 && saw("pci_open"));
+        assert(rig.nextIvars.sessionGeneration != s_disconnectedGeneration);
+        expectLog("disconnect: closing the session for Disconnect GPU (2 client(s) lose the GPU)");
+        std::puts("PASS production disconnect: the session closes for every program, the next one brings the GPU up");
+        return;
+    }
+    if (kind == "disconnect-raw-bar") {
+        UpgradeRig rig(true);
+        assert(s_rawBARLease.claim(1, true, 1) && s_rawBARLease.markMapped(1));
+        rig.retire(MLG_RETIRE_OP_DISCONNECT, false, 1);
+        assert(rig.out[0] == kIOReturnBusy && rig.out[1] == MLG_RETIRE_RAW_BAR);
+        assert(events.empty() && !s_disconnectedGeneration && !s_dmaQuarantined && s_pciOpen);
+        std::puts("PASS production disconnect: a raw BAR mapping refuses the close instead of quarantining");
         return;
     }
     if (kind == "raw-bar") {
