@@ -75,6 +75,13 @@ the next steps.
   `gpu_busy_percent`, `mem_busy_percent`, `gpu_metrics` and hwmon, and
   `AMDGPU_INFO`. That's the same data `amdgpu_top` reads on Linux, and what
   [amdgpu_mtopg](https://github.com/lemonade-sdk/amdgpu_mtopg) displays.
+  Events that matter after a hang or a reboot (driver start, probe result,
+  GPU ring timeouts and device dumps, errors from upstream, removal,
+  quarantine, session close) also go to the macOS unified log, prefixed
+  `mac.linuxgpu: EVENT`; routine lines stay in the retained log only. Read
+  them, from any boot the log still holds, with
+  `log show --last 1d --predicate 'eventMessage BEGINSWITH "mac.linuxgpu: EVENT"'`
+  (DriverKit logs through the kernel, so they show as `kernel`).
 - **Vulkan (in progress).** Mesa's RADV builds for macOS on the same
   upstream amdgpu DRM interface, through a libdrm over the driver's
   Linux-file transport, and runs offline on the test suite's software GPU.

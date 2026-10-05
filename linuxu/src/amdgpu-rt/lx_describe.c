@@ -178,21 +178,92 @@ int mlg_lx_cmd_known(uint32_t dev, uint32_t cmd)
 	}
 }
 
-int mlg_lx_cmd_blocks(uint32_t dev, uint32_t cmd)
+/* The 8 bytes at client address @va as the frame carries them (an IN
+ * segment), or -1 when no IN segment holds them. */
+static int frame_u64(const void *frame, size_t bytes, uint64_t va, int64_t *out)
 {
-	if (dev == MLG_LX_DEV_KFD)
-		return cmd == AMDKFD_IOC_WAIT_EVENTS;
-	if (dev != MLG_LX_DEV_RENDER && dev != MLG_LX_DEV_PRIMARY)
+	const struct mlg_lx_frame *head = frame;
+	const struct mlg_lx_segment *segs =
+		(const struct mlg_lx_segment *)((const uint8_t *)frame + sizeof(*head));
+
+	if (bytes < sizeof(*head) || head->nsegs > MLG_LX_MAX_SEGMENTS ||
+	    bytes < sizeof(*head) + (size_t)head->nsegs * sizeof(*segs))
+		return -1;
+	for (uint32_t i = 0; i < head->nsegs; ++i) {
+		const struct mlg_lx_segment *seg = &segs[i];
+
+		if (!(seg->dir & MLG_LX_SEG_IN) || seg->size < 8 || va < seg->va ||
+		    va - seg->va > seg->size - 8u ||
+		    (uint64_t)seg->data_offset + seg->size > bytes)
+			continue;
+		memcpy(out, (const uint8_t *)frame + seg->data_offset + (va - seg->va), 8);
 		return 0;
-	switch (cmd) {
-	case DRM_IOCTL_AMDGPU_WAIT_CS:
-	case DRM_IOCTL_AMDGPU_WAIT_FENCES:
-	case DRM_IOCTL_AMDGPU_GEM_WAIT_IDLE:
-	case DRM_IOCTL_SYNCOBJ_WAIT:
-	case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT:
+	}
+	return -1;
+}
+
+/* A syncobj wait whose deadline (an absolute CLOCK_MONOTONIC time at
+ * @timeout_va) has passed or is none: drm_timeout_abs_to_jiffies makes it a
+ * zero timeout, and drm_syncobj_array_wait_timeout returns without
+ * sleeping. With MLG_LX_FRAME_TIMEOUT the driver writes now + timeout_ns
+ * there before the call; without it the client's value goes unchanged,
+ * and only one at or below zero is a deadline the driver's clock agrees
+ * has passed. */
+static int syncobj_polls(const void *frame, size_t bytes, uint64_t timeout_va)
+{
+	const struct mlg_lx_frame *head = frame;
+	int64_t deadline;
+
+	if (bytes < sizeof(*head))
+		return 0;
+	if (head->flags & MLG_LX_FRAME_TIMEOUT)
+		return head->timeout_va == timeout_va && head->timeout_ns == 0;
+	return !frame_u64(frame, bytes, timeout_va, &deadline) && deadline <= 0;
+}
+
+/* Every request here was read against upstream for what it can wait on;
+ * anything else sleeps. Not here, though they rarely wait: GEM_CLOSE and
+ * GEM_MMAP (a final buffer release can clear VRAM through the SDMA ring),
+ * every amdgpu request that takes a context (the context manager's lock is
+ * held while a context's scheduler entities flush), reserves a buffer or
+ * allocates one (eviction), INFO (SMU messages, GFXOFF), the KMS requests
+ * (modeset locks held across commits, connector probes over AUX/DDC),
+ * PRIME (dma-buf import reserves), SYNCOBJ_TRANSFER (it can wait for a
+ * submission), and every KFD request but GET_VERSION (the KFD process
+ * mutex is held across GPU mappings that wait). */
+int mlg_lx_cmd_sleeps(uint32_t dev, uint32_t cmd, const void *frame, size_t bytes)
+{
+	const struct mlg_lx_frame *head = frame;
+
+	if (!frame || bytes < sizeof(*head))
 		return 1;
-	default:
+	if (dev == MLG_LX_DEV_KFD)
+		return cmd != AMDKFD_IOC_GET_VERSION;
+	if (dev != MLG_LX_DEV_RENDER && dev != MLG_LX_DEV_PRIMARY)
+		return 1;
+	switch (cmd) {
+	case DRM_IOCTL_VERSION:
+	case DRM_IOCTL_GET_CAP:
+	case DRM_IOCTL_SET_CLIENT_CAP:
+	case DRM_IOCTL_SYNCOBJ_CREATE:
+	case DRM_IOCTL_SYNCOBJ_DESTROY:
+	case DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD:
+	case DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE:
+	case DRM_IOCTL_SYNCOBJ_RESET:
+	case DRM_IOCTL_SYNCOBJ_SIGNAL:
+	case DRM_IOCTL_SYNCOBJ_TIMELINE_SIGNAL:
+	case DRM_IOCTL_SYNCOBJ_QUERY:
+	case DRM_IOCTL_SYNCOBJ_EVENTFD:
 		return 0;
+	case DRM_IOCTL_SYNCOBJ_WAIT:
+		return !syncobj_polls(frame, bytes,
+				      head->arg + offsetof(struct drm_syncobj_wait, timeout_nsec));
+	case DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT:
+		return !syncobj_polls(frame, bytes,
+				      head->arg + offsetof(struct drm_syncobj_timeline_wait,
+							   timeout_nsec));
+	default:
+		return 1;
 	}
 }
 

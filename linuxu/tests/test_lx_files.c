@@ -262,6 +262,9 @@ void rt_lx_gem_unpin(void *pinned)
 
 /* ---- the client side ---- */
 
+/* Whether client_ioctl goes the way the driver's LX_IOCTL does. */
+static int use_nosleep;
+
 /* ioctl(2) as libmlg_drm issues it: describe, frame, call, copy back. */
 static long client_ioctl(struct rt_lx_client *c, uint32_t dev, int fd, uint32_t cmd, void *arg)
 {
@@ -282,7 +285,10 @@ static long client_ioctl(struct rt_lx_client *c, uint32_t dev, int fd, uint32_t 
 			    ktime_get_ns(), frame, sizeof(frame), &out_bytes);
 	if (len < 0)
 		return len;
-	r = rt_lx_ioctl(c, fd, cmd, frame, (size_t)len, rep, sizeof(rep), &rep_bytes, &result);
+	r = use_nosleep ?
+		rt_lx_ioctl_nosleep(c, fd, cmd, frame, (size_t)len, rep, sizeof(rep), &rep_bytes,
+				    &result) :
+		rt_lx_ioctl(c, fd, cmd, frame, (size_t)len, rep, sizeof(rep), &rep_bytes, &result);
 	if (r)
 		return r;
 	CHECK(rep_bytes == mlg_lx_reply_bytes(out_bytes));
@@ -295,24 +301,29 @@ struct async_call {
 	long len;
 	uint64_t token;
 	int done;
-	int keep;
+	int kept;	/* the reply did not come inline */
 	int64_t result;
 	uint8_t inline_rep[256];
 	size_t rep_bytes;
 };
 
-static int async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
-		      size_t reply_bytes)
+static void async_done(void *ctx, uint64_t token, int64_t result, const void *rbuf,
+		       size_t reply_bytes)
 {
 	struct async_call *a = ctx;
 
 	CHECK(token);
 	a->result = result;
 	a->rep_bytes = reply_bytes;
-	if (!a->keep && reply_bytes <= sizeof(a->inline_rep))
-		memcpy(a->inline_rep, rbuf, reply_bytes);
+	if (rbuf || !reply_bytes) {
+		CHECK(reply_bytes <= MLG_LX_ASYNC_INLINE_BYTES && reply_bytes <= sizeof(a->inline_rep));
+		if (reply_bytes)
+			memcpy(a->inline_rep, rbuf, reply_bytes);
+	} else {
+		CHECK(reply_bytes > MLG_LX_ASYNC_INLINE_BYTES);
+		a->kept = 1;
+	}
 	__atomic_store_n(&a->done, 1, __ATOMIC_SEQ_CST);
-	return !a->keep;
 }
 
 static int start_async(struct rt_lx_client *c, int fd, uint32_t cmd, void *arg,
@@ -322,7 +333,6 @@ static int start_async(struct rt_lx_client *c, int fd, uint32_t cmd, void *arg,
 	uint64_t timeout_va = 0;
 	uint32_t n = 0;
 
-	CHECK(mlg_lx_cmd_blocks(MLG_LX_DEV_RENDER, cmd));
 	CHECK(!mlg_lx_describe(MLG_LX_DEV_RENDER, cmd, (uint64_t)(uintptr_t)arg, spans, 16, &n,
 			       &timeout_va));
 	a->len = mlg_lx_encode(cmd, (uint64_t)(uintptr_t)arg, spans, n, timeout_va,
@@ -481,31 +491,162 @@ int main(void)
 		CHECK(client_ioctl(b, MLG_LX_DEV_RENDER, 1, DRM_IOCTL_GEM_CLOSE, &gc) == -EBADF);
 	}
 
-	/* Async waits: a signal ends one; the result waits to be fetched. */
+	/* Async waits: a signal ends one; its result comes with the
+	 * completion. A longer result waits to be fetched. */
 	{
 		uint32_t handle = 5;
 		struct drm_syncobj_wait w = { .handles = (uint64_t)(uintptr_t)&handle,
 					      .timeout_nsec = (int64_t)ms_from_now(10000),
 					      .count_handles = 1, .first_signaled = 77 };
 		struct async_call *call = calloc(1, sizeof(*call));
-		call->keep = 1;
+		CHECK(mlg_lx_cmd_sleeps(MLG_LX_DEV_RENDER, DRM_IOCTL_SYNCOBJ_WAIT, NULL, 0));
 		CHECK(!start_async(a, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w, call));
+		CHECK(mlg_lx_cmd_sleeps(MLG_LX_DEV_RENDER, DRM_IOCTL_SYNCOBJ_WAIT, call->frame,
+					(size_t)call->len));
 		wait_waiters(1);
 		CHECK(!call->done && rt_lx_async_outstanding(a) == 1);
-		uint8_t rep[256];
+		uint8_t rep[512];
 		size_t rep_bytes = 0;
 		int64_t result = 1;
 		CHECK(rt_lx_result(a, call->token, rep, sizeof(rep), &rep_bytes, &result) == -EBUSY);
 		__atomic_store_n(&signaled, 5, __ATOMIC_SEQ_CST);
 		wake_up_all(&syncobj_wq);
 		wait_done(call);
-		CHECK(call->result == 0);
+		CHECK(call->result == 0 && !call->kept);
+		CHECK(!mlg_lx_apply_reply(call->frame, (size_t)call->len, call->inline_rep,
+					  call->rep_bytes, &result));
+		CHECK(w.first_signaled == 0);
+		CHECK(rt_lx_result(a, call->token, rep, sizeof(rep), &rep_bytes, &result) == -ENOENT);
+		CHECK(rt_lx_async_outstanding(a) == 0);
+
+		/* DRM_IOCTL_VERSION with long strings: a reply past the
+		 * completion's inline bytes, kept until fetched. */
+		char vname[200] = {0}, vdate[16] = {0}, vdesc[16] = {0};
+		struct drm_version v = { .name_len = sizeof(vname), .name = vname,
+					 .date_len = sizeof(vdate), .date = vdate,
+					 .desc_len = sizeof(vdesc), .desc = vdesc };
+		memset(call, 0, sizeof(*call));
+		CHECK(!start_async(a, fd_a, DRM_IOCTL_VERSION, &v, call));
+		wait_done(call);
+		CHECK(call->kept && call->result == 0);
+		CHECK(rt_lx_async_outstanding(a) == 1);
 		CHECK(rt_lx_result(a, call->token, rep, 8, &rep_bytes, &result) == -ENOSPC);
 		CHECK(!rt_lx_result(a, call->token, rep, sizeof(rep), &rep_bytes, &result));
 		CHECK(result == 0 && rep_bytes == call->rep_bytes);
 		CHECK(!mlg_lx_apply_reply(call->frame, (size_t)call->len, rep, rep_bytes, &result));
-		CHECK(w.first_signaled == 0);
+		CHECK(!strcmp(vname, "fixture") && v.name_len == 7);
 		CHECK(rt_lx_result(a, call->token, rep, sizeof(rep), &rep_bytes, &result) == -ENOENT);
+		CHECK(rt_lx_async_outstanding(a) == 0);
+		free(call);
+	}
+
+	/* The incoming-call thread runs only requests that cannot sleep:
+	 * a syncobj wait that polls does, one with a deadline is refused
+	 * without running, and so is anything not on the list. */
+	{
+		uint32_t handle = 5;
+		struct drm_syncobj_wait w = { .handles = (uint64_t)(uintptr_t)&handle,
+					      .count_handles = 1, .first_signaled = 77 };
+		struct drm_gem_close gc = { .handle = 7 };
+		char vname[16] = {0};
+		struct drm_version v = { .name_len = sizeof(vname), .name = vname };
+		uint8_t out[8];
+		struct drm_amdgpu_info info = { .return_pointer = (uint64_t)(uintptr_t)out,
+						.return_size = 8, .query = AMDGPU_INFO_DEV_INFO };
+		int64_t past = (int64_t)ktime_get_ns() - 1000000;
+
+		use_nosleep = 1;
+		__atomic_store_n(&signaled, 0, __ATOMIC_SEQ_CST);
+		/* Zero, negative and past deadlines poll. */
+		w.timeout_nsec = 0;
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w) == -ETIME);
+		w.timeout_nsec = -1;
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w) == -ETIME);
+		w.timeout_nsec = past;
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w) == -ETIME);
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_VERSION, &v) == 0);
+		/* A future deadline, a GEM close, an INFO: refused, not run. */
+		w.timeout_nsec = (int64_t)ms_from_now(10000);
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w) == -EDEADLK);
+		CHECK(__atomic_load_n(&waiters, __ATOMIC_SEQ_CST) == 0);
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_GEM_CLOSE, &gc) == -EDEADLK);
+		memset(out, 0xee, sizeof(out));
+		CHECK(client_ioctl(a, MLG_LX_DEV_RENDER, fd_a, DRM_IOCTL_AMDGPU_INFO, &info) == -EDEADLK);
+		CHECK(out[0] == 0xee);
+		use_nosleep = 0;
+
+		/* The table itself, on frames as the client builds them (the
+		 * fixture left VERSION's lengths at its strings'). */
+		v = (struct drm_version){ .name_len = sizeof(vname), .name = vname };
+		struct { uint32_t cmd; void *arg; int sleeps; } table[] = {
+			{ DRM_IOCTL_VERSION, &v, 0 },
+			{ DRM_IOCTL_GEM_CLOSE, &gc, 1 },
+			{ DRM_IOCTL_AMDGPU_INFO, &info, 1 },
+		};
+		for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
+			struct async_call *call = calloc(1, sizeof(*call));
+			struct mlg_lx_span spans[16];
+			uint64_t tva = 0;
+			uint32_t n = 0;
+
+			CHECK(!mlg_lx_describe(MLG_LX_DEV_RENDER, table[i].cmd,
+					       (uint64_t)(uintptr_t)table[i].arg, spans, 16, &n, &tva));
+			call->len = mlg_lx_encode(table[i].cmd, (uint64_t)(uintptr_t)table[i].arg, spans,
+						  n, tva, ktime_get_ns(), call->frame,
+						  sizeof(call->frame), NULL);
+			CHECK(call->len > 0);
+			CHECK(mlg_lx_cmd_sleeps(MLG_LX_DEV_RENDER, table[i].cmd, call->frame,
+						(size_t)call->len) == table[i].sleeps);
+			free(call);
+		}
+		CHECK(!mlg_lx_cmd_sleeps(MLG_LX_DEV_KFD, AMDKFD_IOC_GET_VERSION, &w, sizeof(struct mlg_lx_frame)));
+		CHECK(mlg_lx_cmd_sleeps(MLG_LX_DEV_KFD, AMDKFD_IOC_CREATE_QUEUE, &w, sizeof(struct mlg_lx_frame)));
+		CHECK(mlg_lx_cmd_sleeps(MLG_LX_DEV_RENDER, DRM_IOCTL_AMDGPU_CS, &w, sizeof(struct mlg_lx_frame)));
+	}
+
+	/* LX_CALL_ASYNC: open, mmap, munmap and close on workers. */
+	{
+		struct async_call *call = calloc(1, sizeof(*call));
+		uint64_t open_in[] = { MLG_LX_OP_OPEN, MLG_LX_DEV_KFD, MLG_LX_O_RDWR };
+		uint64_t bad[] = { MLG_LX_OP_OPEN, MLG_LX_DEV_KFD };
+		uint64_t unknown[] = { 9, 0 };
+		uint64_t token = 0;
+		int fd;
+
+		CHECK(rt_lx_op_async(a, bad, 2, async_done, call, &token) == -EINVAL);
+		CHECK(rt_lx_op_async(a, unknown, 2, async_done, call, &token) == -EINVAL);
+		CHECK(!rt_lx_op_async(a, open_in, 3, async_done, call, &call->token));
+		wait_done(call);
+		fd = (int)call->result;
+		CHECK(fd >= 2 && call->rep_bytes == 0);
+
+		uint64_t mmap_in[] = { MLG_LX_OP_MMAP, (uint64_t)fd, 0, PAGE_SIZE,
+				       MLG_LX_PROT_READ | MLG_LX_PROT_WRITE, MLG_LX_MAP_SHARED };
+		memset(call, 0, sizeof(*call));
+		CHECK(!rt_lx_op_async(a, mmap_in, 6, async_done, call, &call->token));
+		wait_done(call);
+		CHECK(call->result == 0 && call->rep_bytes == MLG_LX_OP_MMAP_WORDS * 8);
+		uint64_t words[MLG_LX_OP_MMAP_WORDS];
+		memcpy(words, call->inline_rep, sizeof(words));
+		CHECK(words[0] >= MLG_LX_MMAP_TYPE_BASE && words[1] == PAGE_SIZE);
+		struct rt_lx_map_info mi;
+		CHECK(!rt_lx_map_info(a, words[0], &mi) && mi.backing == RT_LX_RANGE_BAR);
+
+		uint64_t munmap_in[] = { MLG_LX_OP_MUNMAP, words[0] };
+		memset(call, 0, sizeof(*call));
+		CHECK(!rt_lx_op_async(a, munmap_in, 2, async_done, call, &call->token));
+		wait_done(call);
+		CHECK(call->result == 0 && rt_lx_map_info(a, words[0], &mi) == -ENOENT);
+
+		uint64_t close_in[] = { MLG_LX_OP_CLOSE, (uint64_t)fd };
+		memset(call, 0, sizeof(*call));
+		CHECK(!rt_lx_op_async(a, close_in, 2, async_done, call, &call->token));
+		wait_done(call);
+		CHECK(call->result == 0);
+		memset(call, 0, sizeof(*call));
+		CHECK(!rt_lx_op_async(a, close_in, 2, async_done, call, &call->token));
+		wait_done(call);
+		CHECK(call->result == -EBADF);
 		CHECK(rt_lx_async_outstanding(a) == 0);
 		free(call);
 	}
@@ -544,7 +685,6 @@ int main(void)
 			s->w[i] = (struct drm_syncobj_wait){ .handles = (uint64_t)(uintptr_t)&s->handle[i],
 				.timeout_nsec = (int64_t)ms_from_now(10000), .count_handles = 1,
 				.first_signaled = 99 };
-			calls[i].keep = 0;
 		}
 		for (unsigned i = 0; i < MLG_LX_MAX_ASYNC; ++i)
 			CHECK(!start_async(a, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &s->w[i], &calls[i]));
@@ -637,7 +777,7 @@ int main(void)
 	}
 
 	/* close(2) runs the file's release once its last reference goes. */
-	CHECK(rt_lx_close(a, fd_kfd) == 0 && releases == 1);
+	CHECK(rt_lx_close(a, fd_kfd) == 0 && releases == 2);
 	CHECK(rt_lx_close(a, fd_kfd) == -EBADF);
 
 	/* Teardown with a wait in flight: the kill ends it (EINTR), its
@@ -648,12 +788,11 @@ int main(void)
 					      .timeout_nsec = (int64_t)ms_from_now(60000),
 					      .count_handles = 1 };
 		struct async_call *call = calloc(1, sizeof(*call));
-		call->keep = 1;	/* never fetched: dropped by the teardown */
 		CHECK(!start_async(a, fd_a, DRM_IOCTL_SYNCOBJ_WAIT, &w, call));
 		wait_waiters(1);
 		rt_lx_client_destroy(a);
 		CHECK(call->done && call->result == -EINTR);
-		CHECK(releases == 2);	/* a's render file; b's stays open */
+		CHECK(releases == 3);	/* a's render file; b's stays open */
 		free(call);
 	}
 	/* Hop timing: the device's mlg_lx_timing file, added once, shows the
@@ -672,7 +811,7 @@ int main(void)
 		CHECK(rt_lx_timing_show(text, 8) < 8);	/* bounded */
 	}
 	rt_lx_client_destroy(b);
-	CHECK(releases == 3 && opens == 3);
+	CHECK(releases == 4 && opens == 4);
 	unregister_chrdev(DRM_MAJOR, "drm");
 	puts("PASS lx files: per-client processes and descriptors, nested ioctl memory, faults, "
 	     "admission, async waits (signal, timeout, kill), shared argument pages, mmap, teardown");

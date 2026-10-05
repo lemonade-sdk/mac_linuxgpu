@@ -149,8 +149,11 @@ public:
 #import <PCIDriverKit/IOPCIDevice.h>
 #include "retained_log.h"
 
-static void dext_dma_log_sink(const char *text) { IOLog("%s", text); }
-#define DEXT_DMA_LOG(...) maclinuxgpu::RetainedLog(dext_dma_log_sink, __VA_ARGS__)
+// Routine DMA lines stay in the retained ring; only events reach the
+// unified log (retained_log.h).
+static void dext_dma_event_sink(const char *text) { IOLog("%s", text); }
+#define DEXT_DMA_LOG(...) maclinuxgpu::RetainedLog(nullptr, __VA_ARGS__)
+#define DEXT_DMA_EVENT(...) maclinuxgpu::RetainedEvent(dext_dma_event_sink, __VA_ARGS__)
 
 /* 16 KB coherent alignment (firmware/ucode load
  * needs it, matching DART_COHERENT_ALIGN in dart.c). */
@@ -269,7 +272,7 @@ static int dext_dma_complete_now(IODMACommand *dma, IOMemoryDescriptor *buf)
 		dext_dma_acquire();
 		g_dma_cleanup_failed = true;
 		dext_dma_release();
-		DEXT_DMA_LOG("DMA completion failed (%#x); backing retained", completed);
+		DEXT_DMA_EVENT("DMA completion failed (%#x); backing retained", completed);
 		return -1;
 	}
 	/* A quarantine request may arrive while CompleteDMA is in flight. The
@@ -639,7 +642,7 @@ static void dext_dma_refused(const char *call, kern_return_t result, uint64_t by
 	const uint64_t n = repeats;
 	dext_dma_release();
 	if (n & 255) return;
-	DEXT_DMA_LOG("DMA: mapping %llu bytes for the device failed: %s returned %#x (%llu bytes in %u mappings already mapped%s)",
+	DEXT_DMA_EVENT("DMA: mapping %llu bytes for the device failed: %s returned %#x (%llu bytes in %u mappings already mapped%s)",
 		     (unsigned long long)bytes, call, result, (unsigned long long)mapped, live,
 		     n ? "; the same refusal repeats" : "");
 }

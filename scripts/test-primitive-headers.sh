@@ -5,7 +5,8 @@ test_dir=$(mktemp -d)
 trap 'rm -rf "$test_dir"' EXIT
 clang -w -std=gnu11 -D__KERNEL__ -include linux/autoconf.h -include linux/compiler.h -g -O1 -fsanitize=address,undefined \
   -fno-sanitize-recover=all -ffunction-sections -fdata-sections -Ilinuxu/headers \
-  linuxu/tests/test_primitive_headers.c linuxu/src/shims/printk.c third_party/linux/lib/sort.c \
+  linuxu/tests/test_primitive_headers.c linuxu/src/shims/printk.c linuxu/src/shims/dev_coredump.c \
+  third_party/linux/lib/sort.c \
   -Wl,-dead_strip -lpthread -o "$test_dir/test_primitive_headers"
 "$test_dir/test_primitive_headers"
 cat > "$test_dir/assertion.c" <<'SRC'

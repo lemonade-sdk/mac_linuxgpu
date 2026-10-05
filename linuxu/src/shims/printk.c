@@ -16,7 +16,7 @@
 
 #ifdef LINUXU_DEXT_DK
 /* Public DriverKit logging entry point; no stdio stream exists in a dext. */
-extern int IOLogv(const char *format, va_list arguments);
+extern int IOLog(const char *format, ...) __attribute__((format(printf, 1, 2)));
 #endif
 
 /* ---- debug level gate (0=emerg .. 7=debug) ---- */
@@ -152,7 +152,18 @@ static int klog_vemit(int level, const char *f, va_list ap)
 	}
 	klog_append(record, length);
 #ifdef LINUXU_DEXT_DK
-	return IOLogv(f, ap);
+	/* Errors and worse are events (a ring timeout, a failed reset, a
+	 * device dump): they reach the unified log, prefixed as the driver's
+	 * own events are. Everything else stays in the retained ring: a dext
+	 * that logs every line there gets its logging quarantined by the
+	 * system for high volume. */
+	(void)ap;
+	if (level > 3)
+		return 0;
+	if (length >= sizeof(record))
+		length = sizeof(record) - 1;
+	record[length] = '\0';
+	return IOLog("mac.linuxgpu: EVENT %s", record);
 #else
 	pthread_mutex_lock(&klog_lock);
 	fprintf(stderr, "%s ", level_tag(level));

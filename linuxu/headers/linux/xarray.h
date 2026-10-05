@@ -203,7 +203,7 @@ static inline void xa_init_flags(struct xarray *xa, unsigned long flags)
 #define XARRAY_FLAGS(name, mask) struct xarray name = XARRAY_INIT(name, mask)
 
 /*
- * DEFINE_XARRAY_FLAGS / DEFINE_XARRAY / DEFINE_XARRAY_ALLOC - vendor
+ * DEFINE_XARRAY_FLAGS / DEFINE_XARRAY / DEFINE_XARRAY_ALLOC(1) - vendor
  * 2026 definitions (amdgpu_ids.c: DEFINE_XARRAY_FLAGS(amdgpu_pasid_xa,
  * XA_FLAGS_LOCK_IRQ | XA_FLAGS_ALLOC1)).
  */
@@ -211,7 +211,9 @@ static inline void xa_init_flags(struct xarray *xa, unsigned long flags)
 	struct xarray name = { .xa_flags = (flags) }
 
 #define DEFINE_XARRAY(name) DEFINE_XARRAY_FLAGS(name, 0)
-#define DEFINE_XARRAY_ALLOC(name) DEFINE_XARRAY_FLAGS(name, XA_FLAGS_ALLOC1)
+/* As upstream: ALLOC hands out indices from 0, ALLOC1 from 1. */
+#define DEFINE_XARRAY_ALLOC(name) DEFINE_XARRAY_FLAGS(name, XA_FLAGS_ALLOC)
+#define DEFINE_XARRAY_ALLOC1(name) DEFINE_XARRAY_FLAGS(name, XA_FLAGS_ALLOC1)
 
 /*
  * struct xa_limit (vendor 2026, verbatim) + the limit-taking alloc

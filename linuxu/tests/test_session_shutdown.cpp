@@ -32,6 +32,7 @@ static void platformLogSink(const char *text) {
     platformLog += text;
 }
 #define MACLINUXGPU_LOG(...) maclinuxgpu::RetainedLog(platformLogSink, __VA_ARGS__)
+#define MACLINUXGPU_EVENT(...) maclinuxgpu::RetainedEvent(platformLogSink, __VA_ARGS__)
 
 static std::string retainedLog() {
     char bytes[LINUXU_KLOG_CAPACITY];
@@ -54,6 +55,9 @@ static void checkLogFormat() {
     MACLINUXGPU_LOG("%s", large.c_str());
     assert(platformLog.size() - before == LINUXU_KLOG_MESSAGE_CAPACITY - 1);
     expectLog("... [truncated]\n");
+    // Events carry the prefix the unified-log predicate matches.
+    MACLINUXGPU_EVENT("device removed (%s)", "test");
+    expectLog("mac.linuxgpu: EVENT device removed (test)\n");
 }
 
 static std::vector<std::string> events;

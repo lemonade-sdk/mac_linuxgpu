@@ -15,13 +15,17 @@ extern void klog_set_level(int);
 extern void dev_printk_impl(const char *, const char *, const char *, ...);
 
 #ifdef LINUXU_DEXT_DK
-int IOLogv(const char *format, va_list arguments)
+int IOLog(const char *format, ...)
 {
     // The platform sink may reenter diagnostics: the ring lock must already
-    // be released, and formatting must not have consumed the original args.
+    // be released.
     uint64_t cursor = UINT64_MAX, end;
     assert(!klog_read(&cursor, NULL, 0, &end) && cursor == end);
-    return vfprintf(stderr, format, arguments);
+    va_list arguments;
+    va_start(arguments, format);
+    int n = vfprintf(stderr, format, arguments);
+    va_end(arguments);
+    return n;
 }
 #endif
 
@@ -94,7 +98,8 @@ static void basic(void)
     char emitted[128] = {0};
     assert(pread(fileno(stderr), emitted, sizeof(emitted) - 1, 0) > 0);
 #ifdef LINUXU_DEXT_DK
-    assert(!strcmp(emitted, "probe failed r=-19 fw=gc12"));
+    /* An error is an event: the unified log gets the retained record. */
+    assert(!strcmp(emitted, "mac.linuxgpu: EVENT <3> probe failed r=-19 fw=gc12\n"));
 #else
     assert(!strcmp(emitted, "<3> probe failed r=-19 fw=gc12\n"));
 #endif
@@ -161,7 +166,8 @@ static void truncation(void)
     fflush(stderr);
     assert(!fstat(fileno(stderr), &after));
 #ifdef LINUXU_DEXT_DK
-    assert(after.st_size - before.st_size == sizeof(oversized) - 1);
+    /* A warning is not an event: retained only. */
+    assert(after.st_size == before.st_size);
 #else
     assert(after.st_size - before.st_size == sizeof(oversized) + 4);
 #endif

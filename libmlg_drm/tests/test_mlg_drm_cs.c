@@ -170,11 +170,12 @@ int main(void)
 	CHECK(mlg_ioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS, &wcs) == 0 && wcs.out.status == 0);
 	CHECK(lx_loopback_async_calls() == before + 1);
 	CHECK(cpu[0] == 0xfeed0000u && cpu[16] == 0xfeed0001u);
-	/* ... and a poll (no worker). */
+	/* ... and a poll, a worker's too: it takes the context manager's
+	 * lock, which a context's release holds while it flushes. */
 	wcs = (union drm_amdgpu_wait_cs){ .in = { .handle = seq, .ip_type = AMDGPU_HW_IP_COMPUTE,
 		.ctx_id = ctx_id, .timeout = 0 } };
 	CHECK(mlg_ioctl(fd, DRM_IOCTL_AMDGPU_WAIT_CS, &wcs) == 0 && wcs.out.status == 0);
-	CHECK(lx_loopback_async_calls() == before + 1);
+	CHECK(lx_loopback_async_calls() == before + 2);
 
 	/* AMDGPU_WAIT_FENCES: the fence array behind the block. */
 	struct drm_amdgpu_fence fences[1] = { { .ctx_id = ctx_id, .ip_type = AMDGPU_HW_IP_COMPUTE,
@@ -188,6 +189,11 @@ int main(void)
 	struct drm_syncobj_wait sw = { .handles = (uint64_t)(uintptr_t)handles, .count_handles = 1,
 		.timeout_nsec = deadline_ns(2000), .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL };
 	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == 0);
+	/* A syncobj poll never sleeps: it runs on the call itself. */
+	before = lx_loopback_async_calls();
+	sw.timeout_nsec = 0;
+	CHECK(mlg_ioctl(fd, DRM_IOCTL_SYNCOBJ_WAIT, &sw) == 0);
+	CHECK(lx_loopback_async_calls() == before);
 	uint64_t points[1] = { 99 };
 	struct drm_syncobj_timeline_array query = { .handles = (uint64_t)(uintptr_t)handles,
 		.points = (uint64_t)(uintptr_t)points, .count_handles = 1 };

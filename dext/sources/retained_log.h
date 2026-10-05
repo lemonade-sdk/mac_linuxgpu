@@ -12,20 +12,14 @@ namespace maclinuxgpu {
  * ring and platform sink. The sink treats the result as data, so percent signs
  * in messages cannot become os_log format directives. No allocation or driver
  * operation is involved, including while a session is quarantined. */
-static inline void RetainedLog(void (*sink)(const char *), const char *format, ...)
-    __attribute__((format(printf, 2, 3)));
-
-static inline void RetainedLog(void (*sink)(const char *), const char *format, ...)
+static inline void RetainedLogV(void (*sink)(const char *), const char *prefix,
+                                const char *format, va_list arguments)
 {
     char record[LINUXU_KLOG_MESSAGE_CAPACITY];
-    static const char prefix[] = "mac.linuxgpu: ";
-    constexpr size_t prefixLength = sizeof(prefix) - 1;
+    const size_t prefixLength = strlen(prefix);
     memcpy(record, prefix, prefixLength);
-    va_list arguments;
-    va_start(arguments, format);
     const int formatted = vsnprintf(record + prefixLength,
         sizeof(record) - prefixLength, format, arguments);
-    va_end(arguments);
     size_t length;
     if (formatted < 0) {
         static const char error[] = "[format error]\n";
@@ -43,6 +37,33 @@ static inline void RetainedLog(void (*sink)(const char *), const char *format, .
     }
     klog_write(record, length);
     if (sink) sink(record);
+}
+
+/* A routine line: the retained ring (scripts/read-driver-log.py), and the
+ * platform sink when one is given. */
+static inline void RetainedLog(void (*sink)(const char *), const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static inline void RetainedLog(void (*sink)(const char *), const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    RetainedLogV(sink, "mac.linuxgpu: ", format, arguments);
+    va_end(arguments);
+}
+
+/* An event that must outlive the driver (a hang, a reset, a removal, a
+ * quarantine): the ring and the platform's unified log, prefixed so
+ *   log show --predicate 'eventMessage BEGINSWITH "mac.linuxgpu: EVENT"'
+ * finds every one after a hang or a reboot. Rare by construction: never
+ * per request. */
+static inline void RetainedEvent(void (*sink)(const char *), const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
+static inline void RetainedEvent(void (*sink)(const char *), const char *format, ...)
+{
+    va_list arguments;
+    va_start(arguments, format);
+    RetainedLogV(sink, "mac.linuxgpu: EVENT ", format, arguments);
+    va_end(arguments);
 }
 
 } // namespace maclinuxgpu

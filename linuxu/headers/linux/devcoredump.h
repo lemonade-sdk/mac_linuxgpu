@@ -31,15 +31,14 @@ static inline void devcd_free(struct devcd_info *info)
 	(void)info;
 }
 
-static inline void dev_coredumpm(struct device *dev, struct module *owner,
-				  void *data, size_t datalen, gfp_t gfp,
-				  ssize_t (*read)(char *buffer, loff_t offset, size_t count,
-						  void *data, size_t datalen),
-				  void (*free)(void *data))
-{
-	(void)dev; (void)owner; (void)datalen; (void)gfp; (void)read;
-	/* No exporter retains this payload; honor the transferred ownership. */
-	if (free) free(data);
-}
+/* No exporter retains the payload: its head (the device, the ring and
+ * process that hung) goes to the kernel log at error level, which reaches
+ * the unified log as events (linuxu/src/shims/dev_coredump.c); then the
+ * transferred ownership is honored. */
+void dev_coredumpm(struct device *dev, struct module *owner,
+		   void *data, size_t datalen, gfp_t gfp,
+		   ssize_t (*read)(char *buffer, loff_t offset, size_t count,
+				   void *data, size_t datalen),
+		   void (*free)(void *data));
 
 #endif /* __LINUX_DEVCOREDUMP_H */

@@ -304,6 +304,10 @@ unsigned long xa_count(struct xarray *xa, unsigned long index, unsigned long max
 static int xa_alloc_locked(struct xarray *xa, unsigned long *indexp, void *entry,
 			   unsigned long start, unsigned long max, gfp_t gfp)
 {
+	/* An XA_FLAGS_ALLOC1 array never hands out index 0 (Linux keeps it
+	 * busy from xa_init_flags): DRM syncobj handles, among others, are
+	 * nonzero, and 0 means "none" to their users. */
+	if ((xa->xa_flags & XA_FLAGS_ALLOC1) && start == 0) start = 1;
 	if (start > max) return -ENOSPC;
 	unsigned long index = start;
 	while (xa_load_locked(xa, index)) {

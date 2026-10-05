@@ -97,12 +97,15 @@ step "Installing into build/radv/install"
 mkdir -p "$PREFIX/lib" "$PREFIX/share/vulkan/icd.d"
 install -m 755 "$BUILD/src/amd/vulkan/libvulkan_radeon.dylib" "$PREFIX/lib/"
 install -m 755 "$LIBDRM/lib/libdrm_mlg.dylib" "$LIBDRM/lib/libmlg_drm.dylib" "$PREFIX/lib/"
-# The driver finds libdrm-mlg next to itself, wherever the tree is moved.
+# The driver finds libdrm-mlg next to itself, wherever the tree is moved, or
+# else where the MacLinuxGPU installer puts it (/usr/local/lib), which is how
+# a folder that does not carry its own copy (LlamaAMDVulkanOnMac) runs.
 lib="$PREFIX/lib/libvulkan_radeon.dylib"
 while read -r rpath; do
   install_name_tool -delete_rpath "$rpath" "$lib" 2>/dev/null || true
 done < <(otool -l "$lib" | awk '/LC_RPATH/ { getline; getline; print $2 }')
 install_name_tool -add_rpath @loader_path "$lib" 2>/dev/null
+install_name_tool -add_rpath /usr/local/lib "$lib" 2>/dev/null
 for dylib in "$lib" "$PREFIX/lib/libdrm_mlg.dylib" "$PREFIX/lib/libmlg_drm.dylib"; do
   codesign --force --sign - "$dylib" 2>/dev/null
 done
