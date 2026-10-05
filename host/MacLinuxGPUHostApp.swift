@@ -612,6 +612,11 @@ struct DriverInstance {
     let cdhash: String
     /// IOUserClientCreator ("pid N, name") of each attached user client.
     let clients: [String]
+    /// Whether the instance serves calls that can sleep only as async calls
+    /// (driver 243+, which publishes MacLinuxGPUSessionCalls = "async" in its
+    /// personality). An earlier driver serves every selector synchronously
+    /// and never completes an async call.
+    let asyncSessionCalls: Bool
 
     var label: String { String(format: "instance %#llx (cdhash %@)", registryID, String(cdhash.prefix(12))) }
 }
@@ -633,7 +638,9 @@ enum DriverInstances {
             var registryID: UInt64 = 0
             guard IORegistryEntryGetRegistryEntryID(service, &registryID) == KERN_SUCCESS else { continue }
             let cdhash = (property(service, "IOUserServerCDHash") as? String ?? "").lowercased()
-            instances.append(DriverInstance(registryID: registryID, cdhash: cdhash, clients: clients(of: service)))
+            let asyncCalls = property(service, "MacLinuxGPUSessionCalls") as? String == "async"
+            instances.append(DriverInstance(registryID: registryID, cdhash: cdhash, clients: clients(of: service),
+                                            asyncSessionCalls: asyncCalls))
         }
         return instances
     }
@@ -869,6 +876,8 @@ enum DriverUpgrade {
 final class MacLinuxGPUHost {
     private(set) var ucConn: io_connect_t = 0
     private(set) var isOpen: Bool = false
+    /// The open instance's call contract (DriverInstance.asyncSessionCalls).
+    private(set) var asyncSessionCalls = true
     private var logLines: [String] = []
 
     // The dext's PCI identity (from GetIdentity).
@@ -940,6 +949,7 @@ final class MacLinuxGPUHost {
         }
         ucConn = connection
         isOpen = true
+        asyncSessionCalls = instance.asyncSessionCalls
         append("openUserClient: UserClient opened (conn=%d)", ucConn)
         return true
     }
@@ -961,6 +971,24 @@ final class MacLinuxGPUHost {
 
     // MARK: The selector-RPC (IOConnectCallScalarMethod / IOConnectCallStructMethod)
 
+    /// One selector, called as the open instance serves it. From 243:
+    /// synchronously when it never sleeps, else an async session call
+    /// awaited here (host/selector_call.h). Earlier drivers (a previous
+    /// instance during an upgrade) serve every selector synchronously and
+    /// would never complete an async call, so they get IOConnectCallMethod.
+    func selectorCall(_ selector: UInt32, _ input: UnsafePointer<UInt64>?, _ inputCount: UInt32,
+                      _ inputStruct: UnsafeRawPointer?, _ inputStructSize: Int,
+                      _ output: UnsafeMutablePointer<UInt64>?, _ outputCount: UnsafeMutablePointer<UInt32>?,
+                      _ outputStruct: UnsafeMutableRawPointer?, _ outputStructSize: UnsafeMutablePointer<Int>?)
+        -> kern_return_t {
+        if asyncSessionCalls {
+            return mlg_selector_call(ucConn, selector, input, inputCount, inputStruct, inputStructSize,
+                                     output, outputCount, outputStruct, outputStructSize)
+        }
+        return IOConnectCallMethod(ucConn, selector, input, inputCount, inputStruct, inputStructSize,
+                                   output, outputCount, outputStruct, outputStructSize)
+    }
+
     /// Call a scalar selector (the mac_amdgpu reference's callScalar).
     /// The in scalars + the out scalars.  The data buffers are null (the
     /// scalar-only selectors: Ping, SetupInterrupts, etc.).
@@ -971,12 +999,9 @@ final class MacLinuxGPUHost {
         let inCount = UInt32(inScalars.count)
         var outBuf = [UInt64](repeating: 0, count: max(1, outScalars))
         var outN = UInt32(outBuf.count)
-        // As the driver serves it: synchronous when it never sleeps, else an
-        // async session call awaited here (host/selector_call.h).
         let kr: kern_return_t = inScalars.withUnsafeBufferPointer { ibuf in
             outBuf.withUnsafeMutableBufferPointer { obuf in
-                mlg_selector_call(ucConn, selector, ibuf.baseAddress, inCount, nil, 0,
-                                  obuf.baseAddress, &outN, nil, nil)
+                selectorCall(selector, ibuf.baseAddress, inCount, nil, 0, obuf.baseAddress, &outN, nil, nil)
             }
         }
         return (kr, Array(outBuf.prefix(Int(outN))))
@@ -994,12 +1019,10 @@ final class MacLinuxGPUHost {
         let kr: kern_return_t = outData.withUnsafeMutableBytes { outPtr -> kern_return_t in
             if let inData = inData {
                 return inData.withUnsafeBytes { inPtr in
-                    mlg_selector_call(ucConn, selector, nil, 0, inPtr.baseAddress, inSize,
-                                      nil, nil, outPtr.baseAddress, &outCnt)
+                    selectorCall(selector, nil, 0, inPtr.baseAddress, inSize, nil, nil, outPtr.baseAddress, &outCnt)
                 }
             } else {
-                return mlg_selector_call(ucConn, selector, nil, 0, nil, 0,
-                                         nil, nil, outPtr.baseAddress, &outCnt)
+                return selectorCall(selector, nil, 0, nil, 0, nil, nil, outPtr.baseAddress, &outCnt)
             }
         }
         return (kr, outData.prefix(Int(min(outCnt, size_t(max(0, outSize))))))
@@ -1363,9 +1386,9 @@ extension MacLinuxGPUHost {
             outBuf.withUnsafeMutableBufferPointer { obuf in
                 outData.withUnsafeMutableBytes { optr in
                     inData.withUnsafeBytes { iptr in
-                        mlg_selector_call(ucConn, selector, ibuf.baseAddress, UInt32(inScalars.count),
-                                          inData.isEmpty ? nil : iptr.baseAddress, inData.count,
-                                          obuf.baseAddress, &outN, optr.baseAddress, &outCnt)
+                        selectorCall(selector, ibuf.baseAddress, UInt32(inScalars.count),
+                                     inData.isEmpty ? nil : iptr.baseAddress, inData.count,
+                                     obuf.baseAddress, &outN, optr.baseAddress, &outCnt)
                     }
                 }
             }

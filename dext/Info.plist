@@ -67,6 +67,12 @@
 	        upstream amdgpu bring up Display Core (amdgpu.dc=-1) on the GPU's
 	        own outputs. Absent or false keeps amdgpu.dc=0, the compute-only
 	        probe.
+	      - MacLinuxGPUSessionCalls = "async" (243+): every call that can
+	        sleep must be an async call (dext/sources/session_state.h); a
+	        synchronous one is refused. Apps read it to call an instance as
+	        it serves calls: an earlier driver, a previous instance during an
+	        upgrade, serves every selector synchronously and never completes
+	        an async call.
 	-->
 	<key>IOKitPersonalities</key>
 	<dict>
@@ -88,6 +94,8 @@
 			<string>0x03000000&amp;0xFF000000 0x12000000&amp;0xFFFF0000</string>
 			<key>IOProbeScore</key>
 			<integer>10000</integer>
+			<key>MacLinuxGPUSessionCalls</key>
+			<string>async</string>
 			<key>MacLinuxGPUUserClientProperties</key>
 			<dict>
 				<key>IOClass</key>
