@@ -889,6 +889,9 @@ final class MacLinuxGPUHost {
     private(set) var isOpen: Bool = false
     /// The open instance's call contract (DriverInstance.asyncSessionCalls).
     private(set) var asyncSessionCalls = true
+    /// mlg_selector_call_on's per-connection answer to whether the driver
+    /// serves session calls async (RuntimeBuild, asked once).
+    private var sessionCallsState: Int32 = 0
     private var logLines: [String] = []
 
     // The dext's PCI identity (from GetIdentity).
@@ -961,6 +964,7 @@ final class MacLinuxGPUHost {
         ucConn = connection
         isOpen = true
         asyncSessionCalls = instance.asyncSessionCalls
+        sessionCallsState = 0
         append("openUserClient: UserClient opened (conn=%d)", ucConn)
         return true
     }
@@ -984,17 +988,21 @@ final class MacLinuxGPUHost {
 
     /// One selector, called as the open instance serves it. From 243:
     /// synchronously when it never sleeps, else an async session call
-    /// awaited here (host/selector_call.h). Earlier drivers (a previous
-    /// instance during an upgrade) serve every selector synchronously and
-    /// would never complete an async call, so they get IOConnectCallMethod.
+    /// awaited here (host/selector_call.h, which also asks RuntimeBuild once
+    /// per connection and refuses a driver older than 243). An instance
+    /// without MacLinuxGPUSessionCalls = "async" (a previous one during an
+    /// upgrade) serves every selector synchronously and would never complete
+    /// an async call, so it gets IOConnectCallMethod: the installer must
+    /// still be able to Retire it.
     func selectorCall(_ selector: UInt32, _ input: UnsafePointer<UInt64>?, _ inputCount: UInt32,
                       _ inputStruct: UnsafeRawPointer?, _ inputStructSize: Int,
                       _ output: UnsafeMutablePointer<UInt64>?, _ outputCount: UnsafeMutablePointer<UInt32>?,
                       _ outputStruct: UnsafeMutableRawPointer?, _ outputStructSize: UnsafeMutablePointer<Int>?)
         -> kern_return_t {
         if asyncSessionCalls {
-            return mlg_selector_call(ucConn, selector, input, inputCount, inputStruct, inputStructSize,
-                                     output, outputCount, outputStruct, outputStructSize)
+            return mlg_selector_call_on(ucConn, &sessionCallsState, selector, input, inputCount,
+                                        inputStruct, inputStructSize, output, outputCount,
+                                        outputStruct, outputStructSize)
         }
         return IOConnectCallMethod(ucConn, selector, input, inputCount, inputStruct, inputStructSize,
                                    output, outputCount, outputStruct, outputStructSize)
