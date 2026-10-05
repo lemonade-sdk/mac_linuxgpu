@@ -138,10 +138,12 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * order the calls arrived, with the same arguments, and the call completes
  * with async data
  *   [0] token, [1] the selector's IOReturn, [2] n, its scalar output count
- *   (at most MLG_OWNER_ASYNC_SCALARS), [3] bytes of its structure output,
- *   [4 .. 4+n) its scalar outputs.
- * OWNER_RESULT, in [0] = token, returns that structure output once (struct
- * out, sized by the caller), or kIOReturnNotFound. A synchronous call of
+ *   (at most MLG_OWNER_ASYNC_MAX_SCALARS, as many as the caller asked
+ *   for), [3] bytes of its structure output, [4 .. 4+n) its scalar outputs
+ *   when n is at most MLG_OWNER_ASYNC_SCALARS (what the completion holds).
+ * OWNER_RESULT, in [0] = token, returns the rest once (struct out, sized by
+ * the caller), or kIOReturnNotFound: the n scalars first when there are more
+ * than the completion holds (n * 8 bytes), then the structure output. A synchronous call of
  * such a selector is refused with kIOReturnNotPermitted (and logged).
  * EVENT_WAIT keeps its own completion (above): its registration runs on
  * the session queue, then the wait on a driver thread; a wait that does
@@ -157,6 +159,8 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_OWNER_ASYNC_HEADER   4u
 #define MLG_OWNER_ASYNC_SCALARS  12u
 #define MLG_OWNER_ASYNC_WORDS    (MLG_OWNER_ASYNC_HEADER + MLG_OWNER_ASYNC_SCALARS)
+/* IOKit's limit on a call's scalar outputs (QueryInfo's topology is 16). */
+#define MLG_OWNER_ASYNC_MAX_SCALARS 16u
 #define MLG_BOUNDED_READ_MS      250u
 
 /* Interrupt-driven waits on KFD signal events (a session client on the KFD

@@ -1,9 +1,18 @@
-/* libmlg_drm's real IOKit transport (libmlg_drm/src/mlg_transport_iokit.c,
- * mlg_drm.c, mlg_init.c and host/selector_call.h, unchanged) against the
- * dext's real dispatch of a Linux-file client (dext/sources/
- * MacLinuxGPUXcode.mm: ExternalMethod's delivery part, lx_external_method,
- * the owner calls; extracted by scripts/test-lx-transport.sh), with only
- * the Linux process behind it (rt_lx_*) and DriverKit mocked.
+/* The driver's clients' real IOKit transports against the dext's real
+ * dispatch (dext/sources/MacLinuxGPUXcode.mm: ExternalMethod's delivery
+ * part, lx_external_method, the owner calls; extracted by
+ * scripts/test-client-transports.sh), with only what lies behind the
+ * dispatch (the GPU's session answers, the Linux process) and DriverKit
+ * mocked:
+ *   - the HSA runtime (hsa/src, unchanged) bringing a cold GPU up and
+ *     creating queues as LemonSeed Engine's hrx does. On build 245 its
+ *     second hsa_queue_create failed with HSA_STATUS_ERROR_OUT_OF_RESOURCES:
+ *     the compute topology's 16 words did not fit an owner call's
+ *     completion, so the runtime never learned the driver's queue slots and
+ *     allowed one queue;
+ *   - libmlg_drm (libmlg_drm/src/mlg_transport_iokit.c, mlg_drm.c,
+ *     mlg_init.c, unchanged).
+ * Both reach the driver through host/selector_call.h and owner_call.h.
  *
  * Between them sits a test kernel standing for IOKit: every
  * IOConnectCall*Method the library makes reaches the dext's ExternalMethod
@@ -28,6 +37,8 @@
 #include "dext_compute.h"
 #include <rt/lx_abi.h>
 #include <mlg_drm.h>
+#include <hsa/hsa.h>
+#include "selector_call.h"
 
 #include <Block.h>
 #include <atomic>
@@ -62,7 +73,7 @@ enum { RT_LX_HOP_ADMIT, RT_LX_HOP_ARGS, RT_LX_HOP_REPLY, RT_LX_HOP_TOTAL };
 
 static void fail(const char *what)
 {
-    std::fprintf(stderr, "FAIL lx transport: %s\n", what);
+    std::fprintf(stderr, "FAIL client transports: %s\n", what);
     std::fflush(stderr);
     std::_Exit(1);
 }
@@ -231,7 +242,8 @@ static void session_state(uint64_t *out) { memset(out, 0, MLG_SESSION_STATE_WORD
 static size_t klog_read(uint64_t *, char *, size_t, uint64_t *end) { *end = 0; return 0; }
 int dext_compute_runtime_build_cached(uint64_t *out)
 {
-    out[0] = 1; out[1] = 1; out[2] = MLG_SESSION_CALLS_ASYNC_BUILD; out[3] = MLG_SESSION_CALLS_ASYNC_BUILD;
+    // As the installed driver answers (DEXT_RUNTIME_BUILD): "AMDGPUAB", layout 1.
+    out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = 243; out[3] = 243;
     return 0;
 }
 static kern_return_t observer_sysfs_read(IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
@@ -427,33 +439,205 @@ static int rt_lx_scanout(rt_lx_client *, const mlg_lx_scanout *, mlg_lx_scanout_
 // ---- the dext's code, as it ships ----
 #include "lx_transport_production.inc"
 
-// The session calls a Linux-file client makes on the owner's queue (its
-// part of ExternalMethod): the GPU's host window and its initialization.
-static kern_return_t owner_session_call(uint64_t selector, IOUserClientMethodArguments *a)
+// ---- the GPU behind the owner's queue (ExternalMethod's session part) ----
+// Answers as the installed 245 driver gave them to the HSA runtime on an
+// R9700 (QueryInfo tags, GetIdentity, BO and queue calls), each refusing a
+// call that asks for fewer scalars than it answers, as the driver's
+// handlers do (dext_compute_query_info's out_cap checks).
+static std::atomic<uint64_t> gpuStage{0};      // QueryInfo tag 4: 0 cold, 2 up
+static const uint64_t kWindowBytes = 1ull << 30;
+static uint64_t gartWindow, kfdWindow;         // set by HostWindow
+static std::mutex sessionLock;
+struct MockBo { uint64_t size, domain, gpu; };
+static std::map<uint64_t, MockBo> bos;
+static uint64_t nextBo = 0x47, nextVram = 0x600000000000ull, gttUsed, nextQueue = 6, nextEvent = 1;
+static std::map<uint64_t, std::pair<uint64_t, uint64_t>> boMaps;  // type -> (address, size)
+static uint64_t nextBoType = 0x1002f;
+static std::atomic<int> queuesCreated, queuesDestroyed, topologyAnswers, eventWaits, combinedAnswers;
+static const uint64_t kQueueSlots = 24;
+static const uint64_t kTestTag = 0x7e57;       // a test-only tag: 14 scalars and a structure
+
+static void go_cold()
 {
-    if (std::this_thread::get_id() == deliveryThread) ++ownerCallsOnDelivery;
-    switch (selector) {
-    case kMacAMDGPUMethodHostWindow: {
-        static uint64_t base;
-        ++hostWindows;
-        CHECK(a->scalarInputCount == 1 && a->scalarOutputCount >= 3);
-        if (a->scalarInput[0]) base = a->scalarInput[0];
-        a->scalarOutput[0] = base;
-        a->scalarOutput[1] = 1ull << 30;
-        a->scalarOutput[2] = 0;
-        a->scalarOutputCount = 3;
+    gpuStage = 0;
+    s_modulesRunning = false;
+    s_rtDevice = nullptr;
+    s_lxCalls.close();
+    gartWindow = kfdWindow = 0;
+}
+static void go_up()
+{
+    ++initDevices;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));  // the probe
+    s_modulesRunning = true;
+    s_probeAttempted = true;
+    s_rtDevice = (void *)0x1000;
+    s_lxCalls.open();
+    gpuStage = 2;
+}
+
+static kern_return_t answer(IOUserClientMethodArguments *a, std::initializer_list<uint64_t> words)
+{
+    if (a->scalarOutputCount < words.size()) return kIOReturnBadArgument;  // -EINVAL from the handler
+    uint32_t i = 0;
+    for (uint64_t w : words) a->scalarOutput[i++] = w;
+    a->scalarOutputCount = i;
+    return kIOReturnSuccess;
+}
+
+static kern_return_t query_info(IOUserClientMethodArguments *a)
+{
+    if (a->scalarInputCount < 1) return kIOReturnBadArgument;
+    switch (a->scalarInput[0]) {
+    case 1: return answer(a, {0xc, 0, 1});
+    case 2: return answer(a, {0x10000000, 0x7f7000000});
+    case 4: return answer(a, {gpuStage.load()});
+    case 6: return answer(a, {0x7551, 0xc0, 0x500, 0, 0x40, 4, 2, 0x5f5e100, 0x20, 0x20});
+    case 9: return answer(a, {0x7f7000000, 0x7f2954000, 0x692c000, 0x7efed4000, 0x10000000, 0x32dc000});
+    case 10: {  /* the compute topology: 16 words (dext_compute_backend.inc) */
+        const kern_return_t kr = answer(a, {1, 120001, 2, 16, 65536, 262128, 32, kQueueSlots,
+                                            64 | (4096ull << 32), 32768, 8388608, 67108864, 2920, 2, 1, 0});
+        if (kr == kIOReturnSuccess) ++topologyAnswers;
+        return kr;
+    }
+    case 11: {
+        char name[64] = "AMD Radeon AI PRO R9700";
+        if (a->scalarOutputCount < 8) return kIOReturnBadArgument;
+        memcpy(a->scalarOutput, name, 64);
+        a->scalarOutputCount = 8;
         return kIOReturnSuccess;
     }
+    case 12:
+        return answer(a, {1, 2, 0x7f, 4242, kfdWindow, kWindowBytes, 0x10000, 0x7fffffffffffull});
+    case kTestTag: {
+        uint8_t bytes[100];
+        for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(0x30 + i);
+        if (a->structureOutputMaximumSize < sizeof(bytes)) return kIOReturnNoSpace;
+        a->structureOutput = OSData::withBytes(bytes, sizeof(bytes));
+        ++combinedAnswers;
+        return answer(a, {0x900, 0x901, 0x902, 0x903, 0x904, 0x905, 0x906, 0x907, 0x908, 0x909,
+                          0x90a, 0x90b, 0x90c, 0x90d});
+    }
+    default:
+        return kIOReturnUnsupported;
+    }
+}
+
+static kern_return_t host_window(IOUserClientMethodArguments *a)
+{
+    ++hostWindows;
+    CHECK(a->scalarInputCount == 1 && a->scalarOutputCount >= 3);
+    const bool up = gpuStage == 2;
+    uint64_t &base = up ? kfdWindow : gartWindow;
+    if (a->scalarInput[0]) base = a->scalarInput[0];
+    return answer(a, {base, kWindowBytes, up ? 1u : 0u});
+}
+
+// EVENT_WAIT's registration on the owner's queue; the wait ends on a
+// thread of its own (event_wait_main), here at once, timed out.
+static kern_return_t event_wait(IOUserClientMethodArguments *a, MacLinuxGPUUserClient *client)
+{
+    ++eventWaits;
+    OSAction *action = a->completion;
+    const uint64_t token = a->scalarInput[0];
+    action->retain();
+    client->retain();
+    worker([action, client, token] {
+        IOUserClientAsyncArgumentsArray data = {};
+        data[0] = token;
+        data[1] = 0;
+        data[2] = 1;  // timed out
+        client->AsyncCompletion(action, kIOReturnSuccess, data, MLG_EVENT_WAIT_WORDS);
+        action->release();
+        client->release();
+    });
+    a->scalarOutput[0] = 0;
+    a->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
+static kern_return_t owner_session_call(MacLinuxGPUUserClient *client, uint64_t selector,
+                                        IOUserClientMethodArguments *a)
+{
+    if (std::this_thread::get_id() == deliveryThread) ++ownerCallsOnDelivery;
+    const uint64_t *in = a->scalarInput;
+    std::lock_guard guard(sessionLock);
+    switch (selector) {
+    case kMacAMDGPUMethodHostWindow:
+        return host_window(a);
     case kMacAMDGPUMethodInitDevice:
-        ++initDevices;
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));  // the probe
-        s_modulesRunning = true;
-        s_probeAttempted = true;
-        s_rtDevice = (void *)0x1000;
-        s_lxCalls.open();
+        go_up();
         a->scalarOutputCount = 0;
         return kIOReturnSuccess;
+    }
+    if (client->ivars->linuxFile) return kIOReturnUnsupported;
+    switch (selector) {
+    case kMacAMDGPUMethodGetIdentity:
+        return answer(a, {gpuStage == 2 ? 5u : 0u, 0, 0, 0x1002, 0x7551, 0x30000, 0xc0});
+    case kMacAMDGPUMethodQueryInfo:
+        return query_info(a);
+    case kMacAMDGPUMethodBOAlloc: {
+        CHECK(a->scalarInputCount == 4 && in[0]);
+        const uint64_t size = (in[0] + 16383) & ~16383ull;
+        MockBo bo{size, in[1], 0};
+        if (in[1] == 2) {  // GTT: inside the host window
+            CHECK(kfdWindow && gttUsed + size <= kWindowBytes);
+            bo.gpu = kfdWindow + gttUsed;
+            gttUsed += size;
+        } else {
+            bo.gpu = nextVram;
+            nextVram += size;
+        }
+        const uint64_t handle = nextBo++;
+        bos[handle] = bo;
+        return answer(a, {handle, bo.gpu, 0});
+    }
+    case kMacAMDGPUMethodBOFree:
+        CHECK(bos.erase(in[0]) == 1);
+        a->scalarOutputCount = 0;
+        return kIOReturnSuccess;
+    case kMacAMDGPUMethodBOMap: {
+        auto it = bos.find(in[0]);
+        CHECK(it != bos.end());
+        const uint64_t type = nextBoType++;
+        boMaps[type] = {it->second.gpu, it->second.size};
+        return answer(a, {type, it->second.size});
+    }
+    case kMacAMDGPUMethodBOCopy:
+        return answer(a, {0});
+    case kMacAMDGPUMethodBOWrite:
+        a->scalarOutputCount = 0;
+        return kIOReturnSuccess;
+    case kMacAMDGPUMethodBORead: {
+        std::vector<uint8_t> bytes(in[2], 0x42);
+        if (a->structureOutputMaximumSize < bytes.size()) return kIOReturnNoSpace;
+        a->structureOutput = OSData::withBytes(bytes.data(), bytes.size());
+        a->scalarOutputCount = 0;
+        return kIOReturnSuccess;
+    }
+    case kMacAMDGPUMethodComputeDispatch:
+        return answer(a, {0, 3, 3});
+    case kMacAMDGPUMethodAQLQueueCreate:
+        CHECK(a->scalarInputCount == 3 && bos.count(in[0]) && bos.count(in[1]));
+        ++queuesCreated;
+        return answer(a, {0, nextQueue++});
+    case kMacAMDGPUMethodAQLQueueKick:
+        return answer(a, {0});
+    case kMacAMDGPUMethodAQLQueueDestroy:
+        ++queuesDestroyed;
+        return answer(a, {0});
+    case kMacAMDGPUMethodAQLQueueService:
+        return answer(a, {0, 0});
+    case MLG_SELECTOR_EVENT:
+        if (in[0] == 0) {
+            const uint64_t id = nextEvent++;
+            return answer(a, {0, id, id, 0x600000020008ull + 8 * id});
+        }
+        return answer(a, {0, 0, 0, 0});
+    case MLG_SELECTOR_EVENT_WAIT:
+        return event_wait(a, client);
     default:
+        std::fprintf(stderr, "test GPU: selector %llu not modelled\n", (unsigned long long)selector);
         return kIOReturnUnsupported;
     }
 }
@@ -466,15 +650,25 @@ kern_return_t MacLinuxGPUUserClient::ExternalMethod(uint64_t selector, IOUserCli
     (void)dispatch;
     if (!arguments) return kIOReturnBadArgument;
 #include "lx_transport_delivery.inc"
-    return owner_session_call(selector, arguments);
+    return owner_session_call(this, selector, arguments);
 }
 
 // ---- the test kernel: IOKit for the library ----
-static IODispatchQueue ownerQueue;
-static MacLinuxGPUUserClient *dextClient;
+static IODispatchQueue ownerQueue;   // every client's session calls (s_bringupQueue)
 static std::mutex delivery;         // DriverKit delivers a driver's calls on one thread
-static const io_connect_t kConnection = 0x1234;
+static const io_connect_t kConnection = 0x1234;  // the Linux-file client's
+static std::mutex clientsLock;
+static std::map<io_connect_t, MacLinuxGPUUserClient *> clients;
+static io_connect_t nextConnection = 0x2000;
 static std::atomic<int> asyncCalls, syncCalls;
+
+static MacLinuxGPUUserClient *client_of(io_connect_t connection)
+{
+    std::lock_guard g(clientsLock);
+    auto it = clients.find(connection);
+    if (it == clients.end()) fail("a call on a connection the test kernel never opened");
+    return it->second;
+}
 
 struct IONotificationPort { mach_port_t port; };
 struct CompletionMessage {
@@ -502,7 +696,8 @@ static void kernel_complete(OSAction *action, kern_return_t status, const uint64
 }
 
 // One call into the dext, on the delivery thread; nothing there may wait.
-static kern_return_t deliver(uint32_t selector, OSAction *action, const uint64_t *input, uint32_t inputCnt,
+static kern_return_t deliver(MacLinuxGPUUserClient *client, uint32_t selector, OSAction *action,
+                             const uint64_t *input, uint32_t inputCnt,
                              const void *inputStruct, size_t inputStructCnt, uint64_t *output,
                              uint32_t *outputCnt, void *outputStruct, size_t *outputStructCnt)
 {
@@ -523,7 +718,7 @@ static kern_return_t deliver(uint32_t selector, OSAction *action, const uint64_t
         a.structureInput = OSData::withBytes(inputStruct, inputStructCnt);
     }
     a.scalarOutput = out;
-    a.scalarOutputCount = outputCnt ? *outputCnt : 0;
+    a.scalarOutputCount = outputCnt ? (*outputCnt < 16 ? *outputCnt : 16) : 0;  // IOKit's limit
     const size_t room = outputStructCnt ? *outputStructCnt : 0;
     if (room > 4096) {
         outDesc = new IOMemoryDescriptor;
@@ -537,7 +732,7 @@ static kern_return_t deliver(uint32_t selector, OSAction *action, const uint64_t
         std::lock_guard guard(delivery);
         deliveryThread = std::this_thread::get_id();
         const auto start = std::chrono::steady_clock::now();
-        kr = dextClient->ExternalMethod(selector, &a, nullptr, nullptr, nullptr);
+        kr = client->ExternalMethod(selector, &a, nullptr, nullptr, nullptr);
         if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(500))
             fail("a call held the delivery thread");
         deliveryThread = std::thread::id();
@@ -568,30 +763,69 @@ static kern_return_t deliver(uint32_t selector, OSAction *action, const uint64_t
 }
 
 extern "C" {
+// The registry: the driver's service (2) on its PCI device (3).
+static std::mutex iteratorsLock;
+static std::map<io_iterator_t, int> iterators;
+static io_iterator_t nextIterator = 100;
 kern_return_t lxt_IOServiceGetMatchingServices(mach_port_t, CFDictionaryRef matching, io_iterator_t *it)
 {
     if (matching) CFRelease(matching);
-    *it = 1;
+    std::lock_guard g(iteratorsLock);
+    *it = nextIterator++;
+    iterators[*it] = 1;
     return KERN_SUCCESS;
 }
-static int iteratorLeft;
-io_object_t lxt_IOIteratorNext(io_iterator_t)
+io_object_t lxt_IOIteratorNext(io_iterator_t it)
 {
-    return iteratorLeft-- > 0 ? 2 : 0;
+    std::lock_guard g(iteratorsLock);
+    return iterators[it]-- > 0 ? 2 : 0;
 }
 kern_return_t lxt_IOObjectRelease(io_object_t) { return KERN_SUCCESS; }
+kern_return_t lxt_IOObjectRetain(io_object_t) { return KERN_SUCCESS; }
+boolean_t lxt_IOObjectConformsTo(io_object_t object, const io_name_t className)
+{
+    return object == 3 && !strcmp(className, "IOPCIDevice");
+}
+kern_return_t lxt_IORegistryEntryGetParentEntry(io_registry_entry_t entry, const io_name_t, io_registry_entry_t *parent)
+{
+    if (entry != 2) return kIOReturnNoDevice;
+    *parent = 3;
+    return KERN_SUCCESS;
+}
+kern_return_t lxt_IORegistryEntryGetName(io_registry_entry_t entry, io_name_t name)
+{
+    strlcpy(name, entry == 2 ? "MacLinuxGPU" : "pci1002,7551", sizeof(io_name_t));
+    return KERN_SUCCESS;
+}
+static CFTypeRef pci_number(uint32_t value)
+{
+    return CFDataCreate(kCFAllocatorDefault, reinterpret_cast<const UInt8 *>(&value), 4);
+}
 CFTypeRef lxt_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef,
                                               IOOptionBits)
 {
-    if (entry == 2 && CFStringCompare(key, CFSTR("IOUserClass"), 0) == kCFCompareEqualTo)
-        return CFRetain(CFSTR("MacLinuxGPU"));
+    const auto is = [key](CFStringRef name) { return CFStringCompare(key, name, 0) == kCFCompareEqualTo; };
+    if (entry == 2 && is(CFSTR("IOUserClass"))) return CFRetain(CFSTR("MacLinuxGPU"));
+    if (entry == 2 && is(CFSTR("CFBundleIdentifier"))) return CFRetain(CFSTR("com.lemonade.MacLinuxGPU.driver"));
+    if (entry == 3 && is(CFSTR("vendor-id"))) return pci_number(0x1002);
+    if (entry == 3 && is(CFSTR("device-id"))) return pci_number(0x7551);
     return nullptr;
 }
 kern_return_t lxt_IORegistryEntryGetRegistryEntryID(io_registry_entry_t, uint64_t *id) { *id = 7; return KERN_SUCCESS; }
 kern_return_t lxt_IOServiceOpen(io_service_t service, task_port_t, uint32_t type, io_connect_t *connect)
 {
-    CHECK(service == 2 && type == MLG_USER_CLIENT_LINUX_FILE);
-    *connect = kConnection;
+    CHECK(service == 2 && (type == 0 || type == MLG_USER_CLIENT_LINUX_FILE));
+    auto *ivars = new MacLinuxGPUUserClient_IVars{};
+    ivars->sessionGeneration = 1;
+    ivars->linuxFile = type == MLG_USER_CLIENT_LINUX_FILE;
+    ivars->ownerQueue = &ownerQueue;
+    ivars->ownerLock = IOLockAlloc();
+    auto *client = new MacLinuxGPUUserClient;
+    client->ivars = ivars;
+    std::lock_guard g(clientsLock);
+    ivars->clientID = 10 + clients.size();
+    *connect = ivars->linuxFile ? kConnection : nextConnection++;
+    clients[*connect] = client;
     return KERN_SUCCESS;
 }
 kern_return_t lxt_IOServiceClose(io_connect_t) { return KERN_SUCCESS; }
@@ -600,9 +834,8 @@ kern_return_t lxt_IOConnectCallMethod(mach_port_t connection, uint32_t selector,
                                       uint64_t *output, uint32_t *outputCnt, void *outputStruct,
                                       size_t *outputStructCnt)
 {
-    CHECK(connection == kConnection);
     ++syncCalls;
-    return deliver(selector, nullptr, input, inputCnt, inputStruct, inputStructCnt, output, outputCnt,
+    return deliver(client_of(connection), selector, nullptr, input, inputCnt, inputStruct, inputStructCnt, output, outputCnt,
                    outputStruct, outputStructCnt);
 }
 kern_return_t lxt_IOConnectCallScalarMethod(mach_port_t connection, uint32_t selector, const uint64_t *input,
@@ -617,14 +850,15 @@ kern_return_t lxt_IOConnectCallAsyncMethod(mach_port_t connection, uint32_t sele
                                            uint64_t *output, uint32_t *outputCnt, void *outputStruct,
                                            size_t *outputStructCnt)
 {
-    CHECK(connection == kConnection && wake_port != MACH_PORT_NULL && referenceCnt >= kIOAsyncCalloutCount);
+    CHECK(wake_port != MACH_PORT_NULL && referenceCnt >= kIOAsyncCalloutCount);
+    MacLinuxGPUUserClient *client = client_of(connection);
     ++asyncCalls;
     auto *action = new OSAction;
     action->port = wake_port;
     action->callout = reference[kIOAsyncCalloutFuncIndex];
     action->refcon = reference[kIOAsyncCalloutRefconIndex];
     action->selector = selector;
-    const kern_return_t kr = deliver(selector, action, input, inputCnt, inputStruct, inputStructCnt, output,
+    const kern_return_t kr = deliver(client, selector, action, input, inputCnt, inputStruct, inputStructCnt, output,
                                      outputCnt, outputStruct, outputStructCnt);
     // Answered, completed, and nothing kept the completion: none can come
     // (the client would wait for good, its Ping still answering).
@@ -658,18 +892,30 @@ void lxt_IODispatchCalloutFromMessage(void *, mach_msg_header_t *msg, void *)
     for (uint32_t i = 0; i < m->count; ++i) args[i] = (void *)(uintptr_t)m->args[i];
     reinterpret_cast<IOAsyncCallback>(m->callout)((void *)(uintptr_t)m->refcon, m->status, args, m->count);
 }
+// A Linux-file mapping anywhere; a BO at the address the client gives
+// (its GPU VA in the host window, placed); anything else (the firmware
+// mailbox) a zeroed page.
 kern_return_t lxt_IOConnectMapMemory64(io_connect_t connection, uint32_t type, task_port_t,
-                                       mach_vm_address_t *at, mach_vm_size_t *size, IOOptionBits)
+                                       mach_vm_address_t *at, mach_vm_size_t *size, IOOptionBits options)
 {
-    CHECK(connection == kConnection);
-    uint64_t length;
-    {
+    uint64_t length = 16384, want = 0;
+    if (connection == kConnection) {
         std::lock_guard g(mapLengthsLock);
         auto it = mapLengths.find(type);
         if (it == mapLengths.end()) return kIOReturnBadArgument;
         length = it->second;
+    } else {
+        client_of(connection);
+        std::lock_guard g(sessionLock);
+        auto it = boMaps.find(type);
+        if (it != boMaps.end()) {
+            length = it->second.second;
+            want = it->second.first;
+            if (!(options & kIOMapAnywhere) && *at != want) return kIOReturnBadArgument;
+        }
     }
-    void *p = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    void *p = mmap(want ? (void *)(uintptr_t)want : nullptr, length, PROT_READ | PROT_WRITE,
+                   MAP_ANON | MAP_PRIVATE | (want ? MAP_FIXED : 0), -1, 0);
     CHECK(p != MAP_FAILED);
     *at = (mach_vm_address_t)(uintptr_t)p;
     *size = length;
@@ -677,12 +923,19 @@ kern_return_t lxt_IOConnectMapMemory64(io_connect_t connection, uint32_t type, t
 }
 kern_return_t lxt_IOConnectUnmapMemory64(io_connect_t connection, uint32_t type, task_port_t, mach_vm_address_t at)
 {
-    CHECK(connection == kConnection);
-    std::lock_guard g(mapLengthsLock);
-    auto it = mapLengths.find(type);
-    if (it == mapLengths.end()) return kIOReturnBadArgument;
-    munmap((void *)(uintptr_t)at, it->second);
-    mapLengths.erase(it);
+    uint64_t length = 16384;
+    if (connection == kConnection) {
+        std::lock_guard g(mapLengthsLock);
+        auto it = mapLengths.find(type);
+        if (it == mapLengths.end()) return kIOReturnBadArgument;
+        length = it->second;
+        mapLengths.erase(it);
+    } else {
+        std::lock_guard g(sessionLock);
+        auto it = boMaps.find(type);
+        if (it != boMaps.end()) length = it->second.second;
+    }
+    munmap((void *)(uintptr_t)at, length);
     return KERN_SUCCESS;
 }
 }
@@ -727,29 +980,102 @@ static void client_session(int fd, int rounds)
     }
 }
 
+// ---- what the HSA runtime does: LemonSeed Engine's hrx ----
+static hsa_status_t find_gpu(hsa_agent_t agent, void *data)
+{
+    hsa_device_type_t type;
+    if (hsa_agent_get_info(agent, HSA_AGENT_INFO_DEVICE, &type) == HSA_STATUS_SUCCESS &&
+        type == HSA_DEVICE_TYPE_GPU) {
+        *static_cast<hsa_agent_t *>(data) = agent;
+        return HSA_STATUS_INFO_BREAK;
+    }
+    return HSA_STATUS_SUCCESS;
+}
+static void queue_error(hsa_status_t, hsa_queue_t *, void *) {}
+
+static void hsa_session()
+{
+    // From a cold GPU: the runtime claims the session, places the host
+    // window, initializes the GPU, then opens the compute session.
+    CHECK(hsa_init() == HSA_STATUS_SUCCESS);
+    hsa_agent_t gpu{};
+    CHECK(hsa_iterate_agents(find_gpu, &gpu) == HSA_STATUS_INFO_BREAK && gpu.handle);
+    CHECK(initDevices == 1 && gpuStage == 2);
+    // hrx's device bring-up: several MULTI queues with an error callback.
+    uint32_t slots = 0, maxSize = 0;
+    CHECK(hsa_agent_get_info(gpu, HSA_AGENT_INFO_QUEUE_MAX_SIZE, &maxSize) == HSA_STATUS_SUCCESS);
+    hsa_queue_t *queues[3] = {};
+    for (auto &q : queues) {
+        const hsa_status_t status = hsa_queue_create(gpu, maxSize, HSA_QUEUE_TYPE_MULTI, queue_error, nullptr,
+                                                     UINT32_MAX, UINT32_MAX, &q);
+        if (status != HSA_STATUS_SUCCESS) {
+            std::fprintf(stderr, "hsa_queue_create: %#x after %d queues (topology answers %d)\n", status,
+                         queuesCreated.load(), topologyAnswers.load());
+            fail("hsa_queue_create failed, as LemonSeed Engine's did on build 245");
+        }
+    }
+    // The queue slots the driver reports (the topology's 16 words): what
+    // the runtime lets this process create.
+    CHECK(hsa_agent_get_info(gpu, HSA_AGENT_INFO_QUEUES_MAX, &slots) == HSA_STATUS_SUCCESS);
+    CHECK(slots == kQueueSlots);
+    for (auto *q : queues) CHECK(hsa_queue_destroy(q) == HSA_STATUS_SUCCESS);
+    CHECK(hsa_shut_down() == HSA_STATUS_SUCCESS);
+    CHECK(topologyAnswers >= 1 && queuesCreated >= 3);
+}
+
+// host/owner_call.h's every shape against the driver's owner calls: more
+// scalars than a completion holds, with and without a structure output.
+static void owner_call_shapes()
+{
+    io_connect_t connection = 0;
+    CHECK(lxt_IOServiceOpen(2, mach_task_self(), 0, &connection) == KERN_SUCCESS);
+    int state = 0;
+    uint64_t out[16] = {};
+    uint32_t n = 16;
+    const uint64_t topology[1] = {10};
+    CHECK(mlg_selector_call_on(connection, &state, kMacAMDGPUMethodQueryInfo, topology, 1, nullptr, 0, out, &n,
+                               nullptr, nullptr) == kIOReturnSuccess);
+    CHECK(n == 16 && out[0] == 1 && out[7] == kQueueSlots && out[14] == 1);
+    const uint64_t test[1] = {kTestTag};
+    uint8_t bytes[128] = {};
+    size_t room = sizeof(bytes);
+    n = 16;
+    CHECK(mlg_selector_call_on(connection, &state, kMacAMDGPUMethodQueryInfo, test, 1, nullptr, 0, out, &n,
+                               bytes, &room) == kIOReturnSuccess);
+    CHECK(n == 14 && out[0] == 0x900 && out[13] == 0x90d && room == 100 && bytes[0] == 0x30 && bytes[99] == 0x93);
+    // A caller that asks for fewer than a selector answers gets the driver's
+    // refusal, as from the synchronous call.
+    n = 12;
+    CHECK(mlg_selector_call_on(connection, &state, kMacAMDGPUMethodQueryInfo, topology, 1, nullptr, 0, out, &n,
+                               nullptr, nullptr) == kIOReturnBadArgument);
+}
+
 int main()
 {
-    // The driver as a Linux-file client finds it: attached, the GPU not up.
     ownerQueue.start();
-    auto *ivars = new MacLinuxGPUUserClient_IVars{};
-    ivars->sessionGeneration = 1;
-    ivars->clientID = 11;
-    ivars->linuxFile = true;
-    ivars->ownerQueue = &ownerQueue;
-    ivars->ownerLock = IOLockAlloc();
-    dextClient = new MacLinuxGPUUserClient;
-    dextClient->ivars = ivars;
-    iteratorLeft = 1;
-
     std::atomic<bool> done{false};
     std::thread watchdog([&] {
-        for (int i = 0; i < 600 && !done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (!done) fail("a call never returned (30 s): the library waits for a completion that never comes");
+        for (int i = 0; i < 1200 && !done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (!done) fail("a call never returned (60 s): a client waits for a completion that never comes");
     });
 
-    // The first open: the driver has no process for the client and the GPU
-    // is not initialized; the library places the host window, initializes
-    // it, and opens again.
+    // The HSA runtime from a cold GPU, as LemonSeed Engine brings it up.
+    hsa_session();
+    owner_call_shapes();
+    std::printf("PASS hsa transport: the HSA runtime's IOKit transport against the dext's session dispatch: "
+                "cold bring-up with InitDevice, the 16-word topology through an owner call (%llu queue "
+                "slots), three MULTI queues; owner calls with 16 scalars, and 14 with a structure\n",
+                (unsigned long long)kQueueSlots);
+
+    // libmlg_drm from a cold GPU: the driver has no process for the client
+    // and the GPU is not up; the library places the host window,
+    // initializes it, and opens again.
+    {
+        std::lock_guard guard(sessionLock);
+        go_cold();
+    }
+    hostWindows = 0;
+    initDevices = 0;
     const int fd = mlg_open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
     if (fd < 3)
         std::fprintf(stderr, "first open: %d (Linux errno %d), host window calls %d, InitDevice %d\n", fd,
@@ -790,8 +1116,8 @@ int main()
     for (auto &w : workers) w.join();
     ownerQueue.finish();
     std::printf("PASS lx transport: libmlg_drm's IOKit transport against the dext's Linux-file dispatch: "
-                "first open with HostWindow and InitDevice, %d sync and %d async calls, every async one "
-                "completed, BO maps with LX_MMAP_COMMIT, LX_RESULT, LX_SCANOUT, four threads at once\n",
+                "first open with HostWindow and InitDevice, BO maps with LX_MMAP_COMMIT, LX_RESULT, LX_SCANOUT, "
+                "four threads at once; %d sync and %d async calls in all, every async one completed\n",
                 syncCalls.load(), asyncCalls.load());
     return 0;
 }

@@ -9,18 +9,21 @@ host/owner_call.h, for the scripts.
 
 result is the selector's IOReturn (0 on success)."""
 import ctypes as c
+import struct
 import sys
 import time
 
 OWNER_RESULT = 88       # session_state.h MLG_SELECTOR_OWNER_RESULT
 OWNER_HEADER = 4        # MLG_OWNER_ASYNC_HEADER
 OWNER_SCALARS = 12      # MLG_OWNER_ASYNC_SCALARS
+OWNER_MAX_SCALARS = 16  # MLG_OWNER_ASYNC_MAX_SCALARS
 PING = 0
 RUNTIME_BUILD = 43
 SESSION_CALLS_ASYNC_BUILD = 243   # MLG_SESSION_CALLS_ASYNC_BUILD
 CALLOUT_FUNC, CALLOUT_REFCON, CALLOUT_COUNT = 1, 2, 3   # IOKit's kIOAsyncCallout* indices
 MACH_RCV_MSG, MACH_RCV_TIMEOUT, MACH_RCV_TIMED_OUT = 0x2, 0x100, 0x10004003
-NOT_ATTACHED, IPC_ERROR = 0xe00002d8, 0xe00002c3
+NOT_ATTACHED, IPC_ERROR = 0xe00002d9, 0xe00002bf  # kIOReturnNotAttached, kIOReturnIPCError
+NO_SPACE = 0xe00002db  # kIOReturnNoSpace
 TIMEOUT = 0xe00002d6    # kIOReturnTimeout
 # host/owner_call.h's bounds: InitDevice, ShutdownGPU and DrmSelftest the longer.
 BOUND_S, LONG_BOUND_S, LONG_SELECTORS = 120, 300, (9, 42, 82)
@@ -79,8 +82,9 @@ class OwnerCall:
             reference = (c.c_uint64 * 8)()
             reference[CALLOUT_FUNC] = c.cast(callback, c.c_void_p).value
             inputs = (c.c_uint64 * max(1, len(scalars)))(*scalars)
-            immediate = (c.c_uint64 * OWNER_SCALARS)()
-            count = c.c_uint(min(outputs, OWNER_SCALARS))
+            immediate = (c.c_uint64 * OWNER_MAX_SCALARS)()
+            want = min(outputs, OWNER_MAX_SCALARS)
+            count = c.c_uint(want)
             room = c.c_size_t(capacity)
             probe = c.create_string_buffer(max(1, capacity))
             source = c.create_string_buffer(data, len(data)) if data else None
@@ -114,21 +118,38 @@ class OwnerCall:
             args = done["args"]
             if done["status"]:
                 return done["status"] & 0xffffffff, [], b""
-            if len(args) < OWNER_HEADER:
+            if len(args) < OWNER_HEADER or args[2] > want:
                 return IPC_ERROR, [], b""
             code = args[1] & 0xffffffff
-            values = args[OWNER_HEADER:OWNER_HEADER + args[2]][:outputs]
+            if code:
+                return code, [], b""
+            n = args[2]
+            inline = n <= OWNER_SCALARS
+            if inline and len(args) < OWNER_HEADER + n:
+                return IPC_ERROR, [], b""
+            values = args[OWNER_HEADER:OWNER_HEADER + n] if inline else []
             blob = b""
-            if code == 0 and args[3]:
+            # Kept until fetched (session_state.h): the scalars the completion
+            # could not hold, then the structure output.
+            kept = (0 if inline else 8 * n) + args[3]
+            if kept:
+                if args[3] > capacity:
+                    return NO_SPACE, [], b""
                 token = (c.c_uint64 * 1)(args[0])
-                out = c.create_string_buffer(max(1, capacity))
-                size = c.c_size_t(capacity)
+                out = c.create_string_buffer(kept)
+                size = c.c_size_t(kept)
                 none = c.c_uint(0)
                 fetched = io.IOConnectCallMethod(self.connection, OWNER_RESULT, token, 1, None, 0,
                                                  None, c.byref(none), out, c.byref(size))
                 if fetched:
                     return fetched & 0xffffffff, [], b""
-                blob = out.raw[:size.value]
+                if size.value != kept:
+                    return IPC_ERROR, [], b""
+                raw = out.raw[:kept]
+                if not inline:
+                    values = list(struct.unpack_from(f"<{n}Q", raw))
+                    raw = raw[8 * n:]
+                blob = raw
             return code, values, blob
         finally:
             io.IONotificationPortDestroy(port)

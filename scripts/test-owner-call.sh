@@ -28,7 +28,8 @@ def number(text, name):
     return found.group(1).rstrip("u")
 for driver, mirror in (("MLG_SELECTOR_OWNER_RESULT", "MLG_OWNER_CALL_SELECTOR_RESULT"),
                        ("MLG_OWNER_ASYNC_HEADER", "MLG_OWNER_CALL_HEADER"),
-                       ("MLG_OWNER_ASYNC_SCALARS", "MLG_OWNER_CALL_SCALARS")):
+                       ("MLG_OWNER_ASYNC_SCALARS", "MLG_OWNER_CALL_SCALARS"),
+                       ("MLG_OWNER_ASYNC_MAX_SCALARS", "MLG_OWNER_CALL_MAX_SCALARS")):
     if number(state, driver) != number(client, mirror):
         raise SystemExit(f"host/owner_call.h {mirror} differs from session_state.h {driver}")
 backend = pathlib.Path("dext/sources/dext_compute_backend.inc").read_text()
@@ -48,6 +49,7 @@ if not bounds or not all(header_bounds) or \
 for driver, mirror in (("MLG_SELECTOR_OWNER_RESULT", "OWNER_RESULT"),
                        ("MLG_OWNER_ASYNC_HEADER", "OWNER_HEADER"),
                        ("MLG_OWNER_ASYNC_SCALARS", "OWNER_SCALARS"),
+                       ("MLG_OWNER_ASYNC_MAX_SCALARS", "OWNER_MAX_SCALARS"),
                        ("MLG_SESSION_CALLS_ASYNC_BUILD", "SESSION_CALLS_ASYNC_BUILD")):
     found = re.search(r"^" + mirror + r"\s*=\s*(\d+)", python, re.M)
     if not found or found.group(1) != number(state, driver):

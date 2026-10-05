@@ -899,12 +899,12 @@ test-selector-call:
 		-o $(BUILD)/tests/test_selector_call
 	$(BUILD)/tests/test_selector_call
 
-# libmlg_drm's IOKit transport against the dext's Linux-file dispatch.
-test-lx-transport:
-	bash scripts/test-lx-transport.sh
+# The HSA runtime's and libmlg_drm's IOKit transports against the dext's dispatch.
+test-client-transports:
+	bash scripts/test-client-transports.sh
 
-test: test-owner-call test-bounded test-selector-call test-lx-transport
-.PHONY: test-owner-call test-bounded test-selector-call test-lx-transport
+test: test-owner-call test-bounded test-selector-call test-client-transports
+.PHONY: test-owner-call test-bounded test-selector-call test-client-transports
 
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh

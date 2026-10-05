@@ -77,6 +77,7 @@ static IOLock *IOLockAlloc() { return new IOLock; }
 static void IOLockFree(IOLock *l) { delete l; }
 static void IOLockLock(IOLock *l) { l->m.lock(); }
 static void IOLockUnlock(IOLock *l) { l->m.unlock(); }
+static void *IOMalloc(size_t n) { return malloc(n); }
 static void *IOMallocZero(size_t n) { return calloc(1, n); }
 static void IOFree(void *p, size_t) { free(p); }
 
@@ -260,6 +261,13 @@ kern_return_t MacLinuxGPUUserClient::ExternalMethod(uint64_t selector, IOUserCli
         a->scalarOutputCount = 0;
         return kIOReturnSuccess;
     }
+    case MLG_SELECTOR_QUERY_INFO:
+        // A tag that answers 16 words (the compute topology): more than
+        // the completion holds.
+        if (a->scalarOutputCount < 16) return kIOReturnBadArgument;
+        for (uint64_t i = 0; i < 16; ++i) a->scalarOutput[i] = 0x100 + i;
+        a->scalarOutputCount = 16;
+        return kIOReturnSuccess;
     case MLG_SELECTOR_EVENT_WAIT:
         assert(a->completion);
         a->scalarOutput[0] = (uint64_t)(int64_t)-11;  // every waiting thread busy
@@ -430,6 +438,28 @@ int main()
     sysfs.structureOutput->release();
     for (auto &thread : boundedThreads) thread.join();
     path->release();
+
+    // Sixteen scalars: the completion holds none of them, OWNER_RESULT all.
+    {
+        const uint64_t tag[1] = {10};
+        uint64_t topoOut[16] = {};
+        IOUserClientMethodArguments topo{};
+        topo.completion = action; topo.scalarInput = tag; topo.scalarInputCount = 1;
+        topo.scalarOutput = topoOut; topo.scalarOutputCount = 16;
+        assert(owner_call(&client, MLG_SELECTOR_QUERY_INFO, &topo) == kIOReturnSuccess);
+        Completion done = waitCompletion(4);
+        assert(done.args[1] == kIOReturnSuccess && done.args[2] == 16 && done.args[3] == 0 &&
+               done.count == MLG_OWNER_ASYNC_HEADER);
+        const uint64_t topoToken[1] = {done.args[0]};
+        IOUserClientMethodArguments kept{};
+        kept.scalarInput = topoToken; kept.scalarInputCount = 1; kept.structureOutputMaximumSize = 128;
+        assert(owner_result(&client, &kept) == kIOReturnSuccess && kept.structureOutput &&
+               kept.structureOutput->getLength() == 128);
+        uint64_t words[16];
+        memcpy(words, kept.structureOutput->getBytesNoCopy(), sizeof(words));
+        assert(words[0] == 0x100 && words[15] == 0x10f);
+        kept.structureOutput->release();
+    }
 
     owner_results_free(&client);
     owner.finish();

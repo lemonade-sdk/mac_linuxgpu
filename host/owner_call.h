@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <IOKit/IOKitLib.h>
@@ -28,6 +29,7 @@
 #define MLG_OWNER_CALL_HEADER		4u
 #define MLG_OWNER_CALL_SCALARS		12u
 #define MLG_OWNER_CALL_WORDS		(MLG_OWNER_CALL_HEADER + MLG_OWNER_CALL_SCALARS)
+#define MLG_OWNER_CALL_MAX_SCALARS	16u
 
 struct mlg_owner_call_waiter {
 	bool done;
@@ -134,14 +136,16 @@ static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_con
 {
 	struct mlg_owner_call_waiter w;
 	io_user_reference_t ref[kIOAsyncCalloutCount];
-	uint64_t immediate[MLG_OWNER_CALL_SCALARS];
+	uint64_t immediate[MLG_OWNER_CALL_MAX_SCALARS];
 	uint32_t want = output_count ? *output_count : 0, n;
 	size_t struct_cap = output_struct_size ? *output_struct_size : 0;
 	uint8_t struct_probe = 0;
 	kern_return_t kr;
 
-	if (want > MLG_OWNER_CALL_SCALARS)
-		want = MLG_OWNER_CALL_SCALARS;
+	/* Up to IOKit's 16; the driver returns those its completion cannot
+	 * hold (more than MLG_OWNER_CALL_SCALARS) through OWNER_RESULT. */
+	if (want > MLG_OWNER_CALL_MAX_SCALARS)
+		want = MLG_OWNER_CALL_MAX_SCALARS;
 	memset(&w, 0, sizeof(w));
 	memset(ref, 0, sizeof(ref));
 	ref[kIOAsyncCalloutFuncIndex] = (io_user_reference_t)(uintptr_t)mlg_owner_call_completed;
@@ -167,32 +171,54 @@ static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_con
 		return kr;
 	if (w.status != kIOReturnSuccess)
 		return w.status;
-	if (w.nargs < MLG_OWNER_CALL_HEADER || w.args[2] > MLG_OWNER_CALL_SCALARS ||
-	    w.nargs < MLG_OWNER_CALL_HEADER + w.args[2])
+	if (w.nargs < MLG_OWNER_CALL_HEADER || w.args[2] > want)
 		return kIOReturnIPCError;
 	if ((kern_return_t)w.args[1] != kIOReturnSuccess)
 		return (kern_return_t)w.args[1];
 	n = (uint32_t)w.args[2];
-	if (output_count) {
-		if (n > *output_count)
-			n = *output_count;
+	if (n <= MLG_OWNER_CALL_SCALARS) {
+		if (w.nargs < MLG_OWNER_CALL_HEADER + n)
+			return kIOReturnIPCError;
 		for (uint32_t i = 0; i < n; ++i)
 			output[i] = w.args[MLG_OWNER_CALL_HEADER + i];
-		*output_count = n;
+		if (output_count)
+			*output_count = n;
+		n = 0;	/* none in the kept result */
 	}
-	if (w.args[3]) {
-		/* The structure output, kept by the driver until fetched. */
+	if (n || w.args[3]) {
+		/* Kept by the driver until fetched: the scalars the completion
+		 * could not hold, then the structure output. */
 		uint64_t token = w.args[0];
-		size_t size = struct_cap;
+		const size_t scalar_bytes = (size_t)n * sizeof(uint64_t);
+		const size_t bytes = scalar_bytes + (size_t)w.args[3];
+		uint8_t local[MLG_OWNER_CALL_MAX_SCALARS * sizeof(uint64_t)];
+		uint8_t *buffer = scalar_bytes ? local : (uint8_t *)output_struct;
+		size_t size = bytes;
 		uint32_t none = 0;
 
-		if (!output_struct || w.args[3] > struct_cap)
+		if (w.args[3] && (!output_struct || w.args[3] > struct_cap))
 			return kIOReturnNoSpace;
+		if (scalar_bytes && w.args[3]) {
+			buffer = (uint8_t *)malloc(bytes);
+			if (!buffer)
+				return kIOReturnNoMemory;
+		}
 		kr = IOConnectCallMethod(connection, MLG_OWNER_CALL_SELECTOR_RESULT, &token, 1, NULL, 0,
-					 NULL, &none, output_struct, &size);
+					 NULL, &none, buffer, &size);
+		if (kr == kIOReturnSuccess && size != bytes)
+			kr = kIOReturnIPCError;
+		if (kr == kIOReturnSuccess && scalar_bytes) {
+			memcpy(output, buffer, scalar_bytes);
+			*output_count = n;
+			if (w.args[3])
+				memcpy(output_struct, buffer + scalar_bytes, (size_t)w.args[3]);
+		}
+		if (buffer != local && buffer != (uint8_t *)output_struct)
+			free(buffer);
 		if (kr != kIOReturnSuccess)
 			return kr;
-		*output_struct_size = size;
+		if (output_struct_size)
+			*output_struct_size = (size_t)w.args[3];
 	} else if (output_struct_size) {
 		*output_struct_size = 0;
 	}

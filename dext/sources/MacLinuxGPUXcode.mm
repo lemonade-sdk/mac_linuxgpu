@@ -3516,7 +3516,7 @@ static void owner_job_free(OwnerJob *job)
 static void owner_job_main(OwnerJob *job)
 {
     IOUserClientMethodArguments a{};
-    uint64_t out[MLG_OWNER_ASYNC_WORDS] = {};
+    uint64_t out[MLG_OWNER_ASYNC_MAX_SCALARS] = {};
     a.version = kIOUserClientMethodArgumentsCurrentVersion;
     a.selector = job->selector;
     a.scalarInput = job->in;
@@ -3546,16 +3546,39 @@ static void owner_job_main(OwnerJob *job)
         return;
     }
     const uint32_t n = kr == kIOReturnSuccess ?
-        (a.scalarOutputCount < MLG_OWNER_ASYNC_SCALARS ? a.scalarOutputCount : MLG_OWNER_ASYNC_SCALARS) : 0;
+        (a.scalarOutputCount < job->nout ? a.scalarOutputCount : job->nout) : 0;
+    const bool scalarsInline = n <= MLG_OWNER_ASYNC_SCALARS;
     OSData *output = a.structureOutput;
     data[0] = job->token;
     data[1] = (uint64_t)(int64_t)kr;
     data[2] = n;
     data[3] = output ? output->getLength() : 0;
-    for (uint32_t i = 0; i < n; ++i) data[MLG_OWNER_ASYNC_HEADER + i] = out[i];
+    if (scalarsInline) {
+        for (uint32_t i = 0; i < n; ++i) data[MLG_OWNER_ASYNC_HEADER + i] = out[i];
+    } else {
+        // More scalars than the completion holds: OWNER_RESULT returns them,
+        // then the structure output.
+        const size_t structBytes = output ? output->getLength() : 0;
+        const size_t bytes = n * sizeof(uint64_t) + structBytes;
+        auto *blob = static_cast<uint8_t *>(IOMalloc(bytes));
+        OSData *combined = nullptr;
+        if (blob) {
+            memcpy(blob, out, n * sizeof(uint64_t));
+            if (structBytes) memcpy(blob + n * sizeof(uint64_t), output->getBytesNoCopy(), structBytes);
+            combined = OSData::withBytes(blob, bytes);
+            IOFree(blob, bytes);
+        }
+        if (output) output->release();
+        output = combined;
+        if (!combined) {
+            data[1] = (uint64_t)(int64_t)kIOReturnNoMemory;
+            data[2] = data[3] = 0;
+        }
+    }
     // In place before the completion, so a fetch that follows finds it.
     if (output) owner_result_store(job->client, job->token, output);
-    job->client->AsyncCompletion(job->action, kIOReturnSuccess, data, MLG_OWNER_ASYNC_HEADER + n);
+    job->client->AsyncCompletion(job->action, kIOReturnSuccess, data,
+                                 MLG_OWNER_ASYNC_HEADER + (scalarsInline ? n : 0));
     owner_job_free(job);
 }
 
@@ -3579,10 +3602,10 @@ static kern_return_t owner_call(MacLinuxGPUUserClient *client, uint64_t selector
     job->token = __atomic_add_fetch(&client->ivars->ownerToken, 1, __ATOMIC_ACQ_REL);
     job->nin = a->scalarInputCount;
     if (job->nin) memcpy(job->in, a->scalarInput, job->nin * sizeof(uint64_t));
-    // As many scalar outputs as the caller asked for, up to what the
-    // completion carries (EVENT_WAIT: its one status word).
-    job->nout = a->scalarOutputCount < MLG_OWNER_ASYNC_SCALARS ? a->scalarOutputCount
-                                                               : MLG_OWNER_ASYNC_SCALARS;
+    // As many scalar outputs as the caller asked for (EVENT_WAIT: its one
+    // status word); those the completion cannot hold come with OWNER_RESULT.
+    job->nout = a->scalarOutputCount < MLG_OWNER_ASYNC_MAX_SCALARS ? a->scalarOutputCount
+                                                                   : MLG_OWNER_ASYNC_MAX_SCALARS;
     if (selector == MLG_SELECTOR_EVENT_WAIT && job->nout < 1) job->nout = 1;
     // The caller's structure output room (a descriptor above 4096 bytes):
     // the output itself comes back through OWNER_RESULT.
