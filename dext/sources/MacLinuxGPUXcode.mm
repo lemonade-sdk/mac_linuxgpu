@@ -83,6 +83,7 @@
 #include <rt/kfd_session.h>
 #include <rt/wait_pool.h>
 #include <rt/bounded.h>
+#include <rt/recovery.h>
 #include <rt/sysfs.h>
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
@@ -617,6 +618,42 @@ static uint32_t release_blocker()
     return MLG_RELEASE_READY;
 }
 
+// GPU recovery's state (QueryInfo "LRST", session_state.h), as the
+// runtime last published it (recovery_notify), for readers on any thread.
+static uint64_t s_resetState[MLG_RESET_STATE_WORDS];
+static uint32_t s_resetStateLock;
+static void reset_state(uint64_t out[MLG_RESET_STATE_WORDS])
+{
+    while (__atomic_exchange_n(&s_resetStateLock, 1u, __ATOMIC_ACQUIRE)) {}
+    memcpy(out, s_resetState, sizeof(s_resetState));
+    __atomic_store_n(&s_resetStateLock, 0u, __ATOMIC_RELEASE);
+    out[0] = MLG_RESET_STATE_VERSION;
+}
+static void reset_state_store(const struct rt_recovery_state *st)
+{
+    while (__atomic_exchange_n(&s_resetStateLock, 1u, __ATOMIC_ACQUIRE)) {}
+    s_resetState[1] = st ? st->generation : 0;
+    s_resetState[2] = st ? ((st->flags & RT_RECOVERY_WEDGED ? MLG_RESET_FLAG_WEDGED : 0) |
+                            (st->flags & RT_RECOVERY_LAST_VRAM_LOST ? MLG_RESET_FLAG_LAST_VRAM_LOST : 0)) : 0;
+    s_resetState[3] = st ? st->queue_resets : 0;
+    s_resetState[4] = st ? st->vram_lost : 0;
+    s_resetState[5] = st ? (uint64_t)(int64_t)st->last_result : 0;
+    __atomic_store_n(&s_resetStateLock, 0u, __ATOMIC_RELEASE);
+}
+// On the reset domain's thread, once per change: the cached state and an
+// event in the unified log.
+static void recovery_notify(const struct rt_recovery_state *st)
+{
+    reset_state_store(st);
+    if (st->flags & RT_RECOVERY_WEDGED)
+        MACLINUXGPU_EVENT("GPU wedged (reset generation %llu): every request fails until the GPU is "
+                          "power-cycled and reconnected", (unsigned long long)st->generation);
+    else
+        MACLINUXGPU_EVENT("GPU recovery: a queue reset completed (reset generation %llu, %llu queue "
+                          "resets, last result %d)", (unsigned long long)st->generation,
+                          (unsigned long long)st->queue_resets, st->last_result);
+}
+
 static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
 {
     const uint32_t blocker = release_blocker();
@@ -635,6 +672,11 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
+    {
+        uint64_t reset[MLG_RESET_STATE_WORDS];
+        reset_state(reset);
+        if (reset[2] & MLG_RESET_FLAG_WEDGED) flags |= MLG_SESSION_FLAG_GPU_WEDGED;
+    }
     out[0] = MLG_SESSION_STATE_VERSION;
     out[1] = flags;
     out[2] = s_quarantineCause;
@@ -870,6 +912,7 @@ static void close_session(MacLinuxGPU *driver)
         // A removed device's GPU work stops being completed here; upstream
         // removal finishes the rest itself (amdgpu_fence_driver_hw_fini).
         if (s_deviceRemoved) rt_removal_end();
+        rt_recovery_detach_pdev(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         MACLINUXGPU_LOG("session close: removing upstream driver");
         linuxu_driver_shutdown();
         s_modulesRunning = false;
@@ -914,6 +957,7 @@ static void release_removed(MacLinuxGPU *driver)
         const int stopped = dext_compute_stop();
         if (stopped) MACLINUXGPU_LOG("removal: compute stop returned %d; nothing can run", stopped);
         rt_removal_end();
+        rt_recovery_detach_pdev(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         if (auto *drm = __atomic_exchange_n(&s_observerDrm, nullptr, __ATOMIC_ACQ_REL))
             rt_drm_info_close(drm);
         MACLINUXGPU_LOG("removal: removing upstream driver");
@@ -3608,6 +3652,12 @@ static kern_return_t direct_call(MacLinuxGPUUserClient *client, uint64_t selecto
             a->scalarOutputCount = MLG_SESSION_STATE_WORDS;
             return kIOReturnSuccess;
         }
+        if (in[0] == MLG_QUERY_RESET_STATE) {
+            if (!out || a->scalarOutputCount < MLG_RESET_STATE_WORDS) return kIOReturnBadArgument;
+            reset_state(out);
+            a->scalarOutputCount = MLG_RESET_STATE_WORDS;
+            return kIOReturnSuccess;
+        }
         // DEXT_COMPUTE_QUERY_PROBE_STATUS: probe progress, no MMIO.
         if (!out || a->scalarOutputCount < 5) return kIOReturnBadArgument;
         out[0] = s_probeAttempted;
@@ -4265,6 +4315,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnError;
         }
         MACLINUXGPU_EVENT("upstream AMDGPU PCI probe completed");
+        // GPU recovery's platform side (rt/recovery.h): queue resets as
+        // upstream runs them; a device reset, not available yet, wedges.
+        reset_state_store(nullptr);
+        rt_recovery_set_notify(recovery_notify);
+        if (const int attached = rt_recovery_attach_pdev(
+                static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice))))
+            MACLINUXGPU_EVENT("GPU recovery not attached (%d): a hung queue is not reset", attached);
         identity_after_probe(ivars->ownerDriver,
                              static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         int computeResult = dext_compute_start(

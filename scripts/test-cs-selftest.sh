@@ -39,7 +39,9 @@ clang "${cflags[@]}" -fsanitize=address \
   linuxu/tests/removal_check.c linuxu/tests/blocked_call_check.c \
   "${plain[@]}" build/libmacamgdu.a \
   -lpthread -o "$work/test_cs_selftest"
+"$work/test_cs_selftest" wedge
 # CS_SELFTEST_KEEP=<path> keeps the binary for a debugger; CS_FIXTURE_TRACE=1
 # traces what the software engines execute.
 if [ -n "${CS_SELFTEST_KEEP:-}" ]; then cp "$work/test_cs_selftest" "$CS_SELFTEST_KEEP"; fi
 "$work/test_cs_selftest"
+"$work/test_cs_selftest" wedge

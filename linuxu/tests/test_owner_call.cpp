@@ -164,6 +164,7 @@ static uint64_t dext_pci_transport_fault_offset() { return 0; }
 static std::atomic<int> powerWaits;
 static kern_return_t power_wait(MacLinuxGPUUserClient *, OSAction *, uint64_t) { ++powerWaits; return kIOReturnSuccess; }
 static void power_snapshot(uint64_t *out) { memset(out, 0, MLG_POWER_STATE_WORDS * 8); out[0] = MLG_POWER_STATE_VERSION; }
+static void reset_state(uint64_t *out) { memset(out, 0, MLG_RESET_STATE_WORDS * 8); out[0] = MLG_RESET_STATE_VERSION; out[1] = 2; }
 static void session_state(uint64_t *out) { memset(out, 0, MLG_SESSION_STATE_WORDS * 8); out[0] = MLG_SESSION_STATE_VERSION; }
 static size_t klog_read(uint64_t *cursor, char *out, size_t capacity, uint64_t *end)
 {
@@ -324,6 +325,14 @@ int main()
     k.scalarInput = klogTag; k.scalarInputCount = 2; k.scalarOutput = klog; k.scalarOutputCount = 16;
     assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, klogTag, 2));
     assert(direct_call(&client, MLG_SELECTOR_QUERY_INFO, &k) == kIOReturnSuccess && klog[2] == 15);
+    const uint64_t resetTag[1] = {MLG_QUERY_RESET_STATE};
+    uint64_t reset[MLG_RESET_STATE_WORDS] = {};
+    IOUserClientMethodArguments r{};
+    r.scalarInput = resetTag; r.scalarInputCount = 1; r.scalarOutput = reset;
+    r.scalarOutputCount = MLG_RESET_STATE_WORDS;
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, resetTag, 1));
+    assert(direct_call(&client, MLG_SELECTOR_QUERY_INFO, &r) == kIOReturnSuccess &&
+           r.scalarOutputCount == MLG_RESET_STATE_WORDS && reset[0] == MLG_RESET_STATE_VERSION && reset[1] == 2);
     const uint64_t waitIn[2] = {MLG_POWER_OP_WAIT, 3};
     IOUserClientMethodArguments w{};
     w.scalarInput = waitIn; w.scalarInputCount = 2; w.completion = action;

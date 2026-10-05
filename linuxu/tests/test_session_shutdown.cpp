@@ -203,9 +203,15 @@ static void power_before_removal() { ++powerRemovalHooks; }
 static unsigned displayUnpublishes;
 static void displays_unpublish(MacLinuxGPU *) { ++displayUnpublishes; }
 
+#include <rt/recovery.h>
+// GPU recovery comes off before upstream removal (counted, not an event).
+static unsigned recoveryDetaches;
+extern "C" void rt_recovery_detach_pdev(struct pci_dev *) { ++recoveryDetaches; }
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
 static void driver_stop(MacLinuxGPU *driver, IOService *provider);
 #include "session_shutdown_production.inc"
+// Hooked in by InitDevice, which these scenarios do not run.
+[[maybe_unused]] static void (*const recoveryNotify)(const struct rt_recovery_state *) = recovery_notify;
 
 // An observer read in flight when the session closes: the close waits, and
 // the read finishes (leaves) while the close sleeps.

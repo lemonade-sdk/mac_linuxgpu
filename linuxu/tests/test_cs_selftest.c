@@ -37,12 +37,17 @@ static void report(const struct rt_cs_selftest_result *res)
 		res->vram_back_value, (unsigned long long)res->vram_ns);
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
 	struct pci_dev *pdev;
 	/* The BAR covers a quarter of VRAM, as the iPad's covers part of it. */
 	cs_fixture_visible_vram = 64ULL << 20;
 	pdev = cs_fixture_init();
+	if (argc > 1 && !strcmp(argv[1], "wedge")) {
+		/* A process of its own: the device stays wedged. */
+		wedge_check(pdev);
+		return 0;
+	}
 	struct rt_cs_selftest_result res;
 	struct cs_fixture_stats before, after;
 	int r;
@@ -94,6 +99,9 @@ int main(void)
 
 	/* A call blocked on a held queue holds only its own worker. */
 	blocked_call_check(pdev);
+
+	/* A hung queue resets; the rest goes on. */
+	queue_reset_check(pdev);
 
 	/* Last: the device leaves the bus with work outstanding. */
 	removal_check(pdev);

@@ -23,7 +23,7 @@ unsigned int amdgpu_debug_mask;
 int amdgpu_num_kcq;
 int amdgpu_rebar = -1;
 unsigned int amdgpu_pp_feature_mask = 0xfff7bfff; /* upstream default */
-int amdgpu_gpu_recovery = -1;
+int amdgpu_gpu_recovery = 0; /* the bootstrap must set upstream's default */
 int amdgpu_dc = -1; /* upstream default */
 static int expect_dc;
 int linuxu_timer_service_init(void) { return fail_stage == 5 ? -EAGAIN : 0; }
@@ -71,7 +71,7 @@ static int amdgpu_init(void)
 	assert(amdgpu_ras_mask == 0);
 	/* GFXOFF (PP_GFXOFF_MASK) is cleared; other PP features are kept. */
 	assert(amdgpu_pp_feature_mask == (0xfff7bfffu & ~0x8000u));
-	assert(amdgpu_gpu_recovery == 0);
+	assert(amdgpu_gpu_recovery == -1);
 	assert(amdgpu_dc == expect_dc);
 	return fail_stage == 3 ? -ENODEV : 0;
 }

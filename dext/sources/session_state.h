@@ -41,6 +41,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_ISOLATION_ATTEMPTED = 1u << 10,
 	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
 	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
+	MLG_SESSION_FLAG_GPU_WEDGED          = 1u << 13, /* recovery failed: power-cycle the GPU */
 };
 
 /* Which close/probe step quarantined the session. */
@@ -148,6 +149,11 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * stay synchronous, bounded: the read runs on a driver thread, and the
  * call waits at most MLG_BOUNDED_READ_MS for it (kIOReturnTimeout; while
  * it is still running another is kIOReturnBusy). */
+/* The first runtime build (RuntimeBuild's out[3], the compiled build) that
+ * serves session calls this way: a client checks it before an async call,
+ * since an older driver answers such a call synchronously and never
+ * completes it. */
+#define MLG_SESSION_CALLS_ASYNC_BUILD 243u
 #define MLG_OWNER_ASYNC_HEADER   4u
 #define MLG_OWNER_ASYNC_SCALARS  12u
 #define MLG_OWNER_ASYNC_WORDS    (MLG_OWNER_ASYNC_HEADER + MLG_OWNER_ASYNC_SCALARS)
@@ -405,6 +411,19 @@ struct mlg_display_present {
 #define MLG_QUERY_PROBE_STATUS  0x4c50524fULL /* "LPRO" */
 #define MLG_QUERY_KERNEL_LOG    0x4c4c4f47ULL /* "LLOG" */
 #define MLG_QUERY_SESSION_STATE 0x4c534553ULL /* "LSES" */
+/* GPU recovery (linuxu/headers/rt/recovery.h), cached, never blocking:
+ *   out[0] layout version (MLG_RESET_STATE_VERSION)
+ *   out[1] reset generation: queue resets that succeeded, device resets,
+ *          and the wedge, each one step
+ *   out[2] MLG_RESET_FLAG_*
+ *   out[3] queue resets that succeeded
+ *   out[4] upstream's VRAM-lost counter
+ *   out[5] the last reset's result (0, or a negative Linux errno) */
+#define MLG_QUERY_RESET_STATE   0x4c525354ULL /* "LRST" */
+#define MLG_RESET_STATE_VERSION 1u
+#define MLG_RESET_STATE_WORDS   6u
+#define MLG_RESET_FLAG_WEDGED          (1u << 0) /* power-cycle the GPU */
+#define MLG_RESET_FLAG_LAST_VRAM_LOST  (1u << 1)
 
 /* Entitlement a client must hold to release a quarantined session. */
 #define MLG_SESSION_RELEASE_ENTITLEMENT "com.geramyloveless.MacAMDGPUHost.session-release"
@@ -461,6 +480,7 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		return (input[0] == MLG_QUERY_PROBE_STATUS && input_count == 1) ||
 		       (input[0] == MLG_QUERY_SESSION_STATE && input_count == 1) ||
 		       (input[0] == MLG_QUERY_POWER_STATE && input_count == 1) ||
+		       (input[0] == MLG_QUERY_RESET_STATE && input_count == 1) ||
 		       (input[0] == MLG_QUERY_KERNEL_LOG && input_count == 2);
 	case MLG_SELECTOR_SYSFS_READ:
 		return input && input_count == 2 &&
@@ -525,6 +545,7 @@ static inline bool mlg_call_runs_on_delivery(uint64_t selector, const uint64_t *
 		return (input[0] == MLG_QUERY_PROBE_STATUS && input_count == 1) ||
 		       (input[0] == MLG_QUERY_SESSION_STATE && input_count == 1) ||
 		       (input[0] == MLG_QUERY_POWER_STATE && input_count == 1) ||
+		       (input[0] == MLG_QUERY_RESET_STATE && input_count == 1) ||
 		       (input[0] == MLG_QUERY_KERNEL_LOG && input_count == 2);
 	case MLG_SELECTOR_POWER:
 		return input && input_count >= 1 &&

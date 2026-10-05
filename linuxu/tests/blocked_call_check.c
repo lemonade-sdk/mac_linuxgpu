@@ -33,8 +33,11 @@
 #include <drm/drm.h>
 #include <rt/lx_abi.h>
 #include <rt/lx_files.h>
+#include <rt/recovery.h>
 
 #include "amdgpu.h"
+#include "amdgpu_reset.h"
+#include "nvd.h"
 #include "cs_fixture.h"
 #include "blocked_call_check.h"
 
@@ -402,4 +405,190 @@ void blocked_call_after_removal(void)
 	printf("PASS blocked call through removal: the removal ends a submission blocked on a "
 	       "held queue (result %lld) and the client's exit completes\n",
 	       (long long)parked.blocked.result);
+}
+
+/* ---- a hung queue under GPU recovery ----
+ *
+ * Linux's recovery, unmodified: a compute job that never completes times
+ * out (drm_sched), amdgpu_job_timedout resets its queue (the fixture's
+ * fx_ring_reset, as MES resets a kernel queue), the guilty job's fence
+ * gets -ETIME, the jobs queued behind it from other contexts run, the
+ * guilty context reports the reset and refuses further submissions, and a
+ * new context works. Nothing waits forever, nothing escalates. */
+
+#define RESET_VALUE	0xb0b0cafeu
+#define RESET_DATA_OFF	4096u
+
+/* Client @k's IB: one WRITE_DATA of @value to its buffer at @off. */
+static void write_ib(struct bc_client *k, uint32_t value, uint32_t off)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	const uint32_t nop = adev->gfx.compute_ring[0].funcs->nop;
+	const uint64_t dst = k->va + off;
+	uint32_t n = 0;
+
+	k->ib[n++] = PACKET3(PACKET3_WRITE_DATA, 3);
+	k->ib[n++] = (5u << 8) | (1u << 20);	/* memory, write confirm */
+	k->ib[n++] = lower_32_bits(dst);
+	k->ib[n++] = upper_32_bits(dst);
+	k->ib[n++] = value;
+	while (n % 8)
+		k->ib[n++] = nop;
+	k->ib_dw = n;
+}
+
+void queue_reset_check(struct pci_dev *pdev)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	struct amdgpu_ring *ring = &adev->gfx.compute_ring[0];
+	const long saved_timeout = ring->sched.timeout;
+	const int resets = atomic_read(&adev->gpu_reset_counter);
+	struct cs_fixture_stats before, after;
+	struct rt_recovery_state was, now;
+	volatile uint32_t *written;
+	struct bc_client a, b;
+	ktime_t start = ktime_get();
+	long r;
+
+	rt_recovery_state(&was);
+	client_open(pdev, "guilty-client", &a);
+	client_open(pdev, "innocent-client", &b);
+	write_ib(&a, 0x11111111u, RESET_DATA_OFF);
+	write_ib(&b, RESET_VALUE, RESET_DATA_OFF);
+	written = (volatile uint32_t *)((uint8_t *)b.ib + RESET_DATA_OFF);
+	*written = 0;
+
+	/* A's job hangs (the queue does not run it); B's waits behind it. */
+	ring->sched.timeout = msecs_to_jiffies(300);
+	cs_fixture_stats(&before);
+	cs_fixture_hold_compute(1);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+	cs_args(&b);
+	CHECK(call_async(&b, DRM_IOCTL_AMDGPU_CS, &b.cs) == 0);
+
+	/* The timeout fires, the queue resets, B's job runs. */
+	for (int i = 0; i < 1000 && *written != RESET_VALUE; ++i)
+		usleep(5000);
+	cs_fixture_stats(&after);
+	CHECK(after.queue_resets == before.queue_resets + 1);
+	CHECK(*written == RESET_VALUE);
+	CHECK(atomic_read(&adev->gpu_reset_counter) == resets + 1);
+	CHECK(!amdgpu_in_reset(adev));
+	/* The reset generation advanced; nothing wedged. */
+	rt_recovery_state(&now);
+	CHECK(now.queue_resets == was.queue_resets + 1 && now.generation == was.generation + 1);
+	CHECK(!(now.flags & RT_RECOVERY_WEDGED) && now.last_result == 0);
+
+	/* A's context was guilty: it reports the reset and refuses work
+	 * (its last job's error, as Linux returns it). */
+	union drm_amdgpu_ctx query = { .in = { .op = AMDGPU_CTX_OP_QUERY_STATE2, .ctx_id = a.ctx } };
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CTX, &query) == 0);
+	CHECK(query.out.state.flags & AMDGPU_CTX_QUERY2_FLAGS_RESET);
+	cs_args(&a);
+	r = call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs);
+	CHECK(r == -ETIME || r == -ECANCELED);
+
+	/* A new context of the same process works. */
+	union drm_amdgpu_ctx ctx = { .in = { .op = AMDGPU_CTX_OP_ALLOC_CTX,
+					     .priority = AMDGPU_CTX_PRIORITY_NORMAL } };
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CTX, &ctx) == 0);
+	a.ctx = ctx.out.alloc.ctx_id;
+	volatile uint32_t *mine = (volatile uint32_t *)((uint8_t *)a.ib + RESET_DATA_OFF);
+	*mine = 0;
+	write_ib(&a, 0xa0a0beefu, RESET_DATA_OFF);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+	for (int i = 0; i < 400 && *mine != 0xa0a0beefu; ++i)
+		usleep(5000);
+	CHECK(*mine == 0xa0a0beefu);
+
+	/* The innocent client goes on as before. */
+	*written = 0;
+	cs_args(&b);
+	CHECK(call_async(&b, DRM_IOCTL_AMDGPU_CS, &b.cs) == 0);
+	for (int i = 0; i < 400 && *written != RESET_VALUE; ++i)
+		usleep(5000);
+	CHECK(*written == RESET_VALUE);
+
+	ring->sched.timeout = saved_timeout;
+	cs_fixture_hold_compute(0);
+	rt_lx_client_destroy(a.c);
+	rt_lx_client_destroy(b.c);
+	printf("PASS queue reset: a hung compute job times out, its queue resets (no device reset), "
+	       "the job behind it from another process runs, the guilty context reports the reset "
+	       "and refuses work, a new context works (%lld ms)\n",
+	       (long long)ktime_ms_delta(ktime_get(), start));
+}
+
+/* ---- a hang no queue reset ends ----
+ *
+ * The queue reset fails (MES does not answer): upstream would reset the
+ * device, which is not available over Thunderbolt yet, so the device
+ * wedges instead (rt/recovery.h). The blocked work completes with an
+ * error, every new request fails with -ENODEV, the state says wedged, and
+ * nothing tries a device reset (the fixture has no ASIC reset: one would
+ * crash this test). Runs in a process of its own: the device stays
+ * wedged. */
+void wedge_check(struct pci_dev *pdev)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	struct amdgpu_ring *ring = &adev->gfx.compute_ring[0];
+	struct rt_recovery_state st;
+	struct bc_client a, b;
+	struct bc_call blocked;
+	ktime_t start = ktime_get();
+
+	client_open(pdev, "hung-client", &a);
+	client_open(pdev, "bystander", &b);
+	write_ib(&a, 0x11111111u, RESET_DATA_OFF);
+	ring->sched.timeout = msecs_to_jiffies(300);
+	cs_fixture_fail_queue_reset(1);
+	cs_fixture_hold_compute(1);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+
+	/* B waits on that queue too: a CS of its own behind A's, then a
+	 * wait on its fence with no deadline. Both end with the wedge. */
+	struct drm_syncobj_create done = { 0 };
+	CHECK(call_sync(&b, DRM_IOCTL_SYNCOBJ_CREATE, &done) == 0);
+	cs_args(&b);
+	struct drm_amdgpu_cs_chunk_sem out = { .handle = done.handle };
+	struct drm_amdgpu_cs_chunk chunks[3] = { b.chunks[0], b.chunks[1],
+		{ AMDGPU_CHUNK_ID_SYNCOBJ_OUT, sizeof(out) / 4, (uint64_t)(uintptr_t)&out } };
+	uint64_t ptrs[3] = { (uint64_t)(uintptr_t)&chunks[0], (uint64_t)(uintptr_t)&chunks[1],
+			     (uint64_t)(uintptr_t)&chunks[2] };
+	b.cs.in.num_chunks = 3;
+	b.cs.in.chunks = (uint64_t)(uintptr_t)ptrs;
+	CHECK(call_async(&b, DRM_IOCTL_AMDGPU_CS, &b.cs) == 0);
+	uint32_t handles[1] = { done.handle };
+	struct drm_syncobj_wait wait = { .handles = (uint64_t)(uintptr_t)handles,
+		.count_handles = 1, .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+		.timeout_nsec = INT64_MAX };
+	call_start_async(&b, DRM_IOCTL_SYNCOBJ_WAIT, &wait, &blocked);
+
+	/* The timeout fires, the queue reset fails, the device wedges. */
+	for (int i = 0; i < 1000; ++i) {
+		rt_recovery_state(&st);
+		if (st.flags & RT_RECOVERY_WEDGED)
+			break;
+		usleep(5000);
+	}
+	rt_recovery_state(&st);
+	CHECK(st.flags & RT_RECOVERY_WEDGED);
+	CHECK(st.queue_resets == 0 && st.generation == 1);
+	CHECK(!amdgpu_in_reset(adev) && adev->no_hw_access);
+	/* The wait with no deadline ends (its fence completed, cancelled). */
+	CHECK(call_finished(&b, &blocked, 2000));
+	/* New requests fail as for a device that is gone. */
+	struct drm_syncobj_create more = { 0 };
+	CHECK(call_sync(&b, DRM_IOCTL_SYNCOBJ_CREATE, &more) == -ENODEV);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == -ENODEV);
+
+	rt_recovery_end();
+	printf("PASS wedge: a hang the queue reset cannot end wedges the device instead of a "
+	       "device reset; blocked work and a wait with no deadline end, new requests fail "
+	       "with -ENODEV, the state says wedged (%lld ms)\n",
+	       (long long)ktime_ms_delta(ktime_get(), start));
 }
