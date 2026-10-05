@@ -3,7 +3,9 @@
 # software GPU and the DCN 4.0.1 display fixture; no GPU), the release
 # check (no debug instrumentation in release objects), the HSA runtime's
 # unit tests, and unsigned Xcode builds of the dext and the host app. No
-# signing: the signed build and installer stay on a developer Mac.
+# signing: the signed build and installer stay on a developer Mac. Both jobs
+# select Xcode 26: the dext targets DriverKit 25.2, and the image's default
+# Xcode 16 (DriverKit 24.5) lacks APIs it uses (IOSysCtlByName).
 #
 # Not run here: the Vulkan offline tests need RADV and llama.cpp built
 # (make radv, make llama-vulkan; about an hour more), so test-radv-offline,
@@ -27,6 +29,18 @@ jobs:
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
+
+      - name: Xcode 26 (DriverKit 25, as the project targets)
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$xcode" ]; then
+            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          xcrun --sdk driverkit --show-sdk-version
 
       - name: Tools
         run: brew install ripgrep cmake
@@ -58,6 +72,18 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Xcode 26 (DriverKit 25, as the project targets)
+        run: |
+          xcode=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$xcode" ]; then
+            echo "::error::this runner image has no Xcode 26; the dext needs DriverKit 25"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          xcrun --sdk driverkit --show-sdk-version
 
       - name: Upstream checkouts (cached)
         uses: actions/cache@v4
