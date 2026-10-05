@@ -141,6 +141,43 @@ static void trim_and_clear(void)
 	gpu_buddy_fini(&mm); module_stop();
 }
 
+/* A clear, top-down request that the clear tree cannot satisfy takes the
+ * highest free block of the dirty tree, not the smallest-order one wherever
+ * it lies (patches/linux/gpu-buddy-topdown-fallback.patch): amdgpu's KFD
+ * VRAM BOs are VRAM_CLEARED and top-down, and a small BAR exposes only the
+ * low VRAM to the CPU. */
+static void topdown_clear_fallback(bool expect_top)
+{
+	module_start();
+	struct gpu_buddy mm;
+	const u64 mib = 1ULL << 20;
+	assert(!gpu_buddy_init(&mm, 64 * mib, PAGE_SIZE));
+	struct list_head blocks[64];
+	for (int i = 0; i < 64; i++) {
+		INIT_LIST_HEAD(&blocks[i]);
+		assert(!gpu_buddy_alloc_blocks(&mm, 0, mm.size, mib, mib, &blocks[i], 0));
+	}
+	/* Free, dirty: one 1 MiB block low, and the 4 MiB at the top (one block
+	 * of a higher order once they coalesce). */
+	for (int i = 0; i < 64; i++) {
+		u64 offset = gpu_buddy_block_offset(list_first_entry(&blocks[i], struct gpu_buddy_block, link));
+		if (offset == 2 * mib || offset >= 60 * mib)
+			gpu_buddy_free_list(&mm, &blocks[i], 0);
+	}
+	assert(!mm.clear_avail && mm.avail == 5 * mib);
+	LIST_HEAD(got);
+	assert(!gpu_buddy_alloc_blocks(&mm, 0, mm.size, mib, mib, &got,
+		GPU_BUDDY_CLEAR_ALLOCATION | GPU_BUDDY_TOPDOWN_ALLOCATION));
+	u64 at = gpu_buddy_block_offset(list_first_entry(&got, struct gpu_buddy_block, link));
+	printf("clear top-down fallback took the block at %llu MiB\n", (unsigned long long)(at / mib));
+	assert(expect_top ? at >= 60 * mib : at == 2 * mib);
+	gpu_buddy_free_list(&mm, &got, 0);
+	for (int i = 0; i < 64; i++)
+		if (!list_empty(&blocks[i]))
+			gpu_buddy_free_list(&mm, &blocks[i], 0);
+	gpu_buddy_fini(&mm); module_stop();
+}
+
 static void failures(void)
 {
 	dext_heap_test_fail_after(0);
@@ -228,12 +265,16 @@ static void boundaries(void)
 
 int main(int argc, char **argv)
 {
+	if (argc == 2 && !strcmp(argv[1], "--topdown-negative-control")) {
+		topdown_clear_fallback(false);
+		return 0;
+	}
 	if (argc == 2 && !strcmp(argv[1], "--range-split-negative-control")) {
 		negative_control = true;
 		split_failures(1, true);
 		return 0;
 	}
 	assert(argc == 1);
-	boundaries(); actual_vram_init(); trim_and_clear(); failures(); split_failures(4, false);
-	puts("pinned GPU buddy: actual VRAM init, 32624MiB heap, BAR ranges, overlap rejection, trim/clear, OOM rollback passed");
+	boundaries(); actual_vram_init(); trim_and_clear(); topdown_clear_fallback(true); failures(); split_failures(4, false);
+	puts("pinned GPU buddy: actual VRAM init, 32624MiB heap, BAR ranges, overlap rejection, trim/clear, clear top-down fallback, OOM rollback passed");
 }

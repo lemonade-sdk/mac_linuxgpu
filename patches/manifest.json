@@ -34,6 +34,14 @@
         "drivers/gpu/buddy.c"
       ],
       "reason": "Remove a still-free block from its free tree before coalescing during allocation-failure rollback. Otherwise a range-split OOM leaves freed metadata in the tree; scripts/test-gpu-buddy.sh reproduces it as an ASan negative control. AMDGPU driver sources are unchanged."
+    },
+    {
+      "patch": "patches/linux/gpu-buddy-topdown-fallback.patch",
+      "sha256": "db8d8ac3a73e0742f296dea08b13671351bd292b2b018856e79c2c82cfd9228b",
+      "files": [
+        "drivers/gpu/buddy.c"
+      ],
+      "reason": "Honour GPU_BUDDY_TOPDOWN_ALLOCATION when a clear allocation falls back to the dirty tree. Without it amdgpu's VRAM_CLEARED top-down KFD BOs fill the low VRAM, the CPU-visible window of a 256 MiB BAR, and every CPU-access allocation must evict them; scripts/test-gpu-buddy.sh checks the placement. Drop when the pin has upstream's dirty-tracker rework of the buddy allocator."
     }
   ],
   "verified_copies": {

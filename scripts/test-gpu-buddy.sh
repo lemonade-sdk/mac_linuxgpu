@@ -9,10 +9,30 @@ from pathlib import Path
 import sys
 
 source = Path('third_party/linux/drivers/gpu/buddy.c').read_bytes()
-assert hashlib.sha256(source).hexdigest() == '4adc1739282c211826b4c5f908754343efc8c296af7c5e147b78fff3e83a0eb4'
+assert hashlib.sha256(source).hexdigest() == 'f60721fc387f687b7e9e37f221e69adae3c2813485fd5c3d1d7c170b55f630d8'
+# The pinned file, each declared patch reversed (patches/linux/): the
+# negative controls run against it.
 fix = b'\tif (gpu_buddy_block_is_free(block) && !RB_EMPTY_NODE(&block->rb))\n\t\trbtree_remove(mm, block);\n\n'
-assert source.count(fix) == 1
-original = source.replace(fix, b'', 1)
+topdown = (b'\t\tif (flags & GPU_BUDDY_TOPDOWN_ALLOCATION) {\n'
+           b'\t\t\tblock = get_maxblock(mm, order, tree);\n'
+           b'\t\t\tif (block)\n'
+           b'\t\t\t\ttmp = gpu_buddy_block_order(block);\n'
+           b'\t\t} else {\n'
+           b'\t\t\tfor (tmp = order; tmp <= mm->max_order; ++tmp) {\n'
+           b'\t\t\t\troot = &mm->free_trees[tree][tmp];\n'
+           b'\t\t\t\tblock = rbtree_last_free_block(root);\n'
+           b'\t\t\t\tif (block)\n'
+           b'\t\t\t\t\tbreak;\n'
+           b'\t\t\t}\n'
+           b'\t\t}\n')
+pinned_loop = (b'\t\tfor (tmp = order; tmp <= mm->max_order; ++tmp) {\n'
+               b'\t\t\troot = &mm->free_trees[tree][tmp];\n'
+               b'\t\t\tblock = rbtree_last_free_block(root);\n'
+               b'\t\t\tif (block)\n'
+               b'\t\t\t\tbreak;\n'
+               b'\t\t}\n')
+assert source.count(fix) == 1 and source.count(topdown) == 1
+original = source.replace(fix, b'', 1).replace(topdown, pinned_loop, 1)
 assert hashlib.sha256(original).hexdigest() == '61db573ffe054f56fd7e49253d1511ac4be1b616f8fb0395caaf23ed6ee7df95'
 Path(sys.argv[2]).write_bytes(original)
 driver = Path('third_party/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_vram_mgr.c').read_text()
@@ -42,6 +62,11 @@ clang "${common[@]}" "${heap[@]}" linuxu/tests/test_gpu_buddy.c \
   "$work/pinned-buddy.c" third_party/linux/lib/rbtree.c \
   linuxu/src/kmem/{kmemalloc,kmemcheck}.c "$work/backend.o" "$work/heap.o" \
   -Wl,-dead_strip -lpthread -o "$work/test_pinned_buddy"
+# The pinned allocator drops top-down in the clear tree's fallback: the
+# 1 MiB request takes the low block.
+"$work/test_pinned_buddy" --topdown-negative-control | grep -q "fallback took the block at 2 MiB" || {
+  echo "Pinned allocator negative control did not take the low block" >&2; exit 1; }
+echo "Pinned negative control: a clear top-down request fell back to the low block"
 python3 - "$work/test_pinned_buddy" <<'PY'
 import os
 from pathlib import Path
@@ -63,7 +88,7 @@ diagnostic = Path('build/diagnostics/gpu-buddy-negative-control.log')
 diagnostic.parent.mkdir(parents=True, exist_ok=True)
 diagnostic.write_text('Pinned drivers/gpu/buddy.c negative control\n'
                       'SHA256: 61db573ffe054f56fd7e49253d1511ac4be1b616f8fb0395caaf23ed6ee7df95\n'
-                      'Only the declared free-tree removal fix was reversed.\n'
+                      'Both declared patches were reversed.\n'
                       + point + '\n' + '\n'.join(selected) + '\n')
 print(f'Pinned negative control reproduced the expected ASan rollback UAF; {diagnostic}')
 PY

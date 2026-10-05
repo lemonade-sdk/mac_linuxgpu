@@ -1,0 +1,41 @@
+gpu/buddy: honour top-down in the fallback to the other free tree
+
+alloc_from_freetree searches top-down (get_maxblock) only in the tree the
+request names: the clear tree for a GPU_BUDDY_CLEAR_ALLOCATION. When that
+tree has no block of the order, it falls back to the other tree with the
+plain smallest-order scan, dropping GPU_BUDDY_TOPDOWN_ALLOCATION. amdgpu's
+KFD VRAM BOs are VRAM_CLEARED and top-down: with the clear tree empty they
+landed in the low VRAM, the CPU-visible window of a small-BAR card (245 of
+256 MiB held by one compute process with over 13 GB free), so every
+CPU-access allocation had to evict them. The fallback now searches the
+other tree top-down when top-down was asked for.
+
+Drop this patch when the pin picks up the dirty-tracker rework of the
+buddy allocator ("gpu/buddy: replace dual-tree/force_merge with a
+decoupled dirty tracker"), which removes the separate trees.
+
+diff --git a/drivers/gpu/buddy.c b/drivers/gpu/buddy.c
+--- a/drivers/gpu/buddy.c
++++ b/drivers/gpu/buddy.c
+@@ -820,11 +820,17 @@ alloc_from_freetree(struct gpu_buddy *mm,
+ 		tree = (tree == GPU_BUDDY_CLEAR_TREE) ?
+ 			GPU_BUDDY_DIRTY_TREE : GPU_BUDDY_CLEAR_TREE;
+ 
+-		for (tmp = order; tmp <= mm->max_order; ++tmp) {
+-			root = &mm->free_trees[tree][tmp];
+-			block = rbtree_last_free_block(root);
++		if (flags & GPU_BUDDY_TOPDOWN_ALLOCATION) {
++			block = get_maxblock(mm, order, tree);
+ 			if (block)
+-				break;
++				tmp = gpu_buddy_block_order(block);
++		} else {
++			for (tmp = order; tmp <= mm->max_order; ++tmp) {
++				root = &mm->free_trees[tree][tmp];
++				block = rbtree_last_free_block(root);
++				if (block)
++					break;
++			}
+ 		}
+ 
+ 		if (!block)
