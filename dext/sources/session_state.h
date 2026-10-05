@@ -119,6 +119,39 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_SELECTOR_RETIRE              85u
 #define MLG_SELECTOR_EVENT               86u
 #define MLG_SELECTOR_EVENT_WAIT          87u
+#define MLG_SELECTOR_OWNER_RESULT        88u
+
+/* Calls that never sleep, and every other call.
+ *
+ * DriverKit delivers every client's calls, and the driver's own Stop, on
+ * one thread. A call that sleeps there (an upstream lock, an allocation
+ * that evicts, a fence, a probe) holds them all; on a GPU that stopped it
+ * holds them forever (build 241). So only the calls
+ * mlg_call_runs_on_delivery() names (cached state, the power wait's
+ * registration) run on that thread, synchronously as always. Every other
+ * selector (the session client's whole MacAMDGPU set, InitDevice and
+ * HostWindow from any client, the observer's self-test, Retire and
+ * ReleaseQuarantine, EVENT) must be called with IOConnectCallAsync*: the
+ * call returns at once (out[0] = its token when the caller asked for any
+ * scalar output), the selector runs on the driver's session queue, in the
+ * order the calls arrived, with the same arguments, and the call completes
+ * with async data
+ *   [0] token, [1] the selector's IOReturn, [2] n, its scalar output count
+ *   (at most MLG_OWNER_ASYNC_SCALARS), [3] bytes of its structure output,
+ *   [4 .. 4+n) its scalar outputs.
+ * OWNER_RESULT, in [0] = token, returns that structure output once (struct
+ * out, sized by the caller), or kIOReturnNotFound. A synchronous call of
+ * such a selector is refused with kIOReturnNotPermitted (and logged).
+ * EVENT_WAIT keeps its own completion (above): its registration runs on
+ * the session queue, then the wait on a driver thread; a wait that does
+ * not start completes at once with [1] = -errno. SysfsRead and DrmInfo
+ * stay synchronous, bounded: the read runs on a driver thread, and the
+ * call waits at most MLG_BOUNDED_READ_MS for it (kIOReturnTimeout; while
+ * it is still running another is kIOReturnBusy). */
+#define MLG_OWNER_ASYNC_HEADER   4u
+#define MLG_OWNER_ASYNC_SCALARS  12u
+#define MLG_OWNER_ASYNC_WORDS    (MLG_OWNER_ASYNC_HEADER + MLG_OWNER_ASYNC_SCALARS)
+#define MLG_BOUNDED_READ_MS      250u
 
 /* Interrupt-driven waits on KFD signal events (a session client on the KFD
  * path; rt/kfd_session.h has the semantics).
@@ -418,6 +451,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_RUNTIME_BUILD:
 	case MLG_SELECTOR_RELEASE_QUARANTINE:
 		return true;
+	case MLG_SELECTOR_OWNER_RESULT:
+		return input && input_count == 1 && input[0];
 	case MLG_SELECTOR_RETIRE: /* entitlement-checked in the handler */
 		return mlg_retire_args_valid(input, input_count);
 	case MLG_SELECTOR_QUERY_INFO:
@@ -468,6 +503,49 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	default:
 		return false;
 	}
+}
+
+/* Whether a call of @selector with @input runs on the delivery thread
+ * itself (above): Ping, RuntimeBuild (its cached answer), the cached
+ * QueryInfo tags, the power query and the power wait's registration, and
+ * OWNER_RESULT. They read state the session queue publishes, or take only
+ * a spinlock. */
+static inline bool mlg_call_runs_on_delivery(uint64_t selector, const uint64_t *input,
+					     uint32_t input_count)
+{
+	switch (selector) {
+	case MLG_SELECTOR_PING:
+	case MLG_SELECTOR_RUNTIME_BUILD:
+		return true;
+	case MLG_SELECTOR_OWNER_RESULT:
+		return input && input_count == 1 && input[0];
+	case MLG_SELECTOR_QUERY_INFO:
+		if (!input || !input_count)
+			return false;
+		return (input[0] == MLG_QUERY_PROBE_STATUS && input_count == 1) ||
+		       (input[0] == MLG_QUERY_SESSION_STATE && input_count == 1) ||
+		       (input[0] == MLG_QUERY_POWER_STATE && input_count == 1) ||
+		       (input[0] == MLG_QUERY_KERNEL_LOG && input_count == 2);
+	case MLG_SELECTOR_POWER:
+		return input && input_count >= 1 &&
+		       (input[0] == MLG_POWER_OP_QUERY || input[0] == MLG_POWER_OP_WAIT);
+	default:
+		return false;
+	}
+}
+
+/* Whether a client calls @selector with @input synchronously: those that
+ * run on the delivery thread, the bounded reads (SysfsRead, DrmInfo), and
+ * the display's PRESENT and RESULT. Every other call is async. */
+static inline bool mlg_call_is_synchronous(uint64_t selector, const uint64_t *input,
+					   uint32_t input_count)
+{
+	if (mlg_call_runs_on_delivery(selector, input, input_count))
+		return true;
+	if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
+		return true;
+	return selector == MLG_SELECTOR_DISPLAY && input && input_count >= 1 &&
+	       (input[0] == MLG_DISPLAY_OP_PRESENT || input[0] == MLG_DISPLAY_OP_RESULT);
 }
 
 #endif

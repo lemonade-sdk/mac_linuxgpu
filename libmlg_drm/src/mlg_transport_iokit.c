@@ -12,6 +12,7 @@
 #include <mach/mach.h>
 
 #include "mlg_transport.h"
+#include "selector_call.h"
 #include <rt/lx_abi.h>
 
 /* MacAMDGPU selector numbers the Linux-file client also takes (and
@@ -105,7 +106,9 @@ static int scalar(uint32_t selector, const uint64_t *in, uint32_t nin, uint64_t 
 
 	if (r)
 		return r;
-	return from_ioreturn(IOConnectCallScalarMethod(c, selector, in, nin, out, out ? &n : NULL));
+	/* HostWindow and InitDevice can sleep: async session calls. */
+	return from_ioreturn(mlg_selector_call(c, selector, in, nin, NULL, 0, out,
+					       out ? &n : NULL, NULL, NULL));
 }
 
 static int scalar_call(void *ctx, uint32_t selector, const uint64_t *in, uint32_t nin,
@@ -248,7 +251,9 @@ static int call_async(io_connect_t c, uint32_t selector, const uint64_t *in, uin
 		return r;
 	if (w->status != kIOReturnSuccess)
 		return w->status == kIOReturnAborted ? -MLG_LX_EINTR : from_ioreturn(w->status);
-	if (w->nargs < 3 || w->args[0] != *token)
+	/* Token 0: a client's first call, which joins the session before its
+	 * operation gets a token of its own. */
+	if (w->nargs < 3 || (*token && w->args[0] != *token))
 		return -5;	/* EIO */
 	return 0;
 }

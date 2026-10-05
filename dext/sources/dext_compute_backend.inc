@@ -84,6 +84,10 @@ static struct {
     bool removed;
     bool legacy_queues;	/* the queue partition left a legacy HQD */
     bool kfd_disabled;	/* policy: never open KFD sessions */
+    /* Whether the context serves AQL or KFD queues, set on the session
+     * queue when it opens, so RuntimeBuild answers on any thread without
+     * touching the context (dext_compute_runtime_build_cached). */
+    bool runtime_available;
 } production;
 
 uint64_t dext_compute_select_client(uint64_t client)
@@ -134,9 +138,18 @@ static struct production_client *client_record(uint64_t client, bool create)
     return empty;
 }
 
+static void runtime_available_update(void)
+{
+    __atomic_store_n(&production.runtime_available, production.ctx &&
+                     (dext_aql_available(production.ctx) == 0 ||
+                      (!production.kfd_disabled && dext_kfd_supported(production.ctx) == 0)),
+                     __ATOMIC_RELEASE);
+}
+
 void dext_compute_set_kfd_policy(bool enabled)
 {
     production.kfd_disabled = !enabled;
+    runtime_available_update();
 }
 
 int dext_compute_client_identity(uint64_t client, int pid, const char *comm)
@@ -445,6 +458,7 @@ int dext_compute_start(struct pci_dev *pdev)
     production.properties = properties;
     production.ready = true;
     production.uncertain = false;
+    runtime_available_update();
     return 0;
 }
 
@@ -458,6 +472,7 @@ int dext_compute_stop(void)
     if (production.uncertain && !production.uncertain_kfd_only && !production.removed)
         return -EBUSY_L;
     production.ready = false;
+    __atomic_store_n(&production.runtime_available, false, __ATOMIC_RELEASE);
     /* KFD processes first: their queues leave MES and their memory is
      * freed before the kernel BOs and the context go. */
     {
@@ -544,7 +559,11 @@ int dext_compute_runtime_build_cached(uint64_t *out)
         return -EINVAL_L;
     out[0] = DEXT_RUNTIME_MAGIC;
     out[1] = DEXT_RUNTIME_ABI;
-    out[2] = production.ready && !production.uncertain && production.ctx ?
+    /* Flags the session queue publishes: never the context itself, which
+     * may be closing on that queue. */
+    out[2] = __atomic_load_n(&production.ready, __ATOMIC_ACQUIRE) &&
+             !__atomic_load_n(&production.uncertain, __ATOMIC_ACQUIRE) &&
+             __atomic_load_n(&production.runtime_available, __ATOMIC_ACQUIRE) ?
              DEXT_RUNTIME_BUILD : 0;
     out[3] = DEXT_RUNTIME_BUILD;
     return 0;

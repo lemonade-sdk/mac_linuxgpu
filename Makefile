@@ -874,6 +874,22 @@ test-display-async:
 test: test-display-async
 .PHONY: test-display-async
 
+# Session calls off the delivery thread (dext/sources/MacLinuxGPUXcode.mm
+# owner_call), and the bounded reads' runtime (rt/bounded.h).
+test-owner-call:
+	bash scripts/test-owner-call.sh
+
+test-bounded:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -std=gnu11 -g -O1 -w -fsanitize=address,undefined -D__KERNEL__ -include linux/autoconf.h \
+		-Ilinuxu/headers linuxu/tests/test_bounded.c linuxu/src/amdgpu-rt/bounded.c \
+		linuxu/src/amdgpu-rt/wait_pool.c linuxu/src/shims/timekeeping.c -Wl,-dead_strip -lpthread \
+		-o $(BUILD)/tests/test_bounded
+	$(BUILD)/tests/test_bounded
+
+test: test-owner-call test-bounded
+.PHONY: test-owner-call test-bounded
+
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh
 
@@ -1118,7 +1134,7 @@ MLG_DRM_BUILD := $(BUILD)/libmlg_drm
 MLG_DRM_SRCS := libmlg_drm/src/mlg_drm.c libmlg_drm/src/mlg_transport_iokit.c libmlg_drm/src/mlg_init.c \
 	linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c
 MLG_DRM_OBJS := $(addprefix $(MLG_DRM_BUILD)/,$(notdir $(MLG_DRM_SRCS:.c=.o)))
-MLG_DRM_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -MMD -MP -DMLG_LX_CLIENT_BUILD \
+MLG_DRM_CFLAGS := -std=c11 -Wall -Wextra -Werror -O2 -fPIC -MMD -MP -DMLG_LX_CLIENT_BUILD -Ihost \
 	-Ilibmlg_drm/include -Ilibmlg_drm/compat -Ilibmlg_drm/src \
 	-I$(LINUX)/include/uapi -idirafter linuxu/headers
 

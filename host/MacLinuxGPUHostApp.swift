@@ -971,13 +971,12 @@ final class MacLinuxGPUHost {
         let inCount = UInt32(inScalars.count)
         var outBuf = [UInt64](repeating: 0, count: max(1, outScalars))
         var outN = UInt32(outBuf.count)
+        // As the driver serves it: synchronous when it never sleeps, else an
+        // async session call awaited here (host/selector_call.h).
         let kr: kern_return_t = inScalars.withUnsafeBufferPointer { ibuf in
             outBuf.withUnsafeMutableBufferPointer { obuf in
-                IOConnectCallScalarMethod(ucConn, selector,
-                                          ibuf.baseAddress,
-                                          inCount,
-                                          obuf.baseAddress,
-                                          &outN)
+                mlg_selector_call(ucConn, selector, ibuf.baseAddress, inCount, nil, 0,
+                                  obuf.baseAddress, &outN, nil, nil)
             }
         }
         return (kr, Array(outBuf.prefix(Int(outN))))
@@ -995,14 +994,12 @@ final class MacLinuxGPUHost {
         let kr: kern_return_t = outData.withUnsafeMutableBytes { outPtr -> kern_return_t in
             if let inData = inData {
                 return inData.withUnsafeBytes { inPtr in
-                    IOConnectCallStructMethod(ucConn, selector,
-                                              inPtr.baseAddress, inSize,
-                                              outPtr.baseAddress, &outCnt)
+                    mlg_selector_call(ucConn, selector, nil, 0, inPtr.baseAddress, inSize,
+                                      nil, nil, outPtr.baseAddress, &outCnt)
                 }
             } else {
-                return IOConnectCallStructMethod(ucConn, selector,
-                                                 nil, 0,
-                                                 outPtr.baseAddress, &outCnt)
+                return mlg_selector_call(ucConn, selector, nil, 0, nil, 0,
+                                         nil, nil, outPtr.baseAddress, &outCnt)
             }
         }
         return (kr, outData.prefix(Int(min(outCnt, size_t(max(0, outSize))))))
@@ -1366,9 +1363,9 @@ extension MacLinuxGPUHost {
             outBuf.withUnsafeMutableBufferPointer { obuf in
                 outData.withUnsafeMutableBytes { optr in
                     inData.withUnsafeBytes { iptr in
-                        IOConnectCallMethod(ucConn, selector, ibuf.baseAddress, UInt32(inScalars.count),
-                                            inData.isEmpty ? nil : iptr.baseAddress, inData.count,
-                                            obuf.baseAddress, &outN, optr.baseAddress, &outCnt)
+                        mlg_selector_call(ucConn, selector, ibuf.baseAddress, UInt32(inScalars.count),
+                                          inData.isEmpty ? nil : iptr.baseAddress, inData.count,
+                                          obuf.baseAddress, &outN, optr.baseAddress, &outCnt)
                     }
                 }
             }

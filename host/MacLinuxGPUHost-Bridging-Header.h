@@ -5,3 +5,6 @@
 #include "CGVirtualDisplayPrivate.h"
 /* Darwin notifications between the display daemon and the menu bar. */
 #include <notify.h>
+/* Selectors as the driver serves them: synchronous when they never sleep,
+ * else async session calls awaited on the calling thread. */
+#include "selector_call.h"

@@ -34,6 +34,9 @@ import struct
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mlg_owner_call import OwnerCall  # noqa: E402
+
 SESSION_CLIENT, OBSERVER_CLIENT = 0, 1
 RUNTIME_BUILD, INIT_DEVICE = 43, 9
 SYSFS_READ = 80                # MLG_SELECTOR_SYSFS_READ
@@ -287,8 +290,8 @@ def connect(init=False):
         count = c.c_uint(3)
         result = io.IOConnectCallScalarMethod(session, RUNTIME_BUILD, None, 0, build, c.byref(count))
         if not result:
-            count = c.c_uint(0)
-            result = io.IOConnectCallScalarMethod(session, INIT_DEVICE, None, 0, None, c.byref(count))
+            # InitDevice can sleep: an async session call (session_state.h).
+            result, _, _ = OwnerCall(session.value)(INIT_DEVICE, [])
         if result:
             io.IOServiceClose(session)
             io.IOServiceClose(port)
