@@ -11,8 +11,8 @@ namespace mac_hsa {
 namespace {
 // The single shared fake connection, so tests can reach observability
 // accessors after discover_fake. Set by discover_fake.
-std::mutex g_fakeMutex;
-std::shared_ptr<FakeConnection> g_fake;
+std::mutex &g_fakeMutex = *new std::mutex;
+std::shared_ptr<FakeConnection> &g_fake = *new std::shared_ptr<FakeConnection>;
 }
 
 FakeConnection::FakeConnection() : FakeConnection(FakeDeviceConfig{}) {}

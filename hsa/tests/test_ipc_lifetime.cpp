@@ -7,10 +7,10 @@
 #include <unistd.h>
 
 namespace mac_hsa::detail {
-std::mutex runtimeMutex;
+std::mutex &runtimeMutex = *new std::mutex;  // runtime_state.h: process-lifetime state
 uint32_t references = 1;
-std::vector<Agent> agents;
-std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
+std::vector<Agent> &agents = *new std::vector<Agent>;
+std::map<uintptr_t, std::shared_ptr<Allocation>> &allocations = *new std::map<uintptr_t, std::shared_ptr<Allocation>>;
 Agent *findAgent(hsa_agent_t handle) {
     for (auto &agent : agents) if (agent.handle.handle == handle.handle) return &agent;
     return nullptr;

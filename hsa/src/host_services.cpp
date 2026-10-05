@@ -7,11 +7,11 @@
 namespace mac_hsa::detail {
 namespace {
 struct Cache { uint64_t id; hsa_agent_t agent; uint8_t level; uint32_t size; std::string name; };
-std::vector<Cache> caches;
+std::vector<Cache> &caches = *new std::vector<Cache>;
 bool cacheDiscovery = false;
 struct LockRange { uintptr_t begin, end; size_t size; };
-std::map<uintptr_t, uint64_t> lockedPages;
-std::map<uintptr_t, std::vector<LockRange>> lockedRanges;
+std::map<uintptr_t, uint64_t> &lockedPages = *new std::map<uintptr_t, uint64_t>;
+std::map<uintptr_t, std::vector<LockRange>> &lockedRanges = *new std::map<uintptr_t, std::vector<LockRange>>;
 
 hsa_status_t lockHost(void *pointer, size_t size, hsa_agent_t *requested, int count,
     const hsa_amd_memory_pool_t *poolHandle, uint32_t flags, void **out) {

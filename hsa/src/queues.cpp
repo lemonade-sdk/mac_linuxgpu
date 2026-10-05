@@ -149,7 +149,7 @@ static bool pausedNow(const std::weak_ptr<RuntimeQueue> &weak) {
     return queue && queue->paused.load();
 }
 namespace {
-RetiredQueueSet queues;
+RetiredQueueSet &queues = *new RetiredQueueSet;
 std::shared_ptr<RuntimeQueue> findQueue(const hsa_queue_t *pointer) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return {};

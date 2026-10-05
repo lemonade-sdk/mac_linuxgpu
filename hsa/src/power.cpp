@@ -8,8 +8,8 @@
 
 namespace mac_hsa::detail {
 namespace {
-std::mutex heldMutex;
-std::set<const Connection *> held;
+std::mutex &heldMutex = *new std::mutex;
+std::set<const Connection *> &held = *new std::set<const Connection *>;
 
 std::shared_ptr<Connection> agentConnection(hsa_agent_t agent, hsa_status_t &status) {
     std::lock_guard lock(runtimeMutex);

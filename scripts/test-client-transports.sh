@@ -64,9 +64,11 @@ for source in hsa/src/runtime.cpp hsa/src/gpu_signals.cpp hsa/src/gpu_signal_ser
 done
 clang++ -std=c++20 -fblocks -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter \
   -Wno-unused-variable -Wno-missing-field-initializers "${sanitize[@]}" -include "$fake" \
-  -I"$test_dir" -Idext/sources -Ihost -Ilibmlg_drm/include -Ihsa/third_party/hsa/include -idirafter linuxu/headers \
+  -I"$test_dir" -Idext/sources -Ihost -Ilibmlg_drm/include -Ihsa/include -Ihsa/src -Ihsa/third_party/hsa/include -idirafter linuxu/headers \
   -c linuxu/tests/test_client_transports.cpp -o "$test_dir/test_client_transports.o"
 clang++ "${sanitize[@]}" "$test_dir/test_client_transports.o" "${objects[@]}" \
   -framework IOKit -framework CoreFoundation -lpthread -o "$test_dir/test_client_transports"
-"$test_dir/test_client_transports"
 [ -n "${CLIENT_TRANSPORTS_KEEP:-}" ] && cp "$test_dir/test_client_transports" "$CLIENT_TRANSPORTS_KEEP" || true
+"$test_dir/test_client_transports"
+# An HSA client exiting with everything loaded: status 0, no abort in exit().
+"$test_dir/test_client_transports" exit-loaded

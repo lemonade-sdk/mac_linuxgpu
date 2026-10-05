@@ -10,7 +10,7 @@
 #include <unistd.h>
 
 namespace mac_hsa::detail {
-std::recursive_mutex executableLifecycleMutex;
+std::recursive_mutex &executableLifecycleMutex = *new std::recursive_mutex;
 struct CodeReader {
     std::vector<uint8_t> bytes;
     std::string path;
@@ -40,10 +40,10 @@ struct ExecutableSymbol {
     std::shared_ptr<LoadedImage> image;
     size_t kernelIndex = 0;
 };
-std::unordered_map<uint64_t, std::shared_ptr<Executable>> executables;
-std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> executableSymbols;
-std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> codeReaders;
-static std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>> loadedImages;
+std::unordered_map<uint64_t, std::shared_ptr<Executable>> &executables = *new std::unordered_map<uint64_t, std::shared_ptr<Executable>>;
+std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> &executableSymbols = *new std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>>;
+std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> &codeReaders = *new std::unordered_map<uint64_t, std::shared_ptr<CodeReader>>;
+static std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>> &loadedImages = *new std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>>;
 void clearLoadedImages() { loadedImages.clear(); }
 
 static std::string readerURI(const CodeReader &reader) {

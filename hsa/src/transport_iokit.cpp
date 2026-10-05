@@ -28,11 +28,76 @@
 #include <thread>
 #include <unordered_map>
 
+// A session client cannot attach while the driver closes a session, retires
+// or stops: NewUserClient refuses it with kIOReturnNotAttached. Ask an
+// observer (which may attach then) why, wait while a close is in progress,
+// and fail with a status that says what is wrong rather than an invalid
+// agent: kDeviceLostStatus for a session that will not close (quarantine,
+// restart required, wedged GPU, device removed), HSA_STATUS_ERROR_RESOURCE_BUSY
+// (kDeviceSuspendedStatus's value: busy, retry) for a retiring driver or a
+// close still running at the bound.
+static uint64_t sessionFlags(io_service_t service) {
+    io_connect_t observer = IO_OBJECT_NULL;
+    if (IOServiceOpen(service, mach_task_self(), MLG_USER_CLIENT_OBSERVER, &observer) != KERN_SUCCESS)
+        return 0;
+    const uint64_t tag = MLG_QUERY_SESSION_STATE;
+    uint64_t state[MLG_SESSION_STATE_WORDS] = {};
+    uint32_t count = MLG_SESSION_STATE_WORDS;
+    const auto kr = IOConnectCallScalarMethod(observer, MLG_SELECTOR_QUERY_INFO, &tag, 1, state, &count);
+    IOServiceClose(observer);
+    return kr == KERN_SUCCESS && count >= 2 && state[0] >= 1 ? state[1] : 0;
+}
+static uint32_t sessionCloseWaitMs() {
+    const char *value = std::getenv("MAC_HSA_SESSION_CLOSE_WAIT_MS");
+    if (!value || !*value) return 60000;
+    return uint32_t(std::strtoul(value, nullptr, 10));
+}
+static hsa_status_t openSessionClient(io_service_t service, io_connect_t &port) {
+    auto kr = IOServiceOpen(service, mach_task_self(), 0, &port);
+    if (kr == KERN_SUCCESS) return HSA_STATUS_SUCCESS;
+    if (kr != kIOReturnNotAttached) return HSA_STATUS_ERROR_INVALID_AGENT;
+    const uint32_t boundMs = sessionCloseWaitMs();
+    const auto start = std::chrono::steady_clock::now();
+    bool reported = false;
+    for (;;) {
+        const uint64_t flags = sessionFlags(service);
+        if (flags & (MLG_SESSION_FLAG_QUARANTINED | MLG_SESSION_FLAG_RESTART_REQUIRED |
+                     MLG_SESSION_FLAG_GPU_WEDGED | MLG_SESSION_FLAG_DEVICE_REMOVED)) {
+            std::fprintf(stderr, "mac_linuxgpu: the driver's last session did not close cleanly "
+                "(session flags %#llx); the GPU needs the driver restarted or a power cycle\n",
+                (unsigned long long)flags);
+            return mac_hsa::kDeviceLostStatus;
+        }
+        if (flags & MLG_SESSION_FLAG_RETIRING) {
+            std::fprintf(stderr, "mac_linuxgpu: the driver is being retired (an upgrade): no new "
+                "session until the new driver runs\n");
+            return mac_hsa::kDeviceSuspendedStatus;  // HSA_STATUS_ERROR_RESOURCE_BUSY
+        }
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (waited >= boundMs) {
+            std::fprintf(stderr, "mac_linuxgpu: the driver is still closing a session after %.1f s "
+                "(session flags %#llx); retry when it has closed\n", boundMs / 1000.0,
+                (unsigned long long)flags);
+            return mac_hsa::kDeviceSuspendedStatus;  // HSA_STATUS_ERROR_RESOURCE_BUSY
+        }
+        if (!reported) {
+            reported = true;
+            std::fprintf(stderr, "mac_linuxgpu: the driver is closing a session; waiting for it "
+                "(up to %.1f s)\n", boundMs / 1000.0);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        kr = IOServiceOpen(service, mach_task_self(), 0, &port);
+        if (kr == KERN_SUCCESS) return HSA_STATUS_SUCCESS;
+        if (kr != kIOReturnNotAttached) return HSA_STATUS_ERROR_INVALID_AGENT;
+    }
+}
+
 // Whether each open connection's driver serves session calls async
 // (host/selector_call.h): checked on its first async call, forgotten when
 // it closes.
-static std::mutex sessionCallProtocolsLock;
-static std::unordered_map<io_connect_t, int> sessionCallProtocols;
+static std::mutex &sessionCallProtocolsLock = *new std::mutex;
+static std::unordered_map<io_connect_t, int> &sessionCallProtocols = *new std::unordered_map<io_connect_t, int>;
 
 static kern_return_t closeConnection(io_connect_t port) {
     {
@@ -650,8 +715,10 @@ public:
             return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         // Probe before claiming: a stale token must not initialize/reset a GPU.
         io_connect_t probe = ownerPort;
-        if (!probe && IOServiceOpen(service, mach_task_self(), 0, &probe) != KERN_SUCCESS)
-            return HSA_STATUS_ERROR_INVALID_AGENT;
+        if (!probe) {
+            if (const auto opened = openSessionClient(service, probe); opened != HSA_STATUS_SUCCESS)
+                return opened;
+        }
         std::array<uint64_t, 3> build{}; uint64_t tag = 4, stage = 0;
         auto status = call(probe, 43, nullptr, 0, build.data(), 3);
         if (status == HSA_STATUS_SUCCESS) status = call(probe, 21, &tag, 1, &stage, 1);
@@ -1118,8 +1185,8 @@ private:
     hsa_status_t ensureReady(bool allowInitialize = true) {
         if (state == State::Ready) return HSA_STATUS_SUCCESS;
         if (state != State::Unclaimed) return HSA_STATUS_ERROR;
-        if (IOServiceOpen(service, mach_task_self(), 0, &ownerPort) != KERN_SUCCESS)
-            return HSA_STATUS_ERROR_INVALID_AGENT;
+        if (const auto opened = openSessionClient(service, ownerPort); opened != HSA_STATUS_SUCCESS)
+            return opened;
         state = State::Initializing;
         if (linuxShim) {
             initializationTransportFailure = {};
@@ -1416,8 +1483,10 @@ public:
         // A registry reference does not keep a user client connected. Each probe
         // closes before returning, so idle discovery cannot block owner shutdown.
         io_connect_t port = ownerPort;
-        if (!port && IOServiceOpen(service, mach_task_self(), 0, &port) != KERN_SUCCESS)
-            return HSA_STATUS_ERROR_INVALID_AGENT;
+        if (!port) {
+            if (const auto opened = openSessionClient(service, port); opened != HSA_STATUS_SUCCESS)
+                return opened;
+        }
         struct Close { io_connect_t port; ~Close() { if (port) closeConnection(port); } } close{ownerPort ? 0 : port};
         uint64_t identity[3]{};
         auto status = call(port, 43, nullptr, 0, identity, 3);

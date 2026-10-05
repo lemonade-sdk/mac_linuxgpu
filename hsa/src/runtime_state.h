@@ -51,23 +51,30 @@ struct CopyJob {
     std::jthread worker;
 };
 
-extern std::mutex runtimeMutex;
-extern std::recursive_mutex executableLifecycleMutex;
+/* The runtime's process-wide state lives until the process ends and is
+ * never destroyed: a client may exit with executables, queues and buffers
+ * still loaded (without hsa_shut_down), and destroying them from static
+ * destructors would free GPU memory through connections and mutexes that
+ * other translation units' destructors have already finalized (build 246
+ * aborted every LSE run in exit() so). The driver reclaims what a client
+ * held when its connection closes with the process. */
+extern std::mutex &runtimeMutex;
+extern std::recursive_mutex &executableLifecycleMutex;
 void clearLoadedImages(); // caller holds runtimeMutex and executableLifecycleMutex
 hsa_status_t loaderExtensionTable(size_t size, void *table);
 extern uint32_t references;
 extern uint64_t lastHandle;
-extern std::vector<Agent> agents;
-extern std::unordered_map<uint64_t, std::shared_ptr<Signal>> signals;
-extern std::vector<Pool> pools;
-extern std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
-extern std::vector<std::unique_ptr<CopyJob>> copyJobs;
+extern std::vector<Agent> &agents;
+extern std::unordered_map<uint64_t, std::shared_ptr<Signal>> &signals;
+extern std::vector<Pool> &pools;
+extern std::map<uintptr_t, std::shared_ptr<Allocation>> &allocations;
+extern std::vector<std::unique_ptr<CopyJob>> &copyJobs;
 struct Executable;
 struct ExecutableSymbol;
 struct CodeReader;
-extern std::unordered_map<uint64_t, std::shared_ptr<Executable>> executables;
-extern std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> executableSymbols;
-extern std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> codeReaders;
+extern std::unordered_map<uint64_t, std::shared_ptr<Executable>> &executables;
+extern std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> &executableSymbols;
+extern std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> &codeReaders;
 
 // Caller holds runtimeMutex. IDs are never reused across runtime sessions.
 Agent *findAgent(hsa_agent_t handle);
