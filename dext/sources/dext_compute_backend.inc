@@ -1541,8 +1541,6 @@ int dext_compute_shutdown(uint64_t *out)
     return r;
 }
 
-int dext_compute_get_rebar(uint64_t bar, uint64_t *out)
-{ (void)bar; (void)out; return -ENOTREADY_L; }
 int dext_compute_host_mem_test(uint64_t size, uint64_t *out)
 { (void)size; (void)out; return -ENOTREADY_L; }
 int dext_compute_wait_fence(uint64_t handle, uint64_t timeout_ns,

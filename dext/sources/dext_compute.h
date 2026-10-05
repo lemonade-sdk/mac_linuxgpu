@@ -3,7 +3,7 @@
  * T-dext-userclient-seam: the userspace HSA runtime (hsa/ libhsa-runtime64.dylib)
  * talks to the dext over the IOKit user-client selector RPC.  The compute
  * selectors (RuntimeBuild=43, QueryInfo=21, BO*=16-18/36, AQLQueue*=56-59,
- * AQLDispatch=55, HostWindow=54, ShutdownGPU=42, GetReBARInfo=41,
+ * AQLDispatch=55, HostWindow=54, ShutdownGPU=42,
  * HostMemoryTest=44, WaitFence=20, SubmitIB=19, CS*=37-39) all route to the
  * functions declared here.  The selector bodies in MacLinuxGPUXcode.mm read
  * their IOUserClientMethodArguments in the reference's layout and call these.
@@ -225,8 +225,6 @@ int dext_compute_host_window(uint64_t configure, uint64_t *out /* 3 */);
 /* ShutdownGPU (42): out status/phase (phase 6 = complete). */
 int dext_compute_shutdown(uint64_t *out /* 2 */);
 
-/* GetReBARInfo (41): in bar, out offset/cap/ctl/supported/selected/assigned. */
-int dext_compute_get_rebar(uint64_t bar, uint64_t *out /* 6 */);
 
 /* HostMemoryTest (44): in size, out 6 scalars. */
 int dext_compute_host_mem_test(uint64_t size, uint64_t *out /* 6 */);

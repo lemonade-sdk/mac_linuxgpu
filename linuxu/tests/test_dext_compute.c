@@ -315,8 +315,6 @@ static void test_shutdown_and_notready(void)
     uint64_t out[32];
     int r = dext_compute_host_window(0, out);
     CHECK(r == -ENOTREADY_L, "host_window not ready (no stage)");
-    r = dext_compute_get_rebar(0, out);
-    CHECK(r == -ENOTREADY_L, "get_rebar not ready (no pci_open)");
     r = dext_compute_host_mem_test(1024, out);
     CHECK(r == -ENOTREADY_L, "host_mem_test not ready (no pci_open)");
 

@@ -3,7 +3,7 @@
  * The userspace HSA runtime (hsa/ libhsa-runtime64.dylib) talks to the dext
  * over the IOKit user-client selector RPC (MacLinuxGPUUserClient::ExternalMethod).
  * The COMPUTE selectors (RuntimeBuild=43, QueryInfo=21, BO*=16-18/36, AQLQueue*=56-59,
- * AQLDispatch=55, HostWindow=54, ShutdownGPU=42, GetReBARInfo=41, HostMemoryTest=44,
+ * AQLDispatch=55, HostWindow=54, ShutdownGPU=42, HostMemoryTest=44,
  * WaitFence=20, SubmitIB=19, CS*=37-39, ...) all route to this seam.
  *
  * The DriverKit build routes operations to the probed upstream AMDGPU device
@@ -641,21 +641,6 @@ int dext_compute_shutdown(uint64_t *out /* 2 */)
     out[0] = status; out[1] = phase;
     /* Reset the compute state (discard session). */
     dext_compute_reset();
-    return 0;
-}
-
-/* GetReBARInfo (41): in bar, out offset/capability/control/supported/selected/assigned. */
-int dext_compute_get_rebar(uint64_t bar, uint64_t *out /* 6 */)
-{
-    if (!out || bar >= 6)
-        return -EINVAL_L;
-    if (!g_compute.pci_open)
-        return -ENOTREADY_L;
-    if (!g_compute_gpu_op_hook)
-        return -ENOTREADY_L; /* ReBAR needs the IOPCIDevice config space */
-    uint64_t args[1] = { bar };
-    if (g_compute_gpu_op_hook(9, args, out, sizeof(uint64_t) * 6) != 0)
-        return -ENOTREADY_L;
     return 0;
 }
 

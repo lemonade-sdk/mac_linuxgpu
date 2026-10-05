@@ -22,7 +22,7 @@ driver_stop = section("kern_return_t\nIMPL(MacLinuxGPU, Stop)", "void\nMacLinuxG
 finish = section("void\nMacLinuxGPU::FinishSession()", "void\nMacLinuxGPU::FinishStop(IOService *provider)", 100)
 lx_finish = section("static bool session_leave_closes(bool participant, bool legacyClient);\n", "// The client's process exits (async calls return", 40)
 client_stop = section("kern_return_t\nIMPL(MacLinuxGPUUserClient, Stop)", "void\nMacLinuxGPUUserClient::FinishStop(IOService *provider)", 120)
-shutdown = section("    case kMacAMDGPUMethodShutdownGPU: {", "    case kMacAMDGPUMethodGetReBARInfo: {", 40)
+shutdown = section("    case kMacAMDGPUMethodShutdownGPU: {", "    case kMacAMDGPUMethodHostMemoryTest: {", 40)
 probe_failure = section("        if (s_probeResult != 0) {", '        MACLINUXGPU_EVENT("upstream AMDGPU PCI probe completed");', 20)
 wrapper = """
 kern_return_t MacLinuxGPUUserClient::shutdown(IOUserClientMethodArguments *arguments)

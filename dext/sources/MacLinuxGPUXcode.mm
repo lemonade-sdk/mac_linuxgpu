@@ -146,7 +146,7 @@ enum {
     kMacAMDGPUMethodCSDestroy         = 39,
     // v0.1.29 — per-state GFXCLK soft-clamp (scalarInput[0] selects the state).
     kMacAMDGPUMethodSetPowerState      = 40,
-    kMacAMDGPUMethodGetReBARInfo       = 41, // read-only PCIe capability query
+    kMacAMDGPUMethodGetReBARInfo       = 41, // retired: never implemented (Unsupported)
     kMacAMDGPUMethodShutdownGPU        = 42, // reset, close PCI, discard session
     kMacAMDGPUMethodRuntimeBuild       = 43, // actual responding binary, no HW access
     kMacAMDGPUMethodHostMemoryTest     = 44, // data-verified SDMA transfers via GART
@@ -4963,21 +4963,6 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
-    case kMacAMDGPUMethodGetReBARInfo: {
-        // in[0]=bar; out[0..5]=offset/cap/ctl/supported/selected/assigned
-        if (arguments->scalarInput == nullptr || arguments->scalarInputCount != 1 ||
-            arguments->scalarInput[0] >= 6 ||
-            arguments->scalarOutput == nullptr || arguments->scalarOutputCount < 6)
-            return kIOReturnBadArgument;
-        uint64_t out[6] = {0};
-        int r = dext_compute_get_rebar(arguments->scalarInput[0], out);
-        if (r == -ENOTREADY_L) return kIOReturnNotReady;
-        if (r != 0) return kIOReturnBadArgument;
-        for (int i = 0; i < 6; i++) arguments->scalarOutput[i] = out[i];
-        arguments->scalarOutputCount = 6;
-        return kIOReturnSuccess;
-    }
-
     case kMacAMDGPUMethodHostMemoryTest: {
         // in[0]=size; out[0..5]=status/stage/mismatches/first/host_gpu/vram_gpu
         if (arguments->scalarInput == nullptr || arguments->scalarInputCount < 1 ||
@@ -5301,6 +5286,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     case kMacAMDGPUMethodSetIPBase:
     case kMacAMDGPUMethodGetIPBase:
     case kMacAMDGPUMethodLoadDiscoveryBin:
+    case kMacAMDGPUMethodGetReBARInfo:  // retired: macOS fixes BAR sizes; never implemented
     case kMacAMDGPUMethodSubmitTestPM4:
     case kMacAMDGPUMethodSDMACopyTest:
     case kMacAMDGPUMethodGetDiagnostics:
