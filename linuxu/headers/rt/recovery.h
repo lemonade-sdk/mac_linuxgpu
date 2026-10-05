@@ -7,24 +7,26 @@
  * (amdgpu_device_gpu_recover: a mode1 reset on gfx12). KFD and user queues
  * request device resets too (kfd.reset_work, userq_reset_work).
  *
- * A device reset needs platform work this runtime does not do yet over
- * Thunderbolt (the PCI configuration's restore with its BARs, MSI-X,
- * client BAR mappings during the reset window). Until it does
- * (rt_recovery_full_reset_available), every request for one wedges the
- * device instead, which is what Linux ends in when a reset fails:
+ * A device reset runs only when the platform allows it
+ * (rt_recovery_set_full_reset_gate: the PCI configuration's restore puts
+ * the BARs and MSI-X back, and no client may store into a BAR while it
+ * stops decoding). It is bounded (AMDGPU_MAX_RETRY_LIMIT ASIC resets per
+ * recovery), and one that fails wedges the device, as does every request
+ * for one the platform refuses. The wedge is what Linux ends in when a
+ * reset fails:
  *   - the DRM device is unplugged for drm_dev_enter, so new requests fail
  *     with -ENODEV;
  *   - no hardware access (adev->no_hw_access), bus mastering off;
  *   - every ring's fences complete with -ECANCELED, and keep completing
  *     (the halt thread), so no wait on the GPU outlives the wedge;
  *   - the state says wedged until the GPU is power-cycled.
- * Queue resets run as upstream runs them, and each one that succeeds
- * advances the reset generation.
+ * Queue resets run as upstream runs them; each one that succeeds, each
+ * device reset that succeeds (VRAM lost or not), and the wedge advance
+ * the reset generation.
  *
  * rt_recovery_attach hooks this in after the probe: each scheduler's
- * timeout handler and each queue reset are wrapped (upstream's handlers
- * run unchanged inside), and the device-reset works are redirected to the
- * wedge. Every recovery handler runs on the reset domain's one ordered
+ * timeout handler, each queue reset, the ASIC reset and the KFD and user
+ * queue reset works are wrapped (upstream's run unchanged inside). Every recovery handler runs on the reset domain's one ordered
  * work queue, so they never run concurrently. Runtime:
  * linuxu/src/amdgpu-rt/recovery.c. */
 #ifndef LINUXU_RT_RECOVERY_H
@@ -62,6 +64,11 @@ void rt_recovery_detach_pdev(struct pci_dev *pdev);
 void rt_recovery_state(struct rt_recovery_state *out);
 /* Whether a device reset may run (false: such a request wedges). */
 bool rt_recovery_full_reset_available(void);
+/* The platform's say on device resets: @gate returns NULL when one may run
+ * now, or why not (logged with the wedge). With no gate (the default) none
+ * may. The driver's gate refuses while device resets are not enabled for
+ * this device, or while a client maps one of its BARs. */
+void rt_recovery_set_full_reset_gate(const char *(*gate)(void));
 /* Wedge @adev now (above), with @why logged. Idempotent. */
 void rt_recovery_wedge(struct amdgpu_device *adev, const char *why);
 /* Called once per change of the state (a reset, the wedge), on the

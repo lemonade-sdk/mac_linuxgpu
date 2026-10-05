@@ -48,6 +48,10 @@ int main(int argc, char **argv)
 		wedge_check(pdev);
 		return 0;
 	}
+	if (argc > 1 && !strcmp(argv[1], "device-reset")) {
+		device_reset_check(pdev);
+		return 0;
+	}
 	struct rt_cs_selftest_result res;
 	struct cs_fixture_stats before, after;
 	int r;

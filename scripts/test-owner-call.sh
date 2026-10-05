@@ -11,12 +11,12 @@ trap 'rm -rf "$test_dir"' EXIT
 python3 - "$test_dir" <<'PY'
 import pathlib, re, sys
 source = pathlib.Path("dext/sources/MacLinuxGPUXcode.mm").read_text()
-start = "// ----------------------------------------------------------------\n// Session calls off the delivery thread"
+start = "// RESET_WAIT (session_state.h): waits for the reset generation to change."
 end = "// A client's last display op result (MacLinuxGPUUserClient_IVars::displayResults)."
 if source.count(start) != 1 or source.count(end) != 1:
     raise SystemExit("owner call extraction markers changed")
 text = source[source.index(start):source.index(end)]
-if len(text.splitlines()) > 520:
+if len(text.splitlines()) > 620:
     raise SystemExit("owner call extraction exceeded its bounded section")
 pathlib.Path(sys.argv[1], "owner_call_production.inc").write_text(text)
 state = pathlib.Path("dext/sources/session_state.h").read_text()

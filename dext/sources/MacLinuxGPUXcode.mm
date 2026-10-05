@@ -296,6 +296,8 @@ static IODispatchQueue *s_bringupQueue = nullptr;
 // session queue (s_bringupQueue). They arrive on the driver's delivery
 // queue, which never waits for it (IMPL(MacLinuxGPU, Stop)).
 static IODispatchQueue *s_stopQueue = nullptr;
+// Personality MacLinuxGPUDeviceReset: GPU recovery may reset the device.
+static bool s_deviceResetEnabled = false;
 static IOPCIDevice     *s_retainedPCI  = nullptr;
 static void            *s_rtDevice     = nullptr;
 static bool             s_modulesRunning = false;
@@ -685,20 +687,6 @@ static void reset_state_store(const struct rt_recovery_state *st)
     s_resetState[5] = st ? (uint64_t)(int64_t)st->last_result : 0;
     __atomic_store_n(&s_resetStateLock, 0u, __ATOMIC_RELEASE);
 }
-// On the reset domain's thread, once per change: the cached state and an
-// event in the unified log.
-static void recovery_notify(const struct rt_recovery_state *st)
-{
-    reset_state_store(st);
-    if (st->flags & RT_RECOVERY_WEDGED)
-        MACLINUXGPU_EVENT("GPU wedged (reset generation %llu): every request fails until the GPU is "
-                          "power-cycled and reconnected", (unsigned long long)st->generation);
-    else
-        MACLINUXGPU_EVENT("GPU recovery: a queue reset completed (reset generation %llu, %llu queue "
-                          "resets, last result %d)", (unsigned long long)st->generation,
-                          (unsigned long long)st->queue_resets, st->last_result);
-}
-
 static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
 {
     const uint32_t blocker = release_blocker();
@@ -2037,6 +2025,9 @@ IMPL(MacLinuxGPU, Start)
             // unless a personality sets a period.
             if (auto *period = OSDynamicCast(OSNumber, properties->getObject("MacLinuxGPUWptrPollPeriod")))
                 wptrPoll = period->unsigned32BitValue();
+            __atomic_store_n(&s_deviceResetEnabled,
+                             properties->getObject("MacLinuxGPUDeviceReset") == kOSBooleanTrue,
+                             __ATOMIC_RELEASE);
             properties->release();
         }
         rt_wptr_poll_configure(wptrPoll);
@@ -2045,6 +2036,9 @@ IMPL(MacLinuxGPU, Start)
             MACLINUXGPU_EVENT("wptr poll: experiment on (MacLinuxGPUWptrPollPeriod %u): the CP polls queue "
                               "write pointers once a KFD queue is mapped", wptrPoll);
         dext_compute_set_kfd_policy(kfdSessions);
+        MACLINUXGPU_LOG("GPU device resets %s", s_deviceResetEnabled ?
+                        "enabled (a hang the queue reset cannot end resets the device)" :
+                        "off (a hang the queue reset cannot end wedges the GPU)");
         MACLINUXGPU_LOG("KFD compute sessions %s", kfdSessions ? "enabled when supported" : "disabled");
         const int displayRet = linuxu_driver_set_display(display ? 1 : 0);
         MACLINUXGPU_LOG("display %s%s", display ? "requested (amdgpu.dc=-1)" : "off (amdgpu.dc=0)",
@@ -2559,6 +2553,7 @@ static void lx_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
 
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
 static void owner_results_free(MacLinuxGPUUserClient *client);
+static void reset_cancel_waits(MacLinuxGPUUserClient *client);
 static IOMemoryDescriptor *client_memory_find(MacLinuxGPUUserClient *client, uint64_t type);
 
 kern_return_t
@@ -2683,6 +2678,7 @@ MacLinuxGPUUserClient::FinishStop(IOService *provider)
     // Its power waits end now; a low-power hold it kept goes on the
     // default queue, where every power transition runs.
     power_cancel_waits(this);
+    reset_cancel_waits(this);
     if (s_bringupQueue) {
         const uint64_t client = ivars->clientID;
         driver->retain();
@@ -3695,6 +3691,114 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
     }
 }
 
+// RESET_WAIT (session_state.h): waits for the reset generation to change.
+struct ResetWaiter {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+    uint64_t generation;
+};
+static ResetWaiter s_resetWaiters[16];
+static uint32_t s_resetWaitLock;
+static void reset_wait_acquire() { while (__atomic_exchange_n(&s_resetWaitLock, 1u, __ATOMIC_ACQUIRE)) {} }
+static void reset_wait_release() { __atomic_store_n(&s_resetWaitLock, 0u, __ATOMIC_RELEASE); }
+
+static void reset_complete_wait(const ResetWaiter &waiter, kern_return_t status)
+{
+    uint64_t reset[MLG_RESET_STATE_WORDS];
+    reset_state(reset);
+    IOUserClientAsyncArgumentsArray data = {};
+    data[0] = reset[1];
+    data[1] = reset[2];
+    waiter.client->AsyncCompletion(waiter.action, status, data, MLG_RESET_WAIT_WORDS);
+    waiter.action->release();
+    waiter.client->release();
+}
+
+// Every wait whose generation is no longer current completes.
+static void reset_notify_waiters()
+{
+    uint64_t reset[MLG_RESET_STATE_WORDS];
+    reset_state(reset);
+    ResetWaiter ready[16];
+    unsigned count = 0;
+    reset_wait_acquire();
+    for (auto &waiter : s_resetWaiters) {
+        if (!waiter.client || waiter.generation == reset[1]) continue;
+        ready[count++] = waiter;
+        waiter = {};
+    }
+    reset_wait_release();
+    for (unsigned i = 0; i < count; ++i) reset_complete_wait(ready[i], kIOReturnSuccess);
+}
+
+static kern_return_t reset_wait(MacLinuxGPUUserClient *client, OSAction *action, uint64_t known)
+{
+    uint64_t reset[MLG_RESET_STATE_WORDS];
+    ResetWaiter waiter = {client, action, known};
+    client->retain();
+    action->retain();
+    reset_wait_acquire();
+    reset_state(reset);
+    if (reset[1] != known) {
+        reset_wait_release();
+        reset_complete_wait(waiter, kIOReturnSuccess);
+        return kIOReturnSuccess;
+    }
+    for (auto &slot : s_resetWaiters) {
+        if (slot.client) continue;
+        slot = waiter;
+        reset_wait_release();
+        return kIOReturnSuccess;
+    }
+    reset_wait_release();
+    action->release();
+    client->release();
+    return kIOReturnNoResources;
+}
+
+static void reset_cancel_waits(MacLinuxGPUUserClient *client)
+{
+    ResetWaiter cancelled[16];
+    unsigned count = 0;
+    reset_wait_acquire();
+    for (auto &waiter : s_resetWaiters) {
+        if (waiter.client != client) continue;
+        cancelled[count++] = waiter;
+        waiter = {};
+    }
+    reset_wait_release();
+    for (unsigned i = 0; i < count; ++i) reset_complete_wait(cancelled[i], kIOReturnAborted);
+}
+
+// Whether a device reset may run (rt/recovery.h's gate), or why not.
+static const char *device_reset_gate(void)
+{
+    if (!__atomic_load_n(&s_deviceResetEnabled, __ATOMIC_ACQUIRE))
+        return "device resets are not enabled for this GPU (personality MacLinuxGPUDeviceReset)";
+    if (s_rawBARLease.hasMappings())
+        return "a client maps a BAR of the GPU directly (raw lease), and could store into it "
+               "while it stops decoding";
+    if (rt_lx_bar_mappings())
+        return "clients map GPU memory through a BAR (VRAM, doorbells), and could store into it "
+               "while it stops decoding";
+    return nullptr;
+}
+
+// On the reset domain's thread, once per change: the cached state, the
+// waiters, and an event in the unified log.
+static void recovery_notify(const struct rt_recovery_state *st)
+{
+    reset_state_store(st);
+    reset_notify_waiters();
+    if (st->flags & RT_RECOVERY_WEDGED)
+        MACLINUXGPU_EVENT("GPU wedged (reset generation %llu): every request fails until the GPU is "
+                          "power-cycled and reconnected", (unsigned long long)st->generation);
+    else
+        MACLINUXGPU_EVENT("GPU recovery: a queue reset completed (reset generation %llu, %llu queue "
+                          "resets, last result %d)", (unsigned long long)st->generation,
+                          (unsigned long long)st->queue_resets, st->last_result);
+}
+
 // ----------------------------------------------------------------
 // Session calls off the delivery thread (session_state.h, "Calls that
 // never sleep, and every other call").
@@ -4021,6 +4125,9 @@ static kern_return_t direct_call(MacLinuxGPUUserClient *client, uint64_t selecto
     }
     case MLG_SELECTOR_OWNER_RESULT:
         return owner_result(client, a);
+    case MLG_SELECTOR_RESET_WAIT:
+        if (a->scalarInputCount != 1 || !a->completion) return kIOReturnBadArgument;
+        return reset_wait(client, a->completion, in[0]);
     case MLG_SELECTOR_POWER:
         if (in[0] == MLG_POWER_OP_WAIT) {
             if (a->scalarInputCount != 2 || !a->completion) return kIOReturnBadArgument;
@@ -4780,6 +4887,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         // upstream runs them; a device reset, not available yet, wedges.
         reset_state_store(nullptr);
         rt_recovery_set_notify(recovery_notify);
+        rt_recovery_set_full_reset_gate(device_reset_gate);
         if (const int attached = rt_recovery_attach_pdev(
                 static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice))))
             MACLINUXGPU_EVENT("GPU recovery not attached (%d): a hung queue is not reset", attached);

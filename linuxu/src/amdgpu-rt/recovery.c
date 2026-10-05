@@ -18,6 +18,8 @@
 extern int amdgpu_gpu_recovery;
 
 #define WEDGE_TICK_MS	5u
+/* amdgpu_device.c's bound on SR-IOV reset retries, applied to bare metal. */
+#define RECOVERY_ASIC_RESETS	2u
 
 static pthread_mutex_t recovery_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct amdgpu_device *attached;
@@ -32,6 +34,14 @@ static struct drm_sched_backend_ops wrapped_sched_ops[AMDGPU_MAX_RINGS];
 static const struct amdgpu_ring_funcs *upstream_ring_funcs[AMDGPU_MAX_RINGS];
 static struct amdgpu_ring_funcs wrapped_ring_funcs[AMDGPU_MAX_RINGS];
 static work_func_t upstream_kfd_reset, upstream_userq_reset;
+static const struct amdgpu_asic_funcs *upstream_asic_funcs;
+static struct amdgpu_asic_funcs wrapped_asic_funcs;
+
+/* The platform's say on device resets (rt_recovery_set_full_reset_gate). */
+static const char *(*full_reset_gate)(void);
+/* ASIC resets in the current recovery episode (wrapped_asic_reset). */
+static unsigned int episode_asic_resets;
+#define RESET_SENTINEL	(-0x7fff)	/* reset_res before upstream's recovery runs */
 
 static void publish(void)
 {
@@ -64,11 +74,29 @@ void rt_recovery_set_notify(void (*fn)(const struct rt_recovery_state *state))
 	pthread_mutex_unlock(&recovery_lock);
 }
 
+void rt_recovery_set_full_reset_gate(const char *(*gate)(void))
+{
+	pthread_mutex_lock(&recovery_lock);
+	full_reset_gate = gate;
+	pthread_mutex_unlock(&recovery_lock);
+}
+
+/* Why a device reset may not run now, or NULL. */
+static const char *full_reset_refusal(void)
+{
+	const char *(*gate)(void);
+
+	pthread_mutex_lock(&recovery_lock);
+	gate = full_reset_gate;
+	pthread_mutex_unlock(&recovery_lock);
+	if (!gate)
+		return "a device reset is not available on this platform";
+	return gate();
+}
+
 bool rt_recovery_full_reset_available(void)
 {
-	/* Not over Thunderbolt yet: the PCI configuration restore (BARs,
-	 * MSI-X) and the client BAR mappings in the reset window. */
-	return false;
+	return !full_reset_refusal();
 }
 
 /* ---- the wedge ---- */
@@ -184,56 +212,145 @@ static int wrapped_ring_reset(struct amdgpu_ring *ring, unsigned int vmid,
 		dev_err(ring->adev->dev, "GPU recovery: queue %s reset; its guilty context was "
 			"cancelled, other work goes on\n", ring->name);
 		publish();
-	} else if (!rt_recovery_full_reset_available()) {
-		char why[192];
+	} else {
+		const char *refusal = full_reset_refusal();
 
-		snprintf(why, sizeof(why), "the reset of queue %s failed (%d) and a device reset is "
-			 "not available on this platform", ring->name, r);
-		rt_recovery_wedge(ring->adev, why);
+		if (refusal) {
+			char why[256];
+
+			snprintf(why, sizeof(why), "the reset of queue %s failed (%d), and no device "
+				 "reset: %s", ring->name, r, refusal);
+			rt_recovery_wedge(ring->adev, why);
+		}
+		/* Otherwise upstream resets the device next. */
 	}
 	return r;
 }
 
-/* A job timeout: upstream's handler. On a ring without a queue reset it
- * would reset the device; while that is not available, the device wedges
- * instead (recovery is off for upstream's handler, which then only logs). */
+/* The ASIC reset itself (mode1 on gfx12), bounded: upstream retries a
+ * device reset whose IB tests fail with no limit on bare metal; after
+ * RECOVERY_ASIC_RESETS attempts in one recovery the next one fails, so
+ * the recovery ends (and the device wedges). */
+static int wrapped_asic_reset(struct amdgpu_device *adev)
+{
+	int r;
+
+	if (++episode_asic_resets > RECOVERY_ASIC_RESETS) {
+		dev_err(adev->dev, "GPU recovery: the device reset did not bring the GPU back after "
+			"%u attempts; no further attempt\n", RECOVERY_ASIC_RESETS);
+		return -ENODEV;
+	}
+	r = upstream_asic_funcs->reset(adev);
+	pthread_mutex_lock(&recovery_lock);
+	state.last_result = r;
+	pthread_mutex_unlock(&recovery_lock);
+	return r;
+}
+
+/* Around a recovery of upstream's that may reset the device: the episode's
+ * attempts start at zero; afterwards, a device reset that ran either
+ * advanced the generation (VRAM lost or not) or failed, which wedges the
+ * device (upstream leaves its schedulers stopped and sends no event). */
+static void device_reset_begin(struct amdgpu_device *adev)
+{
+	episode_asic_resets = 0;
+	atomic_set(&adev->reset_domain->reset_res, RESET_SENTINEL);
+}
+
+static void device_reset_end(struct amdgpu_device *adev, int vram_lost_before)
+{
+	const int res = atomic_read(&adev->reset_domain->reset_res);
+	const bool vram_lost = atomic_read(&adev->vram_lost_counter) != vram_lost_before;
+
+	if (res == RESET_SENTINEL)
+		return;	/* no device reset ran (the queue reset sufficed) */
+	if (res) {
+		char why[96];
+
+		snprintf(why, sizeof(why), "the device reset failed (%d)", res);
+		rt_recovery_wedge(adev, why);
+		return;
+	}
+	pthread_mutex_lock(&recovery_lock);
+	state.generation++;
+	state.last_result = 0;
+	if (vram_lost)
+		state.flags |= RT_RECOVERY_LAST_VRAM_LOST;
+	else
+		state.flags &= ~RT_RECOVERY_LAST_VRAM_LOST;
+	pthread_mutex_unlock(&recovery_lock);
+	dev_err(adev->dev, "GPU recovery: the device was reset%s\n",
+		vram_lost ? "; VRAM contents were lost" : "");
+	publish();
+}
+
+/* A job timeout: upstream's handler. When it would reset the device (no
+ * queue reset on this ring) and that is refused, the device wedges instead
+ * (recovery is off for upstream's handler, which then only logs). */
 static enum drm_gpu_sched_stat wrapped_timedout(struct drm_sched_job *s_job)
 {
 	struct amdgpu_ring *ring = to_amdgpu_ring(s_job->sched);
+	struct amdgpu_device *adev = ring->adev;
 	const int saved = amdgpu_gpu_recovery;
+	const int vram_lost = atomic_read(&adev->vram_lost_counter);
+	const char *refusal = amdgpu_gpu_recovery ? full_reset_refusal() : NULL;
+	const bool wedge = refusal && !queue_reset_available(ring);
 	enum drm_gpu_sched_stat stat;
-	bool device_reset = !queue_reset_available(ring) && amdgpu_gpu_recovery &&
-			    !rt_recovery_full_reset_available();
 
-	if (device_reset)
+	if (wedge)
 		amdgpu_gpu_recovery = 0;
+	else
+		device_reset_begin(adev);
 	stat = upstream_sched_ops[ring->idx]->timedout_job(s_job);
-	if (device_reset) {
-		char why[192];
+	if (wedge) {
+		char why[256];
 
-		snprintf(why, sizeof(why), "a job on %s timed out, the ring has no queue reset, and "
-			 "a device reset is not available on this platform", ring->name);
 		amdgpu_gpu_recovery = saved;
-		rt_recovery_wedge(ring->adev, why);
+		snprintf(why, sizeof(why), "a job on %s timed out, the ring has no queue reset, and "
+			 "no device reset: %s", ring->name, refusal);
+		rt_recovery_wedge(adev, why);
+	} else {
+		device_reset_end(adev, vram_lost);
 	}
 	return stat;
 }
 
-/* KFD's and the user queues' device-reset requests. */
-static void refused_kfd_reset(struct work_struct *work)
+/* KFD's and the user queues' device-reset requests: upstream's, when a
+ * device reset may run; the wedge otherwise. */
+static void kfd_reset_work(struct work_struct *work)
 {
 	struct amdgpu_device *adev = container_of(work, struct amdgpu_device, kfd.reset_work);
+	const char *refusal = full_reset_refusal();
+	const int vram_lost = atomic_read(&adev->vram_lost_counter);
+	char why[256];
 
-	rt_recovery_wedge(adev, "KFD requested a device reset (its queues stopped answering), "
-			  "which is not available on this platform");
+	if (refusal) {
+		snprintf(why, sizeof(why), "KFD requested a device reset (its queues stopped "
+			 "answering), and no device reset: %s", refusal);
+		rt_recovery_wedge(adev, why);
+		return;
+	}
+	device_reset_begin(adev);
+	upstream_kfd_reset(work);
+	device_reset_end(adev, vram_lost);
 }
 
-static void refused_userq_reset(struct work_struct *work)
+static void userq_reset_work(struct work_struct *work)
 {
 	struct amdgpu_device *adev = container_of(work, struct amdgpu_device, userq_reset_work);
+	const char *refusal = full_reset_refusal();
+	const int vram_lost = atomic_read(&adev->vram_lost_counter);
+	char why[256];
 
-	rt_recovery_wedge(adev, "a user queue requested a device reset, which is not available "
-			  "on this platform");
+	if (refusal) {
+		snprintf(why, sizeof(why), "a user queue requested a device reset, and no device "
+			 "reset: %s", refusal);
+		rt_recovery_wedge(adev, why);
+		return;
+	}
+	device_reset_begin(adev);
+	upstream_userq_reset(work);
+	device_reset_end(adev, vram_lost);
 }
 
 int rt_recovery_attach(struct amdgpu_device *adev)
@@ -266,15 +383,19 @@ int rt_recovery_attach(struct amdgpu_device *adev)
 			ring->funcs = &wrapped_ring_funcs[ring->idx];
 		}
 	}
-	if (!rt_recovery_full_reset_available()) {
-		if (adev->kfd.reset_work.func) {
-			upstream_kfd_reset = adev->kfd.reset_work.func;
-			adev->kfd.reset_work.func = refused_kfd_reset;
-		}
-		if (adev->userq_reset_work.func) {
-			upstream_userq_reset = adev->userq_reset_work.func;
-			adev->userq_reset_work.func = refused_userq_reset;
-		}
+	if (adev->kfd.reset_work.func) {
+		upstream_kfd_reset = adev->kfd.reset_work.func;
+		adev->kfd.reset_work.func = kfd_reset_work;
+	}
+	if (adev->userq_reset_work.func) {
+		upstream_userq_reset = adev->userq_reset_work.func;
+		adev->userq_reset_work.func = userq_reset_work;
+	}
+	if (adev->asic_funcs && adev->asic_funcs->reset) {
+		upstream_asic_funcs = adev->asic_funcs;
+		wrapped_asic_funcs = *adev->asic_funcs;
+		wrapped_asic_funcs.reset = wrapped_asic_reset;
+		adev->asic_funcs = &wrapped_asic_funcs;
 	}
 	return 0;
 }
@@ -301,6 +422,9 @@ void rt_recovery_detach(struct amdgpu_device *adev)
 		upstream_sched_ops[ring->idx] = NULL;
 		upstream_ring_funcs[ring->idx] = NULL;
 	}
+	if (upstream_asic_funcs && adev->asic_funcs == &wrapped_asic_funcs)
+		adev->asic_funcs = upstream_asic_funcs;
+	upstream_asic_funcs = NULL;
 	if (upstream_kfd_reset)
 		adev->kfd.reset_work.func = upstream_kfd_reset;
 	if (upstream_userq_reset)

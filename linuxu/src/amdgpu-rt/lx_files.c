@@ -59,6 +59,7 @@ struct lx_map {
 	struct lx_range *ranges;
 	uint32_t nranges;
 	bool committed;
+	bool counted;		/* in bar_mappings */
 };
 
 struct lx_async {
@@ -1139,10 +1140,23 @@ static int map_pfn(struct rt_lx_client *c, struct lx_map *m)
 	return 0;
 }
 
+/* Client mappings that reach the GPU through a BAR (VRAM, doorbells,
+ * registers), every client's: a device reset may not run while a client
+ * can store into a BAR that stops decoding (rt/lx_files.h). */
+static unsigned int bar_mappings;
+
+unsigned int rt_lx_bar_mappings(void)
+{
+	return __atomic_load_n(&bar_mappings, __ATOMIC_ACQUIRE);
+}
+
 static void map_free(struct rt_lx_client *c, struct lx_map *m, bool in_mm)
 {
 	struct mm_struct *mm = linuxu_process_mm(c->proc);
 	struct vm_area_struct *vma = m->vma;
+
+	if (m->counted)
+		__atomic_sub_fetch(&bar_mappings, 1, __ATOMIC_ACQ_REL);
 
 	if (m->pinned)
 		rt_lx_gem_unpin(m->pinned);
@@ -1256,6 +1270,10 @@ int rt_lx_mmap(struct rt_lx_client *c, int fd, uint64_t offset, uint64_t length,
 		out->backing = m->backing;
 		out->cache = m->cache;
 		out->ranges = m->nranges;
+		if (m->backing == RT_LX_RANGE_BAR) {
+			m->counted = true;
+			__atomic_add_fetch(&bar_mappings, 1, __ATOMIC_ACQ_REL);
+		}
 	}
 	pthread_mutex_unlock(&c->lock);
 	if (r)

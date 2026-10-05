@@ -1118,9 +1118,48 @@ static int fx_read_register(struct amdgpu_device *a, u32 se, u32 sh, u32 reg, u3
 	return 0;
 }
 
+/* The ASIC reset soc24 would do (mode1): the fixture's engines restart
+ * empty. Whatever follows in upstream's recovery runs as it is; the
+ * fixture has no VBIOS, so re-initializing the ASIC afterwards fails, as
+ * a device that does not come back from its reset would. */
+static unsigned int asic_resets;
+static enum amd_reset_method fx_reset_method(struct amdgpu_device *a)
+{
+	(void)a;
+	return AMD_RESET_METHOD_MODE1;
+}
+static bool fx_need_full_reset(struct amdgpu_device *a)
+{
+	(void)a;
+	return true;
+}
+static int fx_asic_reset(struct amdgpu_device *a)
+{
+	struct engine *engines[] = { &compute_engine, &sdma_engine, &sdma1_engine };
+
+	(void)a;
+	__atomic_add_fetch(&asic_resets, 1, __ATOMIC_ACQ_REL);
+	for (unsigned int i = 0; i < 3; ++i) {
+		if (!engines[i]->ring)
+			continue;
+		pthread_mutex_lock(&engines[i]->lock);
+		engines[i]->hold = false;
+		engines[i]->rptr = engines[i]->wptr = 0;
+		pthread_mutex_unlock(&engines[i]->lock);
+	}
+	return 0;
+}
+unsigned int cs_fixture_asic_resets(void)
+{
+	return __atomic_load_n(&asic_resets, __ATOMIC_ACQUIRE);
+}
+
 static const struct amdgpu_asic_funcs fx_asic_funcs = {
 	.read_register = fx_read_register,
 	.get_xclk = fx_get_xclk,
+	.reset = fx_asic_reset,
+	.reset_method = fx_reset_method,
+	.need_full_reset = fx_need_full_reset,
 };
 
 /* The shader array layout, caches and firmware versions gfx_v12_0 reads

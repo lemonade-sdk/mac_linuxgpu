@@ -631,12 +631,15 @@ int main(void)
 		CHECK(words[0] >= MLG_LX_MMAP_TYPE_BASE && words[1] == PAGE_SIZE);
 		struct rt_lx_map_info mi;
 		CHECK(!rt_lx_map_info(a, words[0], &mi) && mi.backing == RT_LX_RANGE_BAR);
+		/* A client mapping through a BAR: device resets wait for it. */
+		CHECK(rt_lx_bar_mappings() == 1);
 
 		uint64_t munmap_in[] = { MLG_LX_OP_MUNMAP, words[0] };
 		memset(call, 0, sizeof(*call));
 		CHECK(!rt_lx_op_async(a, munmap_in, 2, async_done, call, &call->token));
 		wait_done(call);
 		CHECK(call->result == 0 && rt_lx_map_info(a, words[0], &mi) == -ENOENT);
+		CHECK(rt_lx_bar_mappings() == 0);
 
 		uint64_t close_in[] = { MLG_LX_OP_CLOSE, (uint64_t)fd };
 		memset(call, 0, sizeof(*call));

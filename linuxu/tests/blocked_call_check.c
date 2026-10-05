@@ -592,3 +592,55 @@ void wedge_check(struct pci_dev *pdev)
 	       "with -ENODEV, the state says wedged (%lld ms)\n",
 	       (long long)ktime_ms_delta(ktime_get(), start));
 }
+
+/* ---- a device reset that does not bring the GPU back ----
+ *
+ * With device resets allowed (the platform's gate), a hang the queue reset
+ * cannot end resets the device through upstream's own recovery
+ * (amdgpu_device_gpu_recover: the IPs suspend, the ASIC resets, the IPs
+ * re-initialize). The fixture's GPU does not come back (no VBIOS to
+ * re-initialize it from): the recovery fails once, nothing retries without
+ * bound, and the device wedges; blocked work ends. A process of its own. */
+static const char *reset_allowed(void)
+{
+	return NULL;
+}
+
+void device_reset_check(struct pci_dev *pdev)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	struct amdgpu_ring *ring = &adev->gfx.compute_ring[0];
+	struct rt_recovery_state st;
+	struct bc_client a;
+	ktime_t start = ktime_get();
+
+	client_open(pdev, "hung-client", &a);
+	write_ib(&a, 0x11111111u, RESET_DATA_OFF);
+	rt_recovery_set_full_reset_gate(reset_allowed);
+	CHECK(rt_recovery_full_reset_available());
+	ring->sched.timeout = msecs_to_jiffies(300);
+	cs_fixture_fail_queue_reset(1);
+	cs_fixture_hold_compute(1);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+	for (int i = 0; i < 2000; ++i) {
+		rt_recovery_state(&st);
+		if (st.flags & RT_RECOVERY_WEDGED)
+			break;
+		usleep(5000);
+	}
+	rt_recovery_state(&st);
+	CHECK(st.flags & RT_RECOVERY_WEDGED);
+	/* One ASIC reset ran (the failure came after it), and no more. */
+	CHECK(cs_fixture_asic_resets() >= 1 && cs_fixture_asic_resets() <= 2);
+	usleep(500000);
+	CHECK(cs_fixture_asic_resets() <= 2);
+	CHECK(!amdgpu_in_reset(adev));
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == -ENODEV);
+	rt_recovery_end();
+	printf("PASS device reset: with device resets allowed, a hang the queue reset cannot end "
+	       "runs upstream's device reset; one that does not bring the GPU back wedges the "
+	       "device after %u ASIC reset(s), no unbounded retry (%lld ms)\n",
+	       cs_fixture_asic_resets(), (long long)ktime_ms_delta(ktime_get(), start));
+}

@@ -229,8 +229,8 @@ static void driver_stop(MacLinuxGPU *driver, IOService *provider);
 static unsigned watchdogStarts;
 static void session_watchdog_start(MacLinuxGPU *, const char *, bool) { ++watchdogStarts; }
 #include "session_shutdown_production.inc"
-// Hooked in by InitDevice, which these scenarios do not run.
-[[maybe_unused]] static void (*const recoveryNotify)(const struct rt_recovery_state *) = recovery_notify;
+// Published by GPU recovery after the probe, which these scenarios skip.
+[[maybe_unused]] static void (*const resetStateStore)(const struct rt_recovery_state *) = reset_state_store;
 
 // An observer read in flight when the session closes: the close waits, and
 // the read finishes (leaves) while the close sleeps.
@@ -694,7 +694,8 @@ static void checkObserverPolicy() {
     assert(!mlg_sysfs_path_copy(path, tooLong.c_str(), tooLong.size(), false));
     for (uint64_t selector = 1; selector < 128; ++selector) {
         if (selector == MLG_SELECTOR_QUERY_INFO || selector == MLG_SELECTOR_RUNTIME_BUILD ||
-            selector == MLG_SELECTOR_RELEASE_QUARANTINE || selector == MLG_SELECTOR_OWNER_RESULT)
+            selector == MLG_SELECTOR_RELEASE_QUARANTINE || selector == MLG_SELECTOR_OWNER_RESULT ||
+            selector == MLG_SELECTOR_RESET_WAIT)
             continue;
         assert(!mlg_observer_selector_allowed(selector, probe, 1));
     }
@@ -722,6 +723,13 @@ static void checkObserverPolicy() {
     assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_POWER, powerPrepare, 1));
     assert(mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, token, 1));
     assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, noToken, 1));
+    // RESET_WAIT: an observer's, registered on the delivery thread; LRST
+    // is a cached tag.
+    const uint64_t knownGeneration[] = {0}, resetTag[] = {MLG_QUERY_RESET_STATE};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RESET_WAIT, knownGeneration, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_RESET_WAIT, knownGeneration, 1));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, resetTag, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, resetTag, 1));
     for (uint64_t selector : {1ull, 2ull, 6ull, 9ull, 16ull, 17ull, 36ull, 49ull, 50ull, 51ull, 54ull,
                               55ull, 56ull, 57ull, 58ull, 59ull, 61ull, 82ull, 85ull, 86ull, 87ull})
         assert(!mlg_call_runs_on_delivery(selector, probe, 1) &&
