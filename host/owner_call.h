@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include <IOKit/IOKitLib.h>
@@ -94,12 +95,36 @@ static inline kern_return_t mlg_owner_call_wait(io_connect_t connection, IONotif
 	return kIOReturnSuccess;
 }
 
+/* The longest a session call's completion may take. The driver bounds
+ * every call itself; this is the backstop for a completion that never
+ * comes from a driver that still answers Ping (a selector it serves
+ * synchronously, sent async: build 243's LX_MMAP_COMMIT hung every
+ * Vulkan client so). Generous: bringing the GPU up (InitDevice, with the
+ * firmware it asks for), closing it and the submission self-test take the
+ * longest. */
+#ifndef MLG_OWNER_CALL_BOUND_MS		/* (tests shorten them) */
+#define MLG_OWNER_CALL_BOUND_MS		120000u
+#define MLG_OWNER_CALL_LONG_BOUND_MS	300000u
+#endif
+
+static inline uint32_t mlg_owner_call_bound_ms(uint32_t selector)
+{
+	switch (selector) {
+	case 9u:	/* InitDevice */
+	case 42u:	/* ShutdownGPU */
+	case 82u:	/* DrmSelftest */
+		return MLG_OWNER_CALL_LONG_BOUND_MS;
+	default:
+		return MLG_OWNER_CALL_BOUND_MS;
+	}
+}
+
 /* @selector with @input and @input_struct, as IOConnectCallMethod would
  * call it: on return *@output_count scalars are in @output and
  * *@output_struct_size bytes in @output_struct (pass NULLs for none). The
  * result is the selector's IOReturn, or a transport failure (the call did
  * not start, or the driver went away), or kIOReturnTimeout past
- * @timeout_ms (0: none). */
+ * @timeout_ms (0: the selector's bound, mlg_owner_call_bound_ms). */
 static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_connect_t connection,
 					      uint32_t timeout_ms, uint32_t selector,
 					      const uint64_t *input, uint32_t input_count,
@@ -135,6 +160,8 @@ static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_con
 	}
 	if (kr != kIOReturnSuccess)
 		return kr;
+	if (!timeout_ms)
+		timeout_ms = mlg_owner_call_bound_ms(selector);	/* never unbounded */
 	kr = mlg_owner_call_wait(connection, port, &w, timeout_ms);
 	if (kr != kIOReturnSuccess)
 		return kr;
@@ -194,15 +221,23 @@ static inline kern_return_t mlg_owner_call_timed(io_connect_t connection, uint32
 	return kr;
 }
 
+/* An async session call (mlg_owner_call_timed) within its bound; past it,
+ * kIOReturnTimeout and a line on stderr naming the selector. */
 static inline kern_return_t mlg_owner_call(io_connect_t connection, uint32_t selector,
 					   const uint64_t *input, uint32_t input_count,
 					   const void *input_struct, size_t input_struct_size,
 					   uint64_t *output, uint32_t *output_count,
 					   void *output_struct, size_t *output_struct_size)
 {
-	return mlg_owner_call_timed(connection, 0, selector, input, input_count, input_struct,
-				    input_struct_size, output, output_count, output_struct,
-				    output_struct_size);
+	const uint32_t bound = mlg_owner_call_bound_ms(selector);
+	const kern_return_t kr = mlg_owner_call_timed(connection, 0, selector, input, input_count,
+						      input_struct, input_struct_size, output,
+						      output_count, output_struct, output_struct_size);
+
+	if (kr == kIOReturnTimeout)
+		fprintf(stderr, "mac_linuxgpu: selector %u: no completion within %u s from a driver that "
+			"still answers Ping (kIOReturnTimeout)\n", selector, bound / 1000u);
+	return kr;
 }
 
 #endif

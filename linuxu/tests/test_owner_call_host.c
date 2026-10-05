@@ -39,6 +39,8 @@ static kern_return_t mock_scalar(mach_port_t c, uint32_t sel, const uint64_t *in
 	return kIOReturnSuccess;
 }
 
+#define MLG_OWNER_CALL_BOUND_MS 1500u
+#define MLG_OWNER_CALL_LONG_BOUND_MS 3000u
 #define IOConnectCallAsyncMethod mock_async
 #define IOConnectCallScalarMethod mock_scalar
 #include "owner_call.h"
@@ -52,13 +54,30 @@ int main(void)
 	uint64_t start = now_ms();
 	kern_return_t kr;
 
-	alarm(15); /* a wait that ignores its timeout fails here, not hangs */
+	alarm(25); /* a wait that ignores its timeout fails here, not hangs */
 	kr = mlg_owner_call_timed(1, 2500, 85, in, 3, NULL, 0, out, &n, NULL, NULL);
 	uint64_t took = now_ms() - start;
 
 	if (kr != kIOReturnTimeout || took < 2500 || took > 3500 || async_calls != 1 || pings < 2) {
 		fprintf(stderr, "FAIL timed owner call: kr=%#x after %llu ms, %d calls, %d pings\n", kr,
 			(unsigned long long)took, async_calls, pings);
+		return 1;
+	}
+	/* The plain call has a bound too: a completion that never comes
+	 * (a selector the driver serves synchronously, sent async) fails
+	 * loudly within it, the longer bound for bringing the GPU up. */
+	start = now_ms();
+	kr = mlg_owner_call(1, 102, in, 2, NULL, 0, out, &n, NULL, NULL);
+	took = now_ms() - start;
+	if (kr != kIOReturnTimeout || took < 1500 || took > 2500) {
+		fprintf(stderr, "FAIL bounded owner call: kr=%#x after %llu ms\n", kr, (unsigned long long)took);
+		return 1;
+	}
+	start = now_ms();
+	kr = mlg_owner_call(1, 9, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+	took = now_ms() - start;
+	if (kr != kIOReturnTimeout || took < 3000 || took > 4000) {
+		fprintf(stderr, "FAIL bounded InitDevice call: kr=%#x after %llu ms\n", kr, (unsigned long long)took);
 		return 1;
 	}
 	ping_answers = 0;
@@ -71,6 +90,7 @@ int main(void)
 		return 1;
 	}
 	printf("PASS owner call (host): a completion that never comes times out on time "
-	       "(kIOReturnTimeout after %d pings); a driver that stops answering Ping ends the wait\n", pings);
+	       "(kIOReturnTimeout after %d pings), the plain call within its per-selector bound, loudly; "
+	       "a driver that stops answering Ping ends the wait\n", pings);
 	return 0;
 }

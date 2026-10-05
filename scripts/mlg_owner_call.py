@@ -9,6 +9,8 @@ host/owner_call.h, for the scripts.
 
 result is the selector's IOReturn (0 on success)."""
 import ctypes as c
+import sys
+import time
 
 OWNER_RESULT = 88       # session_state.h MLG_SELECTOR_OWNER_RESULT
 OWNER_HEADER = 4        # MLG_OWNER_ASYNC_HEADER
@@ -19,6 +21,9 @@ SESSION_CALLS_ASYNC_BUILD = 243   # MLG_SESSION_CALLS_ASYNC_BUILD
 CALLOUT_FUNC, CALLOUT_REFCON, CALLOUT_COUNT = 1, 2, 3   # IOKit's kIOAsyncCallout* indices
 MACH_RCV_MSG, MACH_RCV_TIMEOUT, MACH_RCV_TIMED_OUT = 0x2, 0x100, 0x10004003
 NOT_ATTACHED, IPC_ERROR = 0xe00002d8, 0xe00002c3
+TIMEOUT = 0xe00002d6    # kIOReturnTimeout
+# host/owner_call.h's bounds: InitDevice, ShutdownGPU and DrmSelftest the longer.
+BOUND_S, LONG_BOUND_S, LONG_SELECTORS = 120, 300, (9, 42, 82)
 
 _CALLBACK = c.CFUNCTYPE(None, c.c_void_p, c.c_int, c.POINTER(c.c_void_p), c.c_uint32)
 
@@ -86,7 +91,14 @@ class OwnerCall:
             if result:
                 return result & 0xffffffff, [], b""
             message = c.create_string_buffer(4096)
+            # As host/owner_call.h: never unbounded, even while Ping answers.
+            bound = LONG_BOUND_S if selector in LONG_SELECTORS else BOUND_S
+            deadline = time.monotonic() + bound
             while "status" not in done:
+                if time.monotonic() >= deadline:
+                    print(f"mac_linuxgpu: selector {selector}: no completion within {bound} s from a "
+                          "driver that still answers Ping (kIOReturnTimeout)", file=sys.stderr)
+                    return TIMEOUT, [], b""
                 received = system.mach_msg(message, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 4096,
                                            io.IONotificationPortGetMachPort(port), 1000, 0)
                 if received & 0xffffffff == MACH_RCV_TIMED_OUT:

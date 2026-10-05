@@ -36,6 +36,15 @@ runtime = re.search(r"#define DEXT_RUNTIME_BUILD (\d+)u", backend)
 if not runtime or int(runtime.group(1)) < int(number(state, "MLG_SESSION_CALLS_ASYNC_BUILD")):
     raise SystemExit("DEXT_RUNTIME_BUILD predates MLG_SESSION_CALLS_ASYNC_BUILD: clients would refuse this driver")
 python = pathlib.Path("scripts/mlg_owner_call.py").read_text()
+bounds = re.search(r"^BOUND_S, LONG_BOUND_S, LONG_SELECTORS = (\d+), (\d+), \(([\d, ]+)\)", python, re.M)
+header_bounds = (re.search(r"#define MLG_OWNER_CALL_BOUND_MS\s+(\d+)u", client),
+                 re.search(r"#define MLG_OWNER_CALL_LONG_BOUND_MS\s+(\d+)u", client))
+long_cases = sorted(int(n) for n in re.findall(r"case (\d+)u:", client.split("mlg_owner_call_bound_ms")[1].split("default:")[0]))
+if not bounds or not all(header_bounds) or \
+        int(bounds.group(1)) * 1000 != int(header_bounds[0].group(1)) or \
+        int(bounds.group(2)) * 1000 != int(header_bounds[1].group(1)) or \
+        sorted(int(n) for n in bounds.group(3).split(",")) != long_cases:
+    raise SystemExit("scripts/mlg_owner_call.py bounds differ from host/owner_call.h")
 for driver, mirror in (("MLG_SELECTOR_OWNER_RESULT", "OWNER_RESULT"),
                        ("MLG_OWNER_ASYNC_HEADER", "OWNER_HEADER"),
                        ("MLG_OWNER_ASYNC_SCALARS", "OWNER_SCALARS"),
