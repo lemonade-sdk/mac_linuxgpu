@@ -149,6 +149,9 @@ static int dext_set_pci(void *, void *);
 static int dext_open(uint32_t *);
 static int dext_compute_query_info(uint64_t, uint64_t *, int);
 static int dext_compute_release_client(uint64_t);
+static bool dext_compute_client_owns(uint64_t);
+static int dext_compute_forget_client(uint64_t);
+static unsigned dext_compute_client_records();
 static uint64_t legacyClientID;  // a client on the legacy (non-KFD) path
 static bool dext_compute_client_legacy(uint64_t client) { return client && client == legacyClientID; }
 // Surprise removal (rt/removal.h, dext_pci_* and dext_dma_device_removed).
@@ -377,11 +380,43 @@ static int dext_compute_query_info(uint64_t tag, uint64_t *out, int) {
 }
 static int releaseError;
 static std::vector<uint64_t> releasedClients;
+// The compute backend's client records (dext_compute_backend.inc): a fixed
+// table of 64, one per client given an identity (or asking for a compute
+// session); what a client owns (a KFD process, queues, BOs) goes with its
+// release, the record with it; forgetting keeps a record whose KFD process
+// is not closed. The real table's stop and churn are dext_compute
+// production checks; here, that every Stop path lets its record go.
+static constexpr size_t kClientRecords = 64;
+static std::vector<uint64_t> records, owners, keptKFD;
+static bool has(const std::vector<uint64_t> &set, uint64_t client) {
+    return std::find(set.begin(), set.end(), client) != set.end();
+}
+static void erase(std::vector<uint64_t> &set, uint64_t client) {
+    set.erase(std::remove(set.begin(), set.end(), client), set.end());
+}
+// A client's first session call (record_client_identity), or a QueryInfo
+// that opens its KFD process: a record, which the table must have room for.
+static void recordClient(uint64_t client, bool owns) {
+    assert(!has(records, client));
+    assert(records.size() < kClientRecords && "every compute record is held");
+    records.push_back(client);
+    if (owns) owners.push_back(client);
+}
+[[maybe_unused]] static bool dext_compute_client_owns(uint64_t client) { return has(owners, client); }
+[[maybe_unused]] static int dext_compute_forget_client(uint64_t client) {
+    if (has(keptKFD, client)) return -16;
+    erase(records, client);
+    return 0;
+}
+[[maybe_unused]] static unsigned dext_compute_client_records() { return unsigned(records.size()); }
 static int dext_compute_release_client(uint64_t client) {
     events.push_back("release_client");
     releasedClients.push_back(client);
     // A client's KFD close fails as the compute stop would (computeError).
-    return releaseError ? releaseError : (computeError ? -16 : 0);
+    const int r = releaseError ? releaseError : (computeError ? -16 : 0);
+    if (!r) { erase(owners, client); erase(records, client); }
+    else if (has(owners, client)) keptKFD.push_back(client);
+    return r;
 }
 
 static int dext_pci_close_removed() {
@@ -677,7 +712,7 @@ static void clientExitReopen(bool queueExhausted) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held; the client's release covers
     // what it had.
@@ -696,7 +731,7 @@ static void clientExitReopen(bool queueExhausted) {
     // The next client joins the running device: no PCI open, no probe.
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 0 && !saw("pci_open"));
     assert(nextIvars.sessionGeneration == s_sessionGeneration);
@@ -725,7 +760,7 @@ static void clientExitCloses(const std::string &kind) {
     bar0Aliases = probed ? 1 : 0;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
     driver.retain(); s_participants = 1;
     if (kind == "client-exit-release-failure") releaseError = -16;
     if (kind == "client-exit-raw-mapped") {
@@ -892,7 +927,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
@@ -976,7 +1011,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     devicePresent = true;
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));
@@ -1242,6 +1277,141 @@ static void retireScenario(const std::string &kind) {
     std::puts("PASS production retire: a quiescent quarantine is released, then the instance terminates");
 }
 
+// Far more programs than the compute backend has records come and go, of
+// every kind and by every Stop path: HSA session clients (one leaving, one
+// killed with what it owns), Linux-file clients (RADV; one whose QueryInfo
+// opened a KFD process), session clients that never joined (one that
+// still opened a KFD process), observers (the display agent, mtopg), and
+// last clients whose leaving closes the session (legacy, never probed).
+// Each Stop lets the client's record go, releasing what it still owns: a
+// new program always gets a record, and the session never needs a close.
+static void clientChurn() {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
+    s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
+    s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
+    bar0Aliases = 1;
+    const uint64_t generation = s_sessionGeneration;
+    constexpr unsigned rounds = 4 * kClientRecords;
+    uint64_t id = 100;
+    struct Program {
+        MacLinuxGPUUserClient client;
+        MacLinuxGPUUserClient_IVars ivars{};
+    };
+    const auto make = [&](Program &p, bool linuxFile, bool observer) {
+        p.ivars = {};
+        p.ivars.ownerDriver = &driver;
+        p.ivars.clientID = ++id;
+        p.ivars.ownerQueue = &s_ownerQueueAtOnce;
+        p.ivars.linuxFile = linuxFile;
+        p.ivars.observer = observer;
+        p.client.ivars = &p.ivars;
+        driver.retain();
+    };
+    const auto lxStop = [&](Program &p) {
+        p.ivars.stopping = true;
+        p.client.retain(); driver.retain();
+        lx_finish_stop(&p.client, &driver);
+    };
+    // A program stays throughout: no one leaving here is the last.
+    Program anchor;
+    make(anchor, false, false);
+    recordClient(id, true);
+    assert(ensure_open(&anchor.client) == kIOReturnSuccess);
+    for (unsigned round = 0; round < rounds; ++round) {
+        Program hsa, killed, radv, radvKFD, idle, idleKFD, display;
+        make(hsa, false, false);
+        assert(ensure_open(&hsa.client) == kIOReturnSuccess);
+        recordClient(id, true);
+        make(killed, false, false);
+        assert(ensure_open(&killed.client) == kIOReturnSuccess);
+        recordClient(id, true);
+        make(radv, true, false);
+        assert(ensure_open(&radv.client) == kIOReturnSuccess);
+        make(radvKFD, true, false);
+        assert(ensure_open(&radvKFD.client) == kIOReturnSuccess);
+        recordClient(id, true);
+        make(idle, false, false);
+        recordClient(id, false);
+        make(idleKFD, false, false);
+        recordClient(id, true);
+        make(display, false, true);
+        assert(s_participants == 5 && records.size() == 6);
+        // A killed process's client stops as any other does.
+        assert(killed.client.Stop(&driver) == kIOReturnSuccess);
+        assert(hsa.client.Stop(&driver) == kIOReturnSuccess);
+        lxStop(radv);
+        lxStop(radvKFD);
+        assert(idle.client.Stop(&driver) == kIOReturnSuccess);
+        assert(idleKFD.client.Stop(&driver) == kIOReturnSuccess);
+        assert(display.client.Stop(&driver) == kIOReturnSuccess);
+        assert(s_participants == 1 && !s_sessionClosing && s_sessionGeneration == generation);
+        assert(records == std::vector<uint64_t>({anchor.ivars.clientID}));
+        assert(owners == std::vector<uint64_t>({anchor.ivars.clientID}));
+    }
+    assert(!saw("upstream_shutdown") && !s_dmaQuarantined && pciOpens == 0);
+    assert(clientStops == 6 * rounds);
+    // A release that fails keeps that client's record, counted, and
+    // taints the session (the anchor's KFD process could not be closed).
+    releaseError = -16;
+    {
+        Program last;
+        make(last, false, false);
+        assert(ensure_open(&last.client) == kIOReturnSuccess);
+        recordClient(id, true);
+        assert(last.client.Stop(&driver) == kIOReturnSuccess);
+        assert(s_dmaQuarantined && records.size() == 2 && has(records, id));
+        expectLog("compute record kept, its KFD process not closed (2 record(s) held)");
+    }
+    std::puts("PASS production session shutdown: client-churn");
+}
+
+// The last client's leaving closes the session (a legacy client, then a
+// session that was never probed), many times over: each close lets that
+// client's record go, so the next session's client gets one.
+static void lastLeaverChurn() {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
+    constexpr unsigned rounds = 4 * kClientRecords;
+    for (unsigned round = 0; round < rounds; ++round) {
+        const bool probed = round % 2 == 0;
+        irqDrained = endpointReset = dmaCompleted = false;
+        events.clear();
+        s_rtDevice = probed ? &device : nullptr; s_modulesRunning = probed; s_probeAttempted = probed;
+        s_irqReady = s_irqDeliver = true; s_pciOpen = true; s_token = 7;
+        bar0Aliases = probed ? 1 : 0;
+        MacLinuxGPUUserClient client;
+        MacLinuxGPUUserClient_IVars ivars{};
+        ivars.ownerDriver = &driver; ivars.clientID = 5000 + round;
+        ivars.ownerQueue = &s_ownerQueueAtOnce; ivars.sessionGeneration = s_sessionGeneration;
+        client.ivars = &ivars;
+        driver.retain(); s_participants = 1;
+        legacyClientID = probed ? ivars.clientID : 0;
+        recordClient(ivars.clientID, probed);
+        assert(client.Stop(&driver) == kIOReturnSuccess);
+        assert(s_sessionClosing && s_participants == 0 && !saw("release_client"));
+        assert(probed == saw("upstream_shutdown"));
+        // The close released what the client owned (dext_compute_stop);
+        // its record went with its Stop.
+        erase(owners, ivars.clientID);
+        assert(records.empty());
+        auto callback = irqCompletion; auto context = irqContext;
+        irqCompletion = nullptr; irqContext = nullptr;
+        irqDrained = true; events.push_back("irq_drained");
+        callback(context);
+        queue.drain();
+        assert(!s_sessionClosing && !s_pciOpen && clientStops == round + 1 && saw("pci_close"));
+    }
+    assert(driver.references == 1);
+    std::puts("PASS production session shutdown: last-leaver-churn");
+}
+
 static rt_drm_info observerDrm;
 int main(int argc, char **argv) {
     alarm(15);
@@ -1249,6 +1419,14 @@ int main(int argc, char **argv) {
     const std::string scenario = argv[1];
     if (scenario == "concurrent-clients") {
         concurrentClients();
+        return 0;
+    }
+    if (scenario == "client-churn") {
+        clientChurn();
+        return 0;
+    }
+    if (scenario == "last-leaver-churn") {
+        lastLeaverChurn();
         return 0;
     }
     if (scenario == "client-exit-unprobed" || scenario == "client-exit-release-failure" ||

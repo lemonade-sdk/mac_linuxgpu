@@ -20,6 +20,9 @@ struct rt_compute_bo { bool live; uint64_t size; unsigned domain; };
 struct rt_compute_fence { unsigned unused; };
 struct dext_aql_queue { bool live, retained; };
 static struct pci_dev pdev;
+/* Clients that come and go in the churn scenarios: four times the
+ * backend's record table (DEXT_CLIENT_SLOTS, 64). */
+#define CHURN_CLIENTS 256u
 static struct rt_compute_ctx context;
 static struct rt_compute_bo bos[32];
 static struct dext_aql_queue queue;
@@ -405,6 +408,15 @@ static uint64_t create_queue(uint64_t *ring, uint64_t *meta)
     assert(dext_compute_aql_queue_create(*ring,*meta,64,&status,&handle)==0);
     assert(!status && handle); return handle;
 }
+/* A client asks for its compute session (tag 12) as HSA does, gets a KFD
+ * process and sets its own host window. */
+static void kfd_session(uint64_t id)
+{
+    uint64_t words[8], window[3];
+    dext_compute_select_client(id);
+    assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+    assert(!dext_compute_host_window(1ULL<<37,window) && window[0]==1ULL<<37);
+}
 static void expect_frozen(uint64_t payload)
 {
     unsigned old_frees=frees, old_destroys=destroys, old_closes=closes;
@@ -580,6 +592,98 @@ int main(int argc, char **argv)
         bounded_error=0;
         assert(dext_compute_aql_dispatch(&request,sizeof(request),out)==0);
         assert(dext_compute_stop()==0 && frees==1 && closes==1);
+    } else if (!strcmp(argv[1],"client-churn-close")) {
+        /* The device stays up across clients, and the last client's leaving
+         * still closes it at the real close points (a legacy client, a raw
+         * BAR mapping, ...): the session's close stops compute, and the next
+         * client starts it again. Far more clients than the backend has
+         * records come and go; each still gets its KFD process. */
+        kfd_supported_error=0;
+        for (uint64_t id=100; id<100+CHURN_CLIENTS; ++id) {
+            uint64_t ring, meta;
+            assert(!dext_compute_client_identity(id,4000+(int)id,"lse"));
+            kfd_session(id);
+            (void)create_queue(&ring,&meta);
+            dext_compute_select_client(0);
+            assert(dext_compute_stop()==0 && !kfd_clients[0].live);
+            assert(dext_compute_start(&pdev)==0);
+        }
+        assert(kfd_opens==CHURN_CLIENTS && kfd_closes==kfd_opens);
+        assert(dext_compute_stop()==0);
+    } else if (!strcmp(argv[1],"client-churn")) {
+        /* Every kind of client, far more than the backend has records,
+         * joins and leaves the running device as the dext ends each: a
+         * session (HSA) client that frees its queue and one killed with it
+         * live (both released), a Linux-file client whose QueryInfo opened
+         * a KFD process (released: it owns one), a session client that
+         * never joined, and observers (display agent, mtopg), which never
+         * get a record. Every stopped client's record is forgotten. */
+        kfd_supported_error=0;
+        const unsigned rounds=CHURN_CLIENTS;
+        uint64_t id=1000, words[16];
+        for (unsigned i=0; i<rounds; ++i) {
+            uint64_t ring, meta, q, status;
+            /* HSA, freeing its queue first. */
+            assert(!dext_compute_client_identity(++id,7000,"llama-bench"));
+            kfd_session(id);
+            q=create_queue(&ring,&meta);
+            assert(!dext_compute_aql_queue_destroy(q,&status));
+            dext_compute_select_client(0);
+            assert(dext_compute_client_owns(id) && !dext_compute_release_client(id));
+            assert(!dext_compute_forget_client(id));
+            /* HSA, killed with its queue live. */
+            assert(!dext_compute_client_identity(++id,7001,"lse"));
+            kfd_session(id);
+            (void)create_queue(&ring,&meta);
+            dext_compute_select_client(0);
+            assert(!dext_compute_release_client(id) && !dext_compute_client_owns(id));
+            assert(!dext_compute_forget_client(id));
+            /* Linux-file: its topology query opened a KFD process. */
+            dext_compute_select_client(++id);
+            assert(dext_compute_query_info(10,words,16)==16 && words[7]==127);
+            dext_compute_select_client(0);
+            assert(dext_compute_client_owns(id) && !dext_compute_release_client(id));
+            assert(!dext_compute_forget_client(id));
+            /* A session client that never joined: an identity only. */
+            assert(!dext_compute_client_identity(++id,7002,"MacLinuxGPUHost"));
+            assert(!dext_compute_client_owns(id) && !dext_compute_forget_client(id));
+            /* Observers: no record to forget. */
+            assert(!dext_compute_forget_client(++id));
+            assert(!dext_compute_client_records());
+        }
+        assert(kfd_opens==3*rounds && kfd_closes==kfd_opens && !kfd_clients[0].live);
+        /* A record whose KFD process cannot be closed stays, counted, until
+         * a close succeeds (the session's stop retries it). */
+        assert(!dext_compute_client_identity(++id,7003,"lse"));
+        kfd_session(id);
+        {
+            uint64_t ring, meta;
+            (void)create_queue(&ring,&meta);
+        }
+        dext_compute_select_client(0);
+        kfd_destroy_error=-ETIMEDOUT;
+        assert(dext_compute_release_client(id)==-EBUSY_L);
+        assert(dext_compute_forget_client(id)==-EBUSY_L && dext_compute_client_records()==1);
+        kfd_destroy_error=0;
+        assert(dext_compute_stop()==0 && !dext_compute_client_records());
+        /* And the device still serves the next client. */
+        assert(dext_compute_start(&pdev)==0);
+        assert(!dext_compute_client_identity(++id,7004,"lse"));
+        kfd_session(id);
+        dext_compute_select_client(0);
+        assert(dext_compute_stop()==0 && !dext_compute_client_records());
+    } else if (!strcmp(argv[1],"client-records-full")) {
+        /* No record for a client (every slot held) is said: its identity
+         * and its compute session fail with "no memory". */
+        uint64_t words[8];
+        kfd_supported_error=0;
+        uint64_t id=1;
+        while (id<CHURN_CLIENTS && !dext_compute_client_identity(id,1,"held")) ++id;
+        assert(id<CHURN_CLIENTS && dext_compute_client_records()==id-1);
+        dext_compute_select_client(id);
+        assert(dext_compute_query_info(12,words,8)==-ENOMEM_L && !kfd_opens);
+        dext_compute_select_client(0);
+        assert(dext_compute_stop()==0 && !dext_compute_client_records());
     } else if (!strcmp(argv[1],"device-spec")) {
         /* QueryInfo tag 8: the structure, cut to the caller's room above
          * its header, which states the bytes filled. */
@@ -694,15 +798,26 @@ int main(int argc, char **argv)
         dext_compute_select_client(0);
         assert(dext_compute_stop()==0 && closes==1 && dext_compute_quiescent());
     } else if (!strcmp(argv[1],"kfd-open-failure")) {
-        /* A session that cannot be opened leaves the client on the legacy
-         * path. */
-        uint64_t words[8];
+        /* A KFD process that cannot be opened on a device that supports
+         * KFD is that client's error, said by every compute call (never the
+         * legacy path, which may have no HQD); the open is not retried. */
+        uint64_t words[16], window[3], handle=0, gpu=0, cpu=0;
         kfd_supported_error=0; kfd_open_error=-EIO;
+        assert(!dext_compute_client_identity(9,4242,"lse"));
         dext_compute_select_client(9);
-        assert(dext_compute_query_info(12,words,8)==8 && words[1]==1 && kfd_opens==1);
-        uint64_t ring, meta;
-        create_queue(&ring,&meta);
-        assert(legacy_creates==1);
+        assert(dext_compute_query_info(12,words,8)==-ENOTREADY_L && kfd_opens==1);
+        assert(dext_compute_query_info(10,words,16)==-ENOTREADY_L);
+        assert(dext_compute_bo_alloc(4096,2,4096,0,&handle,&gpu,&cpu)==-ENOTREADY_L);
+        assert(dext_compute_host_window(0,window)==-ENOTREADY_L);
+        assert(kfd_opens==1 && !legacy_creates && allocations==1 && !kfd_bo_allocs);
+        assert(dext_compute_client_open_error(9)==-EIO && !dext_compute_client_owns(9));
+        assert(dext_compute_client_records()==1 && !dext_compute_forget_client(9));
+        assert(!dext_compute_client_records());
+        /* Out of memory says so. */
+        kfd_open_error=-ENOMEM;
+        dext_compute_select_client(10);
+        assert(dext_compute_query_info(12,words,8)==-ENOMEM_L);
+        assert(!dext_compute_forget_client(10));
         dext_compute_select_client(0);
         assert(dext_compute_stop()==0);
     } else if (!strcmp(argv[1],"kfd-stop")) {

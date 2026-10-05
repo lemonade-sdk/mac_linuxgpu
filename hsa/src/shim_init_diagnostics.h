@@ -26,6 +26,9 @@ void reportShimInitializationFailure(const ShimInitializationFailure &failure,
         operation, failure.selector, static_cast<unsigned long long>(failure.tag),
         unsigned(failure.hasTag), unsigned(failure.status), unsigned(returnedStatus));
     emit(std::string_view(text));
+    if (failure.selector == 21 && failure.hasTag && failure.tag == kComputeSessionQueryTag)
+        emit(std::string_view("mac_linuxgpu: the driver gave this client no compute session "
+                              "(QueryInfo tag 12); the driver log says why\n"));
 }
 
 /* query uses an existing connection and only QueryInfo's two cached tags.

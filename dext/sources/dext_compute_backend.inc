@@ -57,6 +57,8 @@ struct production_client {
     uint32_t mode;
     bool aware;		/* asked for tag 12: configures its own window */
     struct dext_kfd_client *kfd;
+    int open_error;	/* its KFD process could not be opened (-E*_L) */
+    int open_raw;	/* the open's own error (Linux errno) */
     int pid;
     char comm[32];
 };
@@ -170,32 +172,89 @@ int dext_compute_client_identity(uint64_t client, int pid, const char *comm)
 
 /* The selected client's record, deciding its mode on first use once the
  * device is ready: a KFD process when KFD bound a device node scheduled by
- * MES (and policy allows), else the legacy path. A session that cannot be
- * opened falls back to the legacy path; one that cannot be closed again
- * makes the device uncertain. */
+ * MES (and policy allows), else the legacy path. A KFD process that cannot
+ * be opened is that client's error (open_error), never the legacy path; one
+ * that cannot be closed again makes the device uncertain. */
 static struct production_client *selected_session(void)
 {
     struct production_client *rec = client_record(production.selected_client, true);
-    if (!rec || rec->mode != PRODUCTION_UNDECIDED || !production_ready()) return rec;
-    rec->mode = PRODUCTION_LEGACY;
-    if (!production.kfd_disabled && dext_kfd_supported(production.ctx) == 0) {
+    if (!rec || rec->mode != PRODUCTION_UNDECIDED || rec->open_error || !production_ready())
+        return rec;
+    if (production.kfd_disabled || dext_kfd_supported(production.ctx) != 0) {
+        rec->mode = PRODUCTION_LEGACY;
+        return rec;
+    }
+    {
         struct dext_kfd_client *kfd = NULL;
         int r = dext_kfd_open(production.ctx, rec->pid, rec->comm[0] ? rec->comm : NULL, &kfd);
         if (!r) {
             rec->kfd = kfd;
             rec->mode = PRODUCTION_KFD;
-        } else if (kfd) {
+            return rec;
+        }
+        if (kfd) {
             rec->kfd = kfd;	/* retained: it may still own GPU memory */
             freeze(true);
         }
+        rec->open_error = r == -ENOMEM || r == -ENOSPC ? -ENOMEM_L :
+                          r == -EBUSY || kfd ? -EBUSY_L : -ENOTREADY_L;
+        rec->open_raw = r;
     }
     return rec;
+}
+
+/* Why the selected client has no compute session: no record for it (every
+ * slot held: -ENOMEM_L) or a KFD process that could not be opened. 0 when
+ * it has one, or none is decided yet (the device is not up). */
+static int selected_session_error(void)
+{
+    struct production_client *rec = selected_session();
+    if (!production.selected_client) return 0;	/* internal: legacy */
+    if (!rec) return -ENOMEM_L;
+    return rec->open_error;
 }
 
 bool dext_compute_client_legacy(uint64_t client)
 {
     const struct production_client *rec = client_record(client, false);
     return rec && rec->mode == PRODUCTION_LEGACY;
+}
+
+bool dext_compute_client_owns(uint64_t client)
+{
+    const struct production_client *rec = client_record(client, false);
+    if (!client) return false;
+    if (rec && rec->kfd) return true;
+    for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i)
+        if (queue_live(&production.queues[i]) && production.queues[i].owner == client)
+            return true;
+    for (unsigned i = 0; i < DEXT_BO_SLOTS; ++i)
+        if (bo_live(&production.bos[i]) && production.bos[i].owner == client)
+            return true;
+    return false;
+}
+
+int dext_compute_forget_client(uint64_t client)
+{
+    struct production_client *rec = client_record(client, false);
+    if (!rec) return 0;
+    if (rec->kfd) return -EBUSY_L;	/* its KFD process is not closed */
+    memset(rec, 0, sizeof(*rec));
+    return 0;
+}
+
+unsigned dext_compute_client_records(void)
+{
+    unsigned n = 0;
+    for (unsigned i = 0; i < DEXT_CLIENT_SLOTS; ++i)
+        if (production.clients[i].client) ++n;
+    return n;
+}
+
+int dext_compute_client_open_error(uint64_t client)
+{
+    const struct production_client *rec = client_record(client, false);
+    return rec ? rec->open_raw : 0;
 }
 
 static struct dext_kfd_client *selected_kfd(void)
@@ -470,11 +529,22 @@ int dext_compute_start(struct pci_dev *pdev)
     return 0;
 }
 
+/* Records of clients with no KFD process left hold nothing: a stopped
+ * session forgets them (a client of the next session gets a new one). */
+static void forget_settled_clients(void)
+{
+    for (unsigned i = 0; i < DEXT_CLIENT_SLOTS; ++i)
+        if (production.clients[i].client && !production.clients[i].kfd)
+            memset(&production.clients[i], 0, sizeof(production.clients[i]));
+}
+
 int dext_compute_stop(void)
 {
     unsigned i;
-    if (!production.ctx)
+    if (!production.ctx) {
+        forget_settled_clients();
         return 0;
+    }
     /* Only KFD clients may have frozen the device for closing them to be
      * worth trying: their closes retry their recovery. */
     if (production.uncertain && !production.uncertain_kfd_only && !production.removed)
@@ -501,6 +571,7 @@ int dext_compute_stop(void)
             if (rec->mode != PRODUCTION_KFD)
                 rec->mode = PRODUCTION_UNDECIDED;
         }
+        forget_settled_clients();
         if (kept) return -EBUSY_L;
     }
     /* Every KFD client closed: what froze the device has let go. */
@@ -635,6 +706,10 @@ int dext_compute_query_info(uint64_t tag, uint64_t *out, int out_cap)
         struct dext_aql_limits limits;
         struct dext_kfd_client *kfd;
         if (out_cap < 16) return -EINVAL_L;
+        {
+            const int failed = selected_session_error();
+            if (failed) return failed;
+        }
         kfd = selected_kfd();
         if (rt_device_topology(rt_compute_device(production.ctx), &t) != 0)
             return -ENOTREADY_L;
@@ -681,6 +756,10 @@ int dext_compute_query_info(uint64_t tag, uint64_t *out, int out_cap)
     case 12: { /* compute session, version 1 (asking selects the mode) */
         struct production_client *rec;
         if (out_cap < 8) return -EINVAL_L;
+        {
+            const int failed = selected_session_error();
+            if (failed) return failed;
+        }
         rec = selected_session();
         if (!rec || rec->mode == PRODUCTION_UNDECIDED) return -ENOTREADY_L;
         memset(out, 0, 8 * sizeof(*out));
@@ -776,6 +855,7 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
     int r;
     if (!out_handle || !size || flags || !production_ready())
         return -ENOTREADY_L;
+    if ((r = selected_session_error())) return r;
     if (domain == DEXT_COMPUTE_BO_DOMAIN_GTT ||
         domain == DEXT_COMPUTE_BO_DOMAIN_GTT_LEGACY)
         rt_domain = RT_COMPUTE_GTT;
@@ -900,6 +980,10 @@ int dext_compute_bo_import(uint64_t first, uint64_t second, uint64_t size,
     memset(out, 0, 3 * sizeof(*out));
     if (!production_ready()) return -ENOTREADY_L;
     if ((!first && !second) || !size) return -EINVAL_L;
+    {
+        const int failed = selected_session_error();
+        if (failed) return failed;
+    }
     if (selected_kfd()) return -ENOTREADY_L; /* see dext_compute_bo_export */
     struct rt_compute_bo *object = NULL;
     for (unsigned i = 0; i < DEXT_EXPORT_SLOTS; ++i)
@@ -1150,6 +1234,7 @@ int dext_compute_aql_queue_create(uint64_t ring_handle,
         !packets || (packets & (packets - 1)))
         return -EINVAL_L;
     if (!production_ready()) return -ENOTREADY_L;
+    if ((r = selected_session_error())) return r;
     kfd = selected_kfd();
     if (kfd ? dext_kfd_queue_abi(&limits) != 0 :
               dext_aql_limits(production.ctx, &limits) != 0) return -ENOTREADY_L;
@@ -1412,7 +1497,9 @@ int dext_compute_host_window(uint64_t configure, uint64_t *out)
         /* A KFD-aware client's own window inside its process's GPUVM: query
          * reports it (base 0 until set) and the size to reserve; a nonzero
          * value sets it, once, before any shared buffer exists. */
-        struct production_client *rec = selected_session();
+        struct production_client *rec;
+        if ((r = selected_session_error())) return r;
+        rec = selected_session();
         if (rec && rec->mode == PRODUCTION_KFD && rec->aware) {
             struct dext_kfd_info info;
             if (configure) {

@@ -1,4 +1,6 @@
 #include "device_init.h"
+#include "shim_init_diagnostics.h"
+#include <string>
 #include <cassert>
 #include <cstdio>
 using namespace mac_hsa;
@@ -8,6 +10,9 @@ struct RPC final: ShimInitializationRPC {
  // the tag; kfd makes this client a KFD process whose host window is its
  // own (selector 54 then answers for that window once tag 12 was asked).
  bool session=false, kfd=false, sessionAsked=false, failKFDReserve=false;
+ // The driver has tag 12 but gives this client no session: an error, or
+ // an answer with no mode.
+ bool sessionRefused=false, sessionNoMode=false;
  uint64_t kfdWindowBytes=1ull<<37, kfdBase=0, kfdCandidate=0x40000000000ull;
  unsigned kfdConfigs=0, kfdReserves=0;
  unsigned claim=0,config=0,init=0,reserve=0,releases=0,queries=0;
@@ -43,6 +48,8 @@ struct RPC final: ShimInitializationRPC {
    else if(in[0]==2){out[0]=256ull<<20;out[1]=32ull<<30;}
    else if(in[0]==9){out[0]=32ull<<30;out[1]=31ull<<30;out[2]=1ull<<30;
     out[3]=badUsage?33ull<<30:0;out[4]=256ull<<20;out[5]=0;}
+   else if(in[0]==12&&session&&sessionRefused){assert(ready);return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
+   else if(in[0]==12&&session&&sessionNoMode){assert(ready);out[0]=1;out[1]=0;}
    else if(in[0]==12&&session){assert(ready);sessionAsked=true;
     out[0]=1;out[1]=kfd?2:1;out[2]=kfd?127:1;out[3]=kfd?4242:0;
     out[4]=kfd?kfdBase:base;out[5]=kfd?kfdWindowBytes:windowBytes;}
@@ -205,6 +212,21 @@ int main(){
  {RPC r;r.ready=true;r.session=true;r.kfd=true;r.kfdWindowBytes=(1ull<<37)+16384;
   assert(initializeShimDevice(r,out,claimed,false)==HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
   assert(!r.kfdReserves);}
+ // A driver with the tag that gives this client no session fails the
+ // initialization there, never a session without queues.
+ for(bool fresh:{false,true}){
+  RPC r;r.ready=fresh?false:true;r.session=true;r.sessionRefused=true;ShimInitializationFailure failure;
+  assert(initializeShimDevice(r,out,claimed,fresh,&failure)==HSA_STATUS_ERROR_OUT_OF_RESOURCES);
+  assert(failure.operation==ShimInitializationOperation::Scalar&&failure.selector==21&&
+         failure.hasTag&&failure.tag==kComputeSessionQueryTag&&!out.capacity);
+  std::string text;
+  reportShimInitializationFailure(failure,HSA_STATUS_ERROR_OUT_OF_RESOURCES,
+                                  [&](std::string_view t){text+=t;});
+  assert(text.find("no compute session")!=std::string::npos);}
+ {RPC r;r.ready=true;r.session=true;r.sessionNoMode=true;ShimInitializationFailure failure;
+  assert(initializeShimDevice(r,out,claimed,false,&failure)==HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
+  assert(failure.operation==ShimInitializationOperation::Validation&&failure.tag==kComputeSessionQueryTag);}
+ std::puts("Shim init fails when the driver gives the client no compute session");
  std::puts("Shim init negotiates the compute session: legacy keeps the GART window, a KFD process sets its own");
  std::puts("Shim init runs the firmware servicer only around InitDevice and stops it on every exit");
  std::puts("Shim HSA claim-before-configure, ready reuse, failure unwind and capability gates passed");

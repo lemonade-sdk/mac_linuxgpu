@@ -385,6 +385,9 @@ struct MacLinuxGPUUserClient_IVars {
     // (the op may finish after the client stopped).
     uint64_t displayToken;
     struct DisplayResultSlot *displayResults;
+    // The compute backend holds no record for it (every slot held): its
+    // InitDevice and compute session fail (record_client_identity).
+    int identityError;
 };
 
 class ComputeClientScope {
@@ -433,7 +436,15 @@ static void record_client_identity(MacLinuxGPUUserClient *client)
     int pid = 0;
     char name[32] = {};
     client_creator(client, &pid, name, sizeof(name));
-    (void)dext_compute_client_identity(client->ivars->clientID, pid, name[0] ? name : nullptr);
+    const int recorded = dext_compute_client_identity(client->ivars->clientID, pid,
+                                                      name[0] ? name : nullptr);
+    client->ivars->identityError = recorded;
+    if (recorded) {
+        MACLINUXGPU_EVENT("client %llu (pid %d name %s): no compute record (%d, %u held); "
+                          "its InitDevice and compute session fail", client->ivars->clientID, pid,
+                          name[0] ? name : "(unknown)", recorded, dext_compute_client_records());
+        return;
+    }
     MACLINUXGPU_LOG("client %llu identity: pid %d name %s", client->ivars->clientID, pid,
                     name[0] ? name : "(unknown)");
 }
@@ -2206,8 +2217,11 @@ IMPL(MacLinuxGPUUserClient, Start)
 }
 
 static bool session_leave_closes(bool participant, bool legacyClient);
+static void client_release(uint64_t client);
+static void client_record_forget(uint64_t client);
 // A Linux-file client's session membership ends on the owner's queue, as a
-// session client's does (it holds no compute handles to release).
+// session client's does. It holds no compute handles; a KFD process its
+// QueryInfo opened is released like any client's, and its record goes.
 static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
 {
     auto *iv = client->ivars;
@@ -2216,17 +2230,21 @@ static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
     // too, on a thread of its own.
     if (struct rt_lx_client *late = lx_take(client)) (void)rt_lx_client_retire(late, nullptr, nullptr);
     const bool participant = iv->sessionGeneration == s_sessionGeneration;
+    const uint64_t id = iv->clientID;
+    if (dext_compute_client_owns(id) && !s_sessionClosing && !s_dmaQuarantined)
+        client_release(id);
     if (participant) {
         iv->sessionGeneration = 0;
         if (s_participants) --s_participants;
     }
-    if (session_leave_closes(participant, false)) {
+    const bool closes = session_leave_closes(participant, false);
+    if (closes) {
         iv->nextStopping = s_stoppingClients;
         s_stoppingClients = client;
         close_session(iv->ownerDriver);
-    } else {
-        client->FinishStop(provider);
     }
+    client_record_forget(id);
+    if (!closes) client->FinishStop(provider);
 }
 
 // The client's process exits (async calls return, files close through
@@ -2297,7 +2315,11 @@ IMPL(MacLinuxGPUUserClient, Stop)
         // its calls is in flight); a closing session has released them.
         // It finishes on the owner's queue, after its session calls.
         observer_display_client_stop(ivars->clientID);
-        ivars->ownerQueue->DispatchAsync(^{ FinishStop(provider); });
+        const uint64_t id = ivars->clientID;
+        ivars->ownerQueue->DispatchAsync(^{
+            client_record_forget(id);
+            FinishStop(provider);
+        });
         return kIOReturnSuccess;
     }
     // An unplug terminates the clients before the provider: see whether the
@@ -2337,36 +2359,55 @@ static bool session_leave_closes(bool participant, bool legacyClient)
            (participant && (s_dmaQuarantined || (!s_participants && last_leave_closes(legacyClient))));
 }
 
+// What a leaving client owned goes (IRQ delivery stays active while its
+// queues are removed); a release that fails taints the session.
+static void client_release(uint64_t client)
+{
+    const int released = dext_compute_release_client(client);
+    if (released != 0 && s_deviceRemoved) {
+        MACLINUXGPU_EVENT("client close after removal: cleanup returned %d; nothing can run", released);
+    } else if (released != 0) {
+        s_dmaQuarantined = true;
+        note_quarantine(MLG_QUARANTINE_CLIENT_RELEASE, released);
+        MACLINUXGPU_EVENT("client close: cleanup failed (%d); retaining uncertain shared-session backing", released);
+    }
+}
+
+// A stopped client's compute record goes with it, whatever kind of client
+// it was and however it left: the backend's table is fixed and client IDs
+// are never reused. One whose KFD process could not be closed stays, said
+// and counted.
+static void client_record_forget(uint64_t client)
+{
+    if (dext_compute_forget_client(client) != 0)
+        MACLINUXGPU_EVENT("client %llu: compute record kept, its KFD process not closed "
+                          "(%u record(s) held)", client, dext_compute_client_records());
+}
+
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
 {
     auto *ivars = client->ivars;
+    const uint64_t id = ivars->clientID;
     const bool participant = ivars->sessionGeneration == s_sessionGeneration;
-    const bool legacyClient = dext_compute_client_legacy(ivars->clientID);
+    const bool legacyClient = dext_compute_client_legacy(id);
     // What the client owned goes now, unless the session closes with it
-    // (which releases everything).
-    if (participant && !s_sessionClosing && !s_dmaQuarantined &&
-        !(s_participants == 1 && last_leave_closes(legacyClient))) {
-        // IRQ delivery stays active while this client's queues are removed.
-        const int released = dext_compute_release_client(ivars->clientID);
-        if (released != 0 && s_deviceRemoved) {
-            MACLINUXGPU_EVENT("client close after removal: cleanup returned %d; nothing can run", released);
-        } else if (released != 0) {
-            s_dmaQuarantined = true;
-            note_quarantine(MLG_QUARANTINE_CLIENT_RELEASE, released);
-            MACLINUXGPU_EVENT("client close: cleanup failed (%d); retaining uncertain shared-session backing", released);
-        }
-    }
+    // (which releases everything). A client outside the session releases
+    // what it still owns (a KFD process its QueryInfo opened).
+    if ((participant || dext_compute_client_owns(id)) && !s_sessionClosing && !s_dmaQuarantined &&
+        !(participant && s_participants == 1 && last_leave_closes(legacyClient)))
+        client_release(id);
     if (participant) {
         ivars->sessionGeneration = 0;
         if (s_participants) --s_participants;
     }
-    if (session_leave_closes(participant, legacyClient)) {
+    const bool closes = session_leave_closes(participant, legacyClient);
+    if (closes) {
         ivars->nextStopping = s_stoppingClients;
         s_stoppingClients = client;
         close_session(ivars->ownerDriver);
-    } else {
-        client->FinishStop(provider);
     }
+    client_record_forget(id);
+    if (!closes) client->FinishStop(provider);
 }
 
 void
@@ -4332,6 +4373,8 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (arguments->scalarInputCount || arguments->structureInput ||
             arguments->structureInputDescriptor)
             return kIOReturnBadArgument;
+        // A client the compute backend holds no record for has no session.
+        if (ivars->identityError) return kIOReturnNoResources;
         kern_return_t ret = ensure_open(this);
         if (ret != kIOReturnSuccess) return ret;
         if (s_modulesRunning) {
@@ -4559,7 +4602,17 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         int n = dext_compute_query_info(tag, out,
             arguments->scalarOutputCount < 32 ? (int)arguments->scalarOutputCount : 32);
         if (n < 0) {
+            // No compute session for this client: said once per failure,
+            // with why (session_state.h's tag 12; tag 10 asks the same).
+            if (tag == 10 || tag == 12)
+                MACLINUXGPU_EVENT("client %llu: no compute session for QueryInfo tag %llu "
+                                  "(%d; KFD open %d; %u client record(s) held)",
+                                  ivars->clientID, tag, n,
+                                  dext_compute_client_open_error(ivars->clientID),
+                                  dext_compute_client_records());
             if (n == -ENOTREADY_L) return kIOReturnNotReady;
+            if (n == -ENOMEM_L) return kIOReturnNoResources;
+            if (n == -EBUSY_L) return kIOReturnBusy;
             return kIOReturnBadArgument;
         }
         for (int i = 0; i < n && i < (int)arguments->scalarOutputCount; i++)
@@ -4722,6 +4775,8 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         uint64_t out[3] = {0};
         int r = dext_compute_host_window(arguments->scalarInput[0], out);
         if (r == -ENOTREADY_L) return kIOReturnNotReady;
+        if (r == -ENOMEM_L) return kIOReturnNoResources;
+        if (r == -EBUSY_L) return kIOReturnBusy;
         if (r != 0) return kIOReturnBadArgument;
         arguments->scalarOutput[0] = out[0];
         arguments->scalarOutput[1] = out[1];

@@ -272,14 +272,19 @@ hsa_status_t initializeShimDevice(ShimInitializationRPC &rpc,
     // is what opts in: a KFD-backed client then owns a host window in its
     // own GPUVM, reserved and set here like the pre-probe GART window. A
     // driver that predates the tag keeps the GART window as host window.
+    // A driver that has the tag and gives no session fails initialization
+    // here: this client has no queues to run on.
     ComputeSessionMode sessionMode=ComputeSessionMode::Unknown;
     if (build[2]>=kComputeSessionDriverBuild) {
         std::array<uint64_t,kComputeSessionQueryWords> session{};
         const uint64_t sessionTag=kComputeSessionQueryTag;
-        if (rpc.scalar(21,{&sessionTag,1},session)==HSA_STATUS_SUCCESS && session[SessionVersion]>=1 &&
-            (session[SessionMode]==uint64_t(ComputeSessionMode::Legacy) ||
-             session[SessionMode]==uint64_t(ComputeSessionMode::KFD)))
-            sessionMode=ComputeSessionMode(session[SessionMode]);
+        status=scalar(21,{&sessionTag,1},session);
+        if (status!=HSA_STATUS_SUCCESS) return status;
+        if (session[SessionVersion]<1 ||
+            (session[SessionMode]!=uint64_t(ComputeSessionMode::Legacy) &&
+             session[SessionMode]!=uint64_t(ComputeSessionMode::KFD)))
+            return invalid(HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS);
+        sessionMode=ComputeSessionMode(session[SessionMode]);
     }
     query=0;
     status=scalar(54,{&query,1},window);

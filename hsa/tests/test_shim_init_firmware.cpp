@@ -129,7 +129,10 @@ extern "C" kern_return_t test_scalar(mach_port_t port, uint32_t selector, const 
             out[0] = 32ull << 30; out[1] = 31ull << 30; out[2] = 1ull << 30;
             out[3] = 0; out[4] = 256ull << 20; out[5] = 0;
         } else if (in[0] == 12) {
-            return kIOReturnNotReady; /* no compute-session report: legacy path */
+            /* The legacy path: the GART window stays the host window. */
+            assert(ready && *count >= 8);
+            out[0] = 1; out[1] = 1; out[2] = 1; out[3] = 0;
+            out[4] = window_base; out[5] = window_bytes; out[6] = out[7] = 0;
         } else assert(false);
         break;
     default: assert(false);

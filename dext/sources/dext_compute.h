@@ -148,6 +148,16 @@ int dext_compute_device_spec(void *out, size_t cap);
 /* Whether @client uses the legacy path (its session ends with it: the GART
  * host window is in its address space). */
 bool dext_compute_client_legacy(uint64_t client);
+/* Client records (one per runtime client, a fixed table): whether @client
+ * still owns a KFD process, a queue or a BO, which its release frees; a
+ * stopped client's record is forgotten (-EBUSY_L: kept, its KFD process is
+ * not closed); the records held; the error its KFD process's open failed
+ * with (Linux errno, 0 for none). A stopped session forgets every record
+ * with no KFD process left (dext_compute_stop). */
+bool dext_compute_client_owns(uint64_t client);
+int dext_compute_forget_client(uint64_t client);
+unsigned dext_compute_client_records(void);
+int dext_compute_client_open_error(uint64_t client);
 
 /* BOAlloc (16): in size/domain/alignment/flags, out handle/gpu_va/cpu_addr. */
 int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
