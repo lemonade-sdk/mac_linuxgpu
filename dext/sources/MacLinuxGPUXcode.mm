@@ -247,6 +247,10 @@ extern "C" void  rt_device_free(void *dev);
 extern "C" void *rt_device_get_pdev(void *rtdev);
 extern "C" struct kobject *rt_device_kobject(void *rtdev);
 extern "C" int   rt_pci_probe_result(void *pdev);
+extern "C" void  linuxu_pci_set_upstream_partner(uint16_t vendor, uint16_t device,
+                                                 uint16_t pcie_capabilities,
+                                                 uint32_t link_capabilities);
+extern "C" void  linuxu_pci_clear_upstream_partner(void);
 extern "C" int   rt_pci_probe_cleanup_retained(void *pdev);
 extern "C" int   fw_table_register_embedded(void);
 
@@ -1301,6 +1305,73 @@ static void identity_read_provider(IOService *provider)
     properties->release();
 }
 
+// The port the GPU's own PCIe switch hangs off -- on Thunderbolt, the
+// enclosure's downstream port -- for amdgpu's link-speed policy.
+// amdgpu_device_partner_bandwidth walks pci_upstream_bridge() past the
+// dGPU's switch ports and takes the platform's speed from the first other
+// port's Link Capabilities; finding none, it allows Gen1 and Gen2 only, and
+// the SMU's PCIe DPM then holds the link at 5 GT/s (an R9700 behind a
+// 16 GT/s x4 TB5 port measured 1.65 GB/s host to VRAM, the Gen2 x4 rate).
+// DriverKit gives no configuration access past the endpoint, so the port is
+// described from the registry values IOPCIFamily published for it and
+// handed to the PCI shim (linuxu_pci_set_upstream_partner). Read only.
+static void partner_read_provider_chain(IOService *service)
+{
+    linuxu_pci_clear_upstream_partner();
+    if (!service) return;
+    static const char *const kKeys[] = {"vendor-id", "device-id", "IOPCIExpressCapabilities",
+                                        "IOPCIExpressLinkCapabilities"};
+    OSArray *keys = OSArray::withCapacity(4);
+    if (!keys) {
+        MACLINUXGPU_LOG("PCIe partner: no memory for the property keys; amdgpu will allow Gen1/Gen2 only");
+        return;
+    }
+    for (const char *key : kKeys) {
+        OSString *name = OSString::withCString(key);
+        if (name) {
+            keys->setObject(name);
+            name->release();
+        }
+    }
+    OSArray *chain = nullptr;
+    const kern_return_t ret = service->CopyProviderProperties(keys, &chain);
+    keys->release();
+    if (ret != kIOReturnSuccess || !chain) {
+        MACLINUXGPU_LOG("PCIe partner: the provider chain could not be read (%#x); "
+                        "amdgpu will allow Gen1/Gen2 only", ret);
+        if (chain) chain->release();
+        return;
+    }
+    bool found = false;
+    for (uint32_t i = 0; i < chain->getCount() && !found; ++i) {
+        OSDictionary *entry = OSDynamicCast(OSDictionary, chain->getObject(i));
+        uint32_t vendor = 0, device = 0;
+        // Bridge objects between the PCI devices publish no registers.
+        if (!entry || !provider_register(entry, "vendor-id", vendor)) continue;
+        // The GPU and its own switch ports, which upstream skips as well.
+        if (vendor == 0x1002) continue;
+        found = true;
+        OSNumber *link = OSDynamicCast(OSNumber, entry->getObject("IOPCIExpressLinkCapabilities"));
+        OSNumber *caps = OSDynamicCast(OSNumber, entry->getObject("IOPCIExpressCapabilities"));
+        (void)provider_register(entry, "device-id", device);
+        if (!link) {
+            MACLINUXGPU_LOG("PCIe partner %04x:%04x publishes no link capabilities; "
+                            "amdgpu will allow Gen1/Gen2 only", (unsigned)vendor, (unsigned)device);
+            break;
+        }
+        const uint32_t linkCaps = (uint32_t)link->unsigned64BitValue();
+        linuxu_pci_set_upstream_partner((uint16_t)vendor, (uint16_t)device,
+                                        caps ? (uint16_t)caps->unsigned64BitValue() : 0, linkCaps);
+        MACLINUXGPU_LOG("PCIe partner %04x:%04x: Link Capabilities %#x (max speed code %u, x%u)",
+                        (unsigned)vendor, (unsigned)device, linkCaps, linkCaps & 15u,
+                        (linkCaps >> 4) & 63u);
+    }
+    if (!found)
+        MACLINUXGPU_LOG("PCIe partner: no port above the GPU's switch in %u provider entries; "
+                        "amdgpu will allow Gen1/Gen2 only", chain->getCount());
+    chain->release();
+}
+
 static void identity_publish(MacLinuxGPU *driver, const char *when)
 {
     if (!driver) return;
@@ -1969,6 +2040,7 @@ IMPL(MacLinuxGPU, Start)
     s_displaysPublished = false;
     identity_read_provider(pci);
     identity_publish(this, "start");
+    partner_read_provider_chain(this);
     MACLINUXGPU_LOG("driver attached; PCI deferred until a client operation");
     RegisterService();
     return kIOReturnSuccess;

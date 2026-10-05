@@ -413,6 +413,20 @@ extern int pci_device_is_present(struct pci_dev *dev);
  * records with pci_dev_set_disconnected. From then on pci_dev_is_disconnected
  * and pci_device_is_present answer without touching configuration space. */
 extern void linuxu_pci_mark_removed(struct pci_dev *dev);
+/* The port the GPU's own PCIe switch is attached to (on Thunderbolt, the
+ * enclosure's downstream port), as IOPCIFamily published it: what Linux
+ * reaches with pci_upstream_bridge() past the dGPU's switch ports, and what
+ * amdgpu_device_partner_bandwidth reads the platform's link capability
+ * from. DriverKit exposes only the GPU endpoint, so the dext supplies the
+ * port's registry values before the probe. pci_upstream_bridge() then
+ * returns a read-only stand-in for it: vendor and device, and the PCIe
+ * Capabilities and Link Capabilities registers; no configuration access
+ * reaches the GPU through it. Without it amdgpu finds no upstream bridge,
+ * takes the platform's speed as unknown and caps the link at Gen2. */
+extern void linuxu_pci_set_upstream_partner(u16 vendor, u16 device,
+					    u16 pcie_capabilities,
+					    u32 link_capabilities);
+extern void linuxu_pci_clear_upstream_partner(void);
 static inline int pci_channel_offline(struct pci_dev *pdev)
 {
 	return pdev->error_state != pci_channel_state_normal &&

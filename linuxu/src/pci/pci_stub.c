@@ -330,11 +330,25 @@ void pci_mem_unmap(struct pci_dev *dev, void __iomem *base)
 }
 
 /* ---- config space (stub table on the dev) ---- */
+/* The upstream partner port (pci.h). One per process, like the endpoint
+ * every configuration access in this file reaches. */
+static struct pci_dev linuxu_partner;
+static u16 linuxu_partner_pcie_caps;
+static u32 linuxu_partner_link_caps;
+static int linuxu_partner_known;
+
+static int pci_is_partner(const struct pci_dev *dev)
+{
+	return dev == &linuxu_partner;
+}
+
 static int pci_config_access_valid(const struct pci_dev *dev, int where,
 				   unsigned width)
 {
 	unsigned limit;
-	if (!dev || where < 0 || ((unsigned)where & (width - 1)))
+	/* Every access below reaches the GPU endpoint whatever dev says; the
+	 * partner stand-in has no configuration space of its own. */
+	if (!dev || pci_is_partner(dev) || where < 0 || ((unsigned)where & (width - 1)))
 		return 0;
 	limit = dev->cfg_size > 0 ? (unsigned)dev->cfg_size : 4096;
 	if (limit > 4096) limit = 4096;
@@ -451,6 +465,11 @@ int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
 	int offset, r;
 	if (!val) return -EINVAL;
 	*val = 0;
+	if (pci_is_partner(dev)) {
+		if (pos != 2) return -EINVAL;
+		*val = linuxu_partner_pcie_caps;
+		return 0;
+	}
 	r = pcie_capability_offset(dev, pos, sizeof(*val), &offset);
 	return r || !offset ? r : pci_read_config_word(dev, offset, val);
 }
@@ -460,6 +479,11 @@ int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val)
 	int offset, r;
 	if (!val) return -EINVAL;
 	*val = 0;
+	if (pci_is_partner(dev)) {
+		if (pos != 0x0c) return -EINVAL;
+		*val = linuxu_partner_link_caps;
+		return 0;
+	}
 	r = pcie_capability_offset(dev, pos, sizeof(*val), &offset);
 	return r || !offset ? r : pci_read_config_dword(dev, offset, val);
 }
@@ -1155,10 +1179,35 @@ int pci_config_reset(struct pci_dev *dev)
 	return pci_reset_function(dev);
 }
 
+void linuxu_pci_set_upstream_partner(u16 vendor, u16 device, u16 pcie_capabilities,
+				     u32 link_capabilities)
+{
+	__atomic_store_n(&linuxu_partner_known, 0, __ATOMIC_RELEASE);
+	memset(&linuxu_partner, 0, sizeof(linuxu_partner));
+	linuxu_partner.vendor = vendor;
+	linuxu_partner.device = device;
+	linuxu_partner.is_pcie_device = 1;
+	linuxu_partner.pcie_capable = 1;
+	linuxu_partner.is_bridge = 1;
+	linuxu_partner_pcie_caps = pcie_capabilities;
+	linuxu_partner_link_caps = link_capabilities;
+	__atomic_store_n(&linuxu_partner_known, 1, __ATOMIC_RELEASE);
+}
+
+void linuxu_pci_clear_upstream_partner(void)
+{
+	__atomic_store_n(&linuxu_partner_known, 0, __ATOMIC_RELEASE);
+}
+
 struct pci_dev *pci_upstream_bridge(struct pci_dev *dev)
 {
-	(void)dev;
-	return NULL;
+	/* The endpoint's chain is the partner and then nothing: what lies
+	 * beyond it (Thunderbolt's tunnel, the root port) has no registers a
+	 * Linux caller could use. */
+	if (!dev || pci_is_partner(dev) ||
+	    !__atomic_load_n(&linuxu_partner_known, __ATOMIC_ACQUIRE))
+		return NULL;
+	return &linuxu_partner;
 }
 
 int pci_is_root_bus(struct pci_bus *bus)

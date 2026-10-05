@@ -236,6 +236,30 @@ int main(void) {
     struct pci_dev *limiting = &p;
     assert(pcie_bandwidth_available(&p, &limiting, &path_speed, &path_width) == 0);
     assert(!limiting && path_speed == PCI_SPEED_UNKNOWN && path_width == PCIE_LNK_WIDTH_UNKNOWN);
+    /* The upstream partner: none until the dext supplies one, which is
+     * amdgpu's "platform speed unknown" (Gen1/Gen2 only). Once supplied it
+     * answers from the registry values and never from the endpoint's
+     * configuration space, which here says 32 GT/s x16. */
+    assert(pci_upstream_bridge(&p) == NULL);
+    wr32(0x8c, 5 | (16 << 4));
+    linuxu_pci_set_upstream_partner(0x8086, 0x5786, 2 | (PCI_EXP_TYPE_DOWNSTREAM << 4),
+                                    0x00715844); /* 16 GT/s x4, as an Intel TB5 port */
+    struct pci_dev *partner = pci_upstream_bridge(&p);
+    assert(partner && partner != &p && partner->vendor == 0x8086 && partner->device == 0x5786);
+    assert(pci_upstream_bridge(partner) == NULL);
+    assert(pcie_get_speed_cap(partner) == PCIE_SPEED_16_0GT);
+    assert(pcie_get_width_cap(partner) == PCIE_LNK_WIDTH_X4);
+    assert(pci_pcie_type(partner) == PCI_EXP_TYPE_DOWNSTREAM);
+    {
+        u32 value = 0;
+        u16 half = 0;
+        assert(pci_read_config_dword(partner, 0, &value) == -EINVAL && value == UINT32_MAX);
+        assert(pci_write_config_dword(partner, 4, 0) == -EINVAL);
+        assert(pcie_capability_read_word(partner, 0x12, &half) == -EINVAL);
+    }
+    assert(pcie_get_speed_cap(&p) == PCIE_SPEED_32_0GT);
+    linuxu_pci_clear_upstream_partner();
+    assert(pci_upstream_bridge(&p) == NULL);
     wr16(0x8a, 0x1234);
     wr32(0x8c, 0x12345678);
     wr16(0xa8, 0x4321);
