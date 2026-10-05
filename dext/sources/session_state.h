@@ -555,19 +555,21 @@ static inline bool mlg_call_runs_on_delivery(uint64_t selector, const uint64_t *
 	}
 }
 
-/* Whether a client calls @selector with @input synchronously: those that
- * run on the delivery thread, the bounded reads (SysfsRead, DrmInfo), and
- * the display's PRESENT and RESULT. Every other call is async. */
 /* The Linux-file client's own selectors (linuxu/headers/rt/lx_abi.h,
- * MLG_SELECTOR_LX_FIRST..LAST), served on that client's queue: synchronous
- * (LX_IOCTL, LX_RESULT, LX_MMAP_COMMIT, LX_SCANOUT and the retired ones),
- * except LX_IOCTL_ASYNC and LX_CALL_ASYNC, which carry their own completion
- * (never OWNER_RESULT's). test-selector-call checks the numbers. */
+ * MLG_SELECTOR_LX_FIRST..LAST), answered on the call (the delivery
+ * thread): synchronous (LX_IOCTL, LX_RESULT, LX_MMAP_COMMIT, LX_SCANOUT and
+ * the retired ones), except LX_IOCTL_ASYNC and LX_CALL_ASYNC, which carry
+ * their own completion (never OWNER_RESULT's). test-selector-call checks
+ * the numbers. */
 #define MLG_CALL_LX_FIRST		96u
 #define MLG_CALL_LX_IOCTL_ASYNC		99u
 #define MLG_CALL_LX_CALL_ASYNC		105u
 #define MLG_CALL_LX_LAST		105u
 
+/* Whether a client calls @selector with @input synchronously: those that
+ * run on the delivery thread, the Linux-file client's synchronous ones,
+ * the bounded reads (SysfsRead, DrmInfo), and the display's PRESENT and
+ * RESULT. Every other call is async. */
 static inline bool mlg_call_is_synchronous(uint64_t selector, const uint64_t *input,
 					   uint32_t input_count)
 {
