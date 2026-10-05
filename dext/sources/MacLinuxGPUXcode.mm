@@ -323,6 +323,12 @@ static uint64_t         s_disconnectedGeneration = 0;
 // A definite PCI transport fault made this session's GPU unreachable
 // (transport_lost); cleared when the session's provider closes.
 static bool             s_deviceLost = false;
+// The session call running on the session queue (owner_job_main) since
+// this uptime (0: none) and its selector: what a Stop or Retire waits for.
+static uint64_t         s_ownerJobSince = 0;
+static uint32_t         s_ownerJobSelector = 0;
+// Retire calls that reached the session queue (the watchdog's progress).
+static uint64_t         s_retiresRun = 0;
 static bool             s_terminateRequested = false;
 static bool             s_creatingObserver = false;
 static bool             s_creatingLinuxFile = false;
@@ -853,6 +859,30 @@ static void transport_lost(int fault)
                       lost ? " (but its completion thread did not start)" : "");
 }
 
+// The driver's Stop and Retire run on the session queue, behind whatever
+// session call runs there. A call that never returns (a wait for GPU work
+// that cannot complete) would keep the instance alive forever: an upgrade
+// never finishes and a power-cycled GPU's instance lingers. While a Stop or
+// Retire waits, a watchdog (session_watchdog_main, a queue of its own) asks
+// this once a second: a session call running for MLG_SESSION_BLOCK_BOUND_MS
+// makes GPU work complete at once, as a removal does (rt_device_lost), so
+// the call returns and the Stop or Retire runs. The device is unusable for
+// this instance from then on; the session closes with it.
+static bool session_watchdog_step(uint64_t now_ns, const char *waiting)
+{
+    const uint64_t since = __atomic_load_n(&s_ownerJobSince, __ATOMIC_ACQUIRE);
+    if (!mlg_session_blocked(since, now_ns, (uint64_t)MLG_SESSION_BLOCK_BOUND_MS * 1000000ull))
+        return false;
+    if (__atomic_exchange_n(&s_deviceLost, true, __ATOMIC_ACQ_REL)) return true;
+    MACLINUXGPU_EVENT("%s waits behind session call %u, running for %llu s: GPU work completes with "
+                      "-ECANCELED so it returns (the GPU is unusable for this instance)", waiting,
+                      __atomic_load_n(&s_ownerJobSelector, __ATOMIC_RELAXED),
+                      (unsigned long long)((now_ns - since) / 1000000000ull));
+    const int lost = rt_device_lost_active("session queue blocked");
+    if (lost) MACLINUXGPU_EVENT("watchdog: GPU work completion thread not started (%d)", lost);
+    return true;
+}
+
 // Whether the device is still on the bus; once it is not, removal begins.
 // Asked when a client or the driver stops: an unplug terminates the PCI
 // provider and its clients.
@@ -1369,6 +1399,8 @@ static struct mlg_power s_power;
 static uint64_t s_powerStartNs;
 static uint64_t s_powerHolders[16];          // clients holding a PREPARE
 static IODispatchQueue *s_powerQueue;        // the acknowledgement deadline's watcher
+static IODispatchQueue *s_watchdogQueue;     // session_watchdog_start's watches
+static uint32_t s_watchdogActive;
 static uint64_t s_powerAckPending;           // serial of the change awaiting its ack, 0 if none
 static uint64_t s_powerAckSerial;
 static uint32_t s_powerAckFlags;
@@ -1854,6 +1886,9 @@ IMPL(MacLinuxGPU, Start)
     }
     s_bringupQueue = bqueue;
     s_stopQueue = bqueue;
+    if (!s_watchdogQueue &&
+        IODispatchQueue::Create("MacLinuxGPUWatchdog", 0, 0, &s_watchdogQueue) != kIOReturnSuccess)
+        s_watchdogQueue = nullptr;
     // The driver's own calls (Stop, power changes, NewUserClient) arrive
     // on a queue of their own: DriverKit delivers them on the thread every
     // client's calls share, under that queue, so a delivery that had to
@@ -1944,6 +1979,28 @@ IMPL(MacLinuxGPU, Start)
 // the Stop later.
 static void driver_stop(MacLinuxGPU *driver, IOService *provider);
 
+// A Stop or a Retire was asked for: until it runs on the session queue, the
+// watchdog checks once a second whether a session call blocks it there for
+// good (session_watchdog_step). One watch at a time.
+static void session_watchdog_start(MacLinuxGPU *driver, const char *waiting, bool retire)
+{
+    if (!s_watchdogQueue || !driver) return;
+    if (__atomic_exchange_n(&s_watchdogActive, 1u, __ATOMIC_ACQ_REL)) return;
+    const uint64_t retires = __atomic_load_n(&s_retiresRun, __ATOMIC_ACQUIRE);
+    driver->retain();
+    s_watchdogQueue->DispatchAsync(^{
+        for (uint32_t second = 0; second < MLG_SESSION_WATCH_MAX_S; ++second) {
+            if (retire ? __atomic_load_n(&s_retiresRun, __ATOMIC_ACQUIRE) != retires
+                       : __atomic_load_n(&s_stopping, __ATOMIC_ACQUIRE))
+                break;
+            if (session_watchdog_step(power_now_ns(), waiting)) break;
+            IOSleep(1000);
+        }
+        __atomic_store_n(&s_watchdogActive, 0u, __ATOMIC_RELEASE);
+        driver->release();
+    });
+}
+
 kern_return_t
 IMPL(MacLinuxGPU, Stop)
 {
@@ -1955,6 +2012,8 @@ IMPL(MacLinuxGPU, Stop)
         provider->release();
         release();
     });
+    // The Stop queues behind any session call: watch that one returns.
+    session_watchdog_start(this, "the driver's Stop", false);
     return kIOReturnSuccess;
 }
 
@@ -3678,8 +3737,11 @@ static void owner_job_main(OwnerJob *job)
     a.scalarOutputCount = job->nout;
     a.structureOutputMaximumSize = job->outputMax;
     a.completion = job->action;
+    __atomic_store_n(&s_ownerJobSelector, job->selector, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_ownerJobSince, power_now_ns(), __ATOMIC_RELEASE);
     const kern_return_t kr = job->client->ExternalMethod(job->selector, &a, nullptr, nullptr,
                                                          const_cast<uint8_t *>(&kOwnerJob));
+    __atomic_store_n(&s_ownerJobSince, 0, __ATOMIC_RELEASE);
     IOUserClientAsyncArgumentsArray data = {};
     if (job->selector == MLG_SELECTOR_EVENT_WAIT) {
         // Started: event_wait_main completes it. Not started: completed
@@ -4292,6 +4354,8 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return direct_call(this, selector, arguments);
         if (selector == MLG_SELECTOR_OWNER_RESULT) return kIOReturnBadArgument;
         if (!arguments->completion) return refuse_sync(this, selector);
+        // A Retire queues behind any session call: watch that one returns.
+        if (selector == MLG_SELECTOR_RETIRE) session_watchdog_start(ivars->ownerDriver, "Retire", true);
         return owner_call(this, selector, arguments);
     }
     // On the owner's queue (owner_job_main): the session call itself.
@@ -5212,6 +5276,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         return observer_drm_selftest(arguments);
 
     case MLG_SELECTOR_RETIRE: {
+        __atomic_add_fetch(&s_retiresRun, 1, __ATOMIC_ACQ_REL);
         // Hand the GPU to a replacement driver (session_state.h). Entitled:
         // it ends every client's session.
         if (!mlg_retire_args_valid(in, arguments->scalarInputCount) ||

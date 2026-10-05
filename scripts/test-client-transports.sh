@@ -29,7 +29,7 @@ parts = [
     section("static uint32_t s_lxRegistryLock;", "static void lx_gate_close()", 40, "registry"),
     section("// Linux-file calls (rt/lx_abi.h selectors)", "// Interrupt-driven waits (selectors 86 and 87", 200, "lx"),
     section("static kern_return_t lx_call(MacLinuxGPUUserClient *client", "// A Linux-file mapping as client memory", 230, "lx calls"),
-    section("// Session calls off the delivery thread", "// A client's last display op result", 480, "owner calls"),
+    section("// Session calls off the delivery thread", "// A client's last display op result", 520, "owner calls"),
 ]
 (out / "lx_transport_production.inc").write_text("\n".join(parts))
 delivery = section("    if (reference != &kOwnerJob) {", "    // On the owner's queue (owner_job_main)", 40, "delivery")

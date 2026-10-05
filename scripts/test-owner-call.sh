@@ -16,7 +16,7 @@ end = "// A client's last display op result (MacLinuxGPUUserClient_IVars::displa
 if source.count(start) != 1 or source.count(end) != 1:
     raise SystemExit("owner call extraction markers changed")
 text = source[source.index(start):source.index(end)]
-if len(text.splitlines()) > 480:
+if len(text.splitlines()) > 520:
     raise SystemExit("owner call extraction exceeded its bounded section")
 pathlib.Path(sys.argv[1], "owner_call_production.inc").write_text(text)
 state = pathlib.Path("dext/sources/session_state.h").read_text()

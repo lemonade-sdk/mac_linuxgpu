@@ -222,6 +222,10 @@ static unsigned recoveryDetaches;
 extern "C" void rt_recovery_detach_pdev(struct pci_dev *) { ++recoveryDetaches; }
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
 static void driver_stop(MacLinuxGPU *driver, IOService *provider);
+// The driver's Stop starts a watch for a session call that never returns
+// (session_watchdog_step is the production check, tested directly).
+static unsigned watchdogStarts;
+static void session_watchdog_start(MacLinuxGPU *, const char *, bool) { ++watchdogStarts; }
 #include "session_shutdown_production.inc"
 // Hooked in by InitDevice, which these scenarios do not run.
 [[maybe_unused]] static void (*const recoveryNotify)(const struct rt_recovery_state *) = recovery_notify;
@@ -1367,12 +1371,35 @@ static void transportFaultRemoval() {
     devicePresent = false;
     driver.retain(); provider.retain();
     assert(driver.Stop(&provider) == kIOReturnSuccess);
-    assert(driverStops == 1 && clientStops == 1 && !s_stopProvider);
+    assert(driverStops == 1 && clientStops == 1 && !s_stopProvider && watchdogStarts == 1);
     assert(!s_dmaQuarantined && !s_sessionClosing && !s_deviceRemoved && !s_deviceLost);
     assert(saw("removal_begin") && saw("removal_end") && saw("pci_close_removed"));
     assert(!displayShowing && !surfacesImported);
     expectLog("removal: session released after the device left the bus");
     std::puts("PASS production session shutdown: transport fault, then removal: the instance finishes and stops");
+}
+
+// A session call that never returns (a wait for GPU work that cannot
+// complete: 250's eviction stall) holds the session queue, where the
+// driver's Stop and a Retire run. The watchdog asks once a second; past the
+// bound it makes GPU work complete at once, as a removal does, so the call
+// returns and the Stop or Retire runs, once.
+static void watchdogNeverReturning() {
+    const uint64_t s = 1000000000ull;
+    assert(!session_watchdog_step(100 * s, "the driver's Stop") && !saw("device_lost"));
+    s_ownerJobSince = 5 * s; s_ownerJobSelector = 59;
+    assert(!session_watchdog_step(5 * s + (MLG_SESSION_BLOCK_BOUND_MS / 1000 - 1) * s, "Retire"));
+    assert(!saw("device_lost") && !s_deviceLost);
+    assert(session_watchdog_step(5 * s + (MLG_SESSION_BLOCK_BOUND_MS / 1000 + 1) * s, "Retire"));
+    assert(saw("device_lost") && s_deviceLost);
+    expectLog("Retire waits behind session call 59, running for 31 s");
+    // Asked again (a second watch): nothing more is forced.
+    assert(session_watchdog_step(5 * s + 60 * s, "the driver's Stop"));
+    assert(std::count(events.begin(), events.end(), "device_lost") == 1);
+    // The call returned: the session queue is free again.
+    s_ownerJobSince = 0;
+    assert(!session_watchdog_step(200 * s, "the driver's Stop"));
+    std::puts("PASS production session shutdown: a session call that never returns is ended for Stop and Retire");
 }
 
 // Far more programs than the compute backend has records come and go, of
@@ -1517,6 +1544,10 @@ int main(int argc, char **argv) {
     const std::string scenario = argv[1];
     if (scenario == "concurrent-clients") {
         concurrentClients();
+        return 0;
+    }
+    if (scenario == "watchdog-never-returning") {
+        watchdogNeverReturning();
         return 0;
     }
     if (scenario == "transport-fault-removal") {

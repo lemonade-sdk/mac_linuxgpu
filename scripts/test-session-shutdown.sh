@@ -54,7 +54,7 @@ clang++ -std=c++20 -fblocks -Wall -Wextra -Werror -Wno-unused-variable \
 for scenario in log-format success large-mapped hold-failure compute-failure irq-failure irq-failure-late \
   reset-failure dma-fini-failure pre-quarantined isolation-failure raw-mapped shutdown-selector probe-retained \
   client-exit-reopen queue-exhaustion-exit client-exit-unprobed client-exit-release-failure \
-  client-exit-raw-mapped client-exit-legacy concurrent-clients client-churn last-leaver-churn transport-fault-removal observer-quarantined release-after-isolation-failure \
+  client-exit-raw-mapped client-exit-legacy concurrent-clients client-churn last-leaver-churn transport-fault-removal watchdog-never-returning observer-quarantined release-after-isolation-failure \
   release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads \
   selftest-parked display-showing display-quarantined surprise-removal surprise-removal-quarantined surprise-removal-held \
   upgrade-stop-idle upgrade-stop-session upgrade-stop-quarantined upgrade-stop-quarantined-held \

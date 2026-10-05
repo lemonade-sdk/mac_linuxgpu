@@ -233,6 +233,11 @@ extern "C" int rt_bounded_run(void (*fn)(void *), void *arg, void (*release)(voi
     return 0;
 }
 
+// The running session call, for the Stop/Retire watchdog (session
+// shutdown checks it).
+static uint64_t s_ownerJobSince;
+static uint32_t s_ownerJobSelector;
+static uint64_t power_now_ns() { return 1; }
 #include "owner_call_production.inc"
 
 kern_return_t MacLinuxGPUUserClient::ExternalMethod(uint64_t selector, IOUserClientMethodArguments *a,

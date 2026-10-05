@@ -191,7 +191,12 @@ struct IODispatchQueue {
 struct OwnerResult;
 struct ClientMemory;
 struct MacLinuxGPUUserClient;
+struct MacLinuxGPU;
+// A Retire's delivery starts the Stop/Retire watchdog (session shutdown
+// checks it): nothing to watch here.
+static void session_watchdog_start(MacLinuxGPU *, const char *, bool) {}
 struct MacLinuxGPUUserClient_IVars {
+    MacLinuxGPU *ownerDriver;
     uint64_t sessionGeneration;
     uint64_t clientID;
     bool stopping;
@@ -450,6 +455,11 @@ static int rt_lx_scanout(rt_lx_client *, const mlg_lx_scanout *, mlg_lx_scanout_
 }
 
 // ---- the dext's code, as it ships ----
+// The running session call, for the Stop/Retire watchdog (session
+// shutdown checks it).
+static uint64_t s_ownerJobSince;
+static uint32_t s_ownerJobSelector;
+static uint64_t power_now_ns() { return 1; }
 #include "lx_transport_production.inc"
 
 // ---- the GPU behind the owner's queue (ExternalMethod's session part) ----

@@ -238,6 +238,17 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_RETIRE_CONFIRM      0x52455452ULL /* "RETR" */
 #define MLG_RETIRE_WORDS        3u
 
+/* How long a session call may hold the session queue while the driver's
+ * Stop or a Retire waits behind it before the driver makes GPU work
+ * complete at once (MacLinuxGPUXcode.mm's session_watchdog_step), and how
+ * long one watch lasts. */
+#define MLG_SESSION_BLOCK_BOUND_MS 30000u
+#define MLG_SESSION_WATCH_MAX_S    600u
+static inline bool mlg_session_blocked(uint64_t job_since_ns, uint64_t now_ns, uint64_t bound_ns)
+{
+	return job_since_ns && now_ns > job_since_ns && now_ns - job_since_ns >= bound_ns;
+}
+
 enum mlg_retire_state {
 	MLG_RETIRE_IDLE        = 0, /* no session; new sessions refused */
 	MLG_RETIRE_TERMINATING = 1, /* termination requested: stops, then the process exits */
