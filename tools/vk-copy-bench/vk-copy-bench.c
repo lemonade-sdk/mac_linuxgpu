@@ -6,6 +6,11 @@
  * by GPU timestamps around the copies (wall time when a queue has none).
  *
  *   vk-copy-bench [--mib N] [--repeat N]
+ *   vk-copy-bench --alloc [--mib N] [--repeat N]
+ *
+ * --alloc times allocating, binding and freeing host-memory (GTT) buffers
+ * instead: each allocation writes the GPU's page table (GART) for its
+ * pages, the path a model load or any client allocation takes.
  *
  * Run with the RADV ICD: VK_DRIVER_FILES=.../radeon_icd.json. Every failure
  * is reported with the call that failed; nothing is measured in its place. */
@@ -65,10 +70,12 @@ static struct buffer make_buffer(VkDeviceSize size, VkMemoryPropertyFlags want, 
 int main(int argc, char **argv)
 {
 	uint32_t mib = 64, repeat = 8;
+	bool alloc = false;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--mib") && i + 1 < argc) mib = (uint32_t)atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--repeat") && i + 1 < argc) repeat = (uint32_t)atoi(argv[++i]);
-		else FAIL("usage: vk-copy-bench [--mib N] [--repeat N]");
+		else if (!strcmp(argv[i], "--alloc")) alloc = true;
+		else FAIL("usage: vk-copy-bench [--alloc] [--mib N] [--repeat N]");
 	}
 	if (!mib || !repeat)
 		FAIL("--mib and --repeat must be positive");
@@ -129,6 +136,29 @@ int main(int argc, char **argv)
 				   .pQueueCreateInfos = qci };
 	VK(vkCreateDevice(pd, &dci, NULL, &dev));
 
+	if (alloc) {
+		/* Allocate, map, touch a byte per page (the pages exist), free. */
+		for (uint32_t pass = 0; pass < 2; pass++) {
+			const uint64_t t0 = now_ns();
+			for (uint32_t rep = 0; rep < repeat; rep++) {
+				struct buffer b = make_buffer(size, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+								    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+							      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "host");
+				for (VkDeviceSize off = 0; off < size; off += 16384)
+					((volatile uint8_t *)b.map)[off] = (uint8_t)rep;
+				vkUnmapMemory(dev, b.mem);
+				vkDestroyBuffer(dev, b.buf, NULL);
+				vkFreeMemory(dev, b.mem, NULL);
+			}
+			const double each = (double)(now_ns() - t0) / repeat / 1e3;
+			if (pass)	/* the first warms up */
+				printf("allocate, bind, touch and free %u MiB of host memory: %.1f us each, %.2f GB/s (%u times)\n",
+				       mib, each, (double)size / (each * 1e3), repeat);
+		}
+		vkDestroyDevice(dev, NULL);
+		vkDestroyInstance(inst, NULL);
+		return 0;
+	}
 	struct buffer host_a = make_buffer(size, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 					   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "host");
 	struct buffer host_b = make_buffer(size, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,

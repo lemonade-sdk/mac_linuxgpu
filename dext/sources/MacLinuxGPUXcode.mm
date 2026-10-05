@@ -2628,6 +2628,15 @@ static kern_return_t lx_copy_memory(MacLinuxGPUUserClient *client, uint64_t type
         }
         if (descs && built == ranges.count) {
             descriptor = lx_concat(descs, built);
+            /* A CPU mapping of the GPU's BARs in the client's process: a
+             * store through it to an unplugged GPU panics the Mac as the
+             * driver's own did, so each one is logged (which clients map
+             * what, for that decision). */
+            uint64_t bytes = 0;
+            for (size_t i = 0; i < ranges.count; ++i) bytes += ranges.lengths[i];
+            MACLINUXGPU_LOG("client %llu: maps %llu bytes of BAR%u into its process (%s)",
+                            client->ivars->clientID, (unsigned long long)bytes, ranges.bars[0],
+                            ranges.bars[0] == 0 ? "VRAM" : "doorbells or registers");
         } else if (descs) {
             for (size_t i = 0; i < built; ++i) descs[i]->release();
         }
@@ -2702,6 +2711,8 @@ IMPL(MacLinuxGPUUserClient, CopyClientMemoryForType)
     if (ret != kIOReturnSuccess || barMemory == nullptr)
         return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
     (void)s_rawBARLease.markMapped(ivars->clientID);
+    MACLINUXGPU_LOG("client %llu: maps all of BAR%llu (%llu bytes) into its process (raw lease)",
+                    ivars->clientID, (unsigned long long)type, (unsigned long long)barSize);
     *options = 0;
     *memory = barMemory;
     return kIOReturnSuccess;
