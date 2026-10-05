@@ -29,7 +29,7 @@ cflags=("${hostcflags[@]}" -g -O1 -fsanitize=address,undefined -fno-sanitize=shi
   -fno-sanitize-recover=all -DFIXTURE_UPSTREAM_KFD_DEVICE
   -ffunction-sections -fdata-sections "${includes[@]}")
 amdkfd=third_party/linux/drivers/gpu/drm/amd/amdkfd
-sources=(linuxu/tests/test_kfd_power.c linuxu/tests/kfd_session_fixture.c
+sources=(linuxu/tests/test_kfd_power.c linuxu/tests/kfd_session_fixture.c linuxu/src/kmem/device_string.c
   linuxu/src/amdgpu-rt/power.c linuxu/src/amdgpu-rt/tmpring_gc12.c
   linuxu/src/amdgpu-rt/kfd_session.c linuxu/src/amdgpu-rt/process_file.c
   linuxu/src/amdgpu-rt/lx_files.c linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c linuxu/src/amdgpu-rt/lx_timing.c

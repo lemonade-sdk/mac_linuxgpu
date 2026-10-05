@@ -65,8 +65,13 @@
     },
     {
       "flag": "-include rt/device_string.h",
-      "scope": "every DriverKit upstream and linuxu object",
-      "reason": "Replaces memset/memcpy/memmove/memcmp/bzero with scalar volatile routines. Compiler-generated DC ZVA and vector stores fault on BAR0 device memory."
+      "scope": "every DriverKit upstream and linuxu object, and the host library's upstream objects",
+      "reason": "Replaces memset/memcpy/memmove/memcmp/bzero with scalar volatile routines. Compiler-generated DC ZVA and vector stores fault on BAR0 device memory. The routines also send every access to the VRAM aperture through the kernel (rt/aperture.h): a CPU store through a mapping of the BAR to an unplugged GPU panics the Mac. The host library uses the same routines so the CS fixture's no-access aperture catches any direct access offline."
+    },
+    {
+      "flag": "-include rt/dmub_inbox.h",
+      "scope": "build/driver/display/dmub/src/dmub_srv.o and build-dk/driver/display/dmub/src/dmub_srv.o, from drivers/gpu/drm/amd/display/dmub/src/dmub_srv.c",
+      "reason": "dmub_cmd.h's inline dmub_rb_push_front copies a command into the VRAM inbox with a byte loop, and dmub_rb_flush_pending reads it back with READ_ONCE: plain pointer accesses that reached VRAM through a CPU mapping of the BAR, the store that panicked the Mac at a GPU unplug (builds 239 and 240). The header includes dmub_cmd.h first and redirects dmub_srv.c's two calls to the same operations written with dmub_memcpy (as upstream's dmub_rb_out_push_front copies), which reaches VRAM only through the kernel. Ring arithmetic and dmub_cmd.h are unchanged."
     }
   ],
   "config_interventions": [

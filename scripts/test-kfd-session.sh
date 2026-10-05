@@ -30,7 +30,7 @@ cflags=("${hostcflags[@]}" -DRT_KFD_COPY_TIMEOUT_MS=200 -DRT_KFD_SETTLE_MS=200
   -g -O1 -fsanitize=address,undefined -fno-sanitize=shift-base
   -fno-sanitize-recover=all
   -ffunction-sections -fdata-sections "${includes[@]}")
-sources=(linuxu/tests/test_kfd_session.c linuxu/tests/kfd_session_fixture.c
+sources=(linuxu/tests/test_kfd_session.c linuxu/tests/kfd_session_fixture.c linuxu/src/kmem/device_string.c
   linuxu/src/amdgpu-rt/tmpring_gc12.c
   linuxu/src/amdgpu-rt/kfd_session.c linuxu/src/amdgpu-rt/process_file.c
   linuxu/src/amdgpu-rt/lx_files.c linuxu/src/amdgpu-rt/lx_frame.c linuxu/src/amdgpu-rt/lx_describe.c linuxu/src/amdgpu-rt/lx_timing.c

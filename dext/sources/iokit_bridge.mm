@@ -41,6 +41,16 @@
 #include <rt/dext_dma.h>
 /* rt/device_string.h's aperture gate (not the header: it redefines memcpy). */
 extern "C" void linuxu_aperture_set(uintptr_t base, uint64_t size);
+struct linuxu_aperture_ops;
+extern "C" void linuxu_aperture_set_ops(const struct linuxu_aperture_ops *ops);
+/* The aperture's kernel accesses, set by dext_main.mm with the PCI device
+ * (dext_bar0_set_aperture_ops). The bridge's own tests set none: their
+ * aperture is plain memory. */
+static const struct linuxu_aperture_ops *g_bar0_aperture_ops;
+extern "C" void dext_bar0_set_aperture_ops(const struct linuxu_aperture_ops *ops)
+{
+	g_bar0_aperture_ops = ops;
+}
 extern "C" void linuxu_aperture_gone(const char *why);
 extern "C" int linuxu_aperture_is_gone(void);
 
@@ -764,6 +774,9 @@ void *dext_bar0_cpu_map(uint64_t offset, uint64_t size)
 	g_bar0_cpu_base = map->GetAddress();
 	g_bar0_cpu_size = visible_size;
 	g_bar0_cpu_refs = 1;
+	/* Every access to the aperture goes through the kernel (dext_main.mm);
+	 * the mapping only gives the driver's pointers their addresses. */
+	linuxu_aperture_set_ops(g_bar0_aperture_ops);
 	linuxu_aperture_set((uintptr_t)g_bar0_cpu_base, g_bar0_cpu_size);
 	void *address = reinterpret_cast<void *>(g_bar0_cpu_base + offset);
 	dext_dma_release();

@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <rt/dext_pci.h>
+#include <rt/device_string.h>
 #include <rt/dext_dma.h>
 #include <rt/fatal.h>
 /* rt/device_string.h's aperture gate (not the header: it redefines memcpy). */
@@ -80,6 +81,7 @@ public:
     dext_pci_operation(const dext_pci_operation &) = delete;
     dext_pci_operation &operator=(const dext_pci_operation &) = delete;
 };
+static void dext_aperture_install(void);
 /* Primary fake-MMIO token for the register BAR.  0 until dext_open mints
  * it.  Its window is the whole BAR as assigned (see dext_open). */
 static uint32_t     g_reg_token;
@@ -208,6 +210,7 @@ extern "C" int dext_set_pci(void *pci_device, void *client)
 	g_pci = static_cast<IOPCIDevice *>(pci_device);
 	g_pci_client = static_cast<IOService *>(client);
 	g_pci_open = false;
+	dext_aperture_install();	/* VRAM only through the kernel, before any mapping */
 	return 0;
 }
 
@@ -918,6 +921,74 @@ int dext_mem_write64(uint32_t token, uint64_t offset, uint64_t val)
 	LINUXU_DOORBELL_FENCE();
 	g_pci->MemoryWrite64(mi, offset, val);
 	return 0;
+}
+
+/* The VRAM aperture's accesses (rt/device_string.h): BAR0 through the
+ * kernel's MemoryRead/MemoryWrite, as registers are, never a CPU access
+ * through a mapping of the BAR. A device that left the bus answers reads
+ * with all ones here, and a write to it is dropped by the kernel; a CPU
+ * store through a mapping instead panics the Mac (builds 239 and 240). */
+/* BAR0's memory index and size, read once per device (g_pci). */
+static IOPCIDevice *g_bar0_pci;
+static uint8_t g_bar0_index;
+static uint64_t g_bar0_size;
+static bool dext_bar0_info(uint8_t *mi, uint64_t *size)
+{
+	if (g_bar0_pci != g_pci) {
+		uint8_t index = 0, type = 0;
+		uint64_t length = 0;
+		if (g_pci->GetBARInfo(0, &index, &length, &type) != kIOReturnSuccess || !length)
+			return false;
+		g_bar0_index = index;
+		g_bar0_size = length;
+		g_bar0_pci = g_pci;
+	}
+	*mi = g_bar0_index;
+	*size = g_bar0_size;
+	return true;
+}
+
+static void dext_aperture_read(uint64_t offset, void *value, unsigned int width)
+{
+	uint64_t v = UINT64_MAX;
+	dext_pci_operation operation;
+	uint8_t mi = 0;
+	uint64_t size = 0;
+	if (operation && dext_bar0_info(&mi, &size) && offset < size && width <= size - offset) {
+		switch (width) {
+		case 1: { uint8_t x = UINT8_MAX; g_pci->MemoryRead8(mi, offset, &x); v = x; break; }
+		case 2: { uint16_t x = UINT16_MAX; g_pci->MemoryRead16(mi, offset, &x); v = x; break; }
+		case 4: { uint32_t x = UINT32_MAX; g_pci->MemoryRead32(mi, offset, &x); v = x; break; }
+		default: g_pci->MemoryRead64(mi, offset, &v); break;
+		}
+	}
+	for (unsigned int i = 0; i < width; i++)
+		static_cast<uint8_t *>(value)[i] = (uint8_t)(v >> (8 * i));
+}
+
+static void dext_aperture_write(uint64_t offset, const void *value, unsigned int width)
+{
+	uint64_t v = 0;
+	for (unsigned int i = 0; i < width; i++)
+		v |= (uint64_t)static_cast<const uint8_t *>(value)[i] << (8 * i);
+	dext_pci_operation operation;
+	uint8_t mi = 0;
+	uint64_t size = 0;
+	if (!operation || !dext_bar0_info(&mi, &size) || offset >= size || width > size - offset)
+		return;
+	switch (width) {
+	case 1: g_pci->MemoryWrite8(mi, offset, (uint8_t)v); break;
+	case 2: g_pci->MemoryWrite16(mi, offset, (uint16_t)v); break;
+	case 4: g_pci->MemoryWrite32(mi, offset, (uint32_t)v); break;
+	default: g_pci->MemoryWrite64(mi, offset, v); break;
+	}
+}
+
+static const struct linuxu_aperture_ops g_aperture_ops = { dext_aperture_read, dext_aperture_write };
+extern "C" void dext_bar0_set_aperture_ops(const struct linuxu_aperture_ops *ops);
+static void dext_aperture_install(void)
+{
+	dext_bar0_set_aperture_ops(&g_aperture_ops);
 }
 
 typedef int (*dext_irq_handler_t)(int irq, void *arg);

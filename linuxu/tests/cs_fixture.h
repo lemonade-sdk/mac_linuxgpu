@@ -47,6 +47,10 @@ struct amdgpu_device;
 struct amdgpu_device *cs_fixture_adev(void);
 /* The host memory behind VRAM MC address @mc, or NULL. */
 uint8_t *cs_fixture_vram_host(uint64_t mc);
+/* The fixture's read-write view of a driver pointer: one into VRAM (a kernel
+ * VRAM mapping, which the driver reaches only through the aperture, and the
+ * test would fault on) becomes the same bytes of the fixture's VRAM. */
+void *cs_fixture_host_view(const void *driver_pointer);
 /* TTM moves VRAM <-> GTT through the upstream code on this device
  * (ttm_evict_check.c). */
 void ttm_evict_check(void);

@@ -22,6 +22,7 @@
 #endif
 
 #include <rt/rt.h>
+#include <rt/aperture.h>
 
 #if defined(LINUXU_DEXT_DK)
 #include <rt/dext_dma.h>
@@ -41,56 +42,47 @@ static inline uint64_t linuxu_dk_offset(const void __iomem *addr)
 }
 extern uint16_t rt_mmio_readw(struct rt_device *, void *, uint64_t);
 extern void rt_mmio_writew(struct rt_device *, void *, uint64_t, uint16_t);
-/* Direct BAR0 CPU-mapping accesses follow Linux arm64 ordering: a write
- * barrier before each store, so descriptors and ring contents written to
- * DMA memory are visible to the GPU before the register/doorbell write;
- * a read barrier after each load, so later reads of DMA memory cannot be
- * satisfied before the register read that reported completion.  Accesses
- * of the natural width are single, untorn loads/stores.  The token path is
- * an RPC whose call boundary (and the dext's doorbell fence) already
- * orders it, so it takes no extra barrier here.  No _relaxed variants
- * exist yet; they would omit both barriers. */
+/* The VRAM aperture (amdgpu's aper_base_kaddr, TTM kmaps of VRAM) is
+ * reached only through the kernel (rt/device_string.h): never a CPU load
+ * or store through a mapping of the BAR, which panics the Mac once the
+ * device has left the bus. The call orders the access as dma_wmb/dma_rmb
+ * would around a store or load. */
 #define linuxu_bar0_read(type, addr) ({				\
-	type __v = (type)~(type)0;					\
-	if (!dext_pci_removed()) {					\
-		__v = *(const volatile type *)(addr);			\
-		dma_rmb();						\
-	}								\
+	type __v;							\
+	linuxu_aperture_read((addr), &__v, sizeof(type));		\
 	__v;								\
 })
 #define linuxu_bar0_write(type, v, addr) do {			\
-	if (!dext_pci_removed()) {					\
-		dma_wmb();						\
-		*(volatile type *)(addr) = (v);				\
-	}								\
+	type __v = (v);							\
+	linuxu_aperture_write((addr), &__v, sizeof(type));		\
 } while (0)
 static inline u8 readb(const void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u8)))
+	if (linuxu_aperture_contains(addr, sizeof(u8)))
 		return linuxu_bar0_read(u8, addr);
 	return rt_mmio_readb(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u16 readw(const void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u16)))
+	if (linuxu_aperture_contains(addr, sizeof(u16)))
 		return linuxu_bar0_read(u16, addr);
 	return rt_mmio_readw(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u32 readl(const void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u32)))
+	if (linuxu_aperture_contains(addr, sizeof(u32)))
 		return linuxu_bar0_read(u32, addr);
 	return rt_mmio_readl(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u64 readq(const void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u64)))
+	if (linuxu_aperture_contains(addr, sizeof(u64)))
 		return linuxu_bar0_read(u64, addr);
 	return rt_mmio_readq(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline void writeb(u8 v, void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u8))) {
+	if (linuxu_aperture_contains(addr, sizeof(u8))) {
 		linuxu_bar0_write(u8, v, addr);
 		return;
 	}
@@ -98,7 +90,7 @@ static inline void writeb(u8 v, void __iomem *addr)
 }
 static inline void writew(u16 v, void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u16))) {
+	if (linuxu_aperture_contains(addr, sizeof(u16))) {
 		linuxu_bar0_write(u16, v, addr);
 		return;
 	}
@@ -106,7 +98,7 @@ static inline void writew(u16 v, void __iomem *addr)
 }
 static inline void writel(u32 v, void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u32))) {
+	if (linuxu_aperture_contains(addr, sizeof(u32))) {
 		linuxu_bar0_write(u32, v, addr);
 		return;
 	}
@@ -114,7 +106,7 @@ static inline void writel(u32 v, void __iomem *addr)
 }
 static inline void writeq(u64 v, void __iomem *addr)
 {
-	if (dext_bar0_cpu_contains(addr, sizeof(u64))) {
+	if (linuxu_aperture_contains(addr, sizeof(u64))) {
 		linuxu_bar0_write(u64, v, addr);
 		return;
 	}
@@ -123,34 +115,70 @@ static inline void writeq(u64 v, void __iomem *addr)
 #elif !defined(LINUXU_RT_HOST_SHADOW)
 static inline u8 readb(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u8))) {
+		u8 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	return *(const u8 __iomem *)addr;
 }
 static inline u16 readw(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u16))) {
+		u16 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	return *(const u16 __iomem *)addr;
 }
 static inline u32 readl(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u32))) {
+		u32 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	return *(const u32 __iomem *)addr;
 }
 static inline u64 readq(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u64))) {
+		u64 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	return *(const u64 __iomem *)addr;
 }
 static inline void writeb(u8 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u8))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	*(u8 __iomem *)addr = v;
 }
 static inline void writew(u16 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u16))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	*(u16 __iomem *)addr = v;
 }
 static inline void writel(u32 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u32))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	*(u32 __iomem *)addr = v;
 }
 static inline void writeq(u64 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u64))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	*(u64 __iomem *)addr = v;
 }
 #else
@@ -175,6 +203,11 @@ extern const struct mmio_slot *rt_mmio_slot_lookup(uint32_t token, size_t *off);
 
 static inline u8 readb(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u8))) {
+		u8 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -182,6 +215,11 @@ static inline u8 readb(const void __iomem *addr)
 }
 static inline u16 readw(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u16))) {
+		u16 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -189,6 +227,11 @@ static inline u16 readw(const void __iomem *addr)
 }
 static inline u32 readl(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u32))) {
+		u32 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -196,6 +239,11 @@ static inline u32 readl(const void __iomem *addr)
 }
 static inline u64 readq(const void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u64))) {
+		u64 __v;
+		linuxu_aperture_read(addr, &__v, sizeof(__v));
+		return __v;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -203,6 +251,10 @@ static inline u64 readq(const void __iomem *addr)
 }
 static inline void writeb(u8 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u8))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -211,6 +263,10 @@ static inline void writeb(u8 v, void __iomem *addr)
 }
 static inline void writew(u16 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u16))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -219,6 +275,10 @@ static inline void writew(u16 v, void __iomem *addr)
 }
 static inline void writel(u32 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u32))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -227,6 +287,10 @@ static inline void writel(u32 v, void __iomem *addr)
 }
 static inline void writeq(u64 v, void __iomem *addr)
 {
+	if (linuxu_aperture_contains(addr, sizeof(u64))) {
+		linuxu_aperture_write(addr, &v, sizeof(v));
+		return;
+	}
 	uint32_t token = (uintptr_t)addr;
 	size_t off = (uintptr_t)addr - (uintptr_t)token;
 	const struct mmio_slot *s = rt_mmio_slot_lookup(token, &off);
@@ -246,27 +310,31 @@ static inline void ioport_unmap(void __iomem *addr)
 static inline void memcpy_fromio(void *to, const void __iomem *from, size_t count)
 {
 #ifdef LINUXU_DEXT_DK
-	if (dext_bar0_cpu_contains(from, count)) {
-		for (size_t i = 0; i < count; ++i)
-			((u8 *)to)[i] = dext_pci_removed() ? 0xff : ((const volatile u8 *)from)[i];
+	if (linuxu_aperture_contains(from, count)) {
+		linuxu_aperture_copy_out(to, from, count);
 		return;
 	}
 	rt_mmio_memcpy_fromio(to, linuxu_dk_token(from), linuxu_dk_offset(from), count, NULL);
 #else
-	__builtin_memcpy(to, from, count);
+	if (linuxu_aperture_contains(from, count))
+		linuxu_aperture_copy_out(to, from, count);
+	else
+		__builtin_memcpy(to, from, count);
 #endif
 }
 static inline void memcpy_toio(void __iomem *to, const void *from, size_t count)
 {
 #ifdef LINUXU_DEXT_DK
-	if (dext_bar0_cpu_contains(to, count)) {
-		for (size_t i = 0; i < count && !dext_pci_removed(); ++i)
-			((volatile u8 *)to)[i] = ((const u8 *)from)[i];
+	if (linuxu_aperture_contains(to, count)) {
+		linuxu_aperture_copy_in(to, from, count);
 		return;
 	}
 	rt_mmio_memcpy_toio(linuxu_dk_token(to), from, linuxu_dk_offset(to), count, NULL);
 #else
-	__builtin_memcpy(to, from, count);
+	if (linuxu_aperture_contains(to, count))
+		linuxu_aperture_copy_in(to, from, count);
+	else
+		__builtin_memcpy(to, from, count);
 #endif
 }
 
@@ -326,15 +394,18 @@ static inline void iounmap(const volatile void __iomem *addr)
 static inline void *memset_io(void __iomem *addr, int val, size_t count)
 {
 #ifdef LINUXU_DEXT_DK
-	if (dext_bar0_cpu_contains(addr, count)) {
-		for (size_t i = 0; i < count && !dext_pci_removed(); ++i)
-			((volatile u8 *)addr)[i] = (u8)val;
+	if (linuxu_aperture_contains(addr, count)) {
+		linuxu_aperture_fill(addr, val, count);
 		return (void *)addr;
 	}
 	for (size_t i = 0; i < count; i++)
 		writeb((u8)val, (void __iomem *)((uintptr_t)addr + i));
 	return (void *)addr;
 #else
+	if (linuxu_aperture_contains(addr, count)) {
+		linuxu_aperture_fill(addr, val, count);
+		return (void *)addr;
+	}
 	return memset((void *)addr, val, count);
 #endif
 }

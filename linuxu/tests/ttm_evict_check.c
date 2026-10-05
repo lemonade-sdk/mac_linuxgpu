@@ -128,7 +128,7 @@ static void check_tt_content(struct amdgpu_bo *bo, uint32_t seed)
 static void check_window_ptes(struct amdgpu_bo *bo)
 {
 	const struct ttm_tt *ttm = bo->tbo.ttm;
-	const uint64_t *table = adev->gart.ptr;
+	const uint64_t *table = cs_fixture_host_view(adev->gart.ptr);
 	const uint64_t want = AMDGPU_PTE_VALID | AMDGPU_PTE_SYSTEM | AMDGPU_PTE_READABLE |
 			      AMDGPU_PTE_WRITEABLE |
 			      (ttm->caching == ttm_cached ? AMDGPU_PTE_SNOOPED : 0);

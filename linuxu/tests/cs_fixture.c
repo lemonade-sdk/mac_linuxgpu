@@ -28,7 +28,11 @@
  * The fixture's packets are not any real SDMA generation's: the point is
  * that upstream builds, schedules, fences and waits for them. */
 #include <assert.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <rt/device_string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,6 +91,22 @@ enum {
 };
 #define FX_SDMA(op, count)	(((uint32_t)(op) << 24) | (count))
 
+/* VRAM: the fixture's own read-write view and the driver's no-access alias
+ * of the same pages. A direct load or store through a kernel VRAM pointer
+ * crashes the test, as it would panic the Mac at an unplug; accesses
+ * through the aperture (rt/device_string.h, linux/io.h) reach the pages. */
+static uint8_t *vram_alias;
+static uint8_t *fixture_vram_create(void);
+/* The fixture's own view of a driver pointer: VRAM through the aperture
+ * alias becomes the read-write view (the GPU, not the CPU, reads it). */
+static void *fixture_view(const void *driver_pointer);
+void *cs_fixture_host_view(const void *driver_pointer) { return fixture_view(driver_pointer); }
+static void fixture_aperture_read(uint64_t offset, void *value, unsigned int width);
+static void fixture_aperture_write(uint64_t offset, const void *value, unsigned int width);
+static const struct linuxu_aperture_ops fixture_aperture_ops = {
+	fixture_aperture_read, fixture_aperture_write,
+};
+
 static struct pci_dev *pdev;
 static struct amdgpu_device *adev;
 uint64_t cs_fixture_visible_vram;
@@ -132,7 +152,7 @@ static uint8_t *mc_to_host(uint64_t mc)
 		return vram + (mc - adev->gmc.vram_start);
 	if (mc >= adev->gmc.gart_start && mc <= adev->gmc.gart_end) {
 		uint64_t index = (mc - adev->gmc.gart_start) >> AMDGPU_GPU_PAGE_SHIFT;
-		uint64_t entry = ((uint64_t *)adev->gart.ptr)[index];
+		uint64_t entry = ((uint64_t *)fixture_view(adev->gart.ptr))[index];
 
 		if (!(entry & AMDGPU_PTE_VALID))
 			return NULL;
@@ -281,7 +301,7 @@ static struct engine *engine_of(struct amdgpu_ring *ring)
 
 static uint64_t fx_get_rptr(struct amdgpu_ring *ring)
 {
-	return *ring->rptr_cpu_addr;
+	return *(volatile uint32_t *)fixture_view(ring->rptr_cpu_addr);
 }
 
 static uint64_t fx_get_wptr(struct amdgpu_ring *ring)
@@ -734,7 +754,7 @@ static void *engine_main(void *arg)
 					dw[0], take > 1 ? dw[1] : 0, take > 2 ? dw[2] : 0, take > 3 ? dw[3] : 0);
 			used = pm4 ? pm4_packet(e, dw, take, 0, 0) : sdma_packet(e, dw, take, 0, 0);
 			e->rptr += used;
-			*ring->rptr_cpu_addr = e->rptr;
+			*(volatile uint32_t *)fixture_view(ring->rptr_cpu_addr) = e->rptr;
 		}
 	}
 }
@@ -1256,7 +1276,7 @@ struct pci_dev *cs_fixture_init(void)
 	fx_gfx_config();
 
 	/* The GMC's sw_init: memory layout, VM sizes, the GART table. */
-	vram = calloc(1, FX_VRAM_BYTES);
+	vram = fixture_vram_create();
 	doorbells = calloc(1, FX_BAR2_BYTES);
 	if (!vram || !doorbells)
 		FX_ABORT("fixture memory");
@@ -1291,7 +1311,12 @@ struct pci_dev *cs_fixture_init(void)
 	r = amdgpu_ttm_init(adev);
 	if (r)
 		FX_ABORT("amdgpu_ttm_init = %d", r);
-	adev->mman.aper_base_kaddr = vram;
+	/* The driver's view of VRAM (aper_base_kaddr, TTM kmaps): an alias
+	 * that faults on any access, as the dext has no CPU mapping to use;
+	 * only the aperture's accesses reach it (fixture_aperture_ops). */
+	adev->mman.aper_base_kaddr = vram_alias;
+	linuxu_aperture_set_ops(&fixture_aperture_ops);
+	linuxu_aperture_set((uintptr_t)vram_alias, FX_VRAM_BYTES);
 	r = amdgpu_gart_init(adev);
 	if (!r) {
 		/* As gmc_v12_0_gart_init: the table in VRAM. */
@@ -1376,6 +1401,48 @@ void cs_fixture_stats(struct cs_fixture_stats *out)
 	pthread_mutex_lock(&stats_lock);
 	*out = stats;
 	pthread_mutex_unlock(&stats_lock);
+}
+
+static uint8_t *fixture_vram_create(void)
+{
+	void *rw = mmap(NULL, FX_VRAM_BYTES, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+	mach_vm_address_t alias = 0;
+	vm_prot_t cur = 0, max = 0;
+
+	if (rw == MAP_FAILED)
+		FX_ABORT("VRAM: mmap failed");
+	if (mach_vm_remap(mach_task_self(), &alias, FX_VRAM_BYTES, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+			  (mach_vm_address_t)(uintptr_t)rw, FALSE, &cur, &max, VM_INHERIT_NONE) != KERN_SUCCESS)
+		FX_ABORT("VRAM: the driver's alias could not be made");
+	if (mprotect((void *)(uintptr_t)alias, FX_VRAM_BYTES, PROT_NONE))
+		FX_ABORT("VRAM: the driver's alias could not be made inaccessible");
+	vram_alias = (uint8_t *)(uintptr_t)alias;
+	return rw;
+}
+
+static void *fixture_view(const void *p)
+{
+	const uintptr_t a = (uintptr_t)p, lo = (uintptr_t)vram_alias;
+
+	if (vram_alias && a >= lo && a - lo < FX_VRAM_BYTES)
+		return vram + (a - lo);
+	return (void *)(uintptr_t)p;
+}
+
+static void fixture_aperture_read(uint64_t offset, void *value, unsigned int width)
+{
+	if (offset >= FX_VRAM_BYTES || width > FX_VRAM_BYTES - offset)
+		FX_ABORT("aperture read of %u bytes at 0x%llx, past VRAM", width, (unsigned long long)offset);
+	for (unsigned int i = 0; i < width; i++)
+		((uint8_t *)value)[i] = ((volatile uint8_t *)vram)[offset + i];
+}
+
+static void fixture_aperture_write(uint64_t offset, const void *value, unsigned int width)
+{
+	if (offset >= FX_VRAM_BYTES || width > FX_VRAM_BYTES - offset)
+		FX_ABORT("aperture write of %u bytes at 0x%llx, past VRAM", width, (unsigned long long)offset);
+	for (unsigned int i = 0; i < width; i++)
+		((volatile uint8_t *)vram)[offset + i] = ((const uint8_t *)value)[i];
 }
 
 uint8_t *cs_fixture_vram_host(uint64_t mc)

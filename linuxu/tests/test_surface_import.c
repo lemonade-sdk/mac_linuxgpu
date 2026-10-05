@@ -165,6 +165,7 @@ int main(void)
 	/* The scanout-like destination in VRAM. */
 	CHECK(amdgpu_bo_create_kernel(adev, (uint64_t)DST_PITCH * H, PAGE, AMDGPU_GEM_DOMAIN_VRAM,
 				      &dst, &dst_gpu, &dst_cpu) == 0);
+	dst_cpu = cs_fixture_host_view(dst_cpu);	/* the test reads VRAM as the GPU wrote it */
 	memset(dst_cpu, 0, (uint64_t)DST_PITCH * H);
 
 	/* The whole frame, pitches differing: one copy per row. */

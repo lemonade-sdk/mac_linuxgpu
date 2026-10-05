@@ -560,7 +560,11 @@ int main(void)
 		struct rt_surface *lsurf;
 		struct cs_fixture_stats at_removal, later;
 		struct linuxu_aperture_stats ap0, ap1;
-		static uint8_t aperture[1 << 16];
+		/* The last 64 KiB of VRAM: the driver's view (the no-access
+		 * aperture, reached only through it) and the fixture's. */
+		const uint64_t tail = adev->gmc.real_vram_size - (1 << 16);
+		uint8_t *aperture = (uint8_t *)adev->mman.aper_base_kaddr + tail;
+		uint8_t *backing = cs_fixture_vram_host(adev->gmc.vram_start + tail);
 		const struct rt_surface_rect win = { 64, 64, 256, 128 };
 		unsigned long regs;
 		uint32_t lhandle;
@@ -573,7 +577,7 @@ int main(void)
 		CHECK(rt_surface_import(pdev, live.segment, 3, live.size, W, H, PITCH, &provider, &lsurf) == 0);
 		lhandle = rt_surface_add(1, lsurf);
 		CHECK(lhandle);
-		linuxu_aperture_set((uintptr_t)aperture, sizeof(aperture));
+		CHECK(backing && linuxu_aperture_contains(aperture, 1 << 16));
 		regs = __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED);
 		cs_fixture_stats(&at_removal);
 		for (int f = 0; f < 4; f++) {
@@ -596,7 +600,7 @@ int main(void)
 		regs = __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED);
 		cs_fixture_stats(&at_removal);
 		linuxu_aperture_stats(&ap0);
-		memset(aperture, 0x5a, sizeof(aperture));
+		memset(backing, 0x5a, 1 << 16);
 		for (int f = 0; f < 8; f++) {
 			/* DMUB commands and kmap'd VRAM writes go through these. */
 			linuxu_device_memcpy(aperture + 64, &win, sizeof(win));
@@ -617,15 +621,14 @@ int main(void)
 		usleep(50000);
 		cs_fixture_stats(&later);
 		linuxu_aperture_stats(&ap1);
-		for (size_t i = 0; i < sizeof(aperture); i++)
-			CHECK(aperture[i] == 0x5a);
+		for (size_t i = 0; i < (1 << 16); i++)
+			CHECK(backing[i] == 0x5a);
 		printf("pipeline: after removal: %lu register writes, %lu SDMA copies, %llu aperture "
 		       "operations refused\n", __atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED) - regs,
 		       later.copies - at_removal.copies, ap1.skipped - ap0.skipped);
 		CHECK(__atomic_load_n(&dcn401_reg_writes, __ATOMIC_RELAXED) == regs);
 		CHECK(later.copies == at_removal.copies && later.sdma_ibs == at_removal.sdma_ibs);
 		CHECK(ap1.skipped - ap0.skipped >= 17);
-		linuxu_aperture_set(0, 0);
 		rt_removal_end();
 	}
 

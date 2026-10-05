@@ -196,6 +196,9 @@ $(foreach h,$(UPSTREAM_HELPERS),$(eval $(call helper_rule,$(BUILD),HOSTCFLAGS,$(
 # scripts/verify-upstream.py). Route only the GFX12 GMC location call through
 # the host-window policy; amdgpu_gmc.c retains its original symbol.
 $(BUILD)/driver/amdgpu/gmc_v12_0.o: HOSTCFLAGS += -Damdgpu_gmc_gart_location=rt_amdgpu_gmc_gart_location
+# DMUB's inbox ring helpers reach VRAM through memcpy (rt/dmub_inbox.h).
+$(BUILD)/driver/display/dmub/src/dmub_srv.o: HOSTCFLAGS += -include rt/dmub_inbox.h
+$(BUILD)/driver/display/dmub/src/dmub_srv.o: linuxu/headers/rt/dmub_inbox.h
 
 # These upstream BUILD_BUG_ON checks fold table accesses or sizeof-derived
 # local variables. Linux uses optimization; -O0 cannot prove the conditions.
@@ -203,6 +206,11 @@ FOLDED_ASSERT_OBJECTS := drm-core/drm_edid.o \
 	pm/swsmu/smu11/arcturus_ppt.o pm/swsmu/smu11/navi10_ppt.o \
 	pm/swsmu/smu11/sienna_cichlid_ppt.o pm/swsmu/smu13/aldebaran_ppt.o
 $(addprefix $(BUILD)/driver/,$(FOLDED_ASSERT_OBJECTS)): HOSTCFLAGS += -O2 -fno-strict-aliasing
+# The library's upstream objects alias the string functions as the dext's
+# do (rt/device_string.h), so their VRAM aperture accesses take the same
+# route offline and the CS fixture's no-access aperture catches any direct
+# one. linuxu objects, which tests also link one by one, keep libc's.
+$(DRIVER_OBJS): HOSTCFLAGS += -DLINUXU_DEVICE_STRING_ALIASES=1 -include rt/device_string.h
 
 # Pinned generic FIFO helper expects the Linux allocator's core macro includes.
 $(BUILD)/linuxu/shims/kfifo.o: HOSTCFLAGS += -include linux/kernel.h -include linux/bug.h
@@ -255,6 +263,8 @@ $(eval $(call compile_rules,$(DK_BUILD),DK_CFLAGS))
 $(foreach h,$(UPSTREAM_HELPERS),$(eval $(call helper_rule,$(DK_BUILD),DK_CFLAGS,$(word 1,$(subst :, ,$(h))),$(word 2,$(subst :, ,$(h))))))
 
 $(DK_BUILD)/driver/amdgpu/gmc_v12_0.o: DK_CFLAGS += -Damdgpu_gmc_gart_location=rt_amdgpu_gmc_gart_location
+$(DK_BUILD)/driver/display/dmub/src/dmub_srv.o: DK_CFLAGS += -include rt/dmub_inbox.h
+$(DK_BUILD)/driver/display/dmub/src/dmub_srv.o: linuxu/headers/rt/dmub_inbox.h
 $(addprefix $(DK_BUILD)/driver/,$(FOLDED_ASSERT_OBJECTS)): DK_CFLAGS += -O2 -fno-strict-aliasing
 $(DK_BUILD)/linuxu/shims/kfifo.o: DK_CFLAGS += -include linux/kernel.h -include linux/bug.h
 $(DK_BUILD)/linuxu/shims/sort.o: DK_CFLAGS += -include linux/compiler.h -include linux/preempt.h

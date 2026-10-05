@@ -6,6 +6,7 @@
  * work without hardware.  DriverKit backend (LINUXU_DEXT): IOPCIDevice
  * MemoryRead32/64/MemoryWrite32/64 — skeleton with TODOs where the
  * DriverKit specifics need verification. */
+#include <rt/aperture.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -85,8 +86,8 @@ static uint32_t atomic_mmio_token(const volatile void *addr,
 
 int linuxu_atomic64_mmio_read(const volatile void *addr, uint64_t *value)
 {
-	if (dext_bar0_cpu_contains((const void *)addr, sizeof(*value))) {
-		*value = *(const volatile uint64_t *)addr;
+	if (linuxu_aperture_contains(addr, sizeof(*value))) {
+		linuxu_aperture_read(addr, value, sizeof(*value));
 		return 1;
 	}
 	uint64_t offset;
@@ -99,8 +100,8 @@ int linuxu_atomic64_mmio_read(const volatile void *addr, uint64_t *value)
 
 int linuxu_atomic64_mmio_write(volatile void *addr, uint64_t value)
 {
-	if (dext_bar0_cpu_contains((const void *)addr, sizeof(value))) {
-		*(volatile uint64_t *)addr = value;
+	if (linuxu_aperture_contains(addr, sizeof(value))) {
+		linuxu_aperture_write(addr, &value, sizeof(value));
 		return 1;
 	}
 	uint64_t offset;

@@ -23,7 +23,7 @@ cflags=(-w -std=gnu11 -D__KERNEL__ -include linux/autoconf.h
 # build the MQD; gfx_v11_0.c / gfx_v12_0.c (through queue_partition_gfx*.c)
 # provide amdgpu's kernel compute queue MQD builders. Unreferenced upstream
 # code is stripped.
-sources=(linuxu/tests/test_queue_partition.c
+sources=(linuxu/tests/test_queue_partition.c linuxu/src/kmem/device_string.c
   third_party/linux/drivers/gpu/drm/amd/amdgpu/amdgpu_amdkfd.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v11.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_device_queue_manager_v12.c
