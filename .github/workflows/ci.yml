@@ -1,0 +1,85 @@
+# Offline checks for every push and pull request to main, on Apple silicon:
+# the host test suite (the driver built for macOS against the CS fixture's
+# software GPU and the DCN 4.0.1 display fixture; no GPU), the release
+# check (no debug instrumentation in release objects), the HSA runtime's
+# unit tests, and unsigned Xcode builds of the dext and the host app. No
+# signing: the signed build and installer stay on a developer Mac.
+#
+# Not run here: the Vulkan offline tests need RADV and llama.cpp built
+# (make radv, make llama-vulkan; about an hour more), so test-radv-offline,
+# test-radv-scanout and test-llama-offline report SKIP.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Offline tests
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: brew install ripgrep cmake
+
+      - name: Upstream checkouts (cached)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .git/modules
+            third_party/linux
+            build/firmware
+          key: upstream-${{ hashFiles('.gitmodules', 'patches/manifest.json', 'patches/linux/**', 'firmware/firmware.lock') }}
+
+      - name: Bootstrap (pinned Linux, declared patches, locked firmware)
+        run: bash scripts/bootstrap.sh
+
+      - name: Offline test suite
+        run: make -k test
+
+      - name: Release check
+        run: make check-release
+
+      - name: HSA runtime tests
+        run: make hsa-test
+
+  xcode:
+    name: Unsigned Xcode build
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upstream checkouts (cached)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .git/modules
+            third_party/linux
+            build/firmware
+          key: upstream-${{ hashFiles('.gitmodules', 'patches/manifest.json', 'patches/linux/**', 'firmware/firmware.lock') }}
+
+      - name: Bootstrap
+        run: bash scripts/bootstrap.sh
+
+      - name: Driver library for DriverKit
+        run: make lib-dext
+
+      - name: Dext (unsigned)
+        run: >
+          xcodebuild -project mac_linuxgpu.xcodeproj -target MacLinuxGPU -configuration Release
+          CODE_SIGNING_ALLOWED=NO SYMROOT="$PWD/build/ci" OBJROOT="$PWD/build/ci/obj" build
+
+      - name: Host app (unsigned)
+        run: >
+          xcodebuild -project mac_linuxgpu.xcodeproj -target MacLinuxGPUHost -configuration Release
+          CODE_SIGNING_ALLOWED=NO SYMROOT="$PWD/build/ci" OBJROOT="$PWD/build/ci/obj" build
