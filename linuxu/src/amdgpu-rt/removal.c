@@ -82,6 +82,38 @@ int rt_removal_begin(struct pci_dev *pdev)
 	return r;
 }
 
+int rt_device_lost(struct pci_dev *pdev, const char *why)
+{
+	struct drm_device *ddev;
+	struct amdgpu_device *adev;
+	int r = 0;
+
+	if (!pdev)
+		return -EINVAL;
+	linuxu_aperture_gone(why ? why : "the device no longer answers");
+	ddev = pci_get_drvdata(pdev);
+	if (!ddev)
+		return 0;
+	adev = drm_to_adev(ddev);
+	pthread_mutex_lock(&removal_lock);
+	if (!removal_adev) {
+		WRITE_ONCE(ddev->unplugged, true);
+		adev->no_hw_access = true;
+		removal_adev = adev;
+		/* The rings are completed by the thread, never here: the caller
+		 * may hold any lock. */
+		removal_thread = kthread_run(removal_main, adev, "amdgpu-lost");
+		if (IS_ERR_OR_NULL(removal_thread)) {
+			removal_thread = NULL;
+			r = -ENOMEM;
+		}
+		dev_err(adev->dev, "%s: the device no longer answers; no hardware access, "
+			"GPU work completes with -ECANCELED\n", why ? why : "device lost");
+	}
+	pthread_mutex_unlock(&removal_lock);
+	return r;
+}
+
 void rt_removal_end(void)
 {
 	struct task_struct *thread;

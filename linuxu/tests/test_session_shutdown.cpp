@@ -21,7 +21,7 @@ enum {
     kIOReturnNoResources, kIOReturnNotPermitted,
 };
 enum { DEXT_COMPUTE_STAGE_NONE, kMacAMDGPUMethodShutdownGPU = 42 };
-enum { DEXT_PCI_FAULT_NONE = 0, DEXT_PCI_FAULT_CONFIG = 1, DEXT_PCI_FAULT_QUARANTINE = 4 };
+enum { DEXT_PCI_FAULT_NONE = 0, DEXT_PCI_FAULT_CONFIG = 1, DEXT_PCI_FAULT_MMIO = 2, DEXT_PCI_FAULT_QUARANTINE = 4 };
 #define SUPERDISPATCH 0
 #define IMPL(cls, method) cls::method(IOService *provider)
 static std::string platformLog;
@@ -163,6 +163,9 @@ static int dext_pci_close_removed();
 static int rt_removal_begin(struct pci_dev *) { events.push_back("removal_begin"); return 0; }
 static void rt_removal_end() { events.push_back("removal_end"); }
 static void dext_compute_device_removed() { events.push_back("compute_removed"); }
+// A definite transport fault made the GPU unreachable (rt/removal.h's
+// rt_device_lost): its work completes with -ECANCELED from now on.
+static int rt_device_lost_active(const char *) { events.push_back("device_lost"); return 0; }
 static int dext_dma_device_removed() {
     events.push_back("dma_removed");
     // A device off the bus uses no mapping: retired descriptors complete.
@@ -1277,6 +1280,61 @@ static void retireScenario(const std::string &kind) {
     std::puts("PASS production retire: a quiescent quarantine is released, then the instance terminates");
 }
 
+// A definite PCI transport fault while programs run (249's MMIO fault),
+// then the user power-cycles the GPU: the instance must finish and exit,
+// never linger (three 248 instances stayed alive after today's hangs and
+// held the upgrade). The fault makes GPU work complete at once, so no wait
+// holds the session queue; the program leaves, the close quarantines (its
+// DMA hold cannot be taken past the closed admission), and the removal
+// releases everything and stops the driver.
+static void transportFaultRemoval() {
+    MacLinuxGPU driver;
+    IOPCIDevice provider;
+    IODispatchQueue queue;
+    MacLinuxGPUUserClient client;
+    MacLinuxGPUUserClient_IVars clientIvars{};
+    int device = 0;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
+    s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
+    s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
+    bar0Aliases = 1;
+    client.ivars = &clientIvars;
+    clientIvars.ownerDriver = &driver; clientIvars.clientID = 1;
+    clientIvars.sessionGeneration = s_sessionGeneration; clientIvars.ownerQueue = &s_ownerQueueAtOnce;
+    driver.retain(); s_participants = 1;
+    displayShowing = true; surfacesImported = 1;
+    // The fault: recorded by the PCI seam, which calls the hook once.
+    transportFault = DEXT_PCI_FAULT_MMIO;
+    transport_lost(DEXT_PCI_FAULT_MMIO);
+    transport_lost(DEXT_PCI_FAULT_MMIO);
+    assert(std::count(events.begin(), events.end(), "device_lost") == 1 && s_deviceLost);
+    expectLog("the GPU no longer answers this driver");
+    // The program leaves (its calls failed): the close cannot hold DMA past
+    // the closed admission and quarantines, naming the fault.
+    holdError = -5;
+    assert(client.Stop(&driver) == kIOReturnSuccess);
+    assert(s_sessionClosing && s_dmaQuarantined && s_quarantineCause == MLG_QUARANTINE_PCI_FAULT);
+    {
+        assert(irqCompletion);
+        auto callback = irqCompletion; auto context = irqContext;
+        irqCompletion = nullptr; irqContext = nullptr;
+        irqDrained = true; events.push_back("irq_drained");
+        callback(context);
+        queue.drain();
+    }
+    assert(s_dmaQuarantined && !clientStops && !driverStops);
+    // The power cycle: the device leaves the bus, IOKit stops the provider.
+    devicePresent = false;
+    driver.retain(); provider.retain();
+    assert(driver.Stop(&provider) == kIOReturnSuccess);
+    assert(driverStops == 1 && clientStops == 1 && !s_stopProvider);
+    assert(!s_dmaQuarantined && !s_sessionClosing && !s_deviceRemoved && !s_deviceLost);
+    assert(saw("removal_begin") && saw("removal_end") && saw("pci_close_removed"));
+    assert(!displayShowing && !surfacesImported);
+    expectLog("removal: session released after the device left the bus");
+    std::puts("PASS production session shutdown: transport fault, then removal: the instance finishes and stops");
+}
+
 // Far more programs than the compute backend has records come and go, of
 // every kind and by every Stop path: HSA session clients (one leaving, one
 // killed with what it owns), Linux-file clients (RADV; one whose QueryInfo
@@ -1419,6 +1477,10 @@ int main(int argc, char **argv) {
     const std::string scenario = argv[1];
     if (scenario == "concurrent-clients") {
         concurrentClients();
+        return 0;
+    }
+    if (scenario == "transport-fault-removal") {
+        transportFaultRemoval();
         return 0;
     }
     if (scenario == "client-churn") {

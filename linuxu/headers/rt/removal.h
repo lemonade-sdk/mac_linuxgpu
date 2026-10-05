@@ -50,6 +50,17 @@ struct amdgpu_device;
  * no amdgpu device is bound). Idempotent; 0, or -ENOMEM when the removal
  * thread could not start (fences are still force-completed once). */
 int rt_removal_begin(struct pci_dev *pdev);
+/* The device bound to @pdev no longer answers this driver (a definite PCI
+ * transport fault closed admission) while it may still be on the bus: as
+ * for a removal, the DRM device counts as unplugged, hardware access stops
+ * and every ring's fences are force-completed with -ECANCELED from now on
+ * (the removal thread), so no wait for GPU work blocks forever. Unlike a
+ * removal the PCI device is not marked disconnected (rt_removal_active
+ * stays false): the GPU may still reach host memory, so what it was given
+ * stays retained. Idempotent; any thread; rt_removal_end stops it. */
+int rt_device_lost(struct pci_dev *pdev, const char *why);
+/* rt_device_lost for the device the runtime serves now (none: 0). */
+int rt_device_lost_active(const char *why);
 /* Stop the removal thread (fences are completed a last time). */
 void rt_removal_end(void);
 /* Whether @adev's device was removed (rt_removal_begin, or a device that no

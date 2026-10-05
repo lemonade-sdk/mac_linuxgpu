@@ -317,6 +317,9 @@ static bool             s_deviceRemoved = false;
 // to terminate it once its session is gone, so its process exits.
 static bool             s_retiring = false;
 static bool             s_retireTerminate = false;
+// A definite PCI transport fault made this session's GPU unreachable
+// (transport_lost); cleared when the session's provider closes.
+static bool             s_deviceLost = false;
 static bool             s_terminateRequested = false;
 static bool             s_creatingObserver = false;
 static bool             s_creatingLinuxFile = false;
@@ -743,6 +746,7 @@ static void complete_session_close(MacLinuxGPU *driver)
     s_pciOpen = false;
     s_token = 0;
     s_participants = 0;
+    __atomic_store_n(&s_deviceLost, false, __ATOMIC_RELEASE);
     ++s_sessionGeneration;
     s_sessionClosing = false;
     if (s_quarantineRetained) {
@@ -826,6 +830,23 @@ static void note_device_removed(const char *where)
     const int kept = dext_dma_device_removed();
     if (kept) MACLINUXGPU_EVENT("removal: %d DMA descriptor(s) could not be completed; backing retained", kept);
     power_device_removed();
+}
+
+// A definite PCI transport fault (dext_pci_transport_record_fault's hook, on
+// the faulting thread, any lock held): admission is closed, so this driver
+// can no longer reach the GPU and nothing it waits for will complete. As a
+// removal does, GPU work completes with -ECANCELED from now on
+// (rt_device_lost, its own thread), so no wait holds the session queue:
+// clients' calls fail, they leave, the session closes (quarantined by the
+// fault) and is released once the device leaves the bus. What the GPU may
+// still use stays retained by the fault's DMA quarantine.
+static void transport_lost(int fault)
+{
+    if (__atomic_exchange_n(&s_deviceLost, true, __ATOMIC_ACQ_REL)) return;
+    const int lost = rt_device_lost_active("PCI transport fault");
+    MACLINUXGPU_EVENT("PCI transport fault %d: the GPU no longer answers this driver; "
+                      "its work completes with -ECANCELED%s", fault,
+                      lost ? " (but its completion thread did not start)" : "");
 }
 
 // Whether the device is still on the bus; once it is not, removal begins.
@@ -922,7 +943,7 @@ static void close_session(MacLinuxGPU *driver)
             rt_drm_info_close(drm);
         // A removed device's GPU work stops being completed here; upstream
         // removal finishes the rest itself (amdgpu_fence_driver_hw_fini).
-        if (s_deviceRemoved) rt_removal_end();
+        if (s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE)) rt_removal_end();
         rt_recovery_detach_pdev(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         MACLINUXGPU_LOG("session close: removing upstream driver");
         linuxu_driver_shutdown();
@@ -1761,6 +1782,7 @@ IMPL(MacLinuxGPU, Start)
     }
 
     // Optional embedded fallback; may be empty and is never assumed complete.
+    dext_pci_set_fault_hook(transport_lost);
     int fw_result = fw_table_register_embedded();
     if (fw_result != 0) {
         MACLINUXGPU_EVENT("firmware registration failed: %d", fw_result);
@@ -2342,7 +2364,8 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // release or an uncertain GPU: s_dmaQuarantined), or when the last client
 // leaves a session that must end with it (last_leave_closes).
 //
-// The last client's leaving ends the session when the device left the bus,
+// The last client's leaving ends the session when the device left the bus
+// or no longer answers this driver (a transport fault: s_deviceLost),
 // when a raw BAR mapping's revocation is not proved, or when what the
 // session set up was that client's own: a session that never brought the
 // GPU up, or one whose client used the legacy (non-KFD) path, whose host
@@ -2351,7 +2374,8 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // its window again, as before).
 static bool last_leave_closes(bool legacyClient)
 {
-    return s_deviceRemoved || s_rawBARLease.hasMappings() || !s_modulesRunning || legacyClient;
+    return s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE) ||
+           s_rawBARLease.hasMappings() || !s_modulesRunning || legacyClient;
 }
 static bool session_leave_closes(bool participant, bool legacyClient)
 {

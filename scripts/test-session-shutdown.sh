@@ -16,7 +16,7 @@ def section(start, end, limit):
         raise SystemExit("shutdown fixture extraction exceeded its bounded section")
     return text
 state = section("static IODispatchQueue *s_bringupQueue", "class ComputeClientScope", 130)
-close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 570)
+close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 600)
 opening = section("static kern_return_t ensure_open(MacLinuxGPUUserClient *client)", "static kern_return_t prepare_interrupts", 50)
 driver_stop = section("kern_return_t\nIMPL(MacLinuxGPU, Stop)", "void\nMacLinuxGPU::FinishSession()", 50)
 finish = section("void\nMacLinuxGPU::FinishSession()", "void\nMacLinuxGPU::FinishStop(IOService *provider)", 100)
@@ -54,7 +54,7 @@ clang++ -std=c++20 -fblocks -Wall -Wextra -Werror -Wno-unused-variable \
 for scenario in log-format success large-mapped hold-failure compute-failure irq-failure irq-failure-late \
   reset-failure dma-fini-failure pre-quarantined isolation-failure raw-mapped shutdown-selector probe-retained \
   client-exit-reopen queue-exhaustion-exit client-exit-unprobed client-exit-release-failure \
-  client-exit-raw-mapped client-exit-legacy concurrent-clients client-churn last-leaver-churn observer-quarantined release-after-isolation-failure \
+  client-exit-raw-mapped client-exit-legacy concurrent-clients client-churn last-leaver-churn transport-fault-removal observer-quarantined release-after-isolation-failure \
   release-refused-upstream release-reset-failed stop-release pci-fault-cause observer-reads \
   selftest-parked display-showing display-quarantined surprise-removal surprise-removal-quarantined surprise-removal-held \
   upgrade-stop-idle upgrade-stop-session upgrade-stop-quarantined upgrade-stop-quarantined-held \

@@ -16,6 +16,7 @@
 #ifdef LINUXU_DEXT_DK
 #include <rt/dext_pci.h>
 #endif
+#include <rt/removal.h>
 #include <linux/pci.h>
 #include <linux/irqreturn.h>
 #include <linux/interrupt.h>
@@ -394,6 +395,18 @@ void *rt_ioremap(struct rt_device *dev, uint64_t phys, uint64_t size)
 	if (token == RT_MMIO_TOKEN_INVALID)
 		return NULL;
 	return (void *)(uintptr_t)token;
+#endif
+}
+
+int rt_device_lost_active(const char *why)
+{
+#ifdef LINUXU_DEXT_DK
+	struct rt_device *dev = __atomic_load_n(&rt_active_device, __ATOMIC_ACQUIRE);
+
+	return dev ? rt_device_lost(&dev->pdev, why) : 0;
+#else
+	(void)why;
+	return 0;
 #endif
 }
 

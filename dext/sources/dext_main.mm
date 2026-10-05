@@ -93,6 +93,40 @@ static uint64_t     g_transport_fault_offset;
 static int          g_transport_sentinel;
 static uint64_t     g_transport_sentinel_offset;
 
+extern "C" int printk(const char *fmt, ...);
+
+/* The first definite fault names where it came from: the return addresses
+ * of the frames above this one (frame-pointer chain, PAC stripped) and this
+ * function's own address, so the dext binary's symbols place them
+ * (atos -o <dext> -l <load address>). Only on that fault: nothing on any
+ * ordinary access. */
+static void transport_fault_report(int fault, uint64_t offset)
+{
+	const uint64_t mask = 0x0000007fffffffffull;
+	uintptr_t frames[6] = {};
+	unsigned n = 0;
+	const uintptr_t *fp = (const uintptr_t *)__builtin_frame_address(0);
+	for (; fp && n < 6; ++n) {
+		if ((uintptr_t)fp & 15) break;
+		frames[n] = fp[1] & mask;
+		const uintptr_t *next = (const uintptr_t *)(fp[0] & mask);
+		if (next <= fp || (uintptr_t)next - (uintptr_t)fp > (1u << 20)) { ++n; break; }
+		fp = next;
+	}
+	printk("<3>linuxu: PCI transport fault %d at %#llx (record_fault at %#llx); callers %#llx %#llx %#llx %#llx %#llx %#llx\n",
+	       fault, (unsigned long long)offset,
+	       (unsigned long long)((uintptr_t)&dext_pci_transport_record_fault & mask),
+	       (unsigned long long)frames[0], (unsigned long long)frames[1],
+	       (unsigned long long)frames[2], (unsigned long long)frames[3],
+	       (unsigned long long)frames[4], (unsigned long long)frames[5]);
+}
+
+static void (*g_fault_hook)(int);
+extern "C" void dext_pci_set_fault_hook(void (*hook)(int fault))
+{
+	__atomic_store_n(&g_fault_hook, hook, __ATOMIC_RELEASE);
+}
+
 extern "C" void dext_pci_transport_record_fault(int fault, uint64_t offset)
 {
 	int expected = DEXT_PCI_FAULT_NONE;
@@ -109,6 +143,10 @@ extern "C" void dext_pci_transport_record_fault(int fault, uint64_t offset)
 		false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
 		__atomic_store_n(&g_transport_fault_offset, offset, __ATOMIC_RELAXED);
 		__atomic_store_n(&g_transport_fault, fault, __ATOMIC_RELEASE);
+		if (fault != DEXT_PCI_FAULT_FATAL) {
+			transport_fault_report(fault, offset);
+			if (auto hook = __atomic_load_n(&g_fault_hook, __ATOMIC_ACQUIRE)) hook(fault);
+		}
 	}
 }
 

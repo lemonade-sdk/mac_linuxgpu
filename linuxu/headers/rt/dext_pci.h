@@ -88,6 +88,10 @@ uint64_t dext_pci_transport_fault_offset(void);
  * backing before returning. Already admitted operations cannot be cancelled.
  * Sentinel observations alone do not imply failure or close admission. */
 void dext_pci_transport_record_fault(int fault, uint64_t offset);
+/* Called once, on the thread that recorded the first definite fault (other
+ * than FATAL), after admission closed: the session layer's reaction. It may
+ * run with any lock held. */
+void dext_pci_set_fault_hook(void (*hook)(int fault));
 enum dext_pci_transport_sentinel {
 	DEXT_PCI_SENTINEL_NONE = 0,
 	DEXT_PCI_SENTINEL_CONFIG = 1,
