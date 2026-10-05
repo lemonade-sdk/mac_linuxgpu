@@ -39,6 +39,7 @@
 #include <mlg_drm.h>
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
+#include <mac_hsa.h>
 #include "signal_kernels.h"
 #include "selector_call.h"
 
@@ -518,6 +519,27 @@ static kern_return_t query_info(IOUserClientMethodArguments *a)
     }
     case 12:
         return answer(a, {1, 2, 0x7f, 4242, kfdWindow, kWindowBytes, 0x10000, 0x7fffffffffffull});
+    case MLG_QUERY_DEVICE_SPEC: {  /* a structure, as the driver's QueryInfo handler answers it */
+        mlg_device_spec spec{};
+        spec.version = MLG_DEVICE_SPEC_VERSION;
+        spec.present = MLG_DEVICE_SPEC_GEOMETRY | MLG_DEVICE_SPEC_CUS | MLG_DEVICE_SPEC_SHADER_ARRAYS |
+                       MLG_DEVICE_SPEC_SA_DISABLE | MLG_DEVICE_SPEC_BACKENDS;
+        spec.shader_engines = 4; spec.shader_arrays_per_se = 2; spec.backends_per_se = 4;
+        spec.cus_per_array = 8; spec.wavefront_size = 32; spec.max_waves_per_simd = 16;
+        spec.scratch_slots_per_cu = 32; spec.lds_bytes = 65536; spec.active_cus = 64;
+        for (unsigned se = 0; se < 4; ++se)
+            for (unsigned sa = 0; sa < 2; ++sa) spec.cu_bitmap[se][sa] = 0xff00 | (se << 4) | sa;
+        spec.active_sa_bitmap = 0xff; spec.cc_sa_disable = 0x12340000; spec.user_sa_disable = 0x56780000;
+        spec.active_rb_bitmap = 0xffff; spec.active_rbs = 16;
+        const size_t n = a->structureOutputMaximumSize < sizeof(spec) ? (size_t)a->structureOutputMaximumSize
+                                                                      : sizeof(spec);
+        if (n < 16) return kIOReturnBadArgument;
+        spec.size = (uint32_t)n;
+        a->structureOutput = OSData::withBytes(&spec, n);
+        if (a->scalarOutputCount >= 1) { a->scalarOutput[0] = n; a->scalarOutputCount = 1; }
+        else a->scalarOutputCount = 0;
+        return kIOReturnSuccess;
+    }
     case kTestTag: {
         uint8_t bytes[100];
         for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(0x30 + i);
@@ -1039,6 +1061,19 @@ static void hsa_session()
     CHECK(hsa_agent_get_info(gpu, HSA_AGENT_INFO_QUEUES_MAX, &slots) == HSA_STATUS_SUCCESS);
     CHECK(slots == kQueueSlots);
     for (auto *q : queues) CHECK(hsa_queue_destroy(q) == HSA_STATUS_SUCCESS);
+    // The device spec: the driver's structure, through OWNER_RESULT, in
+    // mac_hsa.h's 32 words.
+    mac_hsa_device_spec_t spec{};
+    const hsa_status_t specStatus = mac_hsa_agent_get_device_spec(gpu, &spec, sizeof(spec));
+    if (specStatus != HSA_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mac_hsa_agent_get_device_spec: %#x\n", specStatus);
+        fail("the device spec was not answered");
+    }
+    CHECK(spec.words[0] == MLG_DEVICE_SPEC_VERSION && spec.words[1] == 4 && spec.words[2] == 2 &&
+          spec.words[4] == 8 && spec.words[8] == 65536 && spec.words[9] == 64);
+    CHECK(spec.words[10] == 0xff00 && spec.words[11] == 0xff01 && spec.words[17] == 0xff31);
+    CHECK(spec.words[18] == 0xff && spec.words[19] == 0x12340000 && spec.words[20] == 0x56780000 &&
+          spec.words[21] == 0xffff && spec.words[22] == 16 && spec.words[23] == 0 && spec.words[31] == 0);
     CHECK(hsa_shut_down() == HSA_STATUS_SUCCESS);
     CHECK(topologyAnswers >= 1 && queuesCreated >= 3);
 }
@@ -1164,7 +1199,8 @@ int main(int argc, char **argv)
     close_waits();
     std::printf("PASS hsa transport: the HSA runtime's IOKit transport against the dext's session dispatch: "
                 "cold bring-up with InitDevice, the 16-word topology through an owner call (%llu queue "
-                "slots), three MULTI queues; owner calls with 16 scalars, and 14 with a structure\n",
+                "slots), three MULTI queues, the device spec as a structure; owner calls with 16 scalars, "
+                "and 14 with a structure\n",
                 (unsigned long long)kQueueSlots);
 
     // libmlg_drm from a cold GPU: the driver has no process for the client

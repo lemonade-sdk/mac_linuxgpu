@@ -93,6 +93,34 @@ static hsa_status_t openSessionClient(io_service_t service, io_connect_t &port) 
     }
 }
 
+// The driver's device spec (session_state.h) in mac_hsa_device_spec_t's
+// 32 words (mac_hsa.h): a group the driver did not report stays zero; the
+// CU bitmap words carry two shader arrays per engine for four engines.
+static void deviceSpecWords(const mlg_device_spec &spec, std::array<uint64_t, mac_hsa::kDeviceSpecDwords> &w)
+{
+    w.fill(0);
+    if (!(spec.present & MLG_DEVICE_SPEC_GEOMETRY)) return;  // header 0: GC not resolved
+    w[0] = spec.version;
+    const uint32_t geometry[8] = {spec.shader_engines, spec.shader_arrays_per_se, spec.backends_per_se,
+                                  spec.cus_per_array, spec.wavefront_size, spec.max_waves_per_simd,
+                                  spec.scratch_slots_per_cu, spec.lds_bytes};
+    for (unsigned i = 0; i < 8; ++i) w[1 + i] = geometry[i];
+    if (spec.present & MLG_DEVICE_SPEC_CUS) {
+        w[9] = spec.active_cus;
+        for (unsigned se = 0; se < 4; ++se)
+            for (unsigned sa = 0; sa < 2; ++sa) w[10 + se * 2 + sa] = spec.cu_bitmap[se][sa];
+    }
+    if (spec.present & MLG_DEVICE_SPEC_SHADER_ARRAYS) w[18] = spec.active_sa_bitmap;
+    if (spec.present & MLG_DEVICE_SPEC_SA_DISABLE) {
+        w[19] = spec.cc_sa_disable;
+        w[20] = spec.user_sa_disable;
+    }
+    if (spec.present & MLG_DEVICE_SPEC_BACKENDS) {
+        w[21] = spec.active_rb_bitmap;
+        w[22] = spec.active_rbs;
+    }
+}
+
 // Whether each open connection's driver serves session calls async
 // (host/selector_call.h): checked on its first async call, forgotten when
 // it closes.
@@ -256,13 +284,28 @@ public:
     }
 
     hsa_status_t spec(std::array<uint64_t, kDeviceSpecDwords> &out) override {
-        // Observer QueryInfo tag 8: raw register-level spec from the driver
-        // (GC_INFO geometry + harvest masks + SH-block registers). Requires
-        // the driver build that serves it; older drivers return
-        // kIOReturnNotReady, which maps to an invalid-argument decline here.
+        // QueryInfo tag 8. The Linux-shim driver answers a structure
+        // (session_state.h's struct mlg_device_spec, through OWNER_RESULT);
+        // one that predates it declines (kIOReturnNotReady or
+        // kIOReturnBadArgument), which is an invalid-argument decline here.
         std::lock_guard lock(sessionMutex);
         auto status=ensureReady();
         if (status!=HSA_STATUS_SUCCESS) return status;
+        if (linuxShim) {
+            mlg_device_spec spec{};
+            const uint64_t tag=MLG_QUERY_DEVICE_SPEC;
+            uint64_t bytes=0;
+            uint32_t count=1;
+            size_t size=sizeof(spec);
+            const auto result=rpcMethod(ownerPort,21,&tag,1,nullptr,0,&bytes,&count,&spec,&size);
+            if (result==kIOReturnNotReady || result==kIOReturnBadArgument || result==kIOReturnUnsupported)
+                return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+            if (result!=KERN_SUCCESS) return HSA_STATUS_ERROR;
+            if (size<4*sizeof(uint32_t) || spec.version<1 || spec.size!=size || (count && bytes!=size))
+                return HSA_STATUS_ERROR;
+            deviceSpecWords(spec,out);
+            return HSA_STATUS_SUCCESS;
+        }
         std::array<uint64_t,3> build{};
         status=scalar(43,{},build);
         if (status!=HSA_STATUS_SUCCESS) return status;

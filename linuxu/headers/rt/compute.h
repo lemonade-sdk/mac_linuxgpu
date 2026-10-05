@@ -72,6 +72,24 @@ struct rt_compute_topology {
 	char product_name[64];
 };
 
+/* The GC geometry and what upstream left active (QueryInfo tag 8). */
+#define RT_DEVICE_SPEC_GEOMETRY		(1u << 0)
+#define RT_DEVICE_SPEC_CUS		(1u << 1)
+#define RT_DEVICE_SPEC_SHADER_ARRAYS	(1u << 2)
+#define RT_DEVICE_SPEC_SA_DISABLE	(1u << 3)
+#define RT_DEVICE_SPEC_BACKENDS		(1u << 4)
+struct rt_device_spec {
+	uint32_t present;	/* RT_DEVICE_SPEC_* */
+	uint32_t shader_engines, shader_arrays_per_se, backends_per_se, cus_per_array;
+	uint32_t wavefront_size, max_waves_per_simd, scratch_slots_per_cu, lds_bytes;
+	uint32_t active_cus;
+	uint32_t cu_bitmap[4][4];
+	uint32_t active_sa_bitmap;
+	uint32_t cc_sa_disable, user_sa_disable;
+	uint32_t active_rb_bitmap, active_rbs;
+};
+int rt_device_spec(struct amdgpu_device *adev, struct rt_device_spec *out);
+
 struct rt_compute_bo_info {
 	uint64_t size;
 	uint64_t gpu_address;

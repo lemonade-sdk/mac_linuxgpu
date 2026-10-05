@@ -242,6 +242,14 @@ int dext_compute_quiescent(void)
 
 void dext_compute_device_removed(void) {}
 
+/* The device spec needs the upstream device: none in the host build. */
+int dext_compute_device_spec(void *out, size_t cap)
+{
+    (void)out;
+    (void)cap;
+    return -ENOTREADY_L;
+}
+
 /* QueryInfo (21): in tag, out values[].  Returns the number of out values
  * written on success (the caller copies them to scalarOutput + sets
  * scalarOutputCount), or a -E*_L error. */
