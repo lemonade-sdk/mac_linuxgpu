@@ -18,7 +18,7 @@ void *rt_ioremap_active(uint64_t start, uint64_t size)
         size <= sizeof(aperture) - (start - bar0))
         return aperture + (start - bar0);
     if (start == bar5 && size == 4)
-        return (void *)(uintptr_t)RT_MMIO_DK_TOKEN_STRIDE;
+        return (void *)(uintptr_t)rt_mmio_dk_address(1);
     return NULL;
 }
 int dext_bar0_cpu_contains(const void *address, size_t size)
@@ -37,7 +37,7 @@ int main(void)
     memunmap(mapped);
     assert(unmaps == 1 && last_unmap == mapped);
     assert(!memremap(bar5, 4, MEMREMAP_WC));
-    assert(unmaps == 2 && last_unmap == (void *)(uintptr_t)RT_MMIO_DK_TOKEN_STRIDE);
+    assert(unmaps == 2 && last_unmap == (void *)(uintptr_t)rt_mmio_dk_address(1));
     assert(!memremap(bar0 + 60, 8, MEMREMAP_WB));
     assert(!memremap(UINT64_MAX, 16, MEMREMAP_WC));
     unsigned before = maps;

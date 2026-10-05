@@ -85,14 +85,14 @@ static uint32_t atomic_mmio_token(const volatile void *addr,
 				  uint64_t *offset)
 {
 	uintptr_t raw = (uintptr_t)addr;
-	uint64_t slot = raw / RT_MMIO_DK_TOKEN_STRIDE;
+	uint64_t slot = rt_mmio_dk_token(raw);
 	if (!slot || slot >= RT_MMIO_DK_MAX_SLOTS)
 		return 0;
 	pthread_mutex_lock(&mmio_lock);
 	int issued = mmio_issued[slot];
 	pthread_mutex_unlock(&mmio_lock);
 	if (!issued) return 0;
-	*offset = raw % RT_MMIO_DK_TOKEN_STRIDE;
+	*offset = rt_mmio_dk_offset(raw);
 	return (uint32_t)slot;
 }
 
@@ -275,7 +275,7 @@ void *rt_mmio_iomap(struct pci_dev *dev, int bar, unsigned long maxlen)
 	if (token == RT_MMIO_TOKEN_INVALID)
 		return NULL;
 #ifdef LINUXU_DEXT_DK
-	return (void *)(uintptr_t)((uint64_t)token * RT_MMIO_DK_TOKEN_STRIDE);
+	return (void *)(uintptr_t)rt_mmio_dk_address(token);
 #else
 	return (void *)(uintptr_t)token;
 #endif
@@ -286,7 +286,7 @@ void rt_mmio_iounmap(struct pci_dev *dev, void *base)
 	(void)dev;
 	rt_mmio_free_token((uint32_t)(uintptr_t)
 #ifdef LINUXU_DEXT_DK
-			   ((uint64_t)(uintptr_t)base / RT_MMIO_DK_TOKEN_STRIDE)
+			   rt_mmio_dk_token((uint64_t)(uintptr_t)base)
 #else
 			   base
 #endif

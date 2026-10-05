@@ -61,11 +61,46 @@ extern "C" {
 #define RT_MMIO_SLOT_GRANULE        0x4000u     /* 16 KB */
 #define RT_MMIO_REGION_SIZE         0x10000000ull /* 256 MB */
 #define RT_MMIO_NUM_SLOTS           (RT_MMIO_REGION_SIZE / RT_MMIO_SLOT_GRANULE)
-/* DriverKit tokens are synthetic addresses, not allocated memory.  Give
- * each one enough address space for a full resizable VRAM BAR while keeping
- * the highest minted pointer below the arm64 user VA ceiling. */
+/* DriverKit tokens are synthetic addresses, not allocated memory, in a
+ * range no process memory can occupy: from 2^48, above the arm64 user VA
+ * ceiling (non-canonical: any load or store there faults), so a real
+ * pointer never decodes as a token and a token is never a real pointer.
+ * Each token gets 256 GB (a full resizable VRAM BAR); token 0 is never
+ * minted, so its range only ever reads as a fault. */
 #define RT_MMIO_DK_TOKEN_STRIDE     (1ull << 38) /* 256 GB */
 #define RT_MMIO_DK_MAX_SLOTS        512u
+#define RT_MMIO_DK_TOKEN_BASE       (1ull << 48)
+#define RT_MMIO_DK_TOKEN_END        (RT_MMIO_DK_TOKEN_BASE + \
+				     (unsigned long long)RT_MMIO_DK_MAX_SLOTS * RT_MMIO_DK_TOKEN_STRIDE)
+/* Below this no macOS process maps memory (__PAGEZERO): an address there is
+ * a null-based bug, which fails as a lost mapping rather than a load. */
+#define RT_MMIO_DK_PAGEZERO         (1ull << 32)
+static inline unsigned long long rt_mmio_dk_address(unsigned int token)
+{
+	return RT_MMIO_DK_TOKEN_BASE + (unsigned long long)token * RT_MMIO_DK_TOKEN_STRIDE;
+}
+/* Whether @raw is in the token range (a live, stale or never minted token). */
+static inline int rt_mmio_dk_is_token(unsigned long long raw)
+{
+	return raw >= RT_MMIO_DK_TOKEN_BASE && raw < RT_MMIO_DK_TOKEN_END;
+}
+/* The token @raw names: 0 (never minted) outside the range. */
+static inline unsigned int rt_mmio_dk_token(unsigned long long raw)
+{
+	return rt_mmio_dk_is_token(raw) ?
+		(unsigned int)((raw - RT_MMIO_DK_TOKEN_BASE) / RT_MMIO_DK_TOKEN_STRIDE) : 0u;
+}
+static inline unsigned long long rt_mmio_dk_offset(unsigned long long raw)
+{
+	return rt_mmio_dk_is_token(raw) ? (raw - RT_MMIO_DK_TOKEN_BASE) % RT_MMIO_DK_TOKEN_STRIDE : raw;
+}
+/* What an accessor does with @raw outside the BAR0 aperture: MMIO through
+ * a token (a stale or unknown one faults), or, anywhere else, a plain load
+ * or store (amdgpu writes PTEs into IBs with writeq, as Linux allows). */
+static inline int rt_mmio_dk_is_mmio(unsigned long long raw)
+{
+	return raw < RT_MMIO_DK_PAGEZERO || rt_mmio_dk_is_token(raw);
+}
 
 /*
  * A fake-MMIO "pointer".  The driver stores the result of ioremap/pci_iomap

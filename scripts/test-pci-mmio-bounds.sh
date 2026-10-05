@@ -36,6 +36,9 @@ clang "${flags[@]}" linuxu/tests/test_pci_mmio_bounds.c "$test_dir/pdev_mmio.o" 
 clang "${flags[@]}" -DLINUXU_DEXT_DK=1 linuxu/tests/test_pci_mmio_dk_bounds.c \
   linuxu/src/pci/pdev_mmio.c -Wl,-dead_strip -o "$test_dir/test_pci_mmio_dk_bounds"
 "$test_dir/test_pci_mmio_dk_bounds"
+clang "${flags[@]}" -DLINUXU_DEXT_DK=1 linuxu/tests/test_mmio_dk_accessors.c \
+  linuxu/src/pci/pdev_mmio.c -Wl,-dead_strip -o "$test_dir/test_mmio_dk_accessors"
+"$test_dir/test_mmio_dk_accessors"
 clang "${flags[@]}" -DLINUXU_DEXT_DK=1 linuxu/tests/test_memremap_contract.c \
   -Wl,-dead_strip -o "$test_dir/test_memremap_contract"
 "$test_dir/test_memremap_contract"

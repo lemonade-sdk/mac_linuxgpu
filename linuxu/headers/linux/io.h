@@ -34,12 +34,27 @@ extern int dext_pci_removed(void);
  * within a BAR preserves the token and yields a BAR-relative byte offset. */
 static inline void *linuxu_dk_token(const void __iomem *addr)
 {
-	return (void *)(uintptr_t)((uintptr_t)addr / RT_MMIO_DK_TOKEN_STRIDE);
+	return (void *)(uintptr_t)rt_mmio_dk_token((uintptr_t)addr);
 }
 static inline uint64_t linuxu_dk_offset(const void __iomem *addr)
 {
-	return (uintptr_t)addr % RT_MMIO_DK_TOKEN_STRIDE;
+	return rt_mmio_dk_offset((uintptr_t)addr);
 }
+/* Process memory (an IB, a kernel buffer): a plain access, ordered as
+ * Linux orders readX/writeX (rt/rt.h's rt_mmio_dk_is_mmio). */
+static inline int linuxu_dk_plain(const volatile void __iomem *addr)
+{
+	return !rt_mmio_dk_is_mmio((uintptr_t)addr);
+}
+#define linuxu_plain_read(type, addr) ({				\
+	type __v = *(const volatile type *)(addr);			\
+	__atomic_thread_fence(__ATOMIC_ACQUIRE);			\
+	__v;								\
+})
+#define linuxu_plain_write(type, v, addr) do {			\
+	__atomic_thread_fence(__ATOMIC_RELEASE);			\
+	*(volatile type *)(addr) = (v);					\
+} while (0)
 extern uint16_t rt_mmio_readw(struct rt_device *, void *, uint64_t);
 extern void rt_mmio_writew(struct rt_device *, void *, uint64_t, uint16_t);
 /* The VRAM aperture (amdgpu's aper_base_kaddr, TTM kmaps of VRAM) is
@@ -60,30 +75,42 @@ static inline u8 readb(const void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u8)))
 		return linuxu_bar0_read(u8, addr);
+	if (linuxu_dk_plain(addr))
+		return linuxu_plain_read(u8, addr);
 	return rt_mmio_readb(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u16 readw(const void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u16)))
 		return linuxu_bar0_read(u16, addr);
+	if (linuxu_dk_plain(addr))
+		return linuxu_plain_read(u16, addr);
 	return rt_mmio_readw(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u32 readl(const void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u32)))
 		return linuxu_bar0_read(u32, addr);
+	if (linuxu_dk_plain(addr))
+		return linuxu_plain_read(u32, addr);
 	return rt_mmio_readl(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline u64 readq(const void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u64)))
 		return linuxu_bar0_read(u64, addr);
+	if (linuxu_dk_plain(addr))
+		return linuxu_plain_read(u64, addr);
 	return rt_mmio_readq(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr));
 }
 static inline void writeb(u8 v, void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u8))) {
 		linuxu_bar0_write(u8, v, addr);
+		return;
+	}
+	if (linuxu_dk_plain(addr)) {
+		linuxu_plain_write(u8, v, addr);
 		return;
 	}
 	rt_mmio_writeb(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr), v);
@@ -94,6 +121,10 @@ static inline void writew(u16 v, void __iomem *addr)
 		linuxu_bar0_write(u16, v, addr);
 		return;
 	}
+	if (linuxu_dk_plain(addr)) {
+		linuxu_plain_write(u16, v, addr);
+		return;
+	}
 	rt_mmio_writew(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr), v);
 }
 static inline void writel(u32 v, void __iomem *addr)
@@ -102,12 +133,20 @@ static inline void writel(u32 v, void __iomem *addr)
 		linuxu_bar0_write(u32, v, addr);
 		return;
 	}
+	if (linuxu_dk_plain(addr)) {
+		linuxu_plain_write(u32, v, addr);
+		return;
+	}
 	rt_mmio_writel(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr), v);
 }
 static inline void writeq(u64 v, void __iomem *addr)
 {
 	if (linuxu_aperture_contains(addr, sizeof(u64))) {
 		linuxu_bar0_write(u64, v, addr);
+		return;
+	}
+	if (linuxu_dk_plain(addr)) {
+		linuxu_plain_write(u64, v, addr);
 		return;
 	}
 	rt_mmio_writeq(NULL, linuxu_dk_token(addr), linuxu_dk_offset(addr), v);
@@ -314,6 +353,11 @@ static inline void memcpy_fromio(void *to, const void __iomem *from, size_t coun
 		linuxu_aperture_copy_out(to, from, count);
 		return;
 	}
+	if (linuxu_dk_plain(from)) {
+		__atomic_thread_fence(__ATOMIC_ACQUIRE);
+		__builtin_memcpy(to, (const void *)from, count);
+		return;
+	}
 	rt_mmio_memcpy_fromio(to, linuxu_dk_token(from), linuxu_dk_offset(from), count, NULL);
 #else
 	if (linuxu_aperture_contains(from, count))
@@ -327,6 +371,11 @@ static inline void memcpy_toio(void __iomem *to, const void *from, size_t count)
 #ifdef LINUXU_DEXT_DK
 	if (linuxu_aperture_contains(to, count)) {
 		linuxu_aperture_copy_in(to, from, count);
+		return;
+	}
+	if (linuxu_dk_plain(to)) {
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+		__builtin_memcpy((void *)to, from, count);
 		return;
 	}
 	rt_mmio_memcpy_toio(linuxu_dk_token(to), from, linuxu_dk_offset(to), count, NULL);

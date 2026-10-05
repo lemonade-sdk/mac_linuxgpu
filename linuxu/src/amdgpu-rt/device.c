@@ -402,8 +402,7 @@ void rt_mmio_free(void *cookie)
 #ifdef LINUXU_DEXT_DK
 	if (dext_bar0_cpu_unmap(cookie))
 		return;
-	rt_mmio_free_token((uint32_t)((uint64_t)(uintptr_t)cookie /
-				       RT_MMIO_DK_TOKEN_STRIDE));
+	rt_mmio_free_token(rt_mmio_dk_token((uint64_t)(uintptr_t)cookie));
 #else
 	rt_mmio_free_token((uint32_t)(uintptr_t)cookie);
 #endif
