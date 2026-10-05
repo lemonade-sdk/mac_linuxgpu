@@ -144,6 +144,7 @@ static int rt_wait_pool_run(void (*fn)(void *), void *arg)
 static std::vector<uint64_t> stoppedClients;
 static void observer_display_client_stop_now(uint64_t clientID) { stoppedClients.push_back(clientID); }
 
+#include "display_call_capture.h"
 #include "display_async_production.inc"
 
 // ---- the test ----
@@ -169,6 +170,34 @@ static kern_return_t call(MacLinuxGPUUserClient *client, uint64_t op, uint64_t a
     const kern_return_t kr = display_call(client, 1, &a);
     if (output) *output = a.structureOutput;
     else if (a.structureOutput) a.structureOutput->release();
+    return kr;
+}
+
+// The host app's own call (host/display_call.h through
+// display_call_host.c), handed to the driver as the kernel hands it: the
+// call's scalars, its structure input as data, its output capacity as
+// structureOutputMaximumSize and its async reference as the completion.
+// The mock call() above always offers 4096 bytes, which hid build 242's
+// host passing none.
+static kern_return_t hostCall(MacLinuxGPUUserClient *client, uint64_t op, uint64_t arg, const void *input,
+                              size_t inputSize, OSAction *action, uint64_t out[2], size_t *capacity)
+{
+    display_call_capture cap{};
+    display_call_host_capture(op, arg, input, inputSize, &cap);
+    assert(cap.selector == MLG_SELECTOR_DISPLAY && cap.scalar_count == 3 && cap.has_completion);
+    IOUserClientMethodArguments a{};
+    a.scalarInput = cap.scalars;
+    a.scalarInputCount = cap.scalar_count;
+    OSData *data = cap.input_size ? OSData::withBytes(cap.input, cap.input_size) : nullptr;
+    a.structureInput = data;
+    a.scalarOutput = out;
+    a.scalarOutputCount = cap.out_words;
+    a.structureOutputMaximumSize = cap.has_output ? cap.output_capacity : 0;
+    a.completion = action;
+    *capacity = a.structureOutputMaximumSize;
+    const kern_return_t kr = display_call(client, 1, &a);
+    if (data) data->release();
+    if (a.structureOutput) a.structureOutput->release();
     return kr;
 }
 
@@ -256,6 +285,57 @@ int main()
     for (auto &t : poolThreads) t.join();
     poolThreads.clear();
     { std::lock_guard lock(completionsLock); assert(completions[1].args[3] == 7 && completions[1].args[4] == 0); }
+
+    // Every op that can sleep, as the host app starts it: accepted by the
+    // driver's own validation and completed. Without the output capacity
+    // the report ops are refused (what build 242's host met).
+    {
+        const char connector[] = "DP-4";
+        struct {
+            uint64_t op, arg;
+            const void *input;
+            size_t size;
+        } const ops[] = {
+            {MLG_DISPLAY_OP_PROBE, 0, nullptr, 0},
+            {MLG_DISPLAY_OP_STATUS, 0, nullptr, 0},
+            {MLG_DISPLAY_OP_MODES, 0, connector, sizeof(connector) - 1},
+            {MLG_DISPLAY_OP_SHOW, 1, connector, sizeof(connector) - 1},
+            {MLG_DISPLAY_OP_OFF, 0, nullptr, 0},
+            {MLG_DISPLAY_OP_IMPORT, (2560ull << 48) | (1440ull << 32) | 10240, nullptr, 0},
+            {MLG_DISPLAY_OP_OUTPUT, 59950, &request, sizeof(request)},
+            {MLG_DISPLAY_OP_RELEASE, 7, nullptr, 0},
+        };
+        size_t done = 2;
+        for (const auto &op : ops) {
+            size_t capacity = 0;
+            if (op.op == MLG_DISPLAY_OP_OUTPUT) {
+                std::lock_guard lock(gpuLock);
+                gpuAnswers = true;
+            }
+            const kern_return_t kr = hostCall(client, op.op, op.arg, op.input, op.size, action, out, &capacity);
+            if (kr != kIOReturnSuccess) {
+                std::fprintf(stderr, "FAIL display calls: the host's op %llu refused (%d), output capacity %zu\n",
+                             (unsigned long long)op.op, kr, capacity);
+                return 1;
+            }
+            assert(capacity >= sizeof(struct rt_display_report));
+            assert(waitCompletions(++done));
+            for (auto &t : poolThreads) t.join();
+            poolThreads.clear();
+            std::lock_guard lock(completionsLock);
+            assert(completions[done - 1].args[0] == out[1] && completions[done - 1].args[1] == kIOReturnSuccess);
+        }
+        // The same call without an output capacity: refused before it runs.
+        IOUserClientMethodArguments a{};
+        const uint64_t in[3] = {MLG_DISPLAY_OP_STATUS, 0, MLG_DISPLAY_CONFIRM};
+        a.scalarInput = in;
+        a.scalarInputCount = 3;
+        a.scalarOutput = out;
+        a.scalarOutputCount = MLG_DISPLAY_WORDS;
+        a.completion = action;
+        assert(display_call(client, 1, &a) == kIOReturnBadArgument);
+        assert(!s_displayRunning && s_observerReads.drained());
+    }
 
     // No thread to run it on: refused, and the display is free again.
     poolRefuses = true;

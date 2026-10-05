@@ -8,3 +8,6 @@
 /* Selectors as the driver serves them: synchronous when they never sleep,
  * else async session calls awaited on the calling thread. */
 #include "selector_call.h"
+/* The start of a display op that can sleep, with the output capacity the
+ * driver checks. */
+#include "display_call.h"

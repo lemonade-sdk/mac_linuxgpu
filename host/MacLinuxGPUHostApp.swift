@@ -1434,7 +1434,7 @@ let displayCompleted: IOAsyncCallback = { refcon, result, args, count in
     completion.done = true
 }
 let kDisplayConfirm: UInt64 = 0x44495350   // "DISP"
-let kDisplayReportMax = 1024
+let kDisplayReportMax = Int(MLG_DISPLAY_REPORT_MAX)
 
 extension MacLinuxGPUHost {
     /// IOConnectCallMethod with scalars and structures both ways.
@@ -1490,6 +1490,7 @@ extension MacLinuxGPUHost {
     /// scalars and its output.
     func callDisplayAsync(_ scalars: [UInt64], input: UnsafeRawPointer?, inputLength: Int, outSize: Int,
                           timeout: TimeInterval = 60) -> (kern_return_t, [UInt64], Data) {
+        guard scalars.count == 3 else { return (kIOReturnBadArgument, [], Data()) }
         guard isOpen, let port = IONotificationPortCreate(kIOMainPortDefault) else { return (kIOReturnError, [], Data()) }
         defer { IONotificationPortDestroy(port) }
         let completion = DisplayCompletion()
@@ -1500,25 +1501,14 @@ extension MacLinuxGPUHost {
             io_user_reference_t(UInt(bitPattern: Unmanaged.passUnretained(completion).toOpaque()))
         var out = [UInt64](repeating: 0, count: 2)
         var outCount: UInt32 = 2
-        // The call carries the op's structure output capacity: the driver
-        // checks it (structureOutputMaximumSize) against the report before
-        // it starts PROBE, SHOW, OFF, STATUS or MODES, and refuses a call
-        // without one (kIOReturnBadArgument). The output itself comes later,
-        // with RESULT.
-        var reply = [UInt8](repeating: 0, count: max(outSize, 1))
-        var replySize = outSize
+        // host/display_call.h: the async call, with the output capacity the
+        // driver checks before it starts an op (the output comes with RESULT).
         let kr = scalars.withUnsafeBufferPointer { s in
             out.withUnsafeMutableBufferPointer { o in
-                reply.withUnsafeMutableBytes { b in
-                    withUnsafeMutablePointer(to: &replySize) { size in
-                        reference.withUnsafeMutableBufferPointer { r in
-                            IOConnectCallAsyncMethod(ucConn, kSelDisplay, IONotificationPortGetMachPort(port),
-                                                     r.baseAddress, UInt32(kIOAsyncCalloutCount), s.baseAddress,
-                                                     UInt32(scalars.count), input, inputLength, o.baseAddress,
-                                                     &outCount, outSize > 0 ? b.baseAddress : nil,
-                                                     outSize > 0 ? size : nil)
-                        }
-                    }
+                reference.withUnsafeMutableBufferPointer { r in
+                    mlg_display_call_start(ucConn, IONotificationPortGetMachPort(port), r.baseAddress,
+                                           UInt32(kIOAsyncCalloutCount), s.baseAddress, input, inputLength,
+                                           o.baseAddress, &outCount)
                 }
             }
         }
