@@ -421,8 +421,10 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
 
     func startOutput(_ mode: VirtualDisplayPlan.Mode) -> Bool {
         let mhz = Int((mode.refreshRate * 1000).rounded())
+        let outputStart = uptimeNs()
         let (kr, status, _) = observer.displayOutput(connector: plan.connector, width: mode.width,
                                                      height: mode.height, refreshMilliHz: mhz)
+        let outputNs = uptimeNs() - outputStart
         guard kr == kIOReturnSuccess, status == 0 else {
             failure = kr == kIOReturnSuccess ? "OUTPUT \(mode.width)x\(mode.height)@\(mhz) mHz: \(displayErrno(status))" :
                                                callFailure(kr, "OUTPUT")
@@ -431,6 +433,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
         self.mode = mode
         print(String(format: "display-agent: %@ lit at %dx%d @ %.3f Hz", plan.connector, mode.width,
                      mode.height, mode.refreshRate))
+        print(String(format: "display-agent: OUTPUT (the modeset, three framebuffers) took %.1f ms",
+                     Double(outputNs) / 1e6))
         return true
     }
 
@@ -538,6 +542,7 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             let width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface)
             guard width == mode.width, height == mode.height else { return } // a frame of the old mode
             IOSurfaceLock(surface, .readOnly, nil)
+            let importStart = uptimeNs()
             let (kr, status, h) = observer.displayImport(base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
                                                          length: IOSurfaceGetAllocSize(surface), width: width,
                                                          height: height, pitch: IOSurfaceGetBytesPerRow(surface))
@@ -549,7 +554,8 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             }
             handles[id] = h
             handle = h
-            print("display-agent: capture surface \(id) imported as handle \(h)")
+            print(String(format: "display-agent: capture surface %u imported as handle %u (%.1f ms)", id, h,
+                         Double(uptimeNs() - importStart) / 1e6))
         }
         let dirty = (info[.dirtyRects] as? [NSDictionary] ?? []).compactMap { CGRect(dictionaryRepresentation: $0) }
         let rects = presentRects(dirty, width: mode.width, height: mode.height)
@@ -1288,7 +1294,9 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     var epoch: UInt32 = .max
 
     func publish() {
-        var status = DisplayStatus(daemon: getpid(), driverAttached: watch.present, monitors: [])
+        var status = DisplayStatus(daemon: getpid(), driverAttached: watch.present, monitors: [],
+                                   disconnected: prefs.disconnected && session == nil && observer == nil &&
+                                       children.isEmpty)
         for m in monitors {
             let child = children[m.connector]
             let on = prefs.isOn(m.key)
@@ -1379,11 +1387,33 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             for child in children.values { stop(child) }
             children = [:]
             closeClients()
+            if prefs.disconnected {
+                // Unplugged after "Disconnect GPU": the next GPU is connected.
+                prefs.disconnected = false
+                do { try prefs.save(to: DisplayControl.prefsURL) }
+                catch { agentLog("display-agent: could not write \(DisplayControl.prefsURL.path): \(error)") }
+                notify_post(DisplayControl.prefsChanged)
+                agentLog("display-agent: the GPU left after Disconnect GPU; it is reconnected when it returns")
+            }
             publish()
             agentLog("display-agent: waiting for the driver")
             while !agentInterrupted && !watch.present {
                 _ = RunLoop.main.run(mode: .default, before: .distantFuture)
             }
+            continue
+        }
+        // "Disconnect GPU": no mirroring and no client of the driver, so
+        // nothing of ours touches the GPU when it is unplugged.
+        if prefs.disconnected {
+            for child in children.values { stop(child) }
+            children = [:]
+            closeClients()
+            publish()
+            agentLog("display-agent: disconnected from the GPU; it can be unplugged")
+            while !agentInterrupted && watch.present && prefs.disconnected {
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(1))
+            }
+            if !agentInterrupted && watch.present { agentLog("display-agent: reconnecting to the GPU") }
             continue
         }
         // A session keeps the GPU up; the observer reads its cached state.
@@ -1604,6 +1634,56 @@ func runDisplayAutostart(_ options: [String]) -> Int32 {
 /// notification each way); it never creates a virtual display itself. Runs
 /// as a background agent (never in the Dock), from its own LaunchAgent
 /// (MenuBarAgent).
+/// "Disconnect GPU", like ejecting a disk: the display daemon stops
+/// mirroring and lets go of the driver; once no app holds the driver and
+/// the driver has closed its session, nothing touches the GPU when it is
+/// unplugged. "Reconnect GPU" undoes it; unplugging does too (the daemon
+/// clears the choice once the GPU has left).
+enum GPUDisconnect {
+    static func set(disconnected: Bool) -> Bool {
+        var prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        prefs.disconnected = disconnected
+        do { try prefs.save(to: DisplayControl.prefsURL) } catch { return false }
+        notify_post(DisplayControl.prefsChanged)
+        return true
+    }
+
+    static var requested: Bool { DisplayPrefs.load(from: DisplayControl.prefsURL).disconnected }
+
+    /// Whether the GPU can be unplugged now (one look, no waiting).
+    static func readiness() -> DisconnectReadiness {
+        var status = DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()
+        if status.daemon == 0 || kill(status.daemon, 0) != 0 { status = DisplayStatus() }
+        let instances = DriverInstances.list()
+        let clients = instances.flatMap { $0.clients }
+        var busy = false
+        if !instances.isEmpty {
+            let host = MacLinuxGPUHost()
+            host.quiet = true
+            if host.openUserClient(observer: true) {
+                if let session = host.sessionState() {
+                    busy = session.participants > 0 || session.closing
+                }
+                _ = host.closeUserClient()
+            }
+        }
+        return DisconnectReadiness.evaluate(status: status, clients: clients, selfPID: getpid(), sessionBusy: busy)
+    }
+
+    /// Asks, then waits up to @timeout for the GPU to be free; the last look.
+    static func disconnect(timeout: TimeInterval, progress: (DisconnectReadiness) -> Void) -> DisconnectReadiness {
+        guard set(disconnected: true) else { return .waitingForDisplays }
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: DisconnectReadiness?
+        while true {
+            let now = readiness()
+            if now != last { progress(now); last = now }
+            if now == .safe || Date() >= deadline { return now }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+    }
+}
+
 private final class MenuBarController: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     var status = DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()
@@ -1667,6 +1747,24 @@ private final class MenuBarController: NSObject, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        if status.driverAttached || GPUDisconnect.requested {
+            if GPUDisconnect.requested {
+                let reconnect = NSMenuItem(title: "Reconnect GPU", action: #selector(reconnectGPU), keyEquivalent: "")
+                reconnect.target = self
+                menu.addItem(reconnect)
+                let line = NSMenuItem(title: "    " + (status.driverAttached ? GPUDisconnect.readiness().message
+                                                                             : "The GPU is unplugged"),
+                                      action: nil, keyEquivalent: "")
+                line.isEnabled = false
+                menu.addItem(line)
+            } else {
+                let disconnect = NSMenuItem(title: "Disconnect GPU…", action: #selector(disconnectGPU),
+                                            keyEquivalent: "")
+                disconnect.target = self
+                menu.addItem(disconnect)
+            }
+            menu.addItem(.separator())
+        }
         let auto = NSMenuItem(title: "Start displays automatically", action: #selector(toggleAutostart(_:)),
                               keyEquivalent: "")
         auto.target = self
@@ -1690,6 +1788,29 @@ private final class MenuBarController: NSObject, NSMenuDelegate {
         } catch {
             NSSound.beep()
         }
+    }
+
+    @objc func disconnectGPU() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = GPUDisconnect.disconnect(timeout: 20) { _ in }
+            DispatchQueue.main.async { self.showDisconnect(result) }
+        }
+    }
+
+    private func showDisconnect(_ result: DisconnectReadiness) {
+        let alert = NSAlert()
+        alert.messageText = result == .safe ? "The GPU can be unplugged" : "The GPU is still in use"
+        alert.informativeText = result == .safe ?
+            "Displays on the GPU are off and nothing is using it. Choose Reconnect GPU in this menu to use it again." :
+            result.message
+        alert.addButton(withTitle: "OK")
+        if result != .safe { alert.addButton(withTitle: "Check Again") }
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn { disconnectGPU() }
+    }
+
+    @objc func reconnectGPU() {
+        if !GPUDisconnect.set(disconnected: false) { NSSound.beep() }
     }
 
     @objc func toggleAutostart(_ sender: NSMenuItem) {

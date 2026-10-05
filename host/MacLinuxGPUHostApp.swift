@@ -2121,6 +2121,15 @@ struct AppMain {
         if args[1] == "display-agent" {
             exit(runDisplayAgent(Array(args.dropFirst(2))))
         }
+        if args[1] == "disconnect-gpu" {
+            // As the menu bar's Disconnect GPU: stop mirroring, let go of
+            // the driver, report when the GPU can be unplugged.
+            let result = GPUDisconnect.disconnect(timeout: 20) { print($0.message) }
+            exit(result == .safe ? 0 : 3)
+        }
+        if args[1] == "reconnect-gpu" {
+            exit(GPUDisconnect.set(disconnected: false) ? 0 : 1)
+        }
         if args[1] == "display-autostart" {
             exit(runDisplayAutostart(Array(args.dropFirst(2))))
         }

@@ -830,6 +830,21 @@ func monitorKey(edid: Data?) -> String? {
 /// mirrored unless turned off. Persisted as JSON, keyed by monitorKey.
 struct DisplayPrefs: Codable, Equatable {
     var off: [String] = []
+    /// "Disconnect GPU": the daemon stops mirroring and lets go of the
+    /// driver so the GPU can be unplugged like an ejected disk. Cleared by
+    /// "Reconnect GPU", or by the daemon once the GPU has left the bus.
+    var disconnected = false
+
+    init(off: [String] = [], disconnected: Bool = false) {
+        self.off = off
+        self.disconnected = disconnected
+    }
+    /// Files from before "disconnected" existed read as connected.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        off = try c.decodeIfPresent([String].self, forKey: .off) ?? []
+        disconnected = try c.decodeIfPresent(Bool.self, forKey: .disconnected) ?? false
+    }
 
     func isOn(_ key: String) -> Bool { !off.contains(key) }
     mutating func set(_ key: String, on: Bool) {
@@ -849,6 +864,44 @@ struct DisplayPrefs: Codable, Equatable {
     }
 }
 
+/// "Disconnect GPU": whether the GPU can be unplugged now. Safe once the
+/// display daemon has let go (or is not running) and no app holds a client
+/// of the driver (IOKit's IOUserClientCreator records, "pid N, name"; the
+/// asking process itself excluded); else the apps to quit.
+enum DisconnectReadiness: Equatable {
+    case safe
+    case waitingForDisplays
+    case appsConnected([String])
+    /// No app left, but the driver is still closing its session (stopping
+    /// the GPU's work, releasing its memory).
+    case driverClosing
+
+    static func evaluate(status: DisplayStatus, clients: [String], selfPID: Int32,
+                         sessionBusy: Bool = false) -> DisconnectReadiness {
+        if status.daemon != 0 && status.driverAttached && !status.disconnected { return .waitingForDisplays }
+        let apps = clients.compactMap { creator -> String? in
+            let parts = creator.split(separator: ",", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, parts[0].hasPrefix("pid ") else { return creator }
+            if Int32(parts[0].dropFirst(4)) == selfPID { return nil }
+            return "\(parts[1]) (\(parts[0]))"
+        }
+        if !apps.isEmpty { return .appsConnected(apps) }
+        return sessionBusy ? .driverClosing : .safe
+    }
+
+    /// For the user.
+    var message: String {
+        switch self {
+        case .safe: return "The GPU can be unplugged now."
+        case .waitingForDisplays: return "Waiting for the displays on the GPU to stop…"
+        case .driverClosing: return "Waiting for the driver to finish with the GPU…"
+        case .appsConnected(let apps):
+            return "Still using the GPU: " + apps.joined(separator: ", ") + ". Quit " +
+                (apps.count == 1 ? "it" : "them") + ", then unplug the GPU."
+        }
+    }
+}
+
 /// What the daemon reports for the menu bar.
 struct DisplayStatus: Codable, Equatable {
     enum State: String, Codable { case off, starting, mirroring, error }
@@ -864,6 +917,22 @@ struct DisplayStatus: Codable, Equatable {
     var daemon: Int32 = 0          // the daemon's pid, 0 when it is not running
     var driverAttached = false
     var monitors: [Monitor] = []
+    /// The daemon has let go of the driver for "Disconnect GPU".
+    var disconnected = false
+
+    init(daemon: Int32 = 0, driverAttached: Bool = false, monitors: [Monitor] = [], disconnected: Bool = false) {
+        self.daemon = daemon
+        self.driverAttached = driverAttached
+        self.monitors = monitors
+        self.disconnected = disconnected
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        daemon = try c.decodeIfPresent(Int32.self, forKey: .daemon) ?? 0
+        driverAttached = try c.decodeIfPresent(Bool.self, forKey: .driverAttached) ?? false
+        monitors = try c.decodeIfPresent([Monitor].self, forKey: .monitors) ?? []
+        disconnected = try c.decodeIfPresent(Bool.self, forKey: .disconnected) ?? false
+    }
 
     /// The menu bar icon's state: an error on any monitor, else whether
     /// any is mirrored.

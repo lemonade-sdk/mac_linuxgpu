@@ -472,3 +472,32 @@ do {
     }
 }
 print("PASS latency series and type marks")
+
+// "Disconnect GPU": the choice persists (and old files read as connected);
+// the readiness to unplug follows the daemon and the driver's clients.
+do {
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlg-disconnect-\(getpid())")
+    try? FileManager.default.removeItem(at: dir)
+    let url = dir.appendingPathComponent("displays.json")
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try! Data(#"{"off":["DEL-40DD-1"]}"#.utf8).write(to: url)
+    var prefs = DisplayPrefs.load(from: url)
+    check(prefs.off == ["DEL-40DD-1"] && !prefs.disconnected, "an old file reads as connected")
+    prefs.disconnected = true
+    try! prefs.save(to: url)
+    check(DisplayPrefs.load(from: url).disconnected)
+    try! Data(#"{"daemon":7,"driverAttached":true,"monitors":[]}"#.utf8).write(to: dir.appendingPathComponent("s.json"))
+    check(DisplayStatus.load(from: dir.appendingPathComponent("s.json")) == DisplayStatus(daemon: 7, driverAttached: true))
+    let mirroring = DisplayStatus(daemon: 7, driverAttached: true, monitors: [], disconnected: false)
+    let released = DisplayStatus(daemon: 7, driverAttached: true, monitors: [], disconnected: true)
+    check(DisconnectReadiness.evaluate(status: mirroring, clients: [], selfPID: 1) == .waitingForDisplays)
+    check(DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost"], selfPID: 1) == .safe)
+    check(DisconnectReadiness.evaluate(status: released, clients: ["pid 1, MacLinuxGPUHost", "pid 692, amdgpu_mtopg"],
+                                       selfPID: 1) == .appsConnected(["amdgpu_mtopg (pid 692)"]))
+    check(DisconnectReadiness.evaluate(status: DisplayStatus(), clients: [], selfPID: 1) == .safe, "no daemon running")
+    check(DisconnectReadiness.evaluate(status: released, clients: [], selfPID: 1, sessionBusy: true) == .driverClosing)
+    check(DisconnectReadiness.appsConnected(["amdgpu_mtopg (pid 692)"]).message ==
+          "Still using the GPU: amdgpu_mtopg (pid 692). Quit it, then unplug the GPU.")
+    try? FileManager.default.removeItem(at: dir)
+}
+print("PASS disconnect GPU: the choice persists, readiness follows the daemon and the driver's clients")
