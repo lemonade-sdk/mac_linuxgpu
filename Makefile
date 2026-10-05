@@ -887,8 +887,16 @@ test-bounded:
 		-o $(BUILD)/tests/test_bounded
 	$(BUILD)/tests/test_bounded
 
-test: test-owner-call test-bounded
-.PHONY: test-owner-call test-bounded
+# host/selector_call.h against mock old and new drivers.
+test-selector-call:
+	@mkdir -p $(BUILD)/tests
+	$(CC) -std=gnu11 -g -O1 -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined \
+		-Ihost linuxu/tests/test_selector_call.c -framework IOKit -framework CoreFoundation \
+		-o $(BUILD)/tests/test_selector_call
+	$(BUILD)/tests/test_selector_call
+
+test: test-owner-call test-bounded test-selector-call
+.PHONY: test-owner-call test-bounded test-selector-call
 
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh

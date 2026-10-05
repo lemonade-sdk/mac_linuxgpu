@@ -51,6 +51,7 @@ extern int usleep(unsigned int usec);
 #include <rt/bootstrap.h>
 #include <rt/compute.h>
 #include <rt/dart.h>
+#include <rt/recovery.h>
 
 #include "amdgpu.h"
 #include "amdgpu_reset.h"
@@ -262,6 +263,8 @@ struct engine {
 	uint64_t wptr;		/* what set_wptr published */
 	uint64_t rptr;
 	bool stop, hold;
+	bool waiting;		/* in its wait, between packets */
+	pthread_cond_t idle;	/* signalled when it starts waiting */
 };
 /* The VMID page-table registers, per hub as in the hardware: an engine's
  * VM flush programs the hub every engine on it translates through. */
@@ -734,8 +737,12 @@ static void *engine_main(void *arg)
 		uint64_t wptr;
 
 		pthread_mutex_lock(&e->lock);
-		while (!e->stop && (e->hold || e->rptr == e->wptr))
+		while (!e->stop && (e->hold || e->rptr == e->wptr)) {
+			e->waiting = true;
+			pthread_cond_broadcast(&e->idle);
 			pthread_cond_wait(&e->kick, &e->lock);
+			e->waiting = false;
+		}
 		if (e->stop) {
 			pthread_mutex_unlock(&e->lock);
 			return NULL;
@@ -796,6 +803,86 @@ static void fx_pm4_emit_hdp_flush(struct amdgpu_ring *ring)
 	amdgpu_ring_write(ring, 0);
 }
 
+/* The ring test a queue reset ends with (amdgpu_ring_reset_helper_end):
+ * a write the engine performs from the ring itself, polled for as the
+ * gfx and SDMA ring tests poll their scratch register or write-back slot. */
+static int fx_ring_test(struct amdgpu_ring *ring)
+{
+	const bool pm4 = ring->funcs->type == AMDGPU_RING_TYPE_COMPUTE;
+	volatile uint32_t *slot;
+	uint64_t gpu;
+	uint32_t index;
+	int r;
+
+	r = amdgpu_device_wb_get(adev, &index);
+	if (r)
+		return r;
+	gpu = adev->wb.gpu_addr + index * 4;
+	slot = fixture_view(&adev->wb.wb[index]);
+	*slot = 0xCAFEDEADu;
+	r = amdgpu_ring_alloc(ring, 5);
+	if (!r) {
+		if (pm4) {
+			amdgpu_ring_write(ring, PACKET3(PACKET3_WRITE_DATA, 3));
+			amdgpu_ring_write(ring, 5u << 8);	/* memory */
+		} else {
+			amdgpu_ring_write(ring, FX_SDMA(FX_SDMA_FENCE, 3));
+		}
+		amdgpu_ring_write(ring, lower_32_bits(gpu));
+		amdgpu_ring_write(ring, upper_32_bits(gpu));
+		amdgpu_ring_write(ring, 0xDEADBEEFu);
+		if (!pm4)
+			amdgpu_ring_write(ring, FX_SDMA(FX_SDMA_NOP, 0));
+		amdgpu_ring_commit(ring);
+		r = -ETIMEDOUT;
+		for (unsigned int i = 0; i < adev->usec_timeout; ++i) {
+			if (*slot == 0xDEADBEEFu) {
+				r = 0;
+				break;
+			}
+			udelay(1);
+		}
+	}
+	amdgpu_device_wb_free(adev, index);
+	return r;
+}
+
+/* A per-queue reset (amdgpu_job_timedout -> amdgpu_ring_reset), as MES
+ * resets a hung kernel queue: the commands not yet processed are backed
+ * up, the queue restarts empty (a hold, the fixture's hang, ends with it),
+ * the ring test runs, and the innocent commands are emitted again, the
+ * guilty context's IBs replaced by NOPs (upstream's helpers). */
+static bool queue_reset_fails;
+
+void cs_fixture_fail_queue_reset(int fail)
+{
+	queue_reset_fails = fail;
+}
+
+static int fx_ring_reset(struct amdgpu_ring *ring, unsigned int vmid,
+			 struct amdgpu_fence *guilty_fence)
+{
+	struct engine *e = engine_of(ring);
+
+	(void)vmid;
+	amdgpu_ring_reset_helper_begin(ring, guilty_fence);
+	if (queue_reset_fails)
+		return -ETIMEDOUT;	/* MES did not reset it (a queue stuck for good) */
+	pthread_mutex_lock(&e->lock);
+	e->hold = true;
+	pthread_cond_signal(&e->kick);
+	while (!e->waiting && !e->stop)
+		pthread_cond_wait(&e->idle, &e->lock);
+	amdgpu_ring_clear_ring(ring);
+	ring->wptr = 0;
+	e->rptr = e->wptr = 0;
+	*(volatile uint32_t *)fixture_view(ring->rptr_cpu_addr) = 0;
+	e->hold = false;
+	pthread_mutex_unlock(&e->lock);
+	STAT(queue_resets);
+	return amdgpu_ring_reset_helper_end(ring, guilty_fence);
+}
+
 static const struct amdgpu_ring_funcs fx_compute_funcs = {
 	.type = AMDGPU_RING_TYPE_COMPUTE,
 	.align_mask = 0xff,
@@ -812,6 +899,8 @@ static const struct amdgpu_ring_funcs fx_compute_funcs = {
 	.emit_hdp_flush = fx_pm4_emit_hdp_flush,
 	.insert_nop = amdgpu_ring_insert_nop,
 	.pad_ib = amdgpu_ring_generic_pad_ib,
+	.test_ring = fx_ring_test,
+	.reset = fx_ring_reset,
 };
 
 static void fx_sdma_emit_ib(struct amdgpu_ring *ring, struct amdgpu_job *job,
@@ -874,6 +963,8 @@ static const struct amdgpu_ring_funcs fx_sdma_funcs = {
 	.emit_vm_flush = fx_sdma_emit_vm_flush,
 	.insert_nop = amdgpu_ring_insert_nop,
 	.pad_ib = fx_sdma_pad_ib,
+	.test_ring = fx_ring_test,
+	.reset = fx_ring_reset,
 };
 
 /* ---- buffer and PTE functions (TTM moves/clears, VM updates) ---- */
@@ -1136,6 +1227,8 @@ static void ring_setup(struct amdgpu_ring *ring, const struct amdgpu_ring_funcs 
 		.ops = &amdgpu_sched_ops,
 		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
 		.credit_limit = 0,
+		/* amdgpu's job timeout (amdgpu.lockup_timeout); a recovery
+		 * check shortens its ring's own (queue_reset_check). */
 		.timeout = msecs_to_jiffies(10000),
 		.timeout_wq = adev->reset_domain->wq,
 		.name = name,
@@ -1158,6 +1251,7 @@ static void ring_setup(struct amdgpu_ring *ring, const struct amdgpu_ring_funcs 
 	e->ring = ring;
 	pthread_mutex_init(&e->lock, NULL);
 	pthread_cond_init(&e->kick, NULL);
+	pthread_cond_init(&e->idle, NULL);
 	if (pthread_create(&e->thread, NULL, engine_main, e))
 		FX_ABORT("engine thread");
 }
@@ -1175,9 +1269,10 @@ struct pci_dev *cs_fixture_init(void)
 	    linuxu_module_init_drm_sched_fence_slab_init() || amdgpu_sync_init())
 		FX_ABORT("module init");
 
-	/* linuxu_driver_bootstrap's policy: no GPU recovery, a job timeout
-	 * only signals -ETIME. */
-	amdgpu_gpu_recovery = 0;
+	/* linuxu_driver_bootstrap's policy: upstream's GPU recovery (a job
+	 * timeout resets the queue, then the device). The fixture resets
+	 * queues (fx_ring_reset). */
+	amdgpu_gpu_recovery = -1;
 
 	/* The PCI function: BAR0 VRAM aperture, BAR2 doorbells, BAR5 MMIO. */
 	pdev = &dev;
@@ -1262,6 +1357,9 @@ struct pci_dev *cs_fixture_init(void)
 	amdgpu_set_init_level(adev, AMDGPU_INIT_LEVEL_DEFAULT);
 	adev->gfx_timeout = adev->compute_timeout = adev->sdma_timeout =
 		adev->video_timeout = msecs_to_jiffies(10000);
+	/* What gfx_v12_0 and sdma_v7_0 report with current firmware. */
+	adev->gfx.compute_supported_reset = AMDGPU_RESET_TYPE_PER_QUEUE;
+	adev->sdma.supported_reset = AMDGPU_RESET_TYPE_PER_QUEUE;
 	adev->asic_funcs = &fx_asic_funcs;
 	adev->gfx.funcs = &fx_gfx_funcs;
 	adev->gfx.rlc.funcs = &fx_rlc_funcs;
@@ -1378,6 +1476,10 @@ struct pci_dev *cs_fixture_init(void)
 	r = drm_dev_register(adev_to_drm(adev), 0);
 	if (r)
 		FX_ABORT("drm_dev_register = %d", r);
+	/* GPU recovery's platform side, as the driver hooks it in after the
+	 * probe (rt/recovery.h). */
+	if (rt_recovery_attach(adev))
+		FX_ABORT("recovery attach");
 	return pdev;
 }
 

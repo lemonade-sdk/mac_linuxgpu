@@ -108,12 +108,12 @@ int linuxu_driver_bootstrap(void)
 	 * code reads the global directly (as with a ppfeaturemask without
 	 * GFXOFF on Linux). Lift once GFXOFF entry/exit is validated over TB. */
 	amdgpu_pp_feature_mask &= ~LINUXU_PP_GFXOFF_MASK;
-	/* No GPU recovery: a 2 s job timeout would otherwise trigger soft,
-	 * per-queue, then full ASIC reset (should_recover_gpu is true with RAS
-	 * off). DriverKit owns the PCI function and its reset path, and no
-	 * upstream reset flow has been validated through it. Timeouts still
-	 * signal -ETIME. Lift once reset is validated with DriverKit ownership. */
-	amdgpu_gpu_recovery = 0;
+	/* GPU recovery as on Linux (upstream's default): a job that times out
+	 * resets its queue (MES queue reset for gfx and compute, SDMA queue
+	 * reset), and if that fails the device (amdgpu_device_gpu_recover).
+	 * Without it a hung ring's fences never signal and every wait on them
+	 * lasts forever. */
+	amdgpu_gpu_recovery = -1;
 	/* Keep one upstream kernel compute ring; the runtime selects a free
 	 * MEC slot after probe instead of colliding with kernel/KIQ queues. */
 	amdgpu_num_kcq = 1;

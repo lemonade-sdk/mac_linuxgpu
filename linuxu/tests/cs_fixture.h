@@ -21,6 +21,7 @@ struct cs_fixture_stats {
 	unsigned long release_mem;		/* PM4 RELEASE_MEM in IBs executed */
 	unsigned long dispatches;		/* dispatch packets seen (not run) */
 	unsigned long skipped;			/* packets skipped (state, caches) */
+	unsigned long queue_resets;		/* per-queue resets (fx_ring_reset) */
 };
 
 /* Before cs_fixture_init: two SDMA instances (each its own engine), and a
@@ -37,8 +38,12 @@ struct pci_dev *cs_fixture_init(void);
 /* Stop the software engines. */
 void cs_fixture_stop(void);
 void cs_fixture_stats(struct cs_fixture_stats *out);
-/* Make the compute engine ignore its ring until resumed (a hung queue). */
+/* Make the compute engine ignore its ring until resumed (a hung queue). A
+ * queue reset (a job timeout with GPU recovery) also ends it. */
 void cs_fixture_hold_compute(int hold);
+/* Make every queue reset fail (MES does not answer), as a GPU that needs
+ * a device reset. */
+void cs_fixture_fail_queue_reset(int fail);
 /* The same for the SDMA engine (TTM's moves, clears and PTE uploads). */
 void cs_fixture_hold_sdma(int hold);
 /* CPU-visible VRAM (the BAR), set before cs_fixture_init; 0: all VRAM. */

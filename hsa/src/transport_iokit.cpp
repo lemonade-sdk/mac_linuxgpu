@@ -26,14 +26,47 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
-// A selector as the driver serves it (host/selector_call.h).
+// Whether each open connection's driver serves session calls async
+// (host/selector_call.h): checked on its first async call, forgotten when
+// it closes.
+static std::mutex sessionCallProtocolsLock;
+static std::unordered_map<io_connect_t, int> sessionCallProtocols;
+
+static kern_return_t closeConnection(io_connect_t port) {
+    {
+        std::lock_guard lock(sessionCallProtocolsLock);
+        sessionCallProtocols.erase(port);
+    }
+    return IOServiceClose(port);
+}
+
+// A selector as the driver serves it (host/selector_call.h). Against a
+// driver older than build 243 a session call fails at once, with the
+// reason on stderr, never waiting for a completion that will not come.
 static kern_return_t rpcMethod(io_connect_t port, uint32_t selector, const uint64_t *input,
                                uint32_t inputs, const void *inputStruct, size_t inputStructSize,
                                uint64_t *output, uint32_t *outputs, void *outputStruct,
                                size_t *outputStructSize) {
-    return mlg_selector_call(port, selector, input, inputs, inputStruct, inputStructSize,
-                             output, outputs, outputStruct, outputStructSize);
+    int state;
+    {
+        std::lock_guard lock(sessionCallProtocolsLock);
+        state = sessionCallProtocols[port];
+    }
+    const int before = state;
+    const auto result = mlg_selector_call_on(port, &state, selector, input, inputs, inputStruct,
+                                             inputStructSize, output, outputs, outputStruct,
+                                             outputStructSize);
+    if (state != before) {
+        std::lock_guard lock(sessionCallProtocolsLock);
+        sessionCallProtocols[port] = state;
+        if (state < 0)
+            std::fprintf(stderr, "mac_linuxgpu: the installed MacLinuxGPU driver is older than build %u "
+                         "and this runtime needs it: install the matching driver\n",
+                         MLG_SESSION_CALLS_ASYNC_BUILD);
+    }
+    return result;
 }
 
 namespace mac_hsa {
@@ -119,8 +152,8 @@ public:
             IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host));
         }
         stopFirmwareService(); // Never left running past initialization.
-        if (ownerPort) IOServiceClose(ownerPort);
-        if (pendingProbePort) IOServiceClose(pendingProbePort);
+        if (ownerPort) closeConnection(ownerPort);
+        if (pendingProbePort) closeConnection(pendingProbePort);
         if (service) IOObjectRelease(service);
     }
     bool supportsBuffers() const override { return true; }
@@ -622,7 +655,7 @@ public:
         std::array<uint64_t, 3> build{}; uint64_t tag = 4, stage = 0;
         auto status = call(probe, 43, nullptr, 0, build.data(), 3);
         if (status == HSA_STATUS_SUCCESS) status = call(probe, 21, &tag, 1, &stage, 1);
-        if (probe != ownerPort && IOServiceClose(probe) != KERN_SUCCESS) {
+        if (probe != ownerPort && closeConnection(probe) != KERN_SUCCESS) {
             pendingProbePort = probe;
             state = State::Faulted;
             return HSA_STATUS_ERROR;
@@ -1126,7 +1159,7 @@ private:
                                               nullptr, nullptr));
                 }, emit);
             (void)std::fflush(stderr);
-            const auto closed=IOServiceClose(ownerPort);
+            const auto closed=closeConnection(ownerPort);
             if (closed==KERN_SUCCESS) ownerPort=IO_OBJECT_NULL;
             // A failed claimed session must not automatically retry probe on
             // the next property query. Retain a failed-close port for teardown.
@@ -1140,7 +1173,7 @@ private:
         firmware.clear();
         if (!claimed) {
             // Busy acquisition must not leave an idle client blocking Host Stop.
-            IOServiceClose(ownerPort);
+            closeConnection(ownerPort);
             ownerPort = IO_OBJECT_NULL;
             state = State::Unclaimed;
             return status;
@@ -1385,7 +1418,7 @@ public:
         io_connect_t port = ownerPort;
         if (!port && IOServiceOpen(service, mach_task_self(), 0, &port) != KERN_SUCCESS)
             return HSA_STATUS_ERROR_INVALID_AGENT;
-        struct Close { io_connect_t port; ~Close() { if (port) IOServiceClose(port); } } close{ownerPort ? 0 : port};
+        struct Close { io_connect_t port; ~Close() { if (port) closeConnection(port); } } close{ownerPort ? 0 : port};
         uint64_t identity[3]{};
         auto status = call(port, 43, nullptr, 0, identity, 3);
         if (status != HSA_STATUS_SUCCESS) return status;

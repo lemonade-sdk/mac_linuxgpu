@@ -12,5 +12,10 @@ void blocked_call_check(struct pci_dev *pdev);
  * removal ended it and the client's exit completes. */
 void blocked_call_park(struct pci_dev *pdev);
 void blocked_call_after_removal(void);
+/* A hung compute job under GPU recovery: its queue resets, other work goes
+ * on, the guilty context reports it (blocked_call_check.c). */
+void queue_reset_check(struct pci_dev *pdev);
+/* A hang no queue reset ends: the device wedges (leaves it wedged). */
+void wedge_check(struct pci_dev *pdev);
 
 #endif

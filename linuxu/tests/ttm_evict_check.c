@@ -30,6 +30,8 @@
 #include "amdgpu_ttm.h"
 #include "cs_fixture.h"
 
+extern int amdgpu_gpu_recovery;
+
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
 	__FILE__, __LINE__, #c); abort(); } } while (0)
 
@@ -254,12 +256,26 @@ void ttm_evict_check(void)
 		r = move_to(k, AMDGPU_GEM_DOMAIN_GTT);
 		fprintf(stderr, "ttm evict: held-SDMA move of a kernel BO returned %d after %lld ms\n",
 			r, (long long)ktime_ms_delta(ktime_get(), start));
-		/* A clean failure within a bound: the BO is where it was. */
-		CHECK(r && k->tbo.resource->mem_type == TTM_PL_VRAM);
+		/* Within a bound. Without GPU recovery a clean failure: the BO
+		 * is where it was. With it, the SDMA queue reset (10 s) ends
+		 * the wait, its jobs cancelled (as Linux's per-queue reset
+		 * cancels a guilty context's work), and TTM completes the move
+		 * on their fences. */
+		CHECK(amdgpu_gpu_recovery || (r && k->tbo.resource->mem_type == TTM_PL_VRAM));
 		CHECK(ktime_ms_delta(ktime_get(), start) < 30000);
-		/* The destination pages TTM released are still mapped: the
-		 * engine was stalled when they went. */
-		CHECK(no_hold || linuxu_dart_held() > 0);
+		/* With GPU recovery the SDMA job timed out first (10 s, before
+		 * TTM's 15 s): its queue reset dropped the copy and the window
+		 * PTE upload of the move's context, so nothing will write the
+		 * pages TTM released. Without it, those pages are still mapped:
+		 * the engine was stalled when they went. */
+		if (amdgpu_gpu_recovery) {
+			struct cs_fixture_stats now;
+
+			cs_fixture_stats(&now);
+			CHECK(now.queue_resets > before.queue_resets);
+		} else {
+			CHECK(no_hold || linuxu_dart_held() > 0);
+		}
 		/* The engine catches up and runs what was queued: its window
 		 * PTEs point at those pages, which it may still write. */
 		cs_fixture_hold_sdma(0);
@@ -285,8 +301,8 @@ void ttm_evict_check(void)
 	amdgpu_bo_free_kernel(&staging, &staging_gpu, (void **)&staging_cpu);
 	printf("PASS TTM VRAM<->GTT moves offline: validation and eviction under VRAM pressure "
 	       "through the GART transfer windows, window PTEs on live DMA mappings, "
-	       "contents intact; a move whose SDMA work stalls fails cleanly and its "
-	       "released pages stay mapped until the engine catches up; no GPU or DART "
+	       "contents intact; a move whose SDMA work stalls ends within a bound (its "
+	       "queue resets under GPU recovery); no GPU or DART "
 	       "fault (BAR %llu MiB of %llu MiB VRAM)\n",
 	       (unsigned long long)(adev->gmc.visible_vram_size >> 20),
 	       (unsigned long long)(adev->gmc.real_vram_size >> 20));

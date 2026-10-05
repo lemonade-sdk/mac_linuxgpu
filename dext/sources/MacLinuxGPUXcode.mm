@@ -83,6 +83,7 @@
 #include <rt/kfd_session.h>
 #include <rt/wait_pool.h>
 #include <rt/bounded.h>
+#include <rt/recovery.h>
 #include <rt/sysfs.h>
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
@@ -275,6 +276,10 @@ static void maclinuxgpu_event_sink(const char *text)
 // serial bringup queue (the one-queue model) + the
 // retained PCI + the rt device + the adev.
 static IODispatchQueue *s_bringupQueue = nullptr;
+// Where the driver's own Stop and power changes do their session work: the
+// session queue (s_bringupQueue). They arrive on the driver's delivery
+// queue, which never waits for it (IMPL(MacLinuxGPU, Stop)).
+static IODispatchQueue *s_stopQueue = nullptr;
 static IOPCIDevice     *s_retainedPCI  = nullptr;
 static void            *s_rtDevice     = nullptr;
 static bool             s_modulesRunning = false;
@@ -613,6 +618,42 @@ static uint32_t release_blocker()
     return MLG_RELEASE_READY;
 }
 
+// GPU recovery's state (QueryInfo "LRST", session_state.h), as the
+// runtime last published it (recovery_notify), for readers on any thread.
+static uint64_t s_resetState[MLG_RESET_STATE_WORDS];
+static uint32_t s_resetStateLock;
+static void reset_state(uint64_t out[MLG_RESET_STATE_WORDS])
+{
+    while (__atomic_exchange_n(&s_resetStateLock, 1u, __ATOMIC_ACQUIRE)) {}
+    memcpy(out, s_resetState, sizeof(s_resetState));
+    __atomic_store_n(&s_resetStateLock, 0u, __ATOMIC_RELEASE);
+    out[0] = MLG_RESET_STATE_VERSION;
+}
+static void reset_state_store(const struct rt_recovery_state *st)
+{
+    while (__atomic_exchange_n(&s_resetStateLock, 1u, __ATOMIC_ACQUIRE)) {}
+    s_resetState[1] = st ? st->generation : 0;
+    s_resetState[2] = st ? ((st->flags & RT_RECOVERY_WEDGED ? MLG_RESET_FLAG_WEDGED : 0) |
+                            (st->flags & RT_RECOVERY_LAST_VRAM_LOST ? MLG_RESET_FLAG_LAST_VRAM_LOST : 0)) : 0;
+    s_resetState[3] = st ? st->queue_resets : 0;
+    s_resetState[4] = st ? st->vram_lost : 0;
+    s_resetState[5] = st ? (uint64_t)(int64_t)st->last_result : 0;
+    __atomic_store_n(&s_resetStateLock, 0u, __ATOMIC_RELEASE);
+}
+// On the reset domain's thread, once per change: the cached state and an
+// event in the unified log.
+static void recovery_notify(const struct rt_recovery_state *st)
+{
+    reset_state_store(st);
+    if (st->flags & RT_RECOVERY_WEDGED)
+        MACLINUXGPU_EVENT("GPU wedged (reset generation %llu): every request fails until the GPU is "
+                          "power-cycled and reconnected", (unsigned long long)st->generation);
+    else
+        MACLINUXGPU_EVENT("GPU recovery: a queue reset completed (reset generation %llu, %llu queue "
+                          "resets, last result %d)", (unsigned long long)st->generation,
+                          (unsigned long long)st->queue_resets, st->last_result);
+}
+
 static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
 {
     const uint32_t blocker = release_blocker();
@@ -631,6 +672,11 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
+    {
+        uint64_t reset[MLG_RESET_STATE_WORDS];
+        reset_state(reset);
+        if (reset[2] & MLG_RESET_FLAG_WEDGED) flags |= MLG_SESSION_FLAG_GPU_WEDGED;
+    }
     out[0] = MLG_SESSION_STATE_VERSION;
     out[1] = flags;
     out[2] = s_quarantineCause;
@@ -866,6 +912,7 @@ static void close_session(MacLinuxGPU *driver)
         // A removed device's GPU work stops being completed here; upstream
         // removal finishes the rest itself (amdgpu_fence_driver_hw_fini).
         if (s_deviceRemoved) rt_removal_end();
+        rt_recovery_detach_pdev(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         MACLINUXGPU_LOG("session close: removing upstream driver");
         linuxu_driver_shutdown();
         s_modulesRunning = false;
@@ -910,6 +957,7 @@ static void release_removed(MacLinuxGPU *driver)
         const int stopped = dext_compute_stop();
         if (stopped) MACLINUXGPU_LOG("removal: compute stop returned %d; nothing can run", stopped);
         rt_removal_end();
+        rt_recovery_detach_pdev(static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         if (auto *drm = __atomic_exchange_n(&s_observerDrm, nullptr, __ATOMIC_ACQ_REL))
             rt_drm_info_close(drm);
         MACLINUXGPU_LOG("removal: removing upstream driver");
@@ -1715,10 +1763,24 @@ IMPL(MacLinuxGPU, Start)
         return qret != kIOReturnSuccess ? qret : kIOReturnNoMemory;
     }
     s_bringupQueue = bqueue;
-    qret = SetDispatchQueue(kIOServiceDefaultQueueName, bqueue);
+    s_stopQueue = bqueue;
+    // The driver's own calls (Stop, power changes, NewUserClient) arrive
+    // on a queue of their own: DriverKit delivers them on the thread every
+    // client's calls share, under that queue, so a delivery that had to
+    // wait for the session queue (a probe, a session close, a client's
+    // session call) would hold them all.
+    IODispatchQueue *driverQueue = nullptr;
+    qret = IODispatchQueue::Create("MacLinuxGPUDriver", 0, 0, &driverQueue);
+    if (qret == kIOReturnSuccess && driverQueue) {
+        qret = SetDispatchQueue(kIOServiceDefaultQueueName, driverQueue);
+        driverQueue->release();
+    } else if (qret == kIOReturnSuccess) {
+        qret = kIOReturnNoMemory;
+    }
     if (qret != kIOReturnSuccess) {
         bqueue->release();
         s_bringupQueue = nullptr;
+        s_stopQueue = nullptr;
         return qret;
     }
     // Device power starts active; a sleep's acknowledgement deadline runs
@@ -1787,13 +1849,30 @@ IMPL(MacLinuxGPU, Start)
     return kIOReturnSuccess;
 }
 
+// The driver's Stop: its session work on the session queue, after whatever
+// is queued there; the delivery returns at once and FinishStop completes
+// the Stop later.
+static void driver_stop(MacLinuxGPU *driver, IOService *provider);
+
 kern_return_t
 IMPL(MacLinuxGPU, Stop)
 {
     if (s_driver != this) return Stop(provider, SUPERDISPATCH);
-    if (s_stopping) return kIOReturnSuccess;
-    s_stopping = true;
     retain();
+    provider->retain();
+    s_stopQueue->DispatchAsync(^{
+        driver_stop(this, provider);
+        provider->release();
+        release();
+    });
+    return kIOReturnSuccess;
+}
+
+static void driver_stop(MacLinuxGPU *driver, IOService *provider)
+{
+    if (s_stopping) return;
+    s_stopping = true;
+    driver->retain();
     provider->retain();
     // Termination (an upgrade's Retire, a deactivation, an unplug) of a
     // driver with no session: nothing holds the provider, so release it now
@@ -1801,26 +1880,25 @@ IMPL(MacLinuxGPU, Stop)
     if (session_idle()) {
         observer_reads_close();
         MACLINUXGPU_LOG("stop: no session; provider released at once");
-        FinishStop(provider);
-        return kIOReturnSuccess;
+        driver->FinishStop(provider);
+        return;
     }
     s_stopProvider = provider;
     // An unplug terminates the provider: see whether the device is gone
     // before anything else touches it.
     const bool alreadyClosing = s_sessionClosing;
     if (device_removed("provider stop") && alreadyClosing && s_dmaQuarantined) {
-        release_removed(this);
+        release_removed(driver);
         // Released (and the provider with it, complete_session_close): the
         // session is over. Closing again would find a new, empty session,
         // keep the DMA backing the removal left and quarantine it, and the
         // instance would never exit for a replug.
-        if (!s_sessionClosing) return kIOReturnSuccess;
+        if (!s_sessionClosing) return;
     }
-    close_session(this);
+    close_session(driver);
     // A quarantine that is already provably quiescent must not stall system
     // extension deactivation or upgrade; otherwise FinishSession retries.
-    if (s_dmaQuarantined && s_finalCleanup) (void)release_quarantine(this);
-    return kIOReturnSuccess;
+    if (s_dmaQuarantined && s_finalCleanup) (void)release_quarantine(driver);
 }
 
 void
@@ -1910,21 +1988,32 @@ IMPL(MacLinuxGPU, InterruptOccurred)
 // system are fully powered again, Low for a reduced device power state
 // while the system runs. The change is acknowledged by passing it to the
 // superclass, after the driver made itself safe for it (power_state.h).
+// On the session queue: whether the change waits for work (then
+// AckPowerState acknowledges it later).
+static bool power_change(MacLinuxGPU *driver, uint32_t powerFlags)
+{
+    MACLINUXGPU_LOG("power: SetPowerState(%#x) in state %s, session %s", powerFlags,
+                    power_state_name(s_power.state), power_session_open() ? "open" : "none");
+    if (powerFlags == kIOServicePowerCapabilityOff) return power_sleep(driver, powerFlags);
+    if (powerFlags & kIOServicePowerCapabilityOn)
+        return power_device_change(driver, powerFlags, MLG_POWER_CAPABILITY_ON);
+    if (powerFlags & kIOServicePowerCapabilityLow)
+        return power_device_change(driver, powerFlags, MLG_POWER_CAPABILITY_LOW);
+    return false;
+}
+
 kern_return_t
 IMPL(MacLinuxGPU, SetPowerState)
 {
     if (s_driver != this) return SetPowerState(powerFlags, SUPERDISPATCH);
-    MACLINUXGPU_LOG("power: SetPowerState(%#x) in state %s, session %s", powerFlags,
-                    power_state_name(s_power.state), power_session_open() ? "open" : "none");
-    // A change that needs work is acknowledged later (AckPowerState).
-    if (powerFlags == kIOServicePowerCapabilityOff) {
-        if (power_sleep(this, powerFlags)) return kIOReturnSuccess;
-    } else if (powerFlags & kIOServicePowerCapabilityOn) {
-        if (power_device_change(this, powerFlags, MLG_POWER_CAPABILITY_ON)) return kIOReturnSuccess;
-    } else if (powerFlags & kIOServicePowerCapabilityLow) {
-        if (power_device_change(this, powerFlags, MLG_POWER_CAPABILITY_LOW)) return kIOReturnSuccess;
-    }
-    return SetPowerState(powerFlags, SUPERDISPATCH);
+    // The power state is the session queue's: the change runs there, and
+    // is acknowledged from there, at once or after its work.
+    retain();
+    s_stopQueue->DispatchAsync(^{
+        if (!power_change(this, powerFlags)) AckPowerState(powerFlags);
+        release();
+    });
+    return kIOReturnSuccess;
 }
 
 void
@@ -2024,6 +2113,7 @@ MacLinuxGPU::free()
     if (s_bringupQueue != nullptr) {
         s_bringupQueue->release();
         s_bringupQueue = nullptr;
+        s_stopQueue = nullptr;
     }
     if (s_powerQueue != nullptr) {
         s_powerQueue->release();
@@ -2067,10 +2157,11 @@ IMPL(MacLinuxGPUUserClient, Start)
         (s_creatingLinuxFile || pending_role_take(s_pendingLinuxFiles, this));
     if (s_driver != driver || s_stopping || ((s_sessionClosing || s_retiring) && !observer))
         return kIOReturnNotAttached;
-    IODispatchQueue *ownerQueue = nullptr;
-    ret = driver->CopyDispatchQueue(kIOServiceDefaultQueueName, &ownerQueue);
-    if (ret != kIOReturnSuccess || ownerQueue == nullptr)
-        return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
+    // The session queue (s_bringupQueue), where every client's session
+    // calls run in order.
+    IODispatchQueue *ownerQueue = s_bringupQueue;
+    if (ownerQueue == nullptr) return kIOReturnNoResources;
+    ownerQueue->retain();
     // Every client gets a queue of its own for its calls. DriverKit runs a
     // call on its one delivery thread, under the target queue: a call that
     // waited for the owner's queue (busy with a probe, a session close, or
@@ -3561,6 +3652,12 @@ static kern_return_t direct_call(MacLinuxGPUUserClient *client, uint64_t selecto
             a->scalarOutputCount = MLG_SESSION_STATE_WORDS;
             return kIOReturnSuccess;
         }
+        if (in[0] == MLG_QUERY_RESET_STATE) {
+            if (!out || a->scalarOutputCount < MLG_RESET_STATE_WORDS) return kIOReturnBadArgument;
+            reset_state(out);
+            a->scalarOutputCount = MLG_RESET_STATE_WORDS;
+            return kIOReturnSuccess;
+        }
         // DEXT_COMPUTE_QUERY_PROBE_STATUS: probe progress, no MMIO.
         if (!out || a->scalarOutputCount < 5) return kIOReturnBadArgument;
         out[0] = s_probeAttempted;
@@ -4218,6 +4315,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnError;
         }
         MACLINUXGPU_EVENT("upstream AMDGPU PCI probe completed");
+        // GPU recovery's platform side (rt/recovery.h): queue resets as
+        // upstream runs them; a device reset, not available yet, wedges.
+        reset_state_store(nullptr);
+        rt_recovery_set_notify(recovery_notify);
+        if (const int attached = rt_recovery_attach_pdev(
+                static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice))))
+            MACLINUXGPU_EVENT("GPU recovery not attached (%d): a hung queue is not reset", attached);
         identity_after_probe(ivars->ownerDriver,
                              static_cast<struct pci_dev *>(rt_device_get_pdev(s_rtDevice)));
         int computeResult = dext_compute_start(

@@ -518,6 +518,7 @@ struct SessionState {
     var releasable: Bool { flags & (1 << 6) != 0 }
     var restartRequired: Bool { flags & (1 << 7) != 0 }
     var retiring: Bool { flags & (1 << 12) != 0 }
+    var gpuWedged: Bool { flags & (1 << 13) != 0 }
 
     static let causes = ["none", "raw BAR mapping lifetime uncertain", "DMA shutdown reservation failed",
                          "GPU completion uncertain (compute stop)", "interrupt cancellation failed",
@@ -535,6 +536,9 @@ struct SessionState {
     }
 
     var summary: String {
+        if gpuWedged {
+            return "The GPU stopped answering and its reset failed: power-cycle the GPU, then reconnect it"
+        }
         if restartRequired {
             return "Restart required, do not kill the driver (quarantined: \(SessionState.name(SessionState.causes, cause)), code \(causeCode))"
         }
