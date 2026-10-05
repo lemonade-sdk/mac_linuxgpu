@@ -1015,7 +1015,15 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
         return .ended(1)
     }
     let plan: VirtualDisplayPlan
-    switch planVirtualDisplay(connector: connector.name, modes: modes, edid: observer.connectorEDID(connector.name)) {
+    let edid: Data?
+    switch observer.readConnectorEDID(connector.name) {
+    case .edid(let data): edid = data
+    case .unreadable: edid = nil
+    case .overran(let kr):
+        print("display-agent: \(connector.name): " + callFailure(kr, "EDID read (bounded, overran)"))
+        return .ended(1)
+    }
+    switch planVirtualDisplay(connector: connector.name, modes: modes, edid: edid) {
     case .success(let p): plan = p
     case .failure(let error): print("display-agent: \(connector.name): \(error)"); return .ended(1)
     }
@@ -1454,15 +1462,30 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         }
         guard kr == kIOReturnSuccess, let report else { closeClients(); continue }
         if report.hotplugEpoch != epoch {
-            epoch = report.hotplugEpoch
             let (pkr, _, probed) = observer!.display(.probe)
             let current = (pkr == kIOReturnSuccess ? probed : nil) ?? report
-            monitors = current.connectors.filter { $0.connected }.map { c in
-                let edid = observer!.connectorEDID(c.name)
+            // A monitor's key comes from its EDID; a bounded read that
+            // overran leaves the epoch unseen, so the next poll reads again
+            // rather than keying the monitor by its connector.
+            var overrun: kern_return_t?
+            let found = current.connectors.filter { $0.connected }.map { c -> (connector: String, key: String, name: String) in
+                var edid: Data?
+                switch observer!.readConnectorEDID(c.name) {
+                case .edid(let data): edid = data
+                case .unreadable: break
+                case .overran(let kr): overrun = kr
+                }
                 let summary = edid.flatMap { EDIDSummary($0) }
                 return (c.name, monitorKey(edid: edid) ?? "connector-\(c.name)",
                         summary?.name ?? c.name)
             }
+            if let overrun {
+                agentLog("display-agent: " + callFailure(overrun, "EDID read (bounded, overran)") + "; reading the monitors again")
+                _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
+                continue
+            }
+            epoch = report.hotplugEpoch
+            monitors = found
             agentLog("display-agent: monitors: " + (monitors.isEmpty ? "none" :
                 monitors.map { "\($0.connector) \($0.name) [\($0.key)]" }.joined(separator: ", ")))
         }

@@ -1452,31 +1452,69 @@ extension MacLinuxGPUHost {
         return (result, [a[2], a[3]], data)
     }
 
+    /// A sysfs read's outcome. SysfsRead is synchronous but bounded (driver
+    /// 243+): a read that takes over 250 ms returns kIOReturnTimeout, and
+    /// while it still runs the next is kIOReturnBusy. Either is an overrun:
+    /// the file is unknown this time, not missing.
+    enum SysfsRead {
+        case file(status: Int64, data: Data)
+        case overran(kern_return_t)
+        case failed(kern_return_t)
+    }
+
     /// A sysfs file under the device directory (selector 80), read whole.
-    func sysfsRead(_ path: String, list: Bool = false) -> (Int64, Data)? {
+    func readSysfs(_ path: String, list: Bool = false) -> SysfsRead {
         var data = Data()
         while true {
             let (kr, values, chunk) = callMethod(kSelSysfsRead, inScalars: [list ? 1 : 0, UInt64(data.count)],
                                                  inData: Data(path.utf8), outScalars: 3, outSize: 4096)
-            guard kr == kIOReturnSuccess, values.count == 3 else { return nil }
+            if kr == kIOReturnTimeout || kr == kIOReturnBusy { return .overran(kr) }
+            guard kr == kIOReturnSuccess, values.count == 3 else { return .failed(kr) }
             let status = Int64(bitPattern: values[0])
-            if status != 0 { return (status, Data()) }
+            if status != 0 { return .file(status: status, data: Data()) }
             data.append(chunk.prefix(Int(values[1])))
             let length = values[2]
             if values[1] == 0 || (length > 0 && UInt64(data.count) >= length) || (length == 0 && values[1] < 4096) {
-                return (0, data)
+                return .file(status: 0, data: data)
             }
         }
     }
 
+    /// readSysfs's file, nil when the read failed or overran.
+    func sysfsRead(_ path: String, list: Bool = false) -> (Int64, Data)? {
+        if case .file(let status, let data) = readSysfs(path, list: list) { return (status, data) }
+        return nil
+    }
+
+    enum EDIDRead {
+        case edid(Data)
+        case unreadable
+        case overran(kern_return_t)   // a bounded read overran: ask again later
+    }
+
     /// The connector's EDID, as Linux shows /sys/class/drm/card0-<name>/edid.
-    func connectorEDID(_ name: String) -> Data? {
-        guard let (status, listing) = sysfsRead("drm", list: true), status == 0 else { return nil }
+    func readConnectorEDID(_ name: String) -> EDIDRead {
+        let listing: Data
+        switch readSysfs("drm", list: true) {
+        case .file(0, let data): listing = data
+        case .overran(let kr): return .overran(kr)
+        default: return .unreadable
+        }
         let cards = String(decoding: listing, as: UTF8.self).split(separator: "\n")
             .filter { $0.hasPrefix("d card") && !$0.contains("-") }.map { String($0.dropFirst(2)) }
         for card in cards.sorted() {
-            if let (status, edid) = sysfsRead("drm/\(card)/\(card)-\(name)/edid"), status == 0 { return edid }
+            switch readSysfs("drm/\(card)/\(card)-\(name)/edid") {
+            case .file(0, let edid): return .edid(edid)
+            case .overran(let kr): return .overran(kr)
+            default: continue
+            }
         }
+        return .unreadable
+    }
+
+    /// readConnectorEDID's EDID, nil when unreadable or overran.
+    func connectorEDID(_ name: String) -> Data? {
+        if case .edid(let edid) = readConnectorEDID(name) { return edid }
         return nil
     }
 }
@@ -2237,15 +2275,23 @@ struct AppMain {
 case "pcie":
     // The GPU's PCI Express settings, from its configuration space as
     // Linux shows it (the device's sysfs "config"); read only.
-    if let (status, config) = host.sysfsRead("config"), status == 0, let cap = PCIeCapability(config: config) {
-        cap.lines.forEach { print($0) }
-        commandStatus = 0
-    } else if let (status, config) = host.sysfsRead("config") {
-        print(status != 0 ? "ERROR: reading the configuration space: Linux errno \(-status)" :
-              "ERROR: no PCI Express capability in \(config.count) bytes of configuration space")
+    switch host.readSysfs("config") {
+    case .file(0, let config):
+        if let cap = PCIeCapability(config: config) {
+            cap.lines.forEach { print($0) }
+            commandStatus = 0
+        } else {
+            print("ERROR: no PCI Express capability in \(config.count) bytes of configuration space")
+            commandStatus = 1
+        }
+    case .file(let status, _):
+        print("ERROR: reading the configuration space: Linux errno \(-status)")
         commandStatus = 1
-    } else {
-        print("ERROR: the driver did not answer the sysfs read (is the GPU initialized?)")
+    case .overran(let kr):
+        print(String(format: "ERROR: the driver's bounded sysfs read overran (kr=%#x): the GPU did not answer within 250 ms", kr))
+        commandStatus = 1
+    case .failed(let kr):
+        print(String(format: "ERROR: the driver did not answer the sysfs read (kr=%#x; is the GPU initialized?)", kr))
         commandStatus = 1
     }
 case "ping", "ping-bundled":
