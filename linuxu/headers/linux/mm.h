@@ -262,6 +262,8 @@ extern struct page *alloc_pages(gfp_t gfp, unsigned int order);
 /* linuxu test hook: grow the page pool/arena (must run before the
  * first alloc_pages); see linuxu/src/mm/page.c. */
 extern int linuxu_page_pool_extend(unsigned long pages);
+/* Page descriptors held by allocations (until their backing is released). */
+extern unsigned long linuxu_page_descriptors(void);
 static inline struct page *alloc_page(gfp_t gfp) { return alloc_pages(gfp, 0); }
 static inline struct page *alloc_page_vma(gfp_t gfp, struct vm_area_struct *vma, unsigned long arg)
 {

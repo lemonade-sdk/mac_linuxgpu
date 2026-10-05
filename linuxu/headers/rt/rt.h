@@ -137,6 +137,9 @@ int rt_pci_has_retained_probe(void);
 void *rt_ioremap(struct rt_device *dev, uint64_t phys, uint64_t size);
 void *rt_ioremap_active(uint64_t phys, uint64_t size);
 void rt_mmio_free(void *cookie);
+/* DriverKit build: MMIO mappings (tokens) currently live. Zero between
+ * sessions; at zero the token numbers are renewed. */
+unsigned int rt_mmio_live_tokens(void);
 
 /*
  * The readl/writel/readq/writeq/readb/writeb signatures the driver's

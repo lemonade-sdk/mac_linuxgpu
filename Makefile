@@ -790,6 +790,10 @@ test-fence-lifetime:
 test-upstream-pci-failure: lib
 	bash scripts/test-upstream-pci-failure.sh
 
+# Session open/probe/close cycles return every resource to its baseline.
+test-session-cycles: lib
+	bash scripts/test-session-cycles.sh
+
 test-bitmap-contracts:
 	bash scripts/test-bitmap-contracts.sh
 
@@ -949,7 +953,7 @@ test-ttm-lru-cleanup:
 # Userspace-only crash regressions: mocked DriverKit/PCI boundaries, real shim
 # implementations and upstream error cleanup. No installed driver is opened.
 CRASH_PATH_TESTS := test-dext-alloc test-debugfs-lifecycle test-kmem-cache-lifecycle \
-	test-probe-cleanup test-upstream-pci-failure test-page-alloc-dk test-iokit-dma \
+	test-probe-cleanup test-upstream-pci-failure test-session-cycles test-page-alloc-dk test-iokit-dma \
 	test-pci-dext test-pci-lifecycle test-platform-devres test-dext-sync \
 	test-dext-threads test-task-kthread test-rwsem test-rcu-dk \
 	test-mutex-completion test-wait-event test-drm-lifecycle test-workqueue-lifetime \
@@ -1039,7 +1043,7 @@ test-crash-paths: export UBSAN_OPTIONS = halt_on_error=1:abort_on_error=0
 test-crash-paths: verify-source $(CRASH_PATH_TESTS)
 	@echo "Offline crash-path regressions passed; hardware safety is not established by these checks."
 
-test: test-kmem-cache-lifecycle test-probe-cleanup test-iokit-dma test-upstream-pci-failure test-workqueue-lifetime test-atomic-semantics test-aql-storage-bounds
+test: test-kmem-cache-lifecycle test-probe-cleanup test-iokit-dma test-upstream-pci-failure test-session-cycles test-workqueue-lifetime test-atomic-semantics test-aql-storage-bounds
 test: test-ww-mutex test-compute-dispatch test-compute-lifetime test-irq-lifetime test-xarray-safety test-mm-boundaries test-page-boundaries test-dext-compute-production
 test: test-drm-exec-lifetime test-fence-lifetime
 test: test-gpu-buddy test-partial-ttm-cleanup
@@ -1058,7 +1062,7 @@ test: test-queue-partition
 
 .PHONY: test-ww-mutex test-compute-dispatch test-compute-lifetime test-irq-lifetime test-xarray-safety test-mm-boundaries test-page-boundaries test-dext-compute-production
 
-.PHONY: test-crash-paths test-kmem-cache-lifecycle test-probe-cleanup test-iokit-dma test-upstream-pci-failure test-workqueue-lifetime test-atomic-semantics test-aql-storage-bounds
+.PHONY: test-crash-paths test-kmem-cache-lifecycle test-probe-cleanup test-iokit-dma test-upstream-pci-failure test-session-cycles test-workqueue-lifetime test-atomic-semantics test-aql-storage-bounds
 
 .PHONY: test-ttm-device-pool test-page-alloc-dk all test dext clean config-check hsa hsa-test hsa-ios test-dext-alloc verify-source verify-linux test-dext-time test-dext-stdio test-pci-dext test-pci-lifecycle test-platform-devres test-dext-sync test-dma-mask test-rwsem test-debugfs-lifecycle test-task-kthread test-rbtree test-dext-threads test-mutex-completion test-rcu-dk test-bootstrap test-driver-bootstrap-integration test-pseudo-fs test-jiffies test-spinlock test-wait-event test-chrdev test-class-device test-platform-policy test-xarray-limit test-drm-lifecycle
 

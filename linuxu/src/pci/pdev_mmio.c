@@ -39,11 +39,23 @@ static struct mmio_slot mmio_slots[RT_MMIO_NUM_SLOTS];
 static pthread_mutex_t mmio_lock = PTHREAD_MUTEX_INITIALIZER;
 #ifdef LINUXU_DEXT_DK
 /* Synthetic pointers must never alias a different BAR after unmap.  Keep
- * retired token numbers recognizable so stale doorbell atomics fail closed. */
+ * retired token numbers recognizable so stale doorbell atomics fail closed.
+ * The numbers are renewed when the last mapping is unmapped: the session's
+ * register token lives from dext_open to dext_close, so an empty table means
+ * no session, no upstream module and no synthetic pointer remain. */
 static uint8_t mmio_issued[RT_MMIO_DK_MAX_SLOTS];
+static unsigned int mmio_live;
 #endif
 
 #ifdef LINUXU_DEXT_DK
+unsigned int rt_mmio_live_tokens(void)
+{
+	pthread_mutex_lock(&mmio_lock);
+	unsigned int live = mmio_live;
+	pthread_mutex_unlock(&mmio_lock);
+	return live;
+}
+
 extern int dext_bar_info(uint8_t bar, uint8_t *mem_index, uint64_t *size);
 extern int dext_mem_read8(uint32_t token, uint64_t off, uint8_t *value);
 extern int dext_mem_read16(uint32_t token, uint64_t off, uint16_t *value);
@@ -159,6 +171,7 @@ uint32_t rt_mmio_mint_token(struct pci_dev *dev, uint8_t mem_index,
 			mmio_slots[token].used = 1;
 #ifdef LINUXU_DEXT_DK
 			mmio_issued[token] = 1;
+			mmio_live++;
 #endif
 			mmio_slots[token].dev = dev;
 			mmio_slots[token].mem_index = mem_index;
@@ -189,6 +202,9 @@ uint32_t rt_mmio_mint_token(struct pci_dev *dev, uint8_t mem_index,
 				mmio_slots[token].shadow_len =
 					len ? len : RT_MMIO_SLOT_GRANULE;
 				if (!mmio_slots[token].shadow) {
+#ifdef LINUXU_DEXT_DK
+					mmio_live--;
+#endif
 					memset(&mmio_slots[token], 0, sizeof(mmio_slots[token]));
 					pthread_mutex_unlock(&mmio_lock);
 					return RT_MMIO_TOKEN_INVALID;
@@ -208,6 +224,10 @@ void rt_mmio_free_token(uint32_t token)
 {
 	pthread_mutex_lock(&mmio_lock);
 	if (token && token < RT_MMIO_NUM_SLOTS) {
+#ifdef LINUXU_DEXT_DK
+		if (mmio_slots[token].used && !--mmio_live)
+			memset(mmio_issued, 0, sizeof(mmio_issued));
+#endif
 		free(mmio_slots[token].shadow);
 		memset(&mmio_slots[token], 0,
 		       sizeof(mmio_slots[0]));
