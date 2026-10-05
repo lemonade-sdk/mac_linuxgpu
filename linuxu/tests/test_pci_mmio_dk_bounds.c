@@ -32,5 +32,29 @@ int main(void)
     rt_mmio_free_token(token);
     rt_mmio_memcpy_toio(mapping, bytes, 0, sizeof(bytes), NULL);
     assert(writes == 8 && faults == 3);
+
+    /* While a session holds its register token, an unmapped token number is
+     * not issued again: a stale pointer cannot reach a different mapping. */
+    uint32_t session = rt_mmio_mint_token(&dev, 5, 0, 32, 0);
+    uint32_t first = rt_mmio_mint_token(&dev, 2, 0, 32, 0);
+    assert(session && first && first != session);
+    rt_mmio_free_token(first);
+    for (unsigned i = 0; i < 64; ++i) {
+        uint32_t next = rt_mmio_mint_token(&dev, 2, 0, 32, 0);
+        assert(next && next != first && next != session);
+        rt_mmio_free_token(next);
+    }
+    /* Once the last mapping is gone the numbers are renewed, so sessions
+     * never run out of them (build 242 failed its probe after ~120). */
+    rt_mmio_free_token(session);
+    for (unsigned cycle = 0; cycle < 4 * RT_MMIO_DK_MAX_SLOTS; ++cycle) {
+        session = rt_mmio_mint_token(&dev, 5, 0, 32, 0);
+        uint32_t registers = rt_mmio_mint_token(&dev, 5, 0, 32, 0);
+        uint32_t doorbells = rt_mmio_mint_token(&dev, 2, 0, 32, 0);
+        assert(session && registers && doorbells);
+        rt_mmio_free_token(doorbells);
+        rt_mmio_free_token(registers);
+        rt_mmio_free_token(session);
+    }
     return 0;
 }

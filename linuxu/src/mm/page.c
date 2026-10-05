@@ -64,6 +64,7 @@ static unsigned long page_max;		/* pages at most: RAM, or the test hook's */
 static pthread_cond_t page_changed = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t page_lock = PTHREAD_MUTEX_INITIALIZER;
 static int page_pool_ready;
+static unsigned long page_descriptors;	/* slots owned by an allocation */
 
 static struct page_chunk *page_chunk_of(unsigned long pfn)
 {
@@ -99,6 +100,14 @@ static unsigned long page_ram_pages(void)
 		return 0;
 	}
 	return (unsigned long)(bytes >> LINUXU_PAGE_SHIFT);
+}
+
+unsigned long linuxu_page_descriptors(void)
+{
+	pthread_mutex_lock(&page_lock);
+	unsigned long held = page_descriptors;
+	pthread_mutex_unlock(&page_lock);
+	return held;
 }
 
 /* Test hook: before the first allocation, hold the pool to @pages (tests
@@ -446,6 +455,7 @@ static struct page *alloc_pages_backing(gfp_t gfp, unsigned int order, bool cpu_
 		for (n = 0; n < need; n++) {
 			struct page *page = PG(first + n);
 			PG_ALLOC(first + n) = allocation;
+			page_descriptors++;
 			PG_ORDER(first + n) = n ? -2 : (signed char)order;
 			page->flags = 0;
 			page->mapping = NULL;
@@ -515,6 +525,7 @@ static void page_release_backing(struct linuxu_page_allocation *allocation)
 		if (PG_ALLOC(index) == allocation) {
 			__atomic_store_n(&PG_ALLOC(index), NULL, __ATOMIC_RELEASE);
 			PG_ORDER(index) = -1;
+			page_descriptors--;
 		}
 	}
 	pthread_mutex_unlock(&page_lock);
