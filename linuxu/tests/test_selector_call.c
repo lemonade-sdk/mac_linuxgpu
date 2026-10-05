@@ -24,6 +24,11 @@ static mach_port_t mock_port_machport(IONotificationPortRef);
 #define IONotificationPortDestroy mock_port_destroy
 #define IONotificationPortGetMachPort mock_port_machport
 #include "selector_call.h"
+#include "rt/lx_abi.h"
+
+_Static_assert(MLG_CALL_LX_FIRST == MLG_SELECTOR_LX_FIRST && MLG_CALL_LX_LAST == MLG_SELECTOR_LX_LAST &&
+	       MLG_CALL_LX_IOCTL_ASYNC == MLG_SELECTOR_LX_IOCTL_ASYNC &&
+	       MLG_CALL_LX_CALL_ASYNC == MLG_SELECTOR_LX_CALL_ASYNC, "session_state.h's Linux-file selector numbers");
 
 static uint64_t driver_build;		/* RuntimeBuild out[3]; 0: three words only */
 static int build_fails, builds, syncs, asyncs, ports;
@@ -118,6 +123,21 @@ int main(void)
 	       kIOReturnBadArgument && state > 0 && asyncs == 1 && builds == 1);
 	assert(mlg_selector_call_on(c, &state, 16, out, 1, NULL, 0, out, &n, NULL, NULL) ==
 	       kIOReturnBadArgument && asyncs == 2 && builds == 1 && ports == 0);
+	/* The Linux-file client's synchronous selectors stay synchronous on a
+	 * 243 driver: it answers them on the call and would never complete an
+	 * async one (libmlg_drm's LX_MMAP_COMMIT hung every first BO map). */
+	{
+		const int s0 = syncs, a0 = asyncs;
+		uint64_t commit[2] = { 1, 0x200000000ull };
+
+		assert(mlg_selector_call_on(c, &state, MLG_SELECTOR_LX_MMAP_COMMIT, commit, 2, NULL, 0, out,
+					    &n, NULL, NULL) == kIOReturnSuccess && syncs == s0 + 1 && asyncs == a0);
+		assert(mlg_call_is_synchronous(MLG_SELECTOR_LX_IOCTL, NULL, 0) &&
+		       mlg_call_is_synchronous(MLG_SELECTOR_LX_RESULT, NULL, 0) &&
+		       mlg_call_is_synchronous(MLG_SELECTOR_LX_SCANOUT, NULL, 0) &&
+		       !mlg_call_is_synchronous(MLG_SELECTOR_LX_IOCTL_ASYNC, NULL, 0) &&
+		       !mlg_call_is_synchronous(MLG_SELECTOR_LX_CALL_ASYNC, NULL, 0));
+	}
 	/* The stateless form asks on every async call. */
 	assert(mlg_selector_call(c, 9, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL) ==
 	       kIOReturnBadArgument && builds == 2);

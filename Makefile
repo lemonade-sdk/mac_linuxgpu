@@ -895,7 +895,7 @@ test-bounded:
 test-selector-call:
 	@mkdir -p $(BUILD)/tests
 	$(CC) -std=gnu11 -g -O1 -Wall -Wextra -Werror -Wno-unused-function -fsanitize=address,undefined \
-		-Ihost linuxu/tests/test_selector_call.c -framework IOKit -framework CoreFoundation \
+		-Ihost -Ilinuxu/headers linuxu/tests/test_selector_call.c -framework IOKit -framework CoreFoundation \
 		-o $(BUILD)/tests/test_selector_call
 	$(BUILD)/tests/test_selector_call
 
