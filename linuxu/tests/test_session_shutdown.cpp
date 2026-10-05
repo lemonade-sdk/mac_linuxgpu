@@ -204,6 +204,7 @@ static unsigned displayUnpublishes;
 static void displays_unpublish(MacLinuxGPU *) { ++displayUnpublishes; }
 
 static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
+static void driver_stop(MacLinuxGPU *driver, IOService *provider);
 #include "session_shutdown_production.inc"
 
 // An observer read in flight when the session closes: the close waits, and
@@ -398,7 +399,7 @@ struct Fixture {
     unsigned retainedDriver, retainedProvider;
     int device;
     Fixture() {
-        s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+        s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
         s_rtDevice = &device; s_modulesRunning = true;
         s_irqReady = s_irqDeliver = s_pciOpen = true;
         s_token = 7; s_stopProvider = &provider;
@@ -645,7 +646,7 @@ static void clientExitReopen(bool queueExhausted) {
     MacLinuxGPUUserClient client, next;
     MacLinuxGPUUserClient_IVars clientIvars{}, nextIvars{};
     int device = 0;
-    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
     s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
     s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
     bar0Aliases = 1;
@@ -710,7 +711,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     MacLinuxGPUUserClient client, next;
     MacLinuxGPUUserClient_IVars clientIvars{}, nextIvars{};
     int device = 0;
-    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+    s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
     s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
     s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
     bar0Aliases = 1;
@@ -842,7 +843,7 @@ struct UpgradeRig {
     int device = 0;
     uint64_t out[MLG_RETIRE_WORDS]{};
     explicit UpgradeRig(bool session) {
-        s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue;
+        s_driver = &driver; s_retainedPCI = &provider; s_bringupQueue = &queue; s_stopQueue = &s_ownerQueueAtOnce;
         // An idle observer (a monitor, the installer): never a participant.
         observer.ivars = &observerIvars;
         observerIvars.ownerDriver = &driver; observerIvars.clientID = 3; observerIvars.observer = true;
