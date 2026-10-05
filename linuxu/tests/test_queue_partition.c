@@ -529,6 +529,20 @@ static void build_and_map(struct fixture *f, uint32_t slot, uint32_t db,
 	}
 	adev->have_atomics_support = true;
 
+	/* After a device reset the queue starts where its producer is: packet
+	 * 21 of a 256-byte (4-packet) ring is dword 336, ring offset 16. */
+	{
+		struct v12_compute_mqd *m = (struct v12_compute_mqd *)mqd;
+
+		assert(rt_queue_mqd_set_position(mqd, l.ring_bytes, 21) == 0);
+		assert(m->cp_hqd_pq_rptr == 16 && m->cp_hqd_pq_wptr_lo == 336 &&
+		       m->cp_hqd_pq_wptr_hi == 0);
+		assert(rt_queue_mqd_set_position(mqd, 1ull << 33, 1ull << 31) == 0);
+		assert(m->cp_hqd_pq_rptr == 0 && m->cp_hqd_pq_wptr_lo == 0 && m->cp_hqd_pq_wptr_hi == 8);
+		assert(rt_queue_mqd_set_position(mqd, 384, 1) == -EINVAL);
+		assert(rt_queue_mqd_set_position(NULL, 256, 1) == -EINVAL);
+	}
+
 	maps = unmaps = 0;
 	assert(rt_queue_map(adev, slot, db + 2, l.mqd_address, l.write_pointer) == -EINVAL);
 	assert(maps == 0);

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <linux/errno.h>
 #include <rt/compute.h>
+#include <rt/recovery.h>
 #include <rt/dispatch.h>
 #include <rt/gart.h>
 #include "../../dext/sources/session_state.h"
@@ -18,7 +19,7 @@ struct pci_dev { unsigned unused; };
 struct rt_compute_ctx { bool live; };
 struct rt_compute_bo { bool live; uint64_t size; unsigned domain; };
 struct rt_compute_fence { unsigned unused; };
-struct dext_aql_queue { bool live, retained; };
+struct dext_aql_queue { bool live, retained, mapped; };
 static struct pci_dev pdev;
 /* Clients that come and go in the churn scenarios: four times the
  * backend's record table (DEXT_CLIENT_SLOTS, 64). */
@@ -182,7 +183,8 @@ int dext_aql_create(struct rt_compute_ctx *ctx, struct rt_compute_bo *ring,
      * refused before any allocation or hardware access. */
     if (queue.live) return -ENOSPC;
     if (!create_error || create_retained) {
-        queue.live=true; queue.retained=create_retained; *out=&queue;
+        queue.live=true; queue.retained=create_retained;
+        queue.mapped=!create_error; *out=&queue;
     }
     return create_error;
 }
@@ -201,9 +203,31 @@ int dext_aql_service(struct dext_aql_queue *q, uint64_t *inactive)
 }
 int dext_aql_kick(struct dext_aql_queue *q, uint64_t packet)
 {
-    assert(q==&queue && q->live && !q->retained); (void)packet; ++kicks;
+    assert(q==&queue && q->live); (void)packet;
+    if (q->retained || !q->mapped) return -19;
+    ++kicks;
     if (kick_poison) status_error=-EBUSY;
     return kick_error;
+}
+/* Device resets (rt/recovery.h): the hooks the backend installs, and the
+ * queue's reset calls. */
+static struct rt_recovery_queue_hooks installed_hooks;
+static unsigned hook_installs, hook_removals, prepares, restores;
+static int restore_error;
+void rt_recovery_set_queue_hooks(const struct rt_recovery_queue_hooks *hooks)
+{
+    if (hooks) { installed_hooks=*hooks; ++hook_installs; }
+    else { memset(&installed_hooks,0,sizeof(installed_hooks)); ++hook_removals; }
+}
+/* dext_aql's own list: the one queue, while it lives. */
+void dext_aql_reset_prepare(void)
+{ ++prepares; if (queue.live) queue.mapped=false; }
+int dext_aql_reset_restore(void)
+{
+    ++restores;
+    if (!queue.live || queue.retained) return 0;
+    if (restore_error) { queue.retained=true; return 1; }
+    queue.mapped=true; return 0;
 }
 int dext_aql_uncertain(const struct dext_aql_queue *q)
 { assert(q==&queue && q->live); return q->retained || status_error==-EBUSY; }
@@ -755,6 +779,33 @@ int main(int argc, char **argv)
         assert(dext_compute_device_spec(&spec,8)==-EINVAL_L);
         spec_error=-ENODEV;
         assert(dext_compute_device_spec(&spec,sizeof(spec))==-ENOTREADY_L);
+    } else if (!strcmp(argv[1],"reset-hooks") || !strcmp(argv[1],"reset-hooks-fail")) {
+        /* The session's queues around a device reset: the hooks exist
+         * while the session does; each queue is unmapped before and
+         * mapped again after; one that cannot be freezes the session. */
+        uint64_t ring, meta, status=UINT64_MAX;
+        assert(hook_installs==1 && installed_hooks.before_reset && installed_hooks.after_reset);
+        const uint64_t handle=create_queue(&ring,&meta);
+        assert(queue.mapped);
+        restore_error=!strcmp(argv[1],"reset-hooks-fail") ? -ETIMEDOUT : 0;
+        installed_hooks.before_reset(installed_hooks.arg);
+        assert(prepares==1 && !queue.mapped);
+        /* Between the two, the queue is not mapped: a kick is refused
+         * and the session is not frozen for it. */
+        assert(dext_compute_aql_queue_kick(handle,1,&status)==-ENOTREADY_L);
+        assert(dext_compute_query_info(1,(uint64_t[10]){0},10)==3);
+        installed_hooks.after_reset(installed_hooks.arg,true);
+        assert(restores==1);
+        if (restore_error) {
+            /* The hook leaves the queue retained; its owner's next call
+             * freezes the session, on the owner's queue. */
+            assert(dext_compute_aql_queue_kick(handle,1,&status)==-EBUSY_L);
+            expect_frozen(payload);
+        } else {
+            assert(queue.mapped);
+            assert(dext_compute_aql_queue_kick(handle,1,&status)==0 && !status);
+            assert(dext_compute_stop()==0 && hook_removals==1 && !installed_hooks.before_reset);
+        }
     } else if (!strcmp(argv[1],"create-nospc")) {
         uint64_t ring=alloc_bo(2), meta=alloc_bo(2);
         create_error=-ENOSPC;

@@ -5,6 +5,7 @@
 #include <linux/errno.h>
 #include <linux/kthread.h>
 #include <linux/pci.h>
+#include <drm/drm_client.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/gpu_scheduler.h>
@@ -43,6 +44,18 @@ static const char *(*full_reset_gate)(void);
 static unsigned int episode_asic_resets;
 #define RESET_SENTINEL	(-0x7fff)	/* reset_res before upstream's recovery runs */
 
+/* The driver's own queues across a device reset. They stop through a DRM
+ * client of the device, the hook upstream gives everything outside amdgpu
+ * that must stop before its IPs suspend (amdgpu_device_halt_activities ->
+ * drm_client_dev_suspend). They start again once the recovery has
+ * finished (device_reset_end): restoring a queue writes its storage
+ * through SDMA, which needs the schedulers that drm_client_dev_resume
+ * still precedes. */
+static struct rt_recovery_queue_hooks queue_hooks;
+static struct drm_client_dev reset_client;
+static bool reset_client_listed;
+static bool queues_stopped;	/* before_reset ran; after_reset is owed */
+
 static void publish(void)
 {
 	struct rt_recovery_state copy;
@@ -72,6 +85,85 @@ void rt_recovery_set_notify(void (*fn)(const struct rt_recovery_state *state))
 	pthread_mutex_lock(&recovery_lock);
 	notify_fn = fn;
 	pthread_mutex_unlock(&recovery_lock);
+}
+
+void rt_recovery_set_queue_hooks(const struct rt_recovery_queue_hooks *hooks)
+{
+	pthread_mutex_lock(&recovery_lock);
+	if (hooks)
+		queue_hooks = *hooks;
+	else
+		memset(&queue_hooks, 0, sizeof(queue_hooks));
+	pthread_mutex_unlock(&recovery_lock);
+}
+
+static struct rt_recovery_queue_hooks hooks_now(void)
+{
+	struct rt_recovery_queue_hooks h;
+
+	pthread_mutex_lock(&recovery_lock);
+	h = queue_hooks;
+	pthread_mutex_unlock(&recovery_lock);
+	return h;
+}
+
+/* Only a device reset: a system suspend would call this too (it does not
+ * reach this driver, which suspends KFD itself). */
+static int reset_client_suspend(struct drm_client_dev *client)
+{
+	struct amdgpu_device *adev = drm_to_adev(client->dev);
+	const struct rt_recovery_queue_hooks h = hooks_now();
+
+	if (!amdgpu_in_reset(adev))
+		return 0;
+	queues_stopped = true;
+	if (h.before_reset)
+		h.before_reset(h.arg);
+	return 0;
+}
+
+/* After a device reset that succeeded, on the reset domain's thread. */
+static void queues_restart(bool vram_lost)
+{
+	const struct rt_recovery_queue_hooks h = hooks_now();
+
+	if (!queues_stopped)
+		return;
+	queues_stopped = false;
+	if (h.after_reset)
+		h.after_reset(h.arg, vram_lost);
+}
+
+static const struct drm_client_funcs reset_client_funcs = {
+	.suspend = reset_client_suspend,
+};
+
+/* Listed directly: drm_client_init would open a DRM file and needs a
+ * modesetting driver; this client only takes the two callbacks. */
+static void reset_client_add(struct amdgpu_device *adev)
+{
+	struct drm_device *ddev = adev_to_drm(adev);
+
+	memset(&reset_client, 0, sizeof(reset_client));
+	reset_client.dev = ddev;
+	reset_client.name = "mlg-queues";
+	reset_client.funcs = &reset_client_funcs;
+	mutex_lock(&ddev->clientlist_mutex);
+	list_add_tail(&reset_client.list, &ddev->clientlist);
+	reset_client_listed = true;
+	mutex_unlock(&ddev->clientlist_mutex);
+}
+
+static void reset_client_remove(struct amdgpu_device *adev)
+{
+	struct drm_device *ddev = adev_to_drm(adev);
+
+	if (!reset_client_listed)
+		return;
+	mutex_lock(&ddev->clientlist_mutex);
+	list_del(&reset_client.list);
+	reset_client_listed = false;
+	mutex_unlock(&ddev->clientlist_mutex);
 }
 
 void rt_recovery_set_full_reset_gate(const char *(*gate)(void))
@@ -268,9 +360,12 @@ static void device_reset_end(struct amdgpu_device *adev, int vram_lost_before)
 		char why[96];
 
 		snprintf(why, sizeof(why), "the device reset failed (%d)", res);
+		queues_stopped = false;	/* they stay stopped: the device is gone */
 		rt_recovery_wedge(adev, why);
 		return;
 	}
+	/* The queues run again before clients learn of the new generation. */
+	queues_restart(vram_lost);
 	pthread_mutex_lock(&recovery_lock);
 	state.generation++;
 	state.last_result = 0;
@@ -391,6 +486,7 @@ int rt_recovery_attach(struct amdgpu_device *adev)
 		upstream_userq_reset = adev->userq_reset_work.func;
 		adev->userq_reset_work.func = userq_reset_work;
 	}
+	reset_client_add(adev);
 	if (adev->asic_funcs && adev->asic_funcs->reset) {
 		upstream_asic_funcs = adev->asic_funcs;
 		wrapped_asic_funcs = *adev->asic_funcs;
@@ -410,6 +506,7 @@ void rt_recovery_detach(struct amdgpu_device *adev)
 	attached = NULL;
 	pthread_mutex_unlock(&recovery_lock);
 	rt_recovery_end();
+	reset_client_remove(adev);
 	for (unsigned int i = 0; i < AMDGPU_MAX_RINGS; ++i) {
 		struct amdgpu_ring *ring = adev->rings[i];
 

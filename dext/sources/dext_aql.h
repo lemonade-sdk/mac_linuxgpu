@@ -22,6 +22,13 @@ int dext_aql_create(struct rt_compute_ctx *, struct rt_compute_bo *ring,
                     struct rt_compute_bo *metadata, uint32_t packets,
                     struct dext_aql_queue **);
 int dext_aql_kick(struct dext_aql_queue *, uint64_t packet);
+/* Around a device reset (rt/recovery.h's queue hooks), from the reset
+ * domain's thread: every mapped queue is unmapped with the GPU's state;
+ * after the reset each is written again and mapped at its producer's
+ * position (a destroy in between only frees it). A failed restore leaves
+ * the queue retained (dext_aql_uncertain); returns how many failed. */
+void dext_aql_reset_prepare(void);
+int dext_aql_reset_restore(void);
 int dext_aql_service(struct dext_aql_queue *, uint64_t *inactive);
 /* Retention can begin during scratch service, not only create/destroy. Any
  * uncertain queue requires its caller to retain every client BO as well. */

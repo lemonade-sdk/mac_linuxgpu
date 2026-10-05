@@ -47,6 +47,7 @@ extern int usleep(unsigned int usec);
 #include <drm/drm_file.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_mode_config.h>
 #include <drm/gpu_scheduler.h>
 #include <rt/bootstrap.h>
 #include <rt/compute.h>
@@ -1118,10 +1119,12 @@ static int fx_read_register(struct amdgpu_device *a, u32 se, u32 sh, u32 reg, u3
 	return 0;
 }
 
-/* The ASIC reset soc24 would do (mode1): the fixture's engines restart
- * empty. Whatever follows in upstream's recovery runs as it is; the
- * fixture has no VBIOS, so re-initializing the ASIC afterwards fails, as
- * a device that does not come back from its reset would. */
+/* The ASIC reset soc24 would do (mode1): every engine stops where it is
+ * and loses its queue state; none runs again until its IP's resume
+ * programs its ring (fx_ip_resume). Whatever follows in upstream's
+ * recovery runs as it is; without the VBIOS-optional path the fixture
+ * cannot re-initialize the ASIC, as a device that does not come back from
+ * its reset would. */
 static unsigned int asic_resets;
 static enum amd_reset_method fx_reset_method(struct amdgpu_device *a)
 {
@@ -1140,15 +1143,72 @@ static int fx_asic_reset(struct amdgpu_device *a)
 	(void)a;
 	__atomic_add_fetch(&asic_resets, 1, __ATOMIC_ACQ_REL);
 	for (unsigned int i = 0; i < 3; ++i) {
-		if (!engines[i]->ring)
+		struct engine *e = engines[i];
+
+		if (!e->ring)
 			continue;
-		pthread_mutex_lock(&engines[i]->lock);
-		engines[i]->hold = false;
-		engines[i]->rptr = engines[i]->wptr = 0;
-		pthread_mutex_unlock(&engines[i]->lock);
+		pthread_mutex_lock(&e->lock);
+		/* An engine part way through its ring stops before the next
+		 * packet; it must not carry on from a position the reset
+		 * cleared (it would execute the stale ring from its start,
+		 * old fences included). */
+		e->hold = true;
+		pthread_cond_signal(&e->kick);
+		while (!e->waiting && !e->stop)
+			pthread_cond_wait(&e->idle, &e->lock);
+		e->rptr = e->wptr = 0;
+		pthread_mutex_unlock(&e->lock);
 	}
 	return 0;
 }
+
+/* What gfx_v12_0's and sdma_v7_0's resume do for a ring after a reset:
+ * the ring starts over empty at 0, read and write pointers alike, and
+ * the engine runs it again. */
+static unsigned int ip_resumes;
+static int fx_ip_resume(struct amdgpu_ip_block *block)
+{
+	struct engine *gfx[] = { &compute_engine }, *sdma[] = { &sdma_engine, &sdma1_engine };
+	const bool is_gfx = block->version->type == AMD_IP_BLOCK_TYPE_GFX;
+	struct engine **engines = is_gfx ? gfx : sdma;
+
+	for (unsigned int i = 0; i < (is_gfx ? 1u : 2u); ++i) {
+		struct engine *e = engines[i];
+		struct amdgpu_ring *ring = e->ring;
+
+		if (!ring)
+			continue;
+		pthread_mutex_lock(&e->lock);
+		amdgpu_ring_clear_ring(ring);
+		ring->wptr = 0;
+		e->rptr = e->wptr = 0;
+		*(volatile uint32_t *)fixture_view(ring->rptr_cpu_addr) = 0;
+		e->hold = false;
+		pthread_cond_signal(&e->kick);
+		pthread_mutex_unlock(&e->lock);
+	}
+	__atomic_add_fetch(&ip_resumes, 1, __ATOMIC_ACQ_REL);
+	return 0;
+}
+
+unsigned int cs_fixture_ip_resumes(void)
+{
+	return __atomic_load_n(&ip_resumes, __ATOMIC_ACQUIRE);
+}
+/* Upstream's VBIOS-optional path (a passthrough device with AIDs:
+ * amdgpu_device_get_vbios_flags): re-initializing after a reset then
+ * needs no VBIOS, so the fixture's device comes back. */
+void cs_fixture_asic_reinit_ok(int ok)
+{
+	if (ok) {
+		adev->aid_mask = 1;
+		adev->virt.caps |= AMDGPU_PASSTHROUGH_MODE;
+	} else {
+		adev->aid_mask = 0;
+		adev->virt.caps &= ~AMDGPU_PASSTHROUGH_MODE;
+	}
+}
+
 unsigned int cs_fixture_asic_resets(void)
 {
 	return __atomic_load_n(&asic_resets, __ATOMIC_ACQUIRE);
@@ -1215,7 +1275,7 @@ static void fx_gfx_config(void)
 static const struct amdgpu_gfx_funcs fx_gfx_funcs;
 static const struct amdgpu_rlc_funcs fx_rlc_funcs;
 
-static const struct amd_ip_funcs fx_ip_funcs = { .name = "cs_fixture" };
+static const struct amd_ip_funcs fx_ip_funcs = { .name = "cs_fixture", .resume = fx_ip_resume };
 static const struct amdgpu_ip_block_version fx_gfx_block = {
 	.type = AMD_IP_BLOCK_TYPE_GFX, .major = 12, .minor = 0, .funcs = &fx_ip_funcs,
 };
@@ -1512,6 +1572,10 @@ struct pci_dev *cs_fixture_init(void)
 	 * amdgpu_device_ip_init. */
 	if (cs_fixture_display)
 		cs_fixture_display(adev);
+	else
+		/* amdgpu_device_init initializes mode config on every device;
+		 * a device reset takes its locks (drm_helper_resume_force_mode). */
+		drm_mode_config_init(adev_to_drm(adev));
 	r = drm_dev_register(adev_to_drm(adev), 0);
 	if (r)
 		FX_ABORT("drm_dev_register = %d", r);

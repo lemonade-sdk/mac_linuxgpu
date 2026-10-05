@@ -17,7 +17,8 @@ for scenario in open-failure dispatch-timeout dispatch code-sync bounded-timeout
   kfd-fault-isolated \
   allocation-cleanup create-retained create-oom service-retained kick-poison \
   destroy-retained stop-retained stop-removed ordinary-errors close-retained device-spec \
-  client-churn-close client-churn client-records-full host-window-no-session; do
+  client-churn-close client-churn client-records-full host-window-no-session reset-hooks \
+  reset-hooks-fail; do
   "$test_dir/test_dext_compute_production" "$scenario"
 done
 echo 'Production selector startup, ownership and quarantine checks passed'

@@ -15,9 +15,36 @@ struct dext_aql_queue {
     struct rt_queue_geometry geometry;
     uint32_t slot, doorbell, packets;
     uint64_t storageVA, lastDoorbell;
+    uint64_t ringVA, metadataVA;       // for mapping again after a device reset
     amd_queue_t *cpu;
     const hsa_kernel_dispatch_packet_t *packetsCPU;
     bool mapped, retained, published;
+    bool resetLost;                    // unmapped by a device reset, not yet restored
+    dext_aql_queue *next;              // aql_live
+};
+
+// The persistent queues MES maps, for a device reset's hooks, which run on
+// the reset domain's thread while the owner queue serves its calls.
+// aql_lock guards the list and each listed queue's mapping state. It is
+// held across the bounded steps that change that state (an MES map or
+// unmap, a storage write through SDMA) and never while waiting for
+// anything the reset itself must finish. Made by dext_aql_available,
+// before any queue exists; never freed.
+static IOLock *aql_lock;
+static dext_aql_queue *aql_live;
+
+static void aql_unlink_locked(dext_aql_queue *q)
+{
+    for (dext_aql_queue **at=&aql_live; *at; at=&(*at)->next)
+        if (*at==q) {*at=q->next;q->next=nullptr;return;}
+}
+
+struct aql_guard {
+    // Without the lock no queue exists (dext_aql_create refuses).
+    aql_guard() {if (aql_lock) IOLockLock(aql_lock);}
+    ~aql_guard() {if (aql_lock) IOLockUnlock(aql_lock);}
+    aql_guard(const aql_guard &)=delete;
+    aql_guard &operator=(const aql_guard &)=delete;
 };
 
 // The storage block reserves kAQLMQDBytes for the MQD upstream KFD builds.
@@ -46,6 +73,7 @@ static struct rt_queue_mqd mqd_layout(uint64_t storage, uint64_t ring, uint32_t 
 int dext_aql_available(rt_compute_ctx *ctx)
 {
     struct rt_queue_geometry geometry{};
+    if (!aql_lock && !(aql_lock = IOLockAlloc())) return -ENOMEM;
     int r = rt_compute_status(ctx);
     if (!r) r = geometry_supported(rt_compute_device(ctx), &geometry);
     // Fix the HQD/doorbell split with MES and KFD before any queue exists.
@@ -71,7 +99,13 @@ int dext_aql_limits(rt_compute_ctx *ctx, struct dext_aql_limits *out)
 
 int dext_aql_uncertain(const dext_aql_queue *q)
 {
-    return q && (q->retained || rt_compute_status(q->ctx) == -EBUSY);
+    if (!q) return 0;
+    bool retained;
+    {
+        aql_guard guard;
+        retained=q->retained;
+    }
+    return retained || rt_compute_status(q->ctx) == -EBUSY;
 }
 
 static int scratch_allocate(dext_aql_queue *q, uint32_t laneBytes)
@@ -121,6 +155,7 @@ int dext_aql_create(rt_compute_ctx *ctx, rt_compute_bo *ring,
     if (!out || !ctx || !ring || !metadata || ring==metadata || packets<kAQLQueueMinPackets ||
         packets>kAQLQueueMaxPackets || (packets&(packets-1))) return -22;
     *out=nullptr;
+    if (!aql_lock) return -19;    // dext_aql_available has not run
     auto *q=static_cast<dext_aql_queue *>(IOMallocZero(sizeof(dext_aql_queue)));
     if (!q) return -12;
     q->ctx=ctx; q->ring=ring; q->metadata=metadata; q->packets=packets;
@@ -157,6 +192,8 @@ int dext_aql_create(rt_compute_ctx *ctx, rt_compute_bo *ring,
     }
     if (!r) {
         q->storageVA=si.gpu_address;
+        q->ringVA=ri.gpu_address;
+        q->metadataVA=mi.gpu_address;
         reinterpret_cast<amd_signal_t *>(staging+kAQLInactiveOffset)->kind=AMD_SIGNAL_KIND_USER;
         uint32_t requested=m.scratch_wave64_lane_byte_size;
         m.compute_tmpring_size=0; memset(m.scratch_resource_descriptor,0,sizeof(m.scratch_resource_descriptor));
@@ -187,17 +224,80 @@ int dext_aql_create(rt_compute_ctx *ctx, rt_compute_bo *ring,
         rt_queue_release(adev,q->slot);IOFree(q,sizeof(*q));return r;
     }
     q->retained=true;
-    rt_queue_flush(adev);
-    r=rt_queue_map(adev,q->slot,q->doorbell,si.gpu_address,
-                   mi.gpu_address+offsetof(amd_queue_t,write_dispatch_id));
-    if (!r) {q->mapped=true;q->retained=false;}
+    {
+        // Mapped and listed together: a device reset sees every mapped queue.
+        aql_guard guard;
+        rt_queue_flush(adev);
+        r=rt_queue_map(adev,q->slot,q->doorbell,si.gpu_address,
+                       mi.gpu_address+offsetof(amd_queue_t,write_dispatch_id));
+        if (!r) {q->mapped=true;q->retained=false;q->next=aql_live;aql_live=q;}
+    }
     *out=q; // Keep every referenced BO on a missing firmware acknowledgement.
     return r;
 }
 
+// A device reset (rt/recovery.h's queue hooks), as upstream halts the GPU:
+// every mapped queue goes with MES's state.
+void dext_aql_reset_prepare(void)
+{
+    aql_guard guard;
+    for (dext_aql_queue *q=aql_live; q; q=q->next)
+        if (q->mapped) {q->mapped=false;q->resetLost=true;}
+}
+
+// After the device reset, with the schedulers running again: the queue's
+// storage block is written again (its MQD, built afresh by upstream KFD's
+// manager; the inactive signal; the EOP buffer zeroed: VRAM may be lost)
+// and the queue is mapped where its producer is. Packets it had not
+// finished were lost with the GPU's state, as a device reset ends every
+// kernel ring's unfinished jobs; the reset generation (QueryInfo "LRST")
+// tells clients. Under aql_lock.
+static int reset_restore_locked(dext_aql_queue *q)
+{
+    using namespace amdgpu;
+    auto *adev=rt_compute_device(q->ctx);
+    auto *staging=static_cast<uint8_t *>(aligned_alloc(64,kAQLStorageBytes));
+    if (!staging) return -12;
+    memset(staging,0,kAQLStorageBytes);
+    const uint64_t position=__atomic_load_n(&q->cpu->write_dispatch_id,__ATOMIC_ACQUIRE);
+    const struct rt_queue_mqd layout=mqd_layout(q->storageVA,q->ringVA,q->packets,q->metadataVA);
+    int r=rt_queue_build_mqd(adev,q->slot,q->doorbell,&layout,staging,kAQLMQDBytes);
+    if (!r) r=rt_queue_mqd_set_position(staging,uint64_t(q->packets)*64,position);
+    if (!r) {
+        reinterpret_cast<amd_signal_t *>(staging+kAQLInactiveOffset)->kind=AMD_SIGNAL_KIND_USER;
+        r=rt_compute_bo_write(q->ctx,q->storage,0,staging,kAQLStorageBytes);
+    }
+    free(staging);
+    if (r) return r;
+    // The reader starts at the producer: nothing before it will run.
+    __atomic_store_n(&q->cpu->read_dispatch_id,position,__ATOMIC_RELEASE);
+    q->published=false;
+    q->lastDoorbell=0;
+    rt_queue_flush(adev);
+    return rt_queue_map(adev,q->slot,q->doorbell,q->storageVA,
+                        q->metadataVA+offsetof(amd_queue_t,write_dispatch_id));
+}
+
+// A queue that cannot be restored is retained (dext_aql_uncertain): its
+// owner's next call freezes the session, as after any failed MES call.
+int dext_aql_reset_restore(void)
+{
+    aql_guard guard;
+    int failed=0;
+    for (dext_aql_queue *q=aql_live; q; q=q->next) {
+        if (!q->resetLost || q->retained) continue;
+        if (reset_restore_locked(q)) {q->retained=true;++failed;continue;}
+        q->resetLost=false;
+        q->mapped=true;
+    }
+    return failed;
+}
+
 int dext_aql_kick(dext_aql_queue *q,uint64_t packet)
 {
-    if (!q || !q->mapped || q->retained) return -19;
+    if (!q) return -19;
+    aql_guard guard;
+    if (!q->mapped || q->retained) return -19;
     if (packet==UINT64_MAX || packet>=__atomic_load_n(&q->cpu->write_dispatch_id,__ATOMIC_ACQUIRE)) return -22;
     if (q->published && packet<=q->lastDoorbell) return 0;
     int r=rt_queue_kick(rt_compute_device(q->ctx),q->doorbell,packet);
@@ -208,7 +308,9 @@ int dext_aql_kick(dext_aql_queue *q,uint64_t packet)
 int dext_aql_service(dext_aql_queue *q,uint64_t *inactive)
 {
     using namespace amdgpu;
-    if (!q || !inactive || !q->mapped || q->retained) return -19;
+    if (!q || !inactive) return -19;
+    aql_guard guard;
+    if (!q->mapped || q->retained) return -19;
     int r=rt_compute_bo_read(q->ctx,q->storage,kAQLInactiveOffset+8,inactive,8);
     if (r || !*inactive) return r;
     if (!(*inactive&0x401) || (*inactive&~uint64_t(0x401))) return -5;
@@ -238,11 +340,15 @@ int dext_aql_service(dext_aql_queue *q,uint64_t *inactive)
 
 int dext_aql_destroy(dext_aql_queue *q)
 {
-    if (!q || q->retained || !q->mapped) return -16;
+    if (!q) return -16;
+    aql_guard guard;
+    // A queue a device reset unmapped is no longer MES's: nothing to unmap.
+    if (q->retained || (!q->mapped && !q->resetLost)) return -16;
     q->retained=true;
     auto *adev=rt_compute_device(q->ctx);
-    int r=rt_queue_unmap(adev,q->slot,q->doorbell);
+    int r=q->resetLost ? 0 : rt_queue_unmap(adev,q->slot,q->doorbell);
     if (r) return r;
+    aql_unlink_locked(q);
     if (q->scratch) {
         r=rt_compute_bo_free(q->ctx,q->scratch);
         if (r) return r;

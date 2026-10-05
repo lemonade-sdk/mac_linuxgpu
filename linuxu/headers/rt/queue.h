@@ -85,6 +85,10 @@ void rt_queue_release(struct amdgpu_device *, uint32_t slot);
  * what amdgpu gives it for its kernel compute rings. */
 int rt_queue_build_mqd(struct amdgpu_device *, uint32_t slot, uint32_t doorbell,
                        const struct rt_queue_mqd *, void *mqd, size_t mqd_bytes);
+/* Make the MQD that rt_queue_build_mqd wrote start at AQL packet @packet
+ * of a ring of @ring_bytes (a queue mapped again after a device reset
+ * resumes where its producer is). 0 or -EINVAL. */
+int rt_queue_mqd_set_position(void *mqd, uint64_t ring_bytes, uint64_t packet);
 int rt_queue_map(struct amdgpu_device *, uint32_t slot, uint32_t doorbell,
                  uint64_t mqd, uint64_t write_pointer);
 int rt_queue_unmap(struct amdgpu_device *, uint32_t slot, uint32_t doorbell);

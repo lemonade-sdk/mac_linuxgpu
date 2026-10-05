@@ -5,6 +5,7 @@
 #include <rt/dispatch.h>
 #include <rt/gart.h>
 #include <rt/queue.h>
+#include <rt/recovery.h>
 #include "dext_aql.h"
 #include "dext_kfd.h"
 #include "session_state.h"
@@ -462,6 +463,28 @@ void dext_compute_start_failure(const char **step, int *error)
     if (error) *error = start_failed_error;
 }
 
+/* ---- the session's AQL queues across a device reset (rt/recovery.h) ----
+ * On the reset domain's thread: dext_aql keeps its own list of mapped
+ * queues under its lock, and nothing here touches the owner queue's
+ * state. A queue that cannot be mapped again is retained, and its owner's
+ * next call freezes the session (dext_aql_uncertain). */
+static void queues_before_reset(void *arg)
+{
+    (void)arg;
+    dext_aql_reset_prepare();
+}
+
+static void queues_after_reset(void *arg, bool vram_lost)
+{
+    (void)arg;
+    (void)vram_lost;	/* storage is rewritten either way */
+    dext_aql_reset_restore();
+}
+
+static const struct rt_recovery_queue_hooks queue_reset_hooks = {
+    queues_before_reset, queues_after_reset, NULL,
+};
+
 int dext_compute_start(struct pci_dev *pdev)
 {
     struct rt_compute_ctx *ctx = NULL;
@@ -541,6 +564,7 @@ int dext_compute_start(struct pci_dev *pdev)
     production.ready = true;
     production.uncertain = false;
     runtime_available_update();
+    rt_recovery_set_queue_hooks(&queue_reset_hooks);
     return 0;
 }
 
@@ -566,6 +590,7 @@ int dext_compute_stop(void)
         return -EBUSY_L;
     production.ready = false;
     __atomic_store_n(&production.runtime_available, false, __ATOMIC_RELEASE);
+    rt_recovery_set_queue_hooks(NULL);
     /* KFD processes first: their queues leave MES and their memory is
      * freed before the kernel BOs and the context go. */
     {
