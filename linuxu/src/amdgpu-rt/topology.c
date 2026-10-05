@@ -13,6 +13,9 @@
 #include "amdgpu_fru_eeprom.h"
 #include "kfd_priv.h"
 #include "kfd_topology.h"
+#include "soc15_common.h"
+#include "gc/gc_12_0_0_offset.h"
+#include "gc/gc_12_0_0_sh_mask.h"
 
 _Static_assert(sizeof(((struct rt_compute_topology *)0)->product_name) ==
 	       AMDGPU_PRODUCT_NAME_LEN, "product name length");
@@ -95,5 +98,61 @@ int rt_device_topology(struct amdgpu_device *adev, struct rt_compute_topology *o
 	if (adev->fru_info)
 		memcpy(out->product_name, adev->fru_info->product_name,
 		       sizeof(out->product_name));
+	return 0;
+}
+
+/* QueryInfo tag 8. Upstream's own state: the GC geometry (gfx.config), the
+ * CUs it found active (gfx.cu_info, as KFD reports them), the render
+ * backends (backend_enable_mask), the KFD node's per-CU properties. On GC
+ * 12 the shader-array disable registers upstream reads for its own SA
+ * bitmap (gfx_v12_0_get_sa_active_bitmap) are read the same way, without a
+ * GRBM select: read only. */
+int rt_device_spec(struct amdgpu_device *adev, struct rt_device_spec *out)
+{
+	struct rt_compute_topology topology;
+	const struct amdgpu_gfx_config *c;
+	const struct amdgpu_cu_info *cu;
+	unsigned int ses, sas;
+
+	if (!adev || !out)
+		return -EINVAL;
+	memset(out, 0, sizeof(*out));
+	c = &adev->gfx.config;
+	cu = &adev->gfx.cu_info;
+	if (!c->max_shader_engines || !c->max_sh_per_se)
+		return -ENODEV;	/* the GC IP is not resolved yet */
+	if (rt_device_topology(adev, &topology))
+		return -ENODEV;
+	out->shader_engines = c->max_shader_engines;
+	out->shader_arrays_per_se = c->max_sh_per_se;
+	out->backends_per_se = c->max_backends_per_se;
+	out->cus_per_array = c->max_cu_per_sh;
+	out->wavefront_size = cu->wave_front_size;
+	out->max_waves_per_simd = cu->max_waves_per_simd;
+	out->scratch_slots_per_cu = topology.scratch_slots_per_cu;
+	out->lds_bytes = topology.lds_bytes;
+	out->present |= RT_DEVICE_SPEC_GEOMETRY;
+
+	ses = c->max_shader_engines < 4 ? c->max_shader_engines : 4;
+	sas = c->max_sh_per_se < 4 ? c->max_sh_per_se : 4;
+	out->active_cus = cu->number;
+	for (unsigned int se = 0; se < ses; ++se)
+		for (unsigned int sa = 0; sa < sas; ++sa) {
+			out->cu_bitmap[se][sa] = cu->bitmap[0][se][sa];
+			if (cu->bitmap[0][se][sa] && se * c->max_sh_per_se + sa < 32)
+				out->active_sa_bitmap |= 1u << (se * c->max_sh_per_se + sa);
+		}
+	out->present |= RT_DEVICE_SPEC_CUS | RT_DEVICE_SPEC_SHADER_ARRAYS;
+
+	if (amdgpu_ip_version(adev, GC_HWIP, 0) >= IP_VERSION(12, 0, 0) &&
+	    amdgpu_ip_version(adev, GC_HWIP, 0) < IP_VERSION(13, 0, 0) && !adev->no_hw_access) {
+		out->cc_sa_disable = RREG32_SOC15(GC, 0, regGRBM_CC_GC_SA_UNIT_DISABLE);
+		out->user_sa_disable = RREG32_SOC15(GC, 0, regGRBM_GC_USER_SA_UNIT_DISABLE);
+		out->present |= RT_DEVICE_SPEC_SA_DISABLE;
+	}
+
+	out->active_rb_bitmap = (uint32_t)c->backend_enable_mask;
+	out->active_rbs = c->num_rbs;
+	out->present |= RT_DEVICE_SPEC_BACKENDS;
 	return 0;
 }

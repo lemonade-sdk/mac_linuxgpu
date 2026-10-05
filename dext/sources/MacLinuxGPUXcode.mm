@@ -4503,8 +4503,25 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnSuccess;
         }
 
+        // The device spec: a structure output (session_state.h), out[0] its size.
+        if (in && arguments->scalarInputCount == 1 && in[0] == MLG_QUERY_DEVICE_SPEC) {
+            struct mlg_device_spec spec = {};
+            const size_t room = arguments->structureOutputMaximumSize < sizeof(spec) ?
+                (size_t)arguments->structureOutputMaximumSize : sizeof(spec);
+            const int n = dext_compute_device_spec(&spec, room);
+            if (n < 0) return n == -ENOTREADY_L ? kIOReturnNotReady : kIOReturnBadArgument;
+            arguments->structureOutput = OSData::withBytes(&spec, (size_t)n);
+            if (!arguments->structureOutput) return kIOReturnNoMemory;
+            if (out && arguments->scalarOutputCount >= 1) {
+                out[0] = (uint64_t)n;
+                arguments->scalarOutputCount = 1;
+            } else {
+                arguments->scalarOutputCount = 0;
+            }
+            return kIOReturnSuccess;
+        }
         // in[0]=info tag; out[N]=type-specific payload (the reference's tags
-        // 1/2/3/4/5/6/8).
+        // 1/2/3/4/5/6).
         if (arguments->scalarInput == nullptr || arguments->scalarInputCount < 1 ||
             arguments->scalarOutput == nullptr || arguments->scalarOutputCount < 1)
             return kIOReturnBadArgument;

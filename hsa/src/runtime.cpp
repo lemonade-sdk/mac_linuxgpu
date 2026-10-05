@@ -12,14 +12,14 @@
 #include <sys/sysctl.h>
 
 namespace mac_hsa::detail {
-std::mutex runtimeMutex;
+std::mutex &runtimeMutex = *new std::mutex;
 uint32_t references = 0;
 uint64_t lastHandle = 0;
-std::vector<Agent> agents;
-std::vector<Pool> pools;
-std::map<uintptr_t, std::shared_ptr<Allocation>> allocations;
-std::vector<std::unique_ptr<CopyJob>> copyJobs;
-std::unordered_map<uint64_t, std::shared_ptr<mac_hsa::Signal>> signals;
+std::vector<Agent> &agents = *new std::vector<Agent>;
+std::vector<Pool> &pools = *new std::vector<Pool>;
+std::map<uintptr_t, std::shared_ptr<Allocation>> &allocations = *new std::map<uintptr_t, std::shared_ptr<Allocation>>;
+std::vector<std::unique_ptr<CopyJob>> &copyJobs = *new std::vector<std::unique_ptr<CopyJob>>;
+std::unordered_map<uint64_t, std::shared_ptr<mac_hsa::Signal>> &signals = *new std::unordered_map<uint64_t, std::shared_ptr<mac_hsa::Signal>>;
 std::shared_ptr<mac_hsa::Signal> findSignal(hsa_signal_t handle) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return {};
@@ -594,6 +594,11 @@ SIGNAL_ATOMICS(scacq_screl, std::memory_order_acq_rel, std::memory_order_acquire
 
 hsa_status_t hsa_status_string(hsa_status_t status, const char **out) {
     if (!out) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // hsa_ext_amd.h's: the driver is busy (a session closing, a retire), retry.
+    if (uint32_t(status) == uint32_t(HSA_STATUS_ERROR_RESOURCE_BUSY)) {
+        *out = "HSA_STATUS_ERROR_RESOURCE_BUSY";
+        return HSA_STATUS_SUCCESS;
+    }
     switch (status) {
 #define STATUS(code) case code: *out = #code; return HSA_STATUS_SUCCESS
     STATUS(HSA_STATUS_SUCCESS);

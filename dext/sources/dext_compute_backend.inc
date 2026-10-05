@@ -7,6 +7,7 @@
 #include <rt/queue.h>
 #include "dext_aql.h"
 #include "dext_kfd.h"
+#include "session_state.h"
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
@@ -714,11 +715,48 @@ int dext_compute_query_info(uint64_t tag, uint64_t *out, int out_cap)
         return 6;
     }
     case 5: /* No upstream per-client VRAM accounting snapshot yet. */
-    case 8: /* No raw GC register spec observer yet. */
+    case 8: /* a structure: dext_compute_device_spec */
     default:
         return -ENOTREADY_L;
     }
 }
+
+int dext_compute_device_spec(void *out, size_t cap)
+{
+    struct rt_device_spec rt;
+    struct mlg_device_spec spec;
+    size_t n;
+    if (!out || cap < 4 * sizeof(uint32_t)) return -EINVAL_L;
+    if (!production_ready() || rt_device_spec(rt_compute_device(production.ctx), &rt) != 0)
+        return -ENOTREADY_L;
+    memset(&spec, 0, sizeof(spec));
+    spec.version = MLG_DEVICE_SPEC_VERSION;
+    spec.present = rt.present;  /* RT_DEVICE_SPEC_* are MLG_DEVICE_SPEC_* */
+    spec.shader_engines = rt.shader_engines;
+    spec.shader_arrays_per_se = rt.shader_arrays_per_se;
+    spec.backends_per_se = rt.backends_per_se;
+    spec.cus_per_array = rt.cus_per_array;
+    spec.wavefront_size = rt.wavefront_size;
+    spec.max_waves_per_simd = rt.max_waves_per_simd;
+    spec.scratch_slots_per_cu = rt.scratch_slots_per_cu;
+    spec.lds_bytes = rt.lds_bytes;
+    spec.active_cus = rt.active_cus;
+    memcpy(spec.cu_bitmap, rt.cu_bitmap, sizeof(spec.cu_bitmap));
+    spec.active_sa_bitmap = rt.active_sa_bitmap;
+    spec.cc_sa_disable = rt.cc_sa_disable;
+    spec.user_sa_disable = rt.user_sa_disable;
+    spec.active_rb_bitmap = rt.active_rb_bitmap;
+    spec.active_rbs = rt.active_rbs;
+    n = cap < sizeof(spec) ? cap : sizeof(spec);
+    spec.size = (uint32_t)n;
+    memcpy(out, &spec, n);
+    return (int)n;
+}
+_Static_assert(RT_DEVICE_SPEC_GEOMETRY == MLG_DEVICE_SPEC_GEOMETRY &&
+               RT_DEVICE_SPEC_CUS == MLG_DEVICE_SPEC_CUS &&
+               RT_DEVICE_SPEC_SHADER_ARRAYS == MLG_DEVICE_SPEC_SHADER_ARRAYS &&
+               RT_DEVICE_SPEC_SA_DISABLE == MLG_DEVICE_SPEC_SA_DISABLE &&
+               RT_DEVICE_SPEC_BACKENDS == MLG_DEVICE_SPEC_BACKENDS, "device spec groups");
 
 int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
                           uint64_t flags, uint64_t *out_handle,

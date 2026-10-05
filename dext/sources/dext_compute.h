@@ -140,6 +140,11 @@ int dext_compute_quiescent(void);
 /* QueryInfo (21): in tag, out values[].  Returns the number of out values
  * written on success, or a -E*_L error. */
 int dext_compute_query_info(uint64_t tag, uint64_t *out, int out_cap);
+/* QueryInfo tag 8 (session_state.h's struct mlg_device_spec): up to @cap
+ * bytes of it in @out; the bytes filled, or a negative linuxu errno
+ * (-ENOTREADY_L before the device is up, -EINVAL_L for room under the
+ * header). */
+int dext_compute_device_spec(void *out, size_t cap);
 
 /* BOAlloc (16): in size/domain/alignment/flags, out handle/gpu_va/cpu_addr. */
 int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,

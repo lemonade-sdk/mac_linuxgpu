@@ -153,8 +153,8 @@ struct GPUSignalContext {
         std::memcpy(&old,result.host,8);return true;
     }
 };
-std::mutex contextsMutex;
-std::map<Connection *,std::weak_ptr<GPUSignalContext>> contexts;
+std::mutex &contextsMutex = *new std::mutex;
+std::map<Connection *,std::weak_ptr<GPUSignalContext>> &contexts = *new std::map<Connection *,std::weak_ptr<GPUSignalContext>>;
 struct SignalSlot {
     std::shared_ptr<GPUSignalContext> context;
     unsigned index;

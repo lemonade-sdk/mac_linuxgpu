@@ -20,6 +20,20 @@ void *kzalloc(size_t size, gfp_t flags) { (void)flags; return calloc(1, size); }
 /* Reached only for per-process XNACK with supported == true. */
 bool amdgpu_sriov_xnack_support(struct amdgpu_device *adev) { (void)adev; abort(); }
 void kfree(const void *p) { free((void *)p); }
+/* Not a virtual function here: never reached. */
+u32 amdgpu_sriov_rreg(struct amdgpu_device *adev, u32 offset, u32 acc_flags, u32 hwip, u32 xcc_id)
+{ (void)adev; (void)offset; (void)acc_flags; (void)hwip; (void)xcc_id; abort(); }
+/* The GC registers the device spec reads (read only): GC segment bases
+ * 0x1000 and 0xa000 here; anything else is a register it must not read. */
+static unsigned reg_reads;
+uint32_t amdgpu_device_rreg(struct amdgpu_device *adev, uint32_t reg, uint32_t acc_flags)
+{
+	(void)adev; (void)acc_flags;
+	++reg_reads;
+	if (reg == 0x1000 + 0x0fe9) return 0x00030000;	/* GRBM_CC_GC_SA_UNIT_DISABLE */
+	if (reg == 0xa000 + 0x5b92) return 0x00040000;	/* GRBM_GC_USER_SA_UNIT_DISABLE */
+	abort();
+}
 
 static struct kfd_cache_properties caches[4];
 static void add_cache(unsigned i, uint32_t level, uint32_t kb, uint32_t type)
@@ -112,6 +126,49 @@ int main(void)
 	node1.xcc_mask = 0xc;
 	assert(rt_device_topology(&adev, &t) == 0 && t.xcc_count == 4);
 
-	puts("device topology: KFD node/cache properties, XNACK mode and FRU name passed");
+	/* The device spec: upstream's GC config and active CUs and RBs, the
+	 * KFD node's per-CU properties, GC 12's SA disable registers. */
+	{
+		static uint32_t gc_segments[2] = {0x1000, 0xa000};
+		struct rt_device_spec spec;
+		kfd.num_nodes = 1;
+		node0.xcc_mask = 0x1;
+		adev.ip_versions[GC_HWIP][0] = IP_VERSION(12, 0, 1);
+		adev.reg_offset[GC_HWIP][0] = gc_segments;
+		assert(rt_device_spec(&adev, &spec) == -ENODEV && reg_reads == 0); /* GC not resolved */
+		adev.gfx.config.max_shader_engines = 4;
+		adev.gfx.config.max_sh_per_se = 2;
+		adev.gfx.config.max_backends_per_se = 4;
+		adev.gfx.config.max_cu_per_sh = 8;
+		adev.gfx.config.backend_enable_mask = 0xfff;
+		adev.gfx.config.num_rbs = 12;
+		adev.gfx.cu_info.wave_front_size = 32;
+		adev.gfx.cu_info.max_waves_per_simd = 16;
+		adev.gfx.cu_info.number = 56;
+		for (unsigned se = 0; se < 4; ++se)
+			for (unsigned sa = 0; sa < 2; ++sa)
+				adev.gfx.cu_info.bitmap[0][se][sa] = se == 3 && sa == 1 ? 0 : 0xff;
+		assert(rt_device_spec(&adev, &spec) == 0);
+		assert(spec.present == (RT_DEVICE_SPEC_GEOMETRY | RT_DEVICE_SPEC_CUS |
+		       RT_DEVICE_SPEC_SHADER_ARRAYS | RT_DEVICE_SPEC_SA_DISABLE | RT_DEVICE_SPEC_BACKENDS));
+		assert(spec.shader_engines == 4 && spec.shader_arrays_per_se == 2 &&
+		       spec.backends_per_se == 4 && spec.cus_per_array == 8 && spec.wavefront_size == 32 &&
+		       spec.max_waves_per_simd == 16 && spec.scratch_slots_per_cu == 32 &&
+		       spec.lds_bytes == 65536 && spec.active_cus == 56);
+		assert(spec.cu_bitmap[0][0] == 0xff && spec.cu_bitmap[3][1] == 0 &&
+		       spec.active_sa_bitmap == 0x7f);
+		assert(spec.cc_sa_disable == 0x00030000 && spec.user_sa_disable == 0x00040000 && reg_reads == 2);
+		assert(spec.active_rb_bitmap == 0xfff && spec.active_rbs == 12);
+		/* No register read on another GC, or with hardware access off. */
+		adev.ip_versions[GC_HWIP][0] = IP_VERSION(11, 0, 0);
+		assert(rt_device_spec(&adev, &spec) == 0 && !(spec.present & RT_DEVICE_SPEC_SA_DISABLE) &&
+		       !spec.cc_sa_disable && reg_reads == 2);
+		adev.ip_versions[GC_HWIP][0] = IP_VERSION(12, 0, 1);
+		adev.no_hw_access = true;
+		assert(rt_device_spec(&adev, &spec) == 0 && !(spec.present & RT_DEVICE_SPEC_SA_DISABLE) &&
+		       reg_reads == 2);
+	}
+
+	puts("device topology: KFD node/cache properties, XNACK mode, FRU name and device spec passed");
 	return 0;
 }

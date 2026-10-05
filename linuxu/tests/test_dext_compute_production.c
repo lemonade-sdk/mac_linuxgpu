@@ -9,6 +9,7 @@
 #include <rt/compute.h>
 #include <rt/dispatch.h>
 #include <rt/gart.h>
+#include "../../dext/sources/session_state.h"
 #include "../../dext/sources/dext_compute.h"
 #include "../../dext/sources/dext_aql.h"
 #include "../../dext/sources/dext_kfd.h"
@@ -155,6 +156,17 @@ int rt_device_topology(struct amdgpu_device *adev, struct rt_compute_topology *o
 { assert(adev==fake_adev); if (topology_error) return topology_error; *out=topology; return 0; }
 int dext_aql_limits(struct rt_compute_ctx *ctx, struct dext_aql_limits *out)
 { assert(ctx==&context); if (limits_error) return limits_error; *out=aql_limits; return 0; }
+static int spec_error;
+int rt_device_spec(struct amdgpu_device *adev, struct rt_device_spec *out)
+{
+    assert(adev==fake_adev);
+    if (spec_error) return spec_error;
+    memset(out,0,sizeof(*out));
+    out->present=RT_DEVICE_SPEC_GEOMETRY|RT_DEVICE_SPEC_CUS|RT_DEVICE_SPEC_BACKENDS;
+    out->shader_engines=4; out->shader_arrays_per_se=2; out->cus_per_array=8;
+    out->active_cus=64; out->cu_bitmap[3][1]=0xff; out->active_rbs=16;
+    return 0;
+}
 static unsigned legacy_creates;
 int dext_aql_create(struct rt_compute_ctx *ctx, struct rt_compute_bo *ring,
                     struct rt_compute_bo *meta, uint32_t packets,
@@ -568,6 +580,20 @@ int main(int argc, char **argv)
         bounded_error=0;
         assert(dext_compute_aql_dispatch(&request,sizeof(request),out)==0);
         assert(dext_compute_stop()==0 && frees==1 && closes==1);
+    } else if (!strcmp(argv[1],"device-spec")) {
+        /* QueryInfo tag 8: the structure, cut to the caller's room above
+         * its header, which states the bytes filled. */
+        struct mlg_device_spec spec;
+        memset(&spec,0xa5,sizeof(spec));
+        assert(dext_compute_device_spec(&spec,sizeof(spec))==(int)sizeof(spec));
+        assert(spec.version==MLG_DEVICE_SPEC_VERSION && spec.size==sizeof(spec) && !spec.reserved);
+        assert(spec.present==(MLG_DEVICE_SPEC_GEOMETRY|MLG_DEVICE_SPEC_CUS|MLG_DEVICE_SPEC_BACKENDS));
+        assert(spec.shader_engines==4 && spec.cus_per_array==8 && spec.active_cus==64 &&
+               spec.cu_bitmap[3][1]==0xff && spec.active_rbs==16 && !spec.cc_sa_disable);
+        assert(dext_compute_device_spec(&spec,32)==32 && spec.size==32);
+        assert(dext_compute_device_spec(&spec,8)==-EINVAL_L);
+        spec_error=-ENODEV;
+        assert(dext_compute_device_spec(&spec,sizeof(spec))==-ENOTREADY_L);
     } else if (!strcmp(argv[1],"create-nospc")) {
         uint64_t ring=alloc_bo(2), meta=alloc_bo(2);
         create_error=-ENOSPC;

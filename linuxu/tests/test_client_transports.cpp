@@ -38,6 +38,9 @@
 #include <rt/lx_abi.h>
 #include <mlg_drm.h>
 #include <hsa/hsa.h>
+#include <hsa/hsa_ext_amd.h>
+#include <mac_hsa.h>
+#include "signal_kernels.h"
 #include "selector_call.h"
 
 #include <Block.h>
@@ -238,7 +241,14 @@ static uint64_t dext_pci_transport_fault_offset() { return 0; }
 static kern_return_t power_wait(MacLinuxGPUUserClient *, OSAction *, uint64_t) { return kIOReturnUnsupported; }
 static void power_snapshot(uint64_t *out) { memset(out, 0, MLG_POWER_STATE_WORDS * 8); out[0] = MLG_POWER_STATE_VERSION; }
 static void reset_state(uint64_t *out) { memset(out, 0, MLG_RESET_STATE_WORDS * 8); out[0] = MLG_RESET_STATE_VERSION; }
-static void session_state(uint64_t *out) { memset(out, 0, MLG_SESSION_STATE_WORDS * 8); out[0] = MLG_SESSION_STATE_VERSION; }
+// The driver's lifecycle as NewUserClient and the session state see it.
+static std::atomic<uint64_t> sessionFlagsNow{0};
+static void session_state(uint64_t *out)
+{
+    memset(out, 0, MLG_SESSION_STATE_WORDS * 8);
+    out[0] = MLG_SESSION_STATE_VERSION;
+    out[1] = sessionFlagsNow.load();
+}
 static size_t klog_read(uint64_t *, char *, size_t, uint64_t *end) { *end = 0; return 0; }
 int dext_compute_runtime_build_cached(uint64_t *out)
 {
@@ -268,7 +278,7 @@ struct rt_lx_client {
     std::map<uint64_t, int64_t> keptResult;
 };
 static std::mutex workersLock;
-static std::vector<std::thread> workers;
+static std::vector<std::thread> &workers = *new std::vector<std::thread>;
 static std::atomic<int> commits, opens, closes, mmaps, munmaps, syncIoctls, asyncIoctls, results, scanouts;
 static std::map<uint64_t, uint64_t> mapLengths;        // what IOConnectMapMemory64 maps
 static std::mutex mapLengthsLock;
@@ -509,6 +519,27 @@ static kern_return_t query_info(IOUserClientMethodArguments *a)
     }
     case 12:
         return answer(a, {1, 2, 0x7f, 4242, kfdWindow, kWindowBytes, 0x10000, 0x7fffffffffffull});
+    case MLG_QUERY_DEVICE_SPEC: {  /* a structure, as the driver's QueryInfo handler answers it */
+        mlg_device_spec spec{};
+        spec.version = MLG_DEVICE_SPEC_VERSION;
+        spec.present = MLG_DEVICE_SPEC_GEOMETRY | MLG_DEVICE_SPEC_CUS | MLG_DEVICE_SPEC_SHADER_ARRAYS |
+                       MLG_DEVICE_SPEC_SA_DISABLE | MLG_DEVICE_SPEC_BACKENDS;
+        spec.shader_engines = 4; spec.shader_arrays_per_se = 2; spec.backends_per_se = 4;
+        spec.cus_per_array = 8; spec.wavefront_size = 32; spec.max_waves_per_simd = 16;
+        spec.scratch_slots_per_cu = 32; spec.lds_bytes = 65536; spec.active_cus = 64;
+        for (unsigned se = 0; se < 4; ++se)
+            for (unsigned sa = 0; sa < 2; ++sa) spec.cu_bitmap[se][sa] = 0xff00 | (se << 4) | sa;
+        spec.active_sa_bitmap = 0xff; spec.cc_sa_disable = 0x12340000; spec.user_sa_disable = 0x56780000;
+        spec.active_rb_bitmap = 0xffff; spec.active_rbs = 16;
+        const size_t n = a->structureOutputMaximumSize < sizeof(spec) ? (size_t)a->structureOutputMaximumSize
+                                                                      : sizeof(spec);
+        if (n < 16) return kIOReturnBadArgument;
+        spec.size = (uint32_t)n;
+        a->structureOutput = OSData::withBytes(&spec, n);
+        if (a->scalarOutputCount >= 1) { a->scalarOutput[0] = n; a->scalarOutputCount = 1; }
+        else a->scalarOutputCount = 0;
+        return kIOReturnSuccess;
+    }
     case kTestTag: {
         uint8_t bytes[100];
         for (unsigned i = 0; i < sizeof(bytes); ++i) bytes[i] = (uint8_t)(0x30 + i);
@@ -654,7 +685,9 @@ kern_return_t MacLinuxGPUUserClient::ExternalMethod(uint64_t selector, IOUserCli
 }
 
 // ---- the test kernel: IOKit for the library ----
-static IODispatchQueue ownerQueue;   // every client's session calls (s_bringupQueue)
+// The kernel's threads live with the process (an exiting client does not
+// end the driver's): never destroyed, so exit() finds nothing to join.
+static IODispatchQueue &ownerQueue = *new IODispatchQueue;  // every client's session calls (s_bringupQueue)
 static std::mutex delivery;         // DriverKit delivers a driver's calls on one thread
 static const io_connect_t kConnection = 0x1234;  // the Linux-file client's
 static std::mutex clientsLock;
@@ -733,6 +766,9 @@ static kern_return_t deliver(MacLinuxGPUUserClient *client, uint32_t selector, O
         deliveryThread = std::this_thread::get_id();
         const auto start = std::chrono::steady_clock::now();
         kr = client->ExternalMethod(selector, &a, nullptr, nullptr, nullptr);
+        if (getenv("CLIENT_TRANSPORTS_TRACE"))
+            std::fprintf(stderr, "call %u in[0]=%#llx n_in=%u -> %#x\n", selector,
+                         inputCnt ? (unsigned long long)input[0] : 0ull, inputCnt, kr);
         if (std::chrono::steady_clock::now() - start > std::chrono::milliseconds(500))
             fail("a call held the delivery thread");
         deliveryThread = std::thread::id();
@@ -814,9 +850,15 @@ CFTypeRef lxt_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStrin
 kern_return_t lxt_IORegistryEntryGetRegistryEntryID(io_registry_entry_t, uint64_t *id) { *id = 7; return KERN_SUCCESS; }
 kern_return_t lxt_IOServiceOpen(io_service_t service, task_port_t, uint32_t type, io_connect_t *connect)
 {
-    CHECK(service == 2 && (type == 0 || type == MLG_USER_CLIENT_LINUX_FILE));
+    CHECK(service == 2 && (type == 0 || type == MLG_USER_CLIENT_OBSERVER || type == MLG_USER_CLIENT_LINUX_FILE));
+    // MacLinuxGPU::NewUserClient: only observers while a session closes,
+    // retires or is stuck.
+    if (type != MLG_USER_CLIENT_OBSERVER &&
+        (sessionFlagsNow.load() & (MLG_SESSION_FLAG_CLOSING | MLG_SESSION_FLAG_RETIRING)))
+        return kIOReturnNotAttached;
     auto *ivars = new MacLinuxGPUUserClient_IVars{};
     ivars->sessionGeneration = 1;
+    ivars->observer = type == MLG_USER_CLIENT_OBSERVER;
     ivars->linuxFile = type == MLG_USER_CLIENT_LINUX_FILE;
     ivars->ownerQueue = &ownerQueue;
     ivars->ownerLock = IOLockAlloc();
@@ -1019,6 +1061,19 @@ static void hsa_session()
     CHECK(hsa_agent_get_info(gpu, HSA_AGENT_INFO_QUEUES_MAX, &slots) == HSA_STATUS_SUCCESS);
     CHECK(slots == kQueueSlots);
     for (auto *q : queues) CHECK(hsa_queue_destroy(q) == HSA_STATUS_SUCCESS);
+    // The device spec: the driver's structure, through OWNER_RESULT, in
+    // mac_hsa.h's 32 words.
+    mac_hsa_device_spec_t spec{};
+    const hsa_status_t specStatus = mac_hsa_agent_get_device_spec(gpu, &spec, sizeof(spec));
+    if (specStatus != HSA_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mac_hsa_agent_get_device_spec: %#x\n", specStatus);
+        fail("the device spec was not answered");
+    }
+    CHECK(spec.words[0] == MLG_DEVICE_SPEC_VERSION && spec.words[1] == 4 && spec.words[2] == 2 &&
+          spec.words[4] == 8 && spec.words[8] == 65536 && spec.words[9] == 64);
+    CHECK(spec.words[10] == 0xff00 && spec.words[11] == 0xff01 && spec.words[17] == 0xff31);
+    CHECK(spec.words[18] == 0xff && spec.words[19] == 0x12340000 && spec.words[20] == 0x56780000 &&
+          spec.words[21] == 0xffff && spec.words[22] == 16 && spec.words[23] == 0 && spec.words[31] == 0);
     CHECK(hsa_shut_down() == HSA_STATUS_SUCCESS);
     CHECK(topologyAnswers >= 1 && queuesCreated >= 3);
 }
@@ -1050,9 +1105,88 @@ static void owner_call_shapes()
                                nullptr, nullptr) == kIOReturnBadArgument);
 }
 
-int main()
+// A client that exits with an executable and a queue still loaded,
+// as LemonSeed Engine does (build 246 aborted in exit(): the executable
+// registry's static destructor freed GPU buffers through the transport's
+// already-finalized mutex). Run as a process of its own; it must exit 0.
+static int exit_loaded()
+{
+    CHECK(hsa_init() == HSA_STATUS_SUCCESS);
+    hsa_agent_t gpu{};
+    CHECK(hsa_iterate_agents(find_gpu, &gpu) == HSA_STATUS_INFO_BREAK && gpu.handle);
+    mac_hsa::IsaTarget isa;
+    CHECK(mac_hsa::resolveIsaTarget(120001, mac_hsa::TargetFeature::Off, mac_hsa::TargetFeature::Any, isa));
+    mac_hsa::SignalKernelObjects objects;
+    CHECK(mac_hsa::selectSignalKernels(isa, objects) && !objects.operations.empty());
+    {
+        hsa_code_object_reader_t reader{};
+        hsa_executable_t executable{};
+        CHECK(hsa_code_object_reader_create_from_memory(objects.operations.data(), objects.operations.size(),
+                                                        &reader) == HSA_STATUS_SUCCESS);
+        CHECK(hsa_executable_create_alt(HSA_PROFILE_BASE, HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT, nullptr,
+                                        &executable) == HSA_STATUS_SUCCESS);
+        const hsa_status_t loaded = hsa_executable_load_agent_code_object(executable, gpu, reader, nullptr, nullptr);
+        if (loaded != HSA_STATUS_SUCCESS) std::fprintf(stderr, "load: %#x\n", loaded);
+        CHECK(loaded == HSA_STATUS_SUCCESS);
+        CHECK(hsa_executable_freeze(executable, nullptr) == HSA_STATUS_SUCCESS);
+    }
+    hsa_queue_t *queue = nullptr;
+    CHECK(hsa_queue_create(gpu, 4096, HSA_QUEUE_TYPE_MULTI, queue_error, nullptr, UINT32_MAX, UINT32_MAX,
+                           &queue) == HSA_STATUS_SUCCESS);
+    std::printf("exit-loaded: an executable and a queue loaded; exiting without hsa_shut_down\n");
+    std::fflush(stdout);
+    return 0;  // exit() runs the static destructors
+}
+
+// hsa_init while the driver closes a session: the runtime waits, bounded,
+// for the close, and names a session that will not close (build 246 said
+// HSA_STATUS_ERROR_INVALID_AGENT).
+static void close_waits()
+{
+    // A close that finishes: hsa_init waits for it.
+    sessionFlagsNow = MLG_SESSION_FLAG_CLOSING;
+    std::thread finish([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        sessionFlagsNow = 0;
+    });
+    const auto start = std::chrono::steady_clock::now();
+    const hsa_status_t waited = hsa_init();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+    finish.join();
+    if (waited != HSA_STATUS_SUCCESS) std::fprintf(stderr, "hsa_init during a close: %#x\n", waited);
+    CHECK(waited == HSA_STATUS_SUCCESS && ms >= 400);
+    CHECK(hsa_shut_down() == HSA_STATUS_SUCCESS);
+
+    // A close still running at the bound: busy, retry.
+    setenv("MAC_HSA_SESSION_CLOSE_WAIT_MS", "300", 1);
+    sessionFlagsNow = MLG_SESSION_FLAG_CLOSING;
+    hsa_status_t status = hsa_init();
+    CHECK(uint32_t(status) == uint32_t(HSA_STATUS_ERROR_RESOURCE_BUSY));
+    const char *text = nullptr;
+    CHECK(hsa_status_string(status, &text) == HSA_STATUS_SUCCESS && !strcmp(text, "HSA_STATUS_ERROR_RESOURCE_BUSY"));
+    // A session that will not close: the device is lost, at once.
+    sessionFlagsNow = MLG_SESSION_FLAG_CLOSING | MLG_SESSION_FLAG_QUARANTINED | MLG_SESSION_FLAG_RESTART_REQUIRED;
+    status = hsa_init();
+    CHECK(status == HSA_STATUS_ERROR_FATAL);
+    // Retiring (an upgrade): busy.
+    sessionFlagsNow = MLG_SESSION_FLAG_RETIRING;
+    CHECK(uint32_t(hsa_init()) == uint32_t(HSA_STATUS_ERROR_RESOURCE_BUSY));
+    sessionFlagsNow = 0;
+    unsetenv("MAC_HSA_SESSION_CLOSE_WAIT_MS");
+    std::printf("PASS hsa close: hsa_init waits for a closing session (%lld ms), reports a close past its "
+                "bound and a retiring driver busy (HSA_STATUS_ERROR_RESOURCE_BUSY), a stuck session lost\n",
+                (long long)ms);
+}
+
+int main(int argc, char **argv)
 {
     ownerQueue.start();
+    if (argc > 1 && !strcmp(argv[1], "exit-loaded")) {
+        const int r = exit_loaded();
+        // The kernel's own threads (the owner queue, workers) end with the
+        // process, as a driver's do for an exiting client.
+        return r;
+    }
     std::atomic<bool> done{false};
     std::thread watchdog([&] {
         for (int i = 0; i < 1200 && !done; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1062,9 +1196,11 @@ int main()
     // The HSA runtime from a cold GPU, as LemonSeed Engine brings it up.
     hsa_session();
     owner_call_shapes();
+    close_waits();
     std::printf("PASS hsa transport: the HSA runtime's IOKit transport against the dext's session dispatch: "
                 "cold bring-up with InitDevice, the 16-word topology through an owner call (%llu queue "
-                "slots), three MULTI queues; owner calls with 16 scalars, and 14 with a structure\n",
+                "slots), three MULTI queues, the device spec as a structure; owner calls with 16 scalars, "
+                "and 14 with a structure\n",
                 (unsigned long long)kQueueSlots);
 
     // libmlg_drm from a cold GPU: the driver has no process for the client

@@ -34,9 +34,9 @@ struct Mapping {
         if (base) mmap(base, size, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
     }
 };
-std::map<uintptr_t, std::shared_ptr<Reservation>> reservations;
-std::unordered_map<uint64_t, std::shared_ptr<Backing>> handles;
-std::map<uintptr_t, std::shared_ptr<Allocation>> mappings;
+std::map<uintptr_t, std::shared_ptr<Reservation>> &reservations = *new std::map<uintptr_t, std::shared_ptr<Reservation>>;
+std::unordered_map<uint64_t, std::shared_ptr<Backing>> &handles = *new std::unordered_map<uint64_t, std::shared_ptr<Backing>>;
+std::map<uintptr_t, std::shared_ptr<Allocation>> &mappings = *new std::map<uintptr_t, std::shared_ptr<Allocation>>;
 bool aligned(size_t size) { return size && size % hostPageSize() == 0; }
 std::shared_ptr<Reservation> reservationFor(uintptr_t address, size_t size) {
     auto it = reservations.upper_bound(address);

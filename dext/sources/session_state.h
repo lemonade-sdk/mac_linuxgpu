@@ -405,6 +405,35 @@ struct mlg_display_present {
 #define MLG_DRM_SELFTEST_WORDS      2u
 #define MLG_DRM_SELFTEST_RESULT_MAX 512u
 
+/* QueryInfo tag 8: the device spec, as a structure output (struct
+ * mlg_device_spec; through OWNER_RESULT for an async call), out[0] its
+ * size. Every field is upstream's own: the GC geometry and the CUs, shader
+ * arrays and render backends it left active (adev->gfx.config, cu_info,
+ * the KFD node's properties), and, on GC 12, the shader-array disable
+ * registers it reads (read only; no register is written). A field group
+ * not set in @present was not reported. Clients size their buffer to the
+ * struct they know and read @size of it; later versions only append. */
+#define MLG_QUERY_DEVICE_SPEC		8u
+#define MLG_DEVICE_SPEC_VERSION		1u
+#define MLG_DEVICE_SPEC_GEOMETRY	(1u << 0) /* shader_engines .. lds_bytes */
+#define MLG_DEVICE_SPEC_CUS		(1u << 1) /* active_cus, cu_bitmap */
+#define MLG_DEVICE_SPEC_SHADER_ARRAYS	(1u << 2) /* active_sa_bitmap */
+#define MLG_DEVICE_SPEC_SA_DISABLE	(1u << 3) /* cc_sa_disable, user_sa_disable */
+#define MLG_DEVICE_SPEC_BACKENDS	(1u << 4) /* active_rb_bitmap, active_rbs */
+struct mlg_device_spec {
+	uint32_t version;		/* MLG_DEVICE_SPEC_VERSION */
+	uint32_t size;			/* bytes of this struct the driver filled */
+	uint32_t present;		/* MLG_DEVICE_SPEC_* */
+	uint32_t reserved;
+	uint32_t shader_engines, shader_arrays_per_se, backends_per_se, cus_per_array;
+	uint32_t wavefront_size, max_waves_per_simd, scratch_slots_per_cu, lds_bytes;
+	uint32_t active_cus;
+	uint32_t cu_bitmap[4][4];	/* [shader engine][shader array], as KFD's */
+	uint32_t active_sa_bitmap;	/* bit se * arrays_per_se + sa */
+	uint32_t cc_sa_disable, user_sa_disable; /* GRBM_CC/GC_USER_SA_UNIT_DISABLE, raw */
+	uint32_t active_rb_bitmap, active_rbs;
+};
+
 #define MLG_SYSFS_OP_READ      0u
 #define MLG_SYSFS_OP_LIST      1u
 #define MLG_SYSFS_PATH_MAX     256u
