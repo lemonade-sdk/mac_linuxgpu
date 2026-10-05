@@ -150,10 +150,11 @@ validate_runtime_payload() {
     [[ -e "$entry" || -L "$entry" ]] || continue
     case "${entry##*/}" in
       libhsa-runtime64.0.1.0.dylib|libhsa-runtime64.1.dylib|libhsa-runtime64.dylib) ;;
+      libmlg_drm.dylib|libdrm_mlg.dylib) ;;
       *) echo "error: unexpected runtime payload entry: $entry" >&2; return 1 ;;
     esac
   done
-  for name in libhsa-runtime64.0.1.0.dylib; do
+  for name in libhsa-runtime64.0.1.0.dylib libmlg_drm.dylib libdrm_mlg.dylib; do
     [[ -f "$runtime/$name" && ! -L "$runtime/$name" ]] || {
       echo "error: required runtime library is missing or linked: $name" >&2
       return 1
@@ -194,7 +195,8 @@ cat > "$stage_path/Install MacLinuxGPU.txt" <<'EOF'
 Double-click MacLinuxGPUHost.app to install and activate the driver.
 Follow the app's instructions for macOS approval.
 Keep the app in /Applications after installation so macOS can manage updates.
-The app also installs the bundled HSA runtime library and the bundled AMD GPU
+The app also installs the bundled HSA runtime library and the Linux-file
+client libraries (libmlg_drm, libdrm_mlg) to /usr/local/lib, and the bundled AMD GPU
 firmware (linux-firmware, see its WHENCE file) to
 /Library/Application Support/MacLinuxGPU/firmware.
 EOF

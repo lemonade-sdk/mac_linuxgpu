@@ -49,10 +49,12 @@ private let firmwareRootPath = "/Library/Application Support/MacLinuxGPU/firmwar
 // The disk image contains the signed host app and its embedded dext. Verify the
 // exact package before allowing a privileged replacement in /Applications.
 private enum InstallPackage {
-    // Only the HSA runtime ships with the driver; it must match the dext.
-    // HRX and Loom belong to the applications that use them (LemonSeed
-    // bundles its own).
-    private static let runtimeFiles = ["libhsa-runtime64.0.1.0.dylib"]
+    // The HSA runtime and the Linux-file client libraries (libmlg_drm and
+    // the libdrm over it that RADV links) ship with the driver; each must
+    // match the dext, whose RPC they speak. HRX and Loom belong to the
+    // applications that use them (LemonSeed bundles its own).
+    private static let runtimeFiles = ["libhsa-runtime64.0.1.0.dylib",
+                                       "libmlg_drm.dylib", "libdrm_mlg.dylib"]
     private static let runtimeLinks = [
         "libhsa-runtime64.1.dylib": "libhsa-runtime64.0.1.0.dylib",
         "libhsa-runtime64.dylib": "libhsa-runtime64.1.dylib"
@@ -172,6 +174,7 @@ private enum InstallPackage {
         local_stage=\(shellQuote(localStage))
         local_backup=\(shellQuote(localBackup))
         local_dst=/usr/local/lib
+        local_names="libhsa-runtime64.0.1.0.dylib libhsa-runtime64.1.dylib libhsa-runtime64.dylib libmlg_drm.dylib libdrm_mlg.dylib"
         fw_root=\(shellQuote(firmwareRootPath))
         fw_stage=\(shellQuote(firmwareStage))
         fw_backup=\(shellQuote(firmwareBackup))
@@ -190,7 +193,7 @@ private enum InstallPackage {
           if [ "$committed" -ne 1 ]; then
             set +e
             if [ "$local_started" -eq 1 ]; then
-              for name in libhsa-runtime64.0.1.0.dylib libhsa-runtime64.1.dylib libhsa-runtime64.dylib; do
+              for name in $local_names; do
                 if [ ! -e "$local_stage/$name" ] && [ ! -L "$local_stage/$name" ]; then
                   /bin/rm -f "$local_dst/$name" || result=1
                 fi
@@ -238,10 +241,11 @@ private enum InstallPackage {
           if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then continue; fi
           case "${entry##*/}" in
             libhsa-runtime64.0.1.0.dylib|libhsa-runtime64.1.dylib|libhsa-runtime64.dylib) ;;
+            libmlg_drm.dylib|libdrm_mlg.dylib) ;;
             *) exit 1 ;;
           esac
         done
-        for lib in libhsa-runtime64.0.1.0.dylib; do
+        for lib in libhsa-runtime64.0.1.0.dylib libmlg_drm.dylib libdrm_mlg.dylib; do
           [ -f "$runtime_stage/$lib" ] && [ ! -L "$runtime_stage/$lib" ]
           /usr/bin/codesign --verify --strict "$runtime_stage/$lib"
           /usr/bin/codesign -dv "$runtime_stage/$lib" 2>&1 | /usr/bin/grep -Fxq \(shellQuote("TeamIdentifier=" + expectedTeamIdentifier))
@@ -252,6 +256,8 @@ private enum InstallPackage {
         /usr/bin/ditto "$runtime_stage/libhsa-runtime64.0.1.0.dylib" "$local_stage/libhsa-runtime64.0.1.0.dylib"
         /bin/ln -s libhsa-runtime64.0.1.0.dylib "$local_stage/libhsa-runtime64.1.dylib"
         /bin/ln -s libhsa-runtime64.1.dylib "$local_stage/libhsa-runtime64.dylib"
+        /usr/bin/ditto "$runtime_stage/libmlg_drm.dylib" "$local_stage/libmlg_drm.dylib"
+        /usr/bin/ditto "$runtime_stage/libdrm_mlg.dylib" "$local_stage/libdrm_mlg.dylib"
         if [ -e "$runtime_dst" ]; then /bin/mv "$runtime_dst" "$runtime_backup"; runtime_old=1; fi
         /bin/mv "$runtime_stage" "$runtime_dst"
         runtime_new=1
@@ -259,7 +265,7 @@ private enum InstallPackage {
         /bin/mv "$stage" "$dst"
         app_new=1
         local_started=1
-        for name in libhsa-runtime64.0.1.0.dylib libhsa-runtime64.1.dylib libhsa-runtime64.dylib; do
+        for name in $local_names; do
           if [ -e "$local_dst/$name" ] || [ -L "$local_dst/$name" ]; then
             /bin/mv "$local_dst/$name" "$local_backup/$name"
           fi
@@ -279,7 +285,7 @@ private enum InstallPackage {
         fi
         committed=1
         if [ "$fw_old" -eq 1 ]; then /bin/rm -rf "$fw_backup"; fi
-        printf 'Installed %s\\nPrevious app backup: %s\\nPrevious runtime backup: %s\\nPrevious /usr/local HSA backup: %s\\n' "$dst" "$backup" "$runtime_backup" "$local_backup"
+        printf 'Installed %s\\nPrevious app backup: %s\\nPrevious runtime backup: %s\\nPrevious /usr/local runtime backup: %s\\n' "$dst" "$backup" "$runtime_backup" "$local_backup"
         """
         // AppleScript handles the administrator prompt. The command is fixed;
         // only paths, each shell quoted, vary. A failure retains the old app.

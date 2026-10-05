@@ -157,9 +157,11 @@ fi
 # 2. Build the HSA runtime dylib (if --install-hsa).
 # ---------------------------------------------------------------------------
 if [[ $install_hsa -eq 1 ]]; then
-  echo "==> building HSA runtime dylib (make hsa)"
-  make -C "$PROJECT_ROOT" hsa
-  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib"; do
+  echo "==> building HSA runtime dylib (make hsa) and the Linux-file client libraries"
+  make -C "$PROJECT_ROOT" hsa libdrm-mlg
+  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libmlg_drm.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libdrm_mlg.dylib"; do
     [[ -f "$source" ]] || {
       echo "error: missing HSA runtime: $source" >&2
       exit 1
@@ -329,7 +331,9 @@ stage_runtime_payload() {
   }
   rm -rf "$payload"
   mkdir -p "$payload"
-  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib"; do
+  for source in "$PROJECT_ROOT/build/hsa/libhsa-runtime64.0.1.0.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libmlg_drm.dylib" \
+                "$PROJECT_ROOT/build/libdrm-mlg/lib/libdrm_mlg.dylib"; do
     [[ -f "$source" && ! -L "$source" ]] || {
       echo "error: expected a regular runtime library: $source" >&2
       return 1
@@ -531,6 +535,11 @@ if [[ $install_hsa -eq 1 ]]; then
     /usr/local/lib/libhsa-runtime64.0.1.0.dylib
   sudo ln -sfn libhsa-runtime64.0.1.0.dylib /usr/local/lib/libhsa-runtime64.1.dylib
   sudo ln -sfn libhsa-runtime64.1.dylib /usr/local/lib/libhsa-runtime64.dylib
+  # The Linux-file client libraries RADV and llama.cpp's Vulkan backend load
+  # (by @rpath, which their folders point at /usr/local/lib).
+  echo "==>   installing libmlg_drm.dylib and libdrm_mlg.dylib to /usr/local/lib/"
+  sudo cp -f "$PROJECT_ROOT/build/libdrm-mlg/lib/libmlg_drm.dylib" \
+    "$PROJECT_ROOT/build/libdrm-mlg/lib/libdrm_mlg.dylib" /usr/local/lib/
 
   # Copy the public header.
   echo "==>   copying mac_hsa.h to /usr/local/include/"
