@@ -44,3 +44,8 @@ clang++ -std=c++20 -fblocks -Wall -Wextra -Werror -Wno-unused-function -Wno-unus
   -I"$test_dir" -Idext/sources -idirafter linuxu/headers \
   linuxu/tests/test_owner_call.cpp -lpthread -o "$test_dir/test_owner_call"
 "$test_dir/test_owner_call"
+# The host side: host/owner_call.h's bounded wait.
+clang -std=gnu11 -Wall -Wextra -Werror -g -O1 -fsanitize=address,undefined -Ihost \
+  linuxu/tests/test_owner_call_host.c -framework IOKit -framework CoreFoundation \
+  -o "$test_dir/test_owner_call_host"
+"$test_dir/test_owner_call_host"

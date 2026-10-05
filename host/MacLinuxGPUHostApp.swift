@@ -767,6 +767,10 @@ enum DriverUpgrade {
                     report("Previous driver \(instance.label): " + legacyAdvice)
                 } else if status == kIOReturnNotPrivilegedValue {
                     report("Previous driver \(instance.label) " + notPrivilegedAdvice + ".")
+                } else if status == kIOReturnTimeout {
+                    report("Previous driver \(instance.label) did not complete Retire QUIESCE within " +
+                           "\(MacLinuxGPUHost.retireTimeoutMs / 1000) s (kIOReturnTimeout); its session may still be open. " +
+                           "`MacLinuxGPUHost instances` shows what is attached.")
                 } else {
                     report(String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status))
                 }
@@ -826,6 +830,9 @@ enum DriverUpgrade {
                     line = "Previous driver \(instance.label) is leaving."
                 } else if status == kIOReturnNotPrivilegedValue {
                     line = "Previous driver \(instance.label) " + notPrivilegedAdvice + "."
+                } else if status == kIOReturnTimeout {
+                    line = "Previous driver \(instance.label) did not complete Retire TERMINATE within " +
+                        "\(MacLinuxGPUHost.retireTimeoutMs / 1000) s (kIOReturnTimeout)."
                 } else {
                     line = String(format: "Previous driver %@ did not answer Retire (kr=%#x).", instance.label, status)
                 }
@@ -1316,8 +1323,28 @@ final class MacLinuxGPUHost {
     /// Requires the session-release entitlement. Nil with `lastStatus` set
     /// when the call failed (Unsupported: a driver older than Retire).
     func retire(_ op: UInt64, force: Bool = false) -> RetireResult? {
-        let (kr, values) = callScalar(kSelRetire, inScalars: [op, force ? kRetireForce : 0, kRetireConfirm],
-                                      outScalars: 3)
+        let input = [op, force ? kRetireForce : 0, kRetireConfirm]
+        let (kr, values): (kern_return_t, [UInt64])
+        if asyncSessionCalls && isOpen {
+            // An async session call, bounded: an instance that claims async
+            // calls but never completes this one must not hold the upgrade
+            // (and the observer client it waits on) forever.
+            var out = [UInt64](repeating: 0, count: 3)
+            var count = UInt32(out.count)
+            let status = input.withUnsafeBufferPointer { inPtr in
+                out.withUnsafeMutableBufferPointer { outPtr in
+                    mlg_owner_call_timed(ucConn, Self.retireTimeoutMs, kSelRetire, inPtr.baseAddress,
+                                         UInt32(input.count), nil, 0, outPtr.baseAddress, &count, nil, nil)
+                }
+            }
+            if status == kIOReturnTimeout {
+                append(String(format: "retire: %@: no completion within %u s from an instance that serves " +
+                              "async session calls (kIOReturnTimeout)", Self.retireOpName(op), Self.retireTimeoutMs / 1000))
+            }
+            (kr, values) = (status, Array(out.prefix(Int(count))))
+        } else {
+            (kr, values) = callScalar(kSelRetire, inScalars: input, outScalars: 3)
+        }
         lastStatus = kr
         guard kr == kIOReturnSuccess, let result = RetireResult(values) else {
             append(String(format: "retire: refused (kr=%#x)", kr))
@@ -1327,6 +1354,17 @@ final class MacLinuxGPUHost {
         return result
     }
     private(set) var lastStatus: kern_return_t = kIOReturnSuccess
+    /// How long Retire's completion may take: closing the session the normal
+    /// way is bounded inside the driver well below this.
+    static let retireTimeoutMs: UInt32 = 60_000
+    static func retireOpName(_ op: UInt64) -> String {
+        switch op {
+        case kRetireOpQuiesce: return "QUIESCE"
+        case kRetireOpTerminate: return "TERMINATE"
+        case kRetireOpResume: return "RESUME"
+        default: return "op \(op)"
+        }
+    }
 
     // MARK: Logging
 

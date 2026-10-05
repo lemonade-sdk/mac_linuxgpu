@@ -19,6 +19,7 @@
 
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
+#include <time.h>
 
 /* session_state.h's numbers (scripts/test-owner-call.sh checks they match). */
 #define MLG_OWNER_CALL_SELECTOR_PING	0u
@@ -48,21 +49,35 @@ static inline void mlg_owner_call_completed(void *refcon, IOReturn result, void 
 
 /* Wait for @w's completion on @port. The driver ends every call itself (a
  * session call's own bounds, the session's close); each second without
- * one, a Ping notices a driver that went away (kIOReturnNotAttached). */
+ * one, a Ping notices a driver that went away (kIOReturnNotAttached).
+ * With @timeout_ms (0: none), a completion that has not arrived by then
+ * is kIOReturnTimeout: for a caller that must not wait on a driver that
+ * answers Ping but never completes the call. */
 static inline kern_return_t mlg_owner_call_wait(io_connect_t connection, IONotificationPortRef port,
-						struct mlg_owner_call_waiter *w)
+						struct mlg_owner_call_waiter *w, uint32_t timeout_ms)
 {
 	union {
 		mach_msg_header_t header;
 		uint8_t bytes[4096];
 	} msg;
+	const uint64_t deadline = timeout_ms ? clock_gettime_nsec_np(CLOCK_UPTIME_RAW) +
+						       (uint64_t)timeout_ms * 1000000ull : 0;
 
 	while (!w->done) {
 		kern_return_t kr;
+		mach_msg_timeout_t slice = 1000;
 
+		if (deadline) {
+			const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+
+			if (now >= deadline)
+				return kIOReturnTimeout;
+			if ((deadline - now) / 1000000ull < slice)
+				slice = (mach_msg_timeout_t)((deadline - now + 999999ull) / 1000000ull);
+		}
 		memset(&msg.header, 0, sizeof(msg.header));
 		kr = mach_msg(&msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, sizeof(msg),
-			      IONotificationPortGetMachPort(port), 1000, MACH_PORT_NULL);
+			      IONotificationPortGetMachPort(port), slice, MACH_PORT_NULL);
 		if (kr == MACH_RCV_TIMED_OUT) {
 			uint64_t pong = 0;
 			uint32_t n = 1;
@@ -83,9 +98,10 @@ static inline kern_return_t mlg_owner_call_wait(io_connect_t connection, IONotif
  * call it: on return *@output_count scalars are in @output and
  * *@output_struct_size bytes in @output_struct (pass NULLs for none). The
  * result is the selector's IOReturn, or a transport failure (the call did
- * not start, or the driver went away). */
+ * not start, or the driver went away), or kIOReturnTimeout past
+ * @timeout_ms (0: none). */
 static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_connect_t connection,
-					      uint32_t selector,
+					      uint32_t timeout_ms, uint32_t selector,
 					      const uint64_t *input, uint32_t input_count,
 					      const void *input_struct, size_t input_struct_size,
 					      uint64_t *output, uint32_t *output_count,
@@ -119,7 +135,7 @@ static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_con
 	}
 	if (kr != kIOReturnSuccess)
 		return kr;
-	kr = mlg_owner_call_wait(connection, port, &w);
+	kr = mlg_owner_call_wait(connection, port, &w, timeout_ms);
 	if (kr != kIOReturnSuccess)
 		return kr;
 	if (w.status != kIOReturnSuccess)
@@ -156,22 +172,37 @@ static inline kern_return_t mlg_owner_call_on(IONotificationPortRef port, io_con
 	return kIOReturnSuccess;
 }
 
-static inline kern_return_t mlg_owner_call(io_connect_t connection, uint32_t selector,
-					   const uint64_t *input, uint32_t input_count,
-					   const void *input_struct, size_t input_struct_size,
-					   uint64_t *output, uint32_t *output_count,
-					   void *output_struct, size_t *output_struct_size)
+/* mlg_owner_call, with kIOReturnTimeout when the completion has not come
+ * within @timeout_ms. A completion that comes later is dropped with the
+ * call's notification port. */
+static inline kern_return_t mlg_owner_call_timed(io_connect_t connection, uint32_t timeout_ms,
+						 uint32_t selector,
+						 const uint64_t *input, uint32_t input_count,
+						 const void *input_struct, size_t input_struct_size,
+						 uint64_t *output, uint32_t *output_count,
+						 void *output_struct, size_t *output_struct_size)
 {
 	IONotificationPortRef port = IONotificationPortCreate(kIOMainPortDefault);
 	kern_return_t kr;
 
 	if (!port)
 		return kIOReturnNoMemory;
-	kr = mlg_owner_call_on(port, connection, selector, input, input_count, input_struct,
-			       input_struct_size, output, output_count, output_struct,
+	kr = mlg_owner_call_on(port, connection, timeout_ms, selector, input, input_count,
+			       input_struct, input_struct_size, output, output_count, output_struct,
 			       output_struct_size);
 	IONotificationPortDestroy(port);
 	return kr;
+}
+
+static inline kern_return_t mlg_owner_call(io_connect_t connection, uint32_t selector,
+					   const uint64_t *input, uint32_t input_count,
+					   const void *input_struct, size_t input_struct_size,
+					   uint64_t *output, uint32_t *output_count,
+					   void *output_struct, size_t *output_struct_size)
+{
+	return mlg_owner_call_timed(connection, 0, selector, input, input_count, input_struct,
+				    input_struct_size, output, output_count, output_struct,
+				    output_struct_size);
 }
 
 #endif
