@@ -45,6 +45,8 @@
 #include <rt/removal.h>
 
 #include "amdgpu.h"
+#include "amdgpu_display.h"
+#include "amdgpu_gem.h"
 #include "lx_internal.h"
 
 /* The largest framebuffer the test creates: two 4K monitors side by side
@@ -62,6 +64,52 @@ _Static_assert(sizeof(struct rt_display_present_stats) == 144, "rt_display_prese
 _Static_assert(sizeof(struct rt_surface_verify_result) == 64, "rt_surface_verify_result layout");
 
 static DEFINE_MUTEX(rt_display_lock);
+
+/* A scanout buffer the CPU never touches: the output's framebuffers start
+ * black (SDMA clear) and every frame is an SDMA copy, so unlike a dumb
+ * buffer (amdgpu_mode_dumb_create: CPU_ACCESS_REQUIRED) it needs no room
+ * in the CPU-visible VRAM window (256 MB behind this card's BAR0), which a
+ * compute client can fill: pinning there would evict its buffers. Placed as
+ * a compositor's scanout BO is: VRAM, contiguous, cleared, no CPU access.
+ * The pitch follows the dumb buffer's (amdgpu_gem_align_pitch, linear). */
+static struct drm_client_buffer *scanout_buffer_create(struct drm_client_dev *client,
+						       u32 width, u32 height, u32 format)
+{
+	struct amdgpu_device *adev = drm_to_adev(client->dev);
+	const struct drm_format_info *info = drm_format_info(format);
+	const u32 cpp = info ? info->cpp[0] : 0;
+	const u64 flags = AMDGPU_GEM_CREATE_NO_CPU_ACCESS |
+			  AMDGPU_GEM_CREATE_VRAM_CONTIGUOUS |
+			  AMDGPU_GEM_CREATE_VRAM_CLEARED;
+	struct drm_client_buffer *buffer;
+	struct drm_gem_object *gobj;
+	u32 pitch, handle;
+	u64 size;
+	int r;
+
+	if (cpp != 4 || !width || !height)
+		return ERR_PTR(-EINVAL);
+	/* Clearing needs the buffer functions (the SDMA ring), as the dumb
+	 * buffer's VRAM_CLEARED does; without them nothing would clear it. */
+	if (!adev->mman.buffer_funcs_enabled)
+		return ERR_PTR(-ENODEV);
+	pitch = ALIGN(width, 64u) * cpp;
+	size = ALIGN((u64)pitch * height, PAGE_SIZE);
+	r = amdgpu_gem_object_create(adev, size, 0,
+				     amdgpu_bo_get_preferred_domain(adev,
+					amdgpu_display_supported_domains(adev, flags)),
+				     flags, ttm_bo_type_device, NULL, &gobj, 0);
+	if (r)
+		return ERR_PTR(r);
+	r = drm_gem_handle_create(client->file, gobj, &handle);
+	/* The handle holds it now, then the buffer and its framebuffer. */
+	drm_gem_object_put(gobj);
+	if (r)
+		return ERR_PTR(r);
+	buffer = drm_client_buffer_create(client, width, height, format, handle, pitch);
+	drm_gem_handle_delete(client->file, handle);
+	return buffer;
+}
 
 /* The display configuration before the pattern: per CRTC its mode and
  * enable/active, per plane its CRTC, framebuffer (referenced) and
@@ -2086,13 +2134,13 @@ int rt_display_output(struct pci_dev *pdev, const char *connector, uint32_t widt
 		ret = -ENOENT;
 		goto fail;
 	}
-	/* Three buffers, pinned in VRAM for the output's life (amdgpu clears
-	 * new dumb buffers with SDMA: they start black). */
+	/* Three buffers, pinned in VRAM for the output's life, outside the
+	 * CPU-visible window (scanout_buffer_create: cleared by SDMA, black). */
 	for (int i = 0; i < OUTPUT_BUFFERS; i++) {
 		struct amdgpu_bo *bo;
 
-		o->fb[i] = drm_client_buffer_create_dumb(&rt_display.client, width, height,
-							 DRM_FORMAT_XRGB8888);
+		o->fb[i] = scanout_buffer_create(&rt_display.client, width, height,
+						 DRM_FORMAT_XRGB8888);
 		if (IS_ERR(o->fb[i])) {
 			ret = PTR_ERR(o->fb[i]);
 			o->fb[i] = NULL;
