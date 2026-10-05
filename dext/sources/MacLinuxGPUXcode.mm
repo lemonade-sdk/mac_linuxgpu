@@ -2732,20 +2732,29 @@ struct LxJoin {
 static void lx_join_main(LxJoin *job)
 {
     struct rt_lx_client *lx = nullptr;
-    const kern_return_t kr = lx_join(job->client, &lx);
-    int r = kr == kIOReturnSuccess ? 0 :
-            kr == kIOReturnNoMemory ? -MLG_LX_ENOMEM : -MLG_LX_ENODEV;
-    if (!r) {
+    kern_return_t kr = lx_join(job->client, &lx);
+    int r = 0;
+    if (kr == kIOReturnSuccess) {
         uint64_t token = 0;
         if (!s_lxCalls.enter()) {
-            r = -MLG_LX_ENODEV;
+            kr = kIOReturnNotReady;
         } else {
             r = rt_lx_op_async(lx, job->in, job->nin, lx_async_done, job->ctx, &token);
             s_lxCalls.leave();
         }
     }
-    // Not started: complete it here (the worker completes the others).
-    if (r) lx_async_done(job->ctx, 0, r, nullptr, 0);
+    if (kr != kIOReturnSuccess) {
+        // No process to run it in (the GPU is not up, or the session is
+        // closing): a transport failure, as the synchronous join reported
+        // it, which tells the client to initialize the GPU (libmlg_drm's
+        // first open). Its completion carries the IOReturn.
+        IOUserClientAsyncArgumentsArray data = {};
+        job->ctx->client->AsyncCompletion(job->ctx->action, kr, data, 3);
+        lx_async_abandon(job->ctx);
+    } else if (r) {
+        // Not started: complete it here (the worker completes the others).
+        lx_async_done(job->ctx, 0, r, nullptr, 0);
+    }
     IOFree(job, sizeof(*job));
 }
 
@@ -2776,6 +2785,12 @@ static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t 
                                         IOUserClientMethodArguments *arguments)
 {
     const uint64_t entered_ns = rt_lx_time_ns();
+    // Answered on the call: an async call of one would wait for a
+    // completion that never comes (session_state.h's mlg_call_is_synchronous
+    // names them for the clients). Refused, so such a client fails at once.
+    if (arguments->completion && mlg_call_is_synchronous(selector, arguments->scalarInput,
+                                                         arguments->scalarInputCount))
+        return kIOReturnBadArgument;
     struct rt_lx_client *lx = lx_ready(client);
     if (!lx) {
         // No process yet (or one from a closed session): its first call is
