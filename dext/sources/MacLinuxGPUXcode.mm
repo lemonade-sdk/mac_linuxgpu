@@ -82,6 +82,7 @@
 #include <rt/lx_timing.h>
 #include <rt/kfd_session.h>
 #include <rt/wait_pool.h>
+#include <rt/bounded.h>
 #include <rt/sysfs.h>
 #include <rt/dext_pci.h>
 #include <rt/dext_dma.h>
@@ -357,10 +358,20 @@ struct MacLinuxGPUUserClient_IVars {
     bool stopping;
     bool observer; // read-only: never joins, opens or closes a session
     bool identityRecorded; // pid/name handed to the compute backend
-    // Observers and Linux-file clients run on their own queue and hop to
-    // the owner's queue for everything but their own calls.
+    // Every client's calls arrive on a queue of its own; whatever touches
+    // the session runs on the owner's (session) queue, as an async call
+    // (owner_call) that never holds the delivery thread.
     IODispatchQueue *ownerQueue;
-    bool onOwnerQueue;
+    // Structure outputs of the client's async session calls, until
+    // OWNER_RESULT fetches them (owner_call_store, owner_result).
+    IOLock *ownerLock;
+    struct OwnerResult *ownerResults;
+    uint64_t ownerToken;
+    // The memory of its mapped BOs (BOMap), made on the owner's queue, so a
+    // mapping (CopyClientMemoryForType, on the delivery thread) only looks
+    // one up. Under ownerLock.
+    struct ClientMemory *memories;
+    bool syncRefusalLogged;
     bool linuxFile; // type 2: a Linux process of its own (lx_files)
     struct rt_lx_client *lx; // created on the first Linux-file call
     MacLinuxGPUUserClient *nextLinuxFile; // s_linuxFiles registry
@@ -2060,26 +2071,22 @@ IMPL(MacLinuxGPUUserClient, Start)
     ret = driver->CopyDispatchQueue(kIOServiceDefaultQueueName, &ownerQueue);
     if (ret != kIOReturnSuccess || ownerQueue == nullptr)
         return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
-    // A session client shares the owner's serial queue with every session
-    // transition and LSE ioctl. An observer gets its own: SysfsRead and
-    // DrmInfo run upstream callbacks that take upstream locks and may sleep
-    // on an SMU round trip, so they must neither wait behind an in-flight
-    // ioctl nor stall one. Its other selectors hop to the owner's queue.
-    // A Linux-file client gets its own for the same reason: its process's
-    // system calls (lx_files) may sleep in upstream locks, and none of them
-    // may wait behind another client's.
-    IODispatchQueue *clientQueue = ownerQueue;
-    if (observer || linuxFile) {
-        clientQueue = nullptr;
-        ret = IODispatchQueue::Create(observer ? "MacLinuxGPUObserver" : "MacLinuxGPULinuxFile",
-                                      0, 0, &clientQueue);
-        if (ret != kIOReturnSuccess || clientQueue == nullptr) {
-            ownerQueue->release();
-            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-        }
+    // Every client gets a queue of its own for its calls. DriverKit runs a
+    // call on its one delivery thread, under the target queue: a call that
+    // waited for the owner's queue (busy with a probe, a session close, or
+    // a client's session call that sleeps) would hold every client and the
+    // driver's Stop with it. Session work runs on the owner's queue as
+    // async calls (owner_call), in arrival order.
+    IODispatchQueue *clientQueue = nullptr;
+    ret = IODispatchQueue::Create(observer ? "MacLinuxGPUObserver" :
+                                  linuxFile ? "MacLinuxGPULinuxFile" : "MacLinuxGPUSession",
+                                  0, 0, &clientQueue);
+    if (ret != kIOReturnSuccess || clientQueue == nullptr) {
+        ownerQueue->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
     }
     ret = SetDispatchQueue(kIOServiceDefaultQueueName, clientQueue);
-    if (clientQueue != ownerQueue) clientQueue->release();
+    clientQueue->release();
     if (ret != kIOReturnSuccess || s_nextClientID == UINT64_MAX) {
         ownerQueue->release();
         return ret != kIOReturnSuccess ? ret : kIOReturnNoResources;
@@ -2087,7 +2094,10 @@ IMPL(MacLinuxGPUUserClient, Start)
     ivars = IONewZero(MacLinuxGPUUserClient_IVars, 1);
     if (!ivars) { ownerQueue->release(); return kIOReturnNoMemory; }
     ivars->displayResults = display_slot_new();
-    if (!ivars->displayResults) {
+    ivars->ownerLock = IOLockAlloc();
+    if (!ivars->displayResults || !ivars->ownerLock) {
+        display_slot_put(ivars->displayResults);
+        if (ivars->ownerLock) IOLockFree(ivars->ownerLock);
         IOSafeDeleteNULL(ivars, MacLinuxGPUUserClient_IVars, 1);
         ownerQueue->release();
         return kIOReturnNoMemory;
@@ -2109,6 +2119,10 @@ IMPL(MacLinuxGPUUserClient, Start)
 static void lx_finish_stop(MacLinuxGPUUserClient *client, IOService *provider)
 {
     auto *iv = client->ivars;
+    // A first call that joined on this queue after the Stop took the
+    // client's process (lx_join_main ran in between): that process exits
+    // too, on a thread of its own.
+    if (struct rt_lx_client *late = lx_take(client)) (void)rt_lx_client_retire(late, nullptr, nullptr);
     const bool participant = iv->sessionGeneration == s_sessionGeneration;
     if (participant) {
         iv->sessionGeneration = 0;
@@ -2172,6 +2186,10 @@ static void lx_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
     client->ivars->ownerQueue->DispatchAsync(^{ lx_finish_stop(client, provider); });
 }
 
+static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
+static void owner_results_free(MacLinuxGPUUserClient *client);
+static IOMemoryDescriptor *client_memory_find(MacLinuxGPUUserClient *client, uint64_t type);
+
 kern_return_t
 IMPL(MacLinuxGPUUserClient, Stop)
 {
@@ -2185,8 +2203,9 @@ IMPL(MacLinuxGPUUserClient, Stop)
         // No session membership or mappings. A display agent's imports and
         // the output it started end with it (on its own queue, so none of
         // its calls is in flight); a closing session has released them.
+        // It finishes on the owner's queue, after its session calls.
         observer_display_client_stop(ivars->clientID);
-        FinishStop(provider);
+        ivars->ownerQueue->DispatchAsync(^{ FinishStop(provider); });
         return kIOReturnSuccess;
     }
     // An unplug terminates the clients before the provider: see whether the
@@ -2196,6 +2215,15 @@ IMPL(MacLinuxGPUUserClient, Stop)
         lx_client_stop(this, provider);
         return kIOReturnSuccess;
     }
+    // The rest is session work: on the owner's queue, after the client's
+    // session calls, never on the delivery thread.
+    ivars->ownerQueue->DispatchAsync(^{ session_client_stop(this, provider); });
+    return kIOReturnSuccess;
+}
+
+static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider)
+{
+    auto *ivars = client->ivars;
     const bool participant = ivars->sessionGeneration == s_sessionGeneration;
     if (participant && s_participants > 1 && !s_sessionClosing) {
         // IRQ delivery stays active while this client's queues are removed.
@@ -2214,12 +2242,11 @@ IMPL(MacLinuxGPUUserClient, Stop)
     }
     if (s_sessionClosing || (participant && (!s_participants || s_dmaQuarantined))) {
         ivars->nextStopping = s_stoppingClients;
-        s_stoppingClients = this;
+        s_stoppingClients = client;
         close_session(ivars->ownerDriver);
     } else {
-        FinishStop(provider);
+        client->FinishStop(provider);
     }
-    return kIOReturnSuccess;
 }
 
 void
@@ -2241,6 +2268,7 @@ MacLinuxGPUUserClient::FinishStop(IOService *provider)
     if (!ivars->observer) s_rawBARLease.release(ivars->clientID);
     if (ivars->ownerQueue) ivars->ownerQueue->release();
     display_slot_put(ivars->displayResults);
+    owner_results_free(this);
     IOSafeDeleteNULL(ivars, MacLinuxGPUUserClient_IVars, 1);
     Stop(provider, SUPERDISPATCH);
     provider->release();
@@ -2281,31 +2309,36 @@ IMPL(MacLinuxGPUUserClient, InterruptOccurred)
 // Linux-file calls (rt/lx_abi.h selectors), on the client's own queue.
 // ----------------------------------------------------------------
 
-// The client's process, created on its first call: the client joins the
-// session as a session client does (on the owner's queue, outside the
-// call admission, which a closing session drains while holding that
-// queue), then gets a Linux process with its creator's pid and name.
-static kern_return_t lx_state(MacLinuxGPUUserClient *client, struct rt_lx_client **out)
+// The client's process, created by its first call, on the owner's queue
+// (lx_join): the client joins the session as a session client does, then
+// gets a Linux process with its creator's pid and name. The delivery
+// thread only reads whether it exists (lx_ready).
+static struct rt_lx_client *lx_ready(MacLinuxGPUUserClient *client)
 {
     auto *iv = client->ivars;
-    if (iv->lx && iv->sessionGeneration == __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE)) {
-        *out = iv->lx;
-        return kIOReturnSuccess;
-    }
-    if (iv->lx) {
-        // From a session that has closed: never used since its admission
-        // closed, so it holds no files of the driver that is gone.
-        if (struct rt_lx_client *stale = lx_take(client)) rt_lx_client_destroy(stale);
-    }
-    __block kern_return_t ret = kIOReturnNotReady;
-    __block void *pdev = nullptr;
-    iv->ownerQueue->DispatchSync(^{
-        if (s_stopping || s_sessionClosing || s_dmaQuarantined || !s_modulesRunning || !s_rtDevice)
-            return;
-        ret = ensure_open(client);
-        if (ret == kIOReturnSuccess) pdev = rt_device_get_pdev(s_rtDevice);
-    });
+    lx_registry_acquire();
+    struct rt_lx_client *lx = iv->lx &&
+        iv->sessionGeneration == __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE) ?
+        iv->lx : nullptr;
+    lx_registry_release();
+    return lx;
+}
+
+// On the owner's queue.
+static kern_return_t lx_join(MacLinuxGPUUserClient *client, struct rt_lx_client **out)
+{
+    auto *iv = client->ivars;
+    if (iv->stopping) return kIOReturnNotAttached;
+    if ((*out = lx_ready(client))) return kIOReturnSuccess;
+    // A process from a session that has closed: never used since its
+    // admission closed, so it holds no files of the driver that is gone;
+    // it exits on a thread of its own all the same.
+    if (struct rt_lx_client *stale = lx_take(client)) (void)rt_lx_client_retire(stale, nullptr, nullptr);
+    if (s_stopping || s_sessionClosing || s_dmaQuarantined || !s_modulesRunning || !s_rtDevice)
+        return kIOReturnNotReady;
+    kern_return_t ret = ensure_open(client);
     if (ret != kIOReturnSuccess) return ret;
+    void *pdev = rt_device_get_pdev(s_rtDevice);
     int pid = 0;
     char name[32];
     client_creator(client, &pid, name, sizeof(name));
@@ -2596,13 +2629,70 @@ static kern_return_t lx_scanout_call(struct rt_lx_client *lx, IOUserClientMethod
     return a->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+// A client's first LX_CALL_ASYNC: the join (lx_join) and the operation on
+// the owner's queue; the delivery thread returns at once (token 0: the
+// completion carries the operation's own).
+struct LxJoin {
+    MacLinuxGPUUserClient *client;
+    LxAsync *ctx;
+    uint64_t in[MLG_LX_OP_MMAP_ARGS];
+    uint32_t nin;
+};
+static void lx_join_main(LxJoin *job)
+{
+    struct rt_lx_client *lx = nullptr;
+    const kern_return_t kr = lx_join(job->client, &lx);
+    int r = kr == kIOReturnSuccess ? 0 :
+            kr == kIOReturnNoMemory ? -MLG_LX_ENOMEM : -MLG_LX_ENODEV;
+    if (!r) {
+        uint64_t token = 0;
+        if (!s_lxCalls.enter()) {
+            r = -MLG_LX_ENODEV;
+        } else {
+            r = rt_lx_op_async(lx, job->in, job->nin, lx_async_done, job->ctx, &token);
+            s_lxCalls.leave();
+        }
+    }
+    // Not started: complete it here (the worker completes the others).
+    if (r) lx_async_done(job->ctx, 0, r, nullptr, 0);
+    IOFree(job, sizeof(*job));
+}
+
+static kern_return_t lx_join_call(MacLinuxGPUUserClient *client, IOUserClientMethodArguments *a)
+{
+    const uint32_t nin = a->scalarInputCount;
+    if (!a->completion || !a->scalarInput || nin < 1 || nin > MLG_LX_OP_MMAP_ARGS ||
+        !a->scalarOutput || a->scalarOutputCount < 2)
+        return kIOReturnBadArgument;
+    auto *job = static_cast<LxJoin *>(IOMallocZero(sizeof(LxJoin)));
+    if (!job) return kIOReturnNoMemory;
+    job->ctx = lx_async_begin(client, a->completion);
+    if (!job->ctx) {
+        IOFree(job, sizeof(*job));
+        return kIOReturnNoMemory;
+    }
+    job->client = client;
+    job->nin = nin;
+    memcpy(job->in, a->scalarInput, nin * sizeof(uint64_t));
+    client->ivars->ownerQueue->DispatchAsync(^{ lx_join_main(job); });
+    a->scalarOutput[0] = 0;
+    a->scalarOutput[1] = 0;
+    a->scalarOutputCount = 2;
+    return kIOReturnSuccess;
+}
+
 static kern_return_t lx_external_method(MacLinuxGPUUserClient *client, uint64_t selector,
                                         IOUserClientMethodArguments *arguments)
 {
     const uint64_t entered_ns = rt_lx_time_ns();
-    struct rt_lx_client *lx = nullptr;
-    kern_return_t ret = lx_state(client, &lx);
-    if (ret != kIOReturnSuccess) return ret;
+    struct rt_lx_client *lx = lx_ready(client);
+    if (!lx) {
+        // No process yet (or one from a closed session): its first call is
+        // an open (LX_CALL_ASYNC), which joins on the owner's queue.
+        return selector == MLG_SELECTOR_LX_CALL_ASYNC ? lx_join_call(client, arguments)
+                                                      : kIOReturnNotReady;
+    }
+    kern_return_t ret;
     if (!s_lxCalls.enter()) return kIOReturnNotReady;
     ret = selector == MLG_SELECTOR_LX_SCANOUT ? lx_scanout_call(lx, arguments) :
                                                 lx_call(client, lx, selector, arguments, entered_ns,
@@ -2732,35 +2822,26 @@ static kern_return_t lx_copy_memory(MacLinuxGPUUserClient *client, uint64_t type
 kern_return_t
 IMPL(MacLinuxGPUUserClient, CopyClientMemoryForType)
 {
+    // On the delivery thread: a lookup or a provider call, never the
+    // session's state (the owner's queue made the BO descriptors at BOMap).
     if (!ivars || ivars->stopping) return kIOReturnNotAttached;
     if (ivars->observer) return kIOReturnNotPermitted;
     if (ivars->linuxFile) return lx_copy_memory(this, type, options, memory);
-    ComputeClientScope clientScope(ivars->clientID);
     if (memory == nullptr || options == nullptr) {
         return kIOReturnBadArgument;
     }
     if (s_retainedPCI == nullptr) {
         return kIOReturnNotReady;
     }
-    kern_return_t opened = ensure_open(this);
-    if (opened != kIOReturnSuccess) return opened;
     if (type == MLG_FW_MAILBOX_MEMORY_TYPE) {
         *options = 0;
         return copy_firmware_mailbox(memory);
     }
+    if (ivars->sessionGeneration != __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE))
+        return kIOReturnNotOpen;
     if (type >= 0x10000) {
-        void *cpu = nullptr;
-        uint64_t size = 0;
-        const int located = dext_compute_bo_memory(type, &cpu, &size);
-        IOMemoryDescriptor *descriptor = nullptr;
-        if (located == -EAGAIN_L && size) {
-            // A KFD process's GTT BO: its TTM pages, at the BO's GPU VA.
-            descriptor = copy_bo_ranges_descriptor((uint32_t)type, size);
-        } else {
-            if (located != 0 || !cpu || !size) return kIOReturnBadArgument;
-            descriptor = static_cast<IOMemoryDescriptor *>(dext_dma_copy_descriptor(cpu));
-        }
-        if (!descriptor) return kIOReturnNotReady;
+        IOMemoryDescriptor *descriptor = client_memory_find(this, type);
+        if (!descriptor) return kIOReturnBadArgument;
         *options = 0;
         *memory = descriptor;
         return kIOReturnSuccess;
@@ -3147,6 +3228,449 @@ static kern_return_t display_frames(uint64_t clientID, IOUserClientMethodArgumen
     }
 }
 
+// ----------------------------------------------------------------
+// Session calls off the delivery thread (session_state.h, "Calls that
+// never sleep, and every other call").
+// ----------------------------------------------------------------
+
+// ExternalMethod's reference when a session call runs on the owner's queue
+// (owner_job_main) rather than arriving from a client.
+static const uint8_t kOwnerJob = 0;
+
+struct OwnerResult {
+    OwnerResult *next;
+    uint64_t token;
+    OSData *data;
+};
+
+struct ClientMemory {
+    ClientMemory *next;
+    uint64_t handle, type;
+    IOMemoryDescriptor *memory;
+};
+
+static void owner_results_free(MacLinuxGPUUserClient *client)
+{
+    auto *iv = client->ivars;
+    if (!iv->ownerLock) return;
+    IOLockLock(iv->ownerLock);
+    OwnerResult *list = iv->ownerResults;
+    iv->ownerResults = nullptr;
+    ClientMemory *memories = iv->memories;
+    iv->memories = nullptr;
+    IOLockUnlock(iv->ownerLock);
+    while (memories) {
+        ClientMemory *next = memories->next;
+        memories->memory->release();
+        IOFree(memories, sizeof(*memories));
+        memories = next;
+    }
+    while (list) {
+        OwnerResult *next = list->next;
+        if (list->data) list->data->release();
+        IOFree(list, sizeof(*list));
+        list = next;
+    }
+    IOLockFree(iv->ownerLock);
+    iv->ownerLock = nullptr;
+}
+
+// Keep a call's structure output for OWNER_RESULT (@data's reference
+// passes to the list). Results nobody fetches go with the client.
+static void owner_result_store(MacLinuxGPUUserClient *client, uint64_t token, OSData *data)
+{
+    auto *entry = static_cast<OwnerResult *>(IOMallocZero(sizeof(OwnerResult)));
+    if (!entry) {
+        data->release();
+        return;
+    }
+    entry->token = token;
+    entry->data = data;
+    IOLockLock(client->ivars->ownerLock);
+    entry->next = client->ivars->ownerResults;
+    client->ivars->ownerResults = entry;
+    IOLockUnlock(client->ivars->ownerLock);
+}
+
+// On the owner's queue, after BOMap: the descriptor a mapping of @type
+// hands out (the BO's DMA buffer, or a KFD GTT BO's page ranges).
+static void client_memory_stash(MacLinuxGPUUserClient *client, uint64_t handle, uint64_t type)
+{
+    void *cpu = nullptr;
+    uint64_t size = 0;
+    const int located = dext_compute_bo_memory((uint32_t)type, &cpu, &size);
+    IOMemoryDescriptor *descriptor = nullptr;
+    if (located == -EAGAIN_L && size)
+        descriptor = copy_bo_ranges_descriptor((uint32_t)type, size);
+    else if (located == 0 && cpu && size)
+        descriptor = static_cast<IOMemoryDescriptor *>(dext_dma_copy_descriptor(cpu));
+    if (!descriptor) return;  // the mapping then fails (kIOReturnBadArgument)
+    auto *entry = static_cast<ClientMemory *>(IOMallocZero(sizeof(ClientMemory)));
+    if (!entry) { descriptor->release(); return; }
+    entry->handle = handle;
+    entry->type = type;
+    entry->memory = descriptor;
+    IOLockLock(client->ivars->ownerLock);
+    for (ClientMemory **link = &client->ivars->memories; *link; link = &(*link)->next) {
+        if ((*link)->type != type) continue;
+        ClientMemory *old = *link;  // mapped again: the newer descriptor
+        *link = old->next;
+        old->memory->release();
+        IOFree(old, sizeof(*old));
+        break;
+    }
+    entry->next = client->ivars->memories;
+    client->ivars->memories = entry;
+    IOLockUnlock(client->ivars->ownerLock);
+}
+
+// On the owner's queue, after BOFree.
+static void client_memory_drop(MacLinuxGPUUserClient *client, uint64_t handle)
+{
+    ClientMemory *found = nullptr;
+    IOLockLock(client->ivars->ownerLock);
+    for (ClientMemory **link = &client->ivars->memories; *link; link = &(*link)->next) {
+        if ((*link)->handle != handle) continue;
+        found = *link;
+        *link = found->next;
+        break;
+    }
+    IOLockUnlock(client->ivars->ownerLock);
+    if (found) {
+        found->memory->release();
+        IOFree(found, sizeof(*found));
+    }
+}
+
+// On the delivery thread: the descriptor, retained, or nullptr.
+static IOMemoryDescriptor *client_memory_find(MacLinuxGPUUserClient *client, uint64_t type)
+{
+    IOMemoryDescriptor *memory = nullptr;
+    IOLockLock(client->ivars->ownerLock);
+    for (ClientMemory *entry = client->ivars->memories; entry; entry = entry->next) {
+        if (entry->type != type) continue;
+        memory = entry->memory;
+        memory->retain();
+        break;
+    }
+    IOLockUnlock(client->ivars->ownerLock);
+    return memory;
+}
+
+// OWNER_RESULT, on the delivery thread: a lookup under the client's lock.
+static kern_return_t owner_result(MacLinuxGPUUserClient *client, IOUserClientMethodArguments *a)
+{
+    const uint64_t token = a->scalarInput[0];
+    OSData *data = nullptr;
+    bool fits = true;
+    IOLockLock(client->ivars->ownerLock);
+    for (OwnerResult **link = &client->ivars->ownerResults; *link; link = &(*link)->next) {
+        if ((*link)->token != token) continue;
+        if ((*link)->data->getLength() > a->structureOutputMaximumSize) {
+            fits = false;  // kept: the caller asks again with room
+            break;
+        }
+        OwnerResult *entry = *link;
+        *link = entry->next;
+        data = entry->data;
+        IOFree(entry, sizeof(*entry));
+        break;
+    }
+    IOLockUnlock(client->ivars->ownerLock);
+    if (!fits) return kIOReturnNoSpace;
+    if (!data) return kIOReturnNotFound;
+    a->structureOutput = data;  // its reference passes to the reply
+    a->scalarOutputCount = 0;
+    return kIOReturnSuccess;
+}
+
+struct OwnerJob {
+    MacLinuxGPUUserClient *client;
+    OSAction *action;
+    uint64_t selector;
+    uint64_t token;
+    uint64_t in[16];
+    uint32_t nin, nout;
+    uint64_t outputMax;
+    OSData *input;                       // a copy of the structure input
+    IOMemoryDescriptor *inputDescriptor; // a large structure input, retained
+};
+
+static void owner_job_free(OwnerJob *job)
+{
+    if (job->input) job->input->release();
+    if (job->inputDescriptor) job->inputDescriptor->release();
+    job->action->release();
+    job->client->release();
+    IOFree(job, sizeof(*job));
+}
+
+// On the owner's queue: the selector as it always ran there, then the
+// completion (session_state.h's layout).
+static void owner_job_main(OwnerJob *job)
+{
+    IOUserClientMethodArguments a{};
+    uint64_t out[MLG_OWNER_ASYNC_WORDS] = {};
+    a.version = kIOUserClientMethodArgumentsCurrentVersion;
+    a.selector = job->selector;
+    a.scalarInput = job->in;
+    a.scalarInputCount = job->nin;
+    a.structureInput = job->input;
+    a.structureInputDescriptor = job->inputDescriptor;
+    a.scalarOutput = out;
+    a.scalarOutputCount = job->nout;
+    a.structureOutputMaximumSize = job->outputMax;
+    a.completion = job->action;
+    const kern_return_t kr = job->client->ExternalMethod(job->selector, &a, nullptr, nullptr,
+                                                         const_cast<uint8_t *>(&kOwnerJob));
+    IOUserClientAsyncArgumentsArray data = {};
+    if (job->selector == MLG_SELECTOR_EVENT_WAIT) {
+        // Started: event_wait_main completes it. Not started: completed
+        // here, in EVENT_WAIT's own layout, with the reason.
+        const bool started = kr == kIOReturnSuccess && a.scalarOutputCount >= 1 &&
+                             (int64_t)out[0] >= 0;
+        if (!started) {
+            data[0] = job->in[0];
+            data[1] = kr == kIOReturnSuccess ? out[0] : (uint64_t)(int64_t)-22; /* EINVAL */
+            data[2] = 2;  // the KFD wait failed
+            job->client->AsyncCompletion(job->action, kIOReturnSuccess, data, MLG_EVENT_WAIT_WORDS);
+        }
+        if (a.structureOutput) a.structureOutput->release();
+        owner_job_free(job);
+        return;
+    }
+    const uint32_t n = kr == kIOReturnSuccess ?
+        (a.scalarOutputCount < MLG_OWNER_ASYNC_SCALARS ? a.scalarOutputCount : MLG_OWNER_ASYNC_SCALARS) : 0;
+    OSData *output = a.structureOutput;
+    data[0] = job->token;
+    data[1] = (uint64_t)(int64_t)kr;
+    data[2] = n;
+    data[3] = output ? output->getLength() : 0;
+    for (uint32_t i = 0; i < n; ++i) data[MLG_OWNER_ASYNC_HEADER + i] = out[i];
+    // In place before the completion, so a fetch that follows finds it.
+    if (output) owner_result_store(job->client, job->token, output);
+    job->client->AsyncCompletion(job->action, kIOReturnSuccess, data, MLG_OWNER_ASYNC_HEADER + n);
+    owner_job_free(job);
+}
+
+// The delivery thread's part of a session call: copy the arguments, queue
+// the call on the owner's queue, return.
+static kern_return_t owner_call(MacLinuxGPUUserClient *client, uint64_t selector,
+                                IOUserClientMethodArguments *a)
+{
+    if (a->scalarInputCount > 16 || (a->scalarInputCount && !a->scalarInput))
+        return kIOReturnBadArgument;
+    auto *job = static_cast<OwnerJob *>(IOMallocZero(sizeof(OwnerJob)));
+    if (!job) return kIOReturnNoMemory;
+    if (a->structureInput && a->structureInput->getLength()) {
+        job->input = OSData::withBytes(a->structureInput->getBytesNoCopy(),
+                                       a->structureInput->getLength());
+        if (!job->input) { IOFree(job, sizeof(*job)); return kIOReturnNoMemory; }
+    }
+    job->client = client;
+    job->action = a->completion;
+    job->selector = selector;
+    job->token = __atomic_add_fetch(&client->ivars->ownerToken, 1, __ATOMIC_ACQ_REL);
+    job->nin = a->scalarInputCount;
+    if (job->nin) memcpy(job->in, a->scalarInput, job->nin * sizeof(uint64_t));
+    // As many scalar outputs as the caller asked for, up to what the
+    // completion carries (EVENT_WAIT: its one status word).
+    job->nout = a->scalarOutputCount < MLG_OWNER_ASYNC_SCALARS ? a->scalarOutputCount
+                                                               : MLG_OWNER_ASYNC_SCALARS;
+    if (selector == MLG_SELECTOR_EVENT_WAIT && job->nout < 1) job->nout = 1;
+    // The caller's structure output room (a descriptor above 4096 bytes):
+    // the output itself comes back through OWNER_RESULT.
+    uint64_t room = a->structureOutputMaximumSize;
+    if (a->structureOutputDescriptor) {
+        uint64_t length = 0;
+        if (a->structureOutputDescriptor->GetLength(&length) == kIOReturnSuccess) room = length;
+    }
+    job->outputMax = room;
+    job->inputDescriptor = a->structureInputDescriptor;
+    client->retain();
+    job->action->retain();
+    if (job->inputDescriptor) job->inputDescriptor->retain();
+    client->ivars->ownerQueue->DispatchAsync(^{ owner_job_main(job); });
+    if (a->scalarOutput && a->scalarOutputCount) {
+        a->scalarOutput[0] = selector == MLG_SELECTOR_EVENT_WAIT ? 0 : job->token;
+        a->scalarOutputCount = 1;
+    }
+    return kIOReturnSuccess;
+}
+
+// The calls that run on the delivery thread (mlg_call_runs_on_delivery):
+// published state, a spinlock, or a client's own result list.
+static kern_return_t direct_call(MacLinuxGPUUserClient *client, uint64_t selector,
+                                 IOUserClientMethodArguments *a)
+{
+    const uint64_t *in = a->scalarInput;
+    uint64_t *out = a->scalarOutput;
+    switch (selector) {
+    case MLG_SELECTOR_PING:
+        if (a->scalarInputCount || !out || a->scalarOutputCount < 1) return kIOReturnBadArgument;
+        out[0] = 0xA117AB1Eu;
+        a->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    case MLG_SELECTOR_RUNTIME_BUILD: {
+        // out[0]=magic, out[1]=ABI, out[2]=build when the session serves
+        // compute, out[3] (when asked) the compiled build. Flags only.
+        if (a->scalarInputCount || !out || a->scalarOutputCount < 3) return kIOReturnBadArgument;
+        uint64_t build[4] = {0, 0, 0, 0};
+        if (dext_compute_runtime_build_cached(build) != 0) return kIOReturnError;
+        if (s_sessionClosing) build[2] = 0;
+        const uint32_t words = a->scalarOutputCount >= 4 ? 4 : 3;
+        for (uint32_t i = 0; i < words; ++i) out[i] = build[i];
+        a->scalarOutputCount = words;
+        return kIOReturnSuccess;
+    }
+    case MLG_SELECTOR_OWNER_RESULT:
+        return owner_result(client, a);
+    case MLG_SELECTOR_POWER:
+        if (in[0] == MLG_POWER_OP_WAIT) {
+            if (a->scalarInputCount != 2 || !a->completion) return kIOReturnBadArgument;
+            return power_wait(client, a->completion, in[1]);
+        }
+        if (a->scalarInputCount != 1 || !out || a->scalarOutputCount < MLG_POWER_STATE_WORDS)
+            return kIOReturnBadArgument;
+        power_snapshot(out);
+        a->scalarOutputCount = MLG_POWER_STATE_WORDS;
+        return kIOReturnSuccess;
+    case MLG_SELECTOR_QUERY_INFO:
+        if (in[0] == DEXT_COMPUTE_QUERY_KERNEL_LOG) {
+            if (!out || a->scalarOutputCount < 4) return kIOReturnBadArgument;
+            uint64_t cursor = in[1], end = 0;
+            uint8_t text[104] = {};
+            const uint32_t words = a->scalarOutputCount < 16 ? a->scalarOutputCount : 16;
+            const size_t copied = klog_read(&cursor, (char *)text,
+                                             (words - 3) * sizeof(uint64_t), &end);
+            memset(out, 0, words * sizeof(uint64_t));
+            out[0] = end; out[1] = cursor; out[2] = copied;
+            memcpy(out + 3, text, copied);
+            a->scalarOutputCount = 3 + (uint32_t)((copied + 7) / 8);
+            return kIOReturnSuccess;
+        }
+        if (in[0] == MLG_QUERY_POWER_STATE) {
+            if (!out || a->scalarOutputCount < MLG_POWER_STATE_WORDS) return kIOReturnBadArgument;
+            power_snapshot(out);
+            a->scalarOutputCount = MLG_POWER_STATE_WORDS;
+            return kIOReturnSuccess;
+        }
+        if (in[0] == DEXT_COMPUTE_QUERY_SESSION_STATE) {
+            if (!out || a->scalarOutputCount < MLG_SESSION_STATE_WORDS) return kIOReturnBadArgument;
+            session_state(out);
+            a->scalarOutputCount = MLG_SESSION_STATE_WORDS;
+            return kIOReturnSuccess;
+        }
+        // DEXT_COMPUTE_QUERY_PROBE_STATUS: probe progress, no MMIO.
+        if (!out || a->scalarOutputCount < 5) return kIOReturnBadArgument;
+        out[0] = s_probeAttempted;
+        out[1] = s_modulesRunning;
+        out[2] = (uint64_t)(int64_t)s_probeResult;
+        out[3] = (uint64_t)dext_pci_transport_fault();
+        out[4] = dext_pci_transport_fault_offset();
+        a->scalarOutputCount = 5;
+        return kIOReturnSuccess;
+    default:
+        return kIOReturnUnsupported;
+    }
+}
+
+// SysfsRead and DrmInfo, bounded (session_state.h): the read on a pool
+// thread, the call waiting at most MLG_BOUNDED_READ_MS for it.
+struct BoundedRead {
+    uint64_t selector;
+    uint64_t in[2];
+    OSData *input;
+    uint64_t outputMax;
+    uint64_t out[MLG_SYSFS_READ_WORDS];
+    uint32_t outCount;
+    kern_return_t result;
+    OSData *output;
+};
+static uint32_t s_boundedReadRunning;
+
+static void bounded_read_free(void *arg)
+{
+    auto *r = static_cast<BoundedRead *>(arg);
+    if (r->input) r->input->release();
+    if (r->output) r->output->release();
+    IOFree(r, sizeof(*r));
+    __atomic_store_n(&s_boundedReadRunning, 0u, __ATOMIC_RELEASE);
+}
+
+static void bounded_read_main(void *arg)
+{
+    auto *r = static_cast<BoundedRead *>(arg);
+    IOUserClientMethodArguments a{};
+    a.version = kIOUserClientMethodArgumentsCurrentVersion;
+    a.selector = r->selector;
+    a.scalarInput = r->in;
+    a.scalarInputCount = 2;
+    a.structureInput = r->input;
+    a.scalarOutput = r->out;
+    a.scalarOutputCount = MLG_SYSFS_READ_WORDS;
+    a.structureOutputMaximumSize = r->outputMax;
+    r->result = r->selector == MLG_SELECTOR_SYSFS_READ ? observer_sysfs_read(&a)
+                                                        : observer_drm_info(&a);
+    r->outCount = a.scalarOutputCount;
+    r->output = a.structureOutput;
+}
+
+static kern_return_t bounded_read(uint64_t selector, IOUserClientMethodArguments *a)
+{
+    if (!a->scalarInput || a->scalarInputCount != 2 || !a->scalarOutput ||
+        a->structureInputDescriptor || a->structureOutputDescriptor)
+        return kIOReturnBadArgument;
+    // One at a time: a read still running past its bound makes the next
+    // one busy rather than piling up threads.
+    if (__atomic_exchange_n(&s_boundedReadRunning, 1u, __ATOMIC_ACQ_REL)) return kIOReturnBusy;
+    auto *r = static_cast<BoundedRead *>(IOMallocZero(sizeof(BoundedRead)));
+    if (!r) {
+        __atomic_store_n(&s_boundedReadRunning, 0u, __ATOMIC_RELEASE);
+        return kIOReturnNoMemory;
+    }
+    r->selector = selector;
+    r->in[0] = a->scalarInput[0];
+    r->in[1] = a->scalarInput[1];
+    r->outputMax = a->structureOutputMaximumSize;
+    if (a->structureInput && a->structureInput->getLength()) {
+        r->input = OSData::withBytes(a->structureInput->getBytesNoCopy(),
+                                     a->structureInput->getLength());
+        if (!r->input) { bounded_read_free(r); return kIOReturnNoMemory; }
+    }
+    const int ran = rt_bounded_run(bounded_read_main, r, bounded_read_free, MLG_BOUNDED_READ_MS);
+    if (ran == -110 /* Linux ETIMEDOUT (rt/bounded.h) */) {
+        MACLINUXGPU_LOG("observer read (selector %llu) still running after %u ms; answered with a timeout",
+                        (unsigned long long)selector, MLG_BOUNDED_READ_MS);
+        return kIOReturnTimeout;
+    }
+    if (ran) {
+        bounded_read_free(r);
+        return kIOReturnNoResources;
+    }
+    const kern_return_t kr = r->result;
+    const uint32_t words = r->outCount < a->scalarOutputCount ? r->outCount : a->scalarOutputCount;
+    for (uint32_t i = 0; i < words; ++i) a->scalarOutput[i] = r->out[i];
+    a->scalarOutputCount = words;
+    a->structureOutput = r->output;  // its reference passes to the reply
+    r->output = nullptr;
+    bounded_read_free(r);
+    return kr;
+}
+
+// A synchronous call of a selector that must be called async: refused,
+// and logged once per client (an old client library or runtime).
+static kern_return_t refuse_sync(MacLinuxGPUUserClient *client, uint64_t selector)
+{
+    if (!client->ivars->syncRefusalLogged) {
+        client->ivars->syncRefusalLogged = true;
+        MACLINUXGPU_EVENT("client %llu: selector %llu called synchronously; it can sleep and must be "
+                          "called async (a client library or runtime older than this driver: "
+                          "rebuild it)", client->ivars->clientID, (unsigned long long)selector);
+    }
+    return kIOReturnNotPermitted;
+}
+
 // A client's last display op result (MacLinuxGPUUserClient_IVars::displayResults).
 struct DisplayResultSlot {
     uint32_t refs;
@@ -3430,6 +3954,7 @@ static kern_return_t display_call(MacLinuxGPUUserClient *client, uint64_t client
     return kIOReturnSuccess;
 }
 
+
 // ----------------------------------------------------------------
 // ExternalMethod — the selector-RPC dispatch.
 //
@@ -3447,47 +3972,37 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                                       void *reference)
 {
     (void)target;
-    (void)reference;
+    (void)dispatch;
     if (!arguments) return kIOReturnBadArgument;
-    if (ivars && ivars->observer && !ivars->onOwnerQueue) {
-        // On the observer's own queue. Only the Linux reads run here; the
-        // rest reads session state, which lives on the owner's queue.
-        if (ivars->stopping) return kIOReturnNotAttached;
-        if (!mlg_observer_selector_allowed(selector, arguments->scalarInput,
-                                           arguments->scalarInputCount))
-            return kIOReturnNotPermitted;
-        if (selector == MLG_SELECTOR_SYSFS_READ) return observer_sysfs_read(arguments);
-        if (selector == MLG_SELECTOR_DRM_INFO) return observer_drm_info(arguments);
-        if (selector == MLG_SELECTOR_DRM_SELFTEST) return observer_drm_selftest(arguments);
-        if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
-        __block kern_return_t result = kIOReturnNotAttached;
-        ivars->onOwnerQueue = true;
-        ivars->ownerQueue->DispatchSync(^{
-            result = ExternalMethod(selector, arguments, dispatch, target, reference);
-        });
-        ivars->onOwnerQueue = false;
-        return result;
+    if (reference != &kOwnerJob) {
+        // From a client, on the delivery thread every client's calls share:
+        // nothing here may sleep or wait for the owner's queue.
+        if (!ivars || ivars->stopping) return kIOReturnNotAttached;
+        const uint64_t *in = arguments->scalarInput;
+        const uint32_t nin = arguments->scalarInputCount;
+        if (ivars->observer) {
+            if (!mlg_observer_selector_allowed(selector, in, nin))
+                return kIOReturnNotPermitted;
+            if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
+                return bounded_read(selector, arguments);
+            if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
+        } else if (ivars->linuxFile) {
+            // Its process's system calls, the GPU's initialization (with the
+            // host window it needs) and the cached queries.
+            if (selector >= MLG_SELECTOR_LX_FIRST && selector <= MLG_SELECTOR_LX_LAST)
+                return lx_external_method(this, selector, arguments);
+            if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
+                selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice &&
+                selector != kMacAMDGPUMethodHostWindow && selector != MLG_SELECTOR_OWNER_RESULT)
+                return kIOReturnUnsupported;
+        }
+        if (mlg_call_runs_on_delivery(selector, in, nin))
+            return direct_call(this, selector, arguments);
+        if (selector == MLG_SELECTOR_OWNER_RESULT) return kIOReturnBadArgument;
+        if (!arguments->completion) return refuse_sync(this, selector);
+        return owner_call(this, selector, arguments);
     }
-    if (ivars && ivars->linuxFile && !ivars->onOwnerQueue) {
-        // On the client's own queue: its process's system calls run here;
-        // device initialization and cached queries on the owner's queue.
-        // HostWindow comes with InitDevice: the probe maps the GART at the
-        // host window the client placed (libmlg_drm/src/mlg_init.c).
-        if (ivars->stopping) return kIOReturnNotAttached;
-        if (selector >= MLG_SELECTOR_LX_FIRST && selector <= MLG_SELECTOR_LX_LAST)
-            return lx_external_method(this, selector, arguments);
-        if (selector != kMacAMDGPUMethodPing && selector != kMacAMDGPUMethodRuntimeBuild &&
-            selector != kMacAMDGPUMethodQueryInfo && selector != kMacAMDGPUMethodInitDevice &&
-            selector != kMacAMDGPUMethodHostWindow)
-            return kIOReturnUnsupported;
-        __block kern_return_t result = kIOReturnNotAttached;
-        ivars->onOwnerQueue = true;
-        ivars->ownerQueue->DispatchSync(^{
-            result = ExternalMethod(selector, arguments, dispatch, target, reference);
-        });
-        ivars->onOwnerQueue = false;
-        return result;
-    }
+    // On the owner's queue (owner_job_main): the session call itself.
     if (!ivars || ivars->stopping || ivars->ownerDriver != s_driver ||
         (s_stopping && !ivars->observer))
         return kIOReturnNotAttached;
@@ -3895,6 +4410,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (arguments->scalarInput == nullptr || arguments->scalarInputCount < 1)
             return kIOReturnBadArgument;
         int r = dext_compute_bo_free(arguments->scalarInput[0]);
+        if (r == 0) client_memory_drop(this, arguments->scalarInput[0]);
         if (r == -ENOENT_L) return kIOReturnBadArgument;
         if (r == -EAGAIN_L || r == -EBUSY_L) return kIOReturnBusy;
         if (r != 0) return kIOReturnError;
@@ -3928,6 +4444,7 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutput[0] = out[0];
         if (arguments->scalarOutputCount >= 2) arguments->scalarOutput[1] = out[1];
         if (arguments->scalarOutputCount > 2) arguments->scalarOutputCount = 2;
+        client_memory_stash(this, arguments->scalarInput[0], out[0]);
         return kIOReturnSuccess;
     }
 
@@ -4347,6 +4864,12 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         arguments->scalarOutputCount = 1;
         return kIOReturnSuccess;
     }
+
+    case MLG_SELECTOR_DRM_SELFTEST:
+        // The observer's self-test: GPU work for seconds, so an async call
+        // on this (the owner's) queue.
+        if (!ivars->observer) return kIOReturnUnsupported;
+        return observer_drm_selftest(arguments);
 
     case MLG_SELECTOR_RETIRE: {
         // Hand the GPU to a replacement driver (session_state.h). Entitled:

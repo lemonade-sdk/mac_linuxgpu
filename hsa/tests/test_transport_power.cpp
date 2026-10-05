@@ -12,6 +12,8 @@
 #define IOConnectCallMethod test_method
 #define mlg_fw_service_start_connection test_fw_start
 #define mlg_fw_service_stop test_fw_stop
+/* The IOKit calls are replaced: every selector reaches them synchronously. */
+#define MLG_SELECTOR_CALL_TEST_SYNC
 #include "../src/transport_iokit.cpp"
 #include <cassert>
 #include <cstdio>

@@ -3,6 +3,7 @@
 #include "transport_fake.h"
 #include "../abi/amdgpu_vram_accounting.h"
 #include "fw_mailbox_service.h"
+#include "selector_call.h"
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
@@ -25,6 +26,15 @@
 #include <optional>
 #include <string>
 #include <thread>
+
+// A selector as the driver serves it (host/selector_call.h).
+static kern_return_t rpcMethod(io_connect_t port, uint32_t selector, const uint64_t *input,
+                               uint32_t inputs, const void *inputStruct, size_t inputStructSize,
+                               uint64_t *output, uint32_t *outputs, void *outputStruct,
+                               size_t *outputStructSize) {
+    return mlg_selector_call(port, selector, input, inputs, inputStruct, inputStructSize,
+                             output, outputs, outputStruct, outputStructSize);
+}
 
 namespace mac_hsa {
 namespace {
@@ -180,8 +190,8 @@ public:
                       uint64_t *output, uint32_t outputs, uint32_t *rawResult = nullptr,
                       uint32_t *actualCount = nullptr) {
         uint32_t count = outputs;
-        const auto result = IOConnectCallScalarMethod(port, selector, input, inputs,
-                                                      output, &count);
+        const auto result = rpcMethod(port, selector, input, inputs, nullptr, 0,
+                                      output, &count, nullptr, nullptr);
         if (rawResult) *rawResult = uint32_t(result);
         if (actualCount) *actualCount = count;
         if (selector == 60 && (result != KERN_SUCCESS || count != outputs))
@@ -466,7 +476,7 @@ public:
         std::array<uint64_t,5> output{};
         uint32_t count=output.size();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const auto status=IOConnectCallMethod(ownerPort,55,nullptr,0,&request,sizeof(request),
+        const auto status=rpcMethod(ownerPort,55,nullptr,0,&request,sizeof(request),
             output.data(),&count,nullptr,nullptr);
         // Linux-shim contract: kIOReturnNoResources means every queue slot is
         // held (possibly by another client) and the driver refused before
@@ -498,7 +508,7 @@ public:
         std::array<uint64_t, 3> output{};
         uint32_t count = output.size();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const auto status = IOConnectCallMethod(ownerPort, 51, nullptr, 0, &request,
+        const auto status = rpcMethod(ownerPort, 51, nullptr, 0, &request,
             request.version == 1 ? amdgpu::kComputeDispatchV1Bytes : sizeof(request),
             output.data(), &count, nullptr, nullptr);
         // Linux-shim contract (as for 55): kIOReturnNoResources means every
@@ -893,7 +903,7 @@ private:
             const uint64_t input[] = {kCachedKernelLog, cursor};
             std::array<uint64_t, 16> output{};
             uint32_t count = output.size();
-            if (IOConnectCallScalarMethod(ownerPort, 21, input, 2, output.data(), &count) != KERN_SUCCESS ||
+            if (rpcMethod(ownerPort, 21, input, 2, nullptr, 0, output.data(), &count, nullptr, nullptr) != KERN_SUCCESS ||
                 count < 3 || output[2] > (count - 3) * sizeof(uint64_t))
                 return;
             if (chunk == 0) {
@@ -1112,7 +1122,8 @@ private:
             // Close can finish teardown. No diagnostic claims PCI or retries init.
             if (ownerPort) dumpCachedShimDiagnostics(
                 [this](const uint64_t *input, uint32_t inputs, uint64_t *output, uint32_t *outputs) {
-                    return uint32_t(IOConnectCallScalarMethod(ownerPort, 21, input, inputs, output, outputs));
+                    return uint32_t(rpcMethod(ownerPort, 21, input, inputs, nullptr, 0, output, outputs,
+                                              nullptr, nullptr));
                 }, emit);
             (void)std::fflush(stderr);
             const auto closed=IOServiceClose(ownerPort);
@@ -1302,7 +1313,7 @@ private:
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                 } else {
                     size_t returned = span;
-                    const auto result = IOConnectCallMethod(ownerPort, 50, io.data(), 3, nullptr, 0,
+                    const auto result = rpcMethod(ownerPort, 50, io.data(), 3, nullptr, 0,
                                                             nullptr, nullptr, chunk, &returned);
                     if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
                     if (result != KERN_SUCCESS || returned != span) { state = State::Faulted; return HSA_STATUS_ERROR; }
@@ -1313,7 +1324,7 @@ private:
                 if (mapped) {
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                 } else {
-                    const auto result = IOConnectCallMethod(ownerPort, 49, io.data(), 3, chunk, span,
+                    const auto result = rpcMethod(ownerPort, 49, io.data(), 3, chunk, span,
                                                             nullptr, nullptr, nullptr, nullptr);
                     if (result == kIOReturnOffline) return kDeviceSuspendedStatus;
                     if (result != KERN_SUCCESS) { state = State::Faulted; return HSA_STATUS_ERROR; }

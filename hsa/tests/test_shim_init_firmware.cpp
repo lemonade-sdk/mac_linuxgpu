@@ -17,6 +17,8 @@
 #define IOConnectUnmapMemory64 test_unmap_memory
 #define mach_vm_map test_vm_map
 #define mach_vm_deallocate test_vm_deallocate
+/* The IOKit calls are replaced: every selector reaches them synchronously. */
+#define MLG_SELECTOR_CALL_TEST_SYNC
 #include "../src/transport_iokit.cpp"
 #include "fw/fw_mailbox.h"
 #include "../../linuxu/headers/rt/fw_mailbox.h"

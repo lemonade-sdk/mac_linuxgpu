@@ -82,7 +82,11 @@ struct IOPCIDevice : IOService {};
 struct IODispatchQueue {
     using Block = void (^)(void);
     std::deque<Block> pending;
+    // The owner's queue as a client's Stop sees it: nothing else is queued
+    // there in these scenarios, so its block runs at once.
+    bool runsAtOnce = false;
     void DispatchAsync(Block block) {
+        if (runsAtOnce) { block(); return; }
         assert(irqDrained);
         events.push_back("enqueue_finish");
         pending.push_back(Block_copy(block));
@@ -100,6 +104,8 @@ struct IOUserClientMethodArguments {
     uint32_t scalarOutputCount = 2;
 };
 struct MacLinuxGPUUserClient_IVars;
+struct IOLock;
+static IODispatchQueue s_ownerQueueAtOnce{{}, true};
 struct MacLinuxGPU : IOService {
     void FinishSession();
     void FinishStop(IOService *provider);
@@ -197,6 +203,7 @@ static void power_before_removal() { ++powerRemovalHooks; }
 static unsigned displayUnpublishes;
 static void displays_unpublish(MacLinuxGPU *) { ++displayUnpublishes; }
 
+static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provider);
 #include "session_shutdown_production.inc"
 
 // An observer read in flight when the session closes: the close waits, and
@@ -403,12 +410,14 @@ struct Fixture {
             clients[i].ivars = &ivars[i];
             ivars[i].ownerDriver = &driver; ivars[i].stopProvider = &driver;
             ivars[i].clientID = i + 1; ivars[i].stopping = true;
+            ivars[i].ownerQueue = &s_ownerQueueAtOnce;
             ivars[i].nextStopping = i ? nullptr : &clients[1];
             driver.retain(); driver.retain(); clients[i].retain();
         }
         s_stoppingClients = &clients[0];
         observer.ivars = &ivars[2];
         ivars[2].ownerDriver = &driver; ivars[2].clientID = 3;
+        ivars[2].ownerQueue = &s_ownerQueueAtOnce;
         retainedDriver = driver.references; retainedProvider = provider.references;
     }
     void deliverIRQDrain() {
@@ -583,9 +592,48 @@ static void checkObserverPolicy() {
     assert(!mlg_sysfs_path_copy(path, tooLong.c_str(), tooLong.size(), false));
     for (uint64_t selector = 1; selector < 128; ++selector) {
         if (selector == MLG_SELECTOR_QUERY_INFO || selector == MLG_SELECTOR_RUNTIME_BUILD ||
-            selector == MLG_SELECTOR_RELEASE_QUARANTINE) continue;
+            selector == MLG_SELECTOR_RELEASE_QUARANTINE || selector == MLG_SELECTOR_OWNER_RESULT)
+            continue;
         assert(!mlg_observer_selector_allowed(selector, probe, 1));
     }
+    // OWNER_RESULT names the call's token, never 0.
+    const uint64_t token[] = {5}, noToken[] = {0};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_OWNER_RESULT, token, 1));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_OWNER_RESULT, noToken, 1));
+
+    // What runs on the delivery thread (session_state.h): cached state,
+    // the power query and wait, the result fetch; nothing else.
+    const uint64_t klog[] = {MLG_QUERY_KERNEL_LOG, 0}, qSession[] = {MLG_QUERY_SESSION_STATE},
+                   qPower[] = {MLG_QUERY_POWER_STATE}, probeStatus[] = {MLG_QUERY_PROBE_STATUS},
+                   computeTag[] = {10}, powerQuery[] = {MLG_POWER_OP_QUERY},
+                   powerWait[] = {MLG_POWER_OP_WAIT, 1}, powerPrepare[] = {MLG_POWER_OP_PREPARE};
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_PING, nullptr, 0));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_RUNTIME_BUILD, nullptr, 0));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, klog, 2));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, qSession, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, qPower, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, probeStatus, 1));
+    assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, computeTag, 1));
+    assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, klog, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_POWER, powerQuery, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_POWER, powerWait, 2));
+    assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_POWER, powerPrepare, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, token, 1));
+    assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, noToken, 1));
+    for (uint64_t selector : {1ull, 2ull, 6ull, 9ull, 16ull, 17ull, 36ull, 49ull, 50ull, 51ull, 54ull,
+                              55ull, 56ull, 57ull, 58ull, 59ull, 61ull, 82ull, 85ull, 86ull, 87ull})
+        assert(!mlg_call_runs_on_delivery(selector, probe, 1) &&
+               !mlg_call_is_synchronous(selector, probe, 1));
+    // The bounded reads and the display's PRESENT and RESULT stay
+    // synchronous; its other ops are async.
+    const uint64_t present[] = {MLG_DISPLAY_OP_PRESENT, 0, MLG_DISPLAY_CONFIRM},
+                   result[] = {MLG_DISPLAY_OP_RESULT, 1, MLG_DISPLAY_CONFIRM},
+                   output[] = {MLG_DISPLAY_OP_OUTPUT, 1, MLG_DISPLAY_CONFIRM};
+    assert(mlg_call_is_synchronous(MLG_SELECTOR_SYSFS_READ, probe, 1));
+    assert(mlg_call_is_synchronous(MLG_SELECTOR_DRM_INFO, probe, 1));
+    assert(mlg_call_is_synchronous(MLG_SELECTOR_DISPLAY, present, 3));
+    assert(mlg_call_is_synchronous(MLG_SELECTOR_DISPLAY, result, 3));
+    assert(!mlg_call_is_synchronous(MLG_SELECTOR_DISPLAY, output, 3));
 }
 
 // Successful probe and compute start, then the only client exits without
@@ -602,8 +650,8 @@ static void clientExitReopen(bool queueExhausted) {
     s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
     bar0Aliases = 1;
     client.ivars = &clientIvars;
-    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
-                   false, nullptr, nullptr, 0, nullptr};
+    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held. The runtime refused it before
     // any allocation (or the driver did, with -ENOSPC before reserving), so
@@ -638,8 +686,8 @@ static void clientExitReopen(bool queueExhausted) {
     expectLog("session closed after upstream removal, interrupt drain and endpoint isolation");
     // The dext is reusable: a new client opens a new PCI session.
     next.ivars = &nextIvars;
-    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
-                 false, nullptr, nullptr, 0, nullptr};
+    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 1 && saw("pci_open"));
@@ -667,8 +715,8 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     s_irqReady = s_irqDeliver = s_pciOpen = true; s_token = 7;
     bar0Aliases = 1;
     client.ivars = &clientIvars;
-    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, nullptr, false,
-                   false, nullptr, nullptr, 0, nullptr};
+    clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
@@ -757,8 +805,8 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     // The replugged device: a new client opens a new session.
     devicePresent = true;
     next.ivars = &nextIvars;
-    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, nullptr, false,
-                 false, nullptr, nullptr, 0, nullptr};
+    nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));
@@ -798,6 +846,7 @@ struct UpgradeRig {
         // An idle observer (a monitor, the installer): never a participant.
         observer.ivars = &observerIvars;
         observerIvars.ownerDriver = &driver; observerIvars.clientID = 3; observerIvars.observer = true;
+        observerIvars.ownerQueue = &s_ownerQueueAtOnce;
         driver.retain();
         if (session) {
             s_rtDevice = &device; s_modulesRunning = true; s_probeAttempted = true;
@@ -805,6 +854,7 @@ struct UpgradeRig {
             bar0Aliases = 1;
             client.ivars = &clientIvars;
             clientIvars.ownerDriver = &driver; clientIvars.clientID = 1;
+            clientIvars.ownerQueue = &s_ownerQueueAtOnce;
             clientIvars.sessionGeneration = s_sessionGeneration;
             driver.retain(); s_participants = 1;
         } else {
@@ -813,6 +863,7 @@ struct UpgradeRig {
         }
         next.ivars = &nextIvars;
         nextIvars.ownerDriver = &driver; nextIvars.clientID = 2;
+        nextIvars.ownerQueue = &s_ownerQueueAtOnce;
     }
     void deliverIRQDrain() {
         assert(irqCompletion);

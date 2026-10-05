@@ -58,6 +58,8 @@ endif()
 add_library(hsa-runtime64 ${HSA_RUNTIME_LIBRARY_TYPE} ${HSA_RUNTIME_SOURCES} ${FW_SERVICER_SOURCES})
 target_compile_definitions(hsa-runtime64 PRIVATE HSA_EXPORT)
 target_include_directories(hsa-runtime64 PUBLIC include third_party/hsa/include)
+# host/selector_call.h (async session calls, with the driver's selector
+# rules from dext/sources/session_state.h) is shared with the host app.
 target_include_directories(hsa-runtime64 PRIVATE ${FW_SERVICER_DIR})
 target_compile_options(hsa-runtime64 PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(hsa-runtime64 PRIVATE "-framework IOKit" "-framework CoreFoundation")

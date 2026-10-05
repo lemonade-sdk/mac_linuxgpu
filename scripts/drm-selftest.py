@@ -31,6 +31,9 @@ import os
 import struct
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mlg_owner_call import OwnerCall  # noqa: E402
+
 SESSION_CLIENT, OBSERVER_CLIENT = 0, 1
 RUNTIME_BUILD, INIT_DEVICE, HOST_WINDOW = 43, 9, 54
 DRM_SELFTEST = 82              # dext/sources/session_state.h MLG_SELECTOR_DRM_SELFTEST
@@ -160,6 +163,9 @@ def connect(init=False):
         io.IOObjectRelease(service)
     if result:
         raise DriverError(f"observer open failed: {result & 0xffffffff:#x}")
+    # Every selector that can sleep is an async session call (session_state.h).
+    owner = OwnerCall(session.value) if init else None
+    observer = OwnerCall(port.value)
     if init:
         build = (c.c_uint64 * 3)()
         count = c.c_uint(3)
@@ -169,11 +175,8 @@ def connect(init=False):
             # Place the host window before the probe, as the HSA runtime does:
             # query the GART aperture size, reserve that much address space
             # aligned to its size, and hand the base to the driver.
-            window = (c.c_uint64 * 3)()
-            count = c.c_uint(3)
-            query = (c.c_uint64 * 1)(0)
-            result = io.IOConnectCallScalarMethod(session, HOST_WINDOW, query, 1, window, c.byref(count))
-            size = window[1]
+            result, window, _ = owner(HOST_WINDOW, [0], outputs=3)
+            size = window[1] if len(window) > 1 else 0
             if not result and size and not size & (size - 1):
                 system.mmap.argtypes = [c.c_void_p, c.c_size_t, c.c_int, c.c_int, c.c_int, c.c_long]
                 system.mmap.restype = c.c_void_p
@@ -182,12 +185,9 @@ def connect(init=False):
                 if raw and raw != c.c_void_p(-1).value:
                     reservation = (raw, size * 2)
                     base = (raw + size - 1) & ~(size - 1)
-                    count = c.c_uint(3)
-                    request = (c.c_uint64 * 1)(base)
-                    result = io.IOConnectCallScalarMethod(session, HOST_WINDOW, request, 1, window, c.byref(count))
+                    result, window, _ = owner(HOST_WINDOW, [base], outputs=3)
         if not result:
-            count = c.c_uint(0)
-            result = io.IOConnectCallScalarMethod(session, INIT_DEVICE, None, 0, None, c.byref(count))
+            result, _, _ = owner(INIT_DEVICE, [])
         if reservation:
             system.munmap(reservation[0], reservation[1])
         if result:
@@ -197,23 +197,17 @@ def connect(init=False):
                               "(scripts/read-driver-log.py shows why)")
 
     def call(selector, scalars, capacity):
-        inputs = (c.c_uint64 * len(scalars))(*scalars)
-        outputs = (c.c_uint64 * 2)()
-        count = c.c_uint(2)
-        out = c.create_string_buffer(capacity)
-        size = c.c_size_t(capacity)
-        result = io.IOConnectCallMethod(port, selector, inputs, len(scalars), None, 0,
-                                        outputs, c.byref(count), out, c.byref(size))
-        code = result & 0xffffffff
+        # The self-test runs for seconds: an async session call.
+        code, values, blob = observer(selector, scalars, outputs=2, capacity=capacity)
         if code == NOT_READY:
             raise DriverError("not ready: the upstream driver is not running in an open session")
         if code == NOT_PERMITTED:
             raise DriverError("not permitted: this driver predates the CS self-test")
         if code == BUSY:
             raise DriverError("busy: another self-test is running")
-        if result:
+        if code:
             raise DriverError(f"self-test call failed: {code:#x}")
-        return list(outputs[:count.value]), out.raw[:size.value]
+        return values, blob
 
     def close():
         result = io.IOServiceClose(port)
