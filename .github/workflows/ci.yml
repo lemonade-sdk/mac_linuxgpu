@@ -52,7 +52,8 @@ jobs:
         run: brew install ripgrep cmake
 
       - name: Upstream checkouts (cached)
-        uses: actions/cache@v4
+        id: upstream
+        uses: actions/cache/restore@v4
         with:
           path: |
             .git/modules
@@ -62,6 +63,20 @@ jobs:
 
       - name: Bootstrap (pinned Linux, declared patches, locked firmware)
         run: bash scripts/bootstrap.sh
+
+      # Saved as soon as the checkouts exist, not at the end of the job: on a
+      # cache miss the first fetch from github.com takes about 40 minutes on
+      # a runner, and a job that fails or is cancelled later would otherwise
+      # never save it.
+      - name: Save the upstream checkouts
+        if: steps.upstream.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules
+            third_party/linux
+            build/firmware
+          key: ${{ steps.upstream.outputs.cache-primary-key }}
 
       - name: Offline test suite
         run: make -k test
@@ -97,7 +112,8 @@ jobs:
           fi
 
       - name: Upstream checkouts (cached)
-        uses: actions/cache@v4
+        id: upstream
+        uses: actions/cache/restore@v4
         with:
           path: |
             .git/modules
@@ -107,6 +123,20 @@ jobs:
 
       - name: Bootstrap
         run: bash scripts/bootstrap.sh
+
+      # Saved as soon as the checkouts exist, not at the end of the job: on a
+      # cache miss the first fetch from github.com takes about 40 minutes on
+      # a runner, and a job that fails or is cancelled later would otherwise
+      # never save it.
+      - name: Save the upstream checkouts
+        if: steps.upstream.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .git/modules
+            third_party/linux
+            build/firmware
+          key: ${{ steps.upstream.outputs.cache-primary-key }}
 
       - name: Driver library for DriverKit
         run: make lib-dext
