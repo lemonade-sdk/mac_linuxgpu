@@ -121,6 +121,7 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_SELECTOR_EVENT               86u
 #define MLG_SELECTOR_EVENT_WAIT          87u
 #define MLG_SELECTOR_OWNER_RESULT        88u
+#define MLG_SELECTOR_SYSFS_WRITE         89u
 
 /* Calls that never sleep, and every other call.
  *
@@ -295,6 +296,80 @@ static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_c
  *   struct out: return_size bytes of the result
  *   scalar out: [0] 0 or the ioctl's negative Linux errno, sign-extended
  * IOReturn as SysfsRead; NotPermitted for any other query. */
+/* SysfsWrite: an allowlisted write of the amdgpu device's sysfs, run by
+ * upstream's own store() (amdgpu_pm.c), as root's write on Linux. For the
+ * host app's performance controls; an observer client with the
+ * session-release entitlement, synchronous and bounded like SysfsRead.
+ *   scalar in:  [0] MLG_SYSFS_WRITE_* (the attribute), [1] value bytes
+ *   struct in:  the value, 1 to MLG_SYSFS_WRITE_VALUE_MAX bytes, one
+ *               trailing newline allowed:
+ *     PERF_LEVEL     power_dpm_force_performance_level: auto, low, high or
+ *                    profile_peak (the levels a user picks; the others,
+ *                    manual and the profile_min_* and standard ones, are
+ *                    not offered)
+ *     POWER_PROFILE  pp_power_profile_mode: a profile index, 0-99 (the card
+ *                    lists its profiles; custom parameters are not offered)
+ *   scalar out: [0] store()'s result: the bytes taken, or a negative Linux
+ *               errno, sign-extended (EINVAL for a level or profile the
+ *               card refuses, EPERM while the GPU is in reset, ...)
+ * IOReturn: NotPrivileged without the entitlement, NotPermitted for a value
+ * outside the allowlist, NotReady as SysfsRead, Timeout when store() is
+ * still running after MLG_BOUNDED_READ_MS (it may still complete). */
+#define MLG_SYSFS_WRITE_PERF_LEVEL     0u
+#define MLG_SYSFS_WRITE_POWER_PROFILE  1u
+#define MLG_SYSFS_WRITE_ATTRS          2u
+#define MLG_SYSFS_WRITE_VALUE_MAX      32u
+#define MLG_SYSFS_WRITE_WORDS          1u
+
+static inline const char *mlg_sysfs_write_path(uint64_t attr)
+{
+	switch (attr) {
+	case MLG_SYSFS_WRITE_PERF_LEVEL: return "power_dpm_force_performance_level";
+	case MLG_SYSFS_WRITE_POWER_PROFILE: return "pp_power_profile_mode";
+	default: return (const char *)0;
+	}
+}
+
+/* Whether @bytes (@length of them) is a value the allowlist takes for
+ * @attr; copies it, NUL-terminated and without the newline, to @value. */
+static inline bool mlg_sysfs_write_value(uint64_t attr, const char *bytes, size_t length,
+					 char value[MLG_SYSFS_WRITE_VALUE_MAX + 1])
+{
+	static const char *const levels[] = { "auto", "low", "high", "profile_peak" };
+	size_t n = length;
+
+	if (!bytes || !length || length > MLG_SYSFS_WRITE_VALUE_MAX)
+		return false;
+	if (bytes[n - 1] == '\n')
+		--n;
+	if (!n)
+		return false;
+	for (size_t i = 0; i < n; ++i)
+		value[i] = bytes[i];
+	value[n] = '\0';
+	switch (attr) {
+	case MLG_SYSFS_WRITE_PERF_LEVEL:
+		for (size_t i = 0; i < sizeof(levels) / sizeof(levels[0]); ++i) {
+			const char *l = levels[i];
+			size_t j = 0;
+			while (l[j] && j < n && l[j] == value[j])
+				++j;
+			if (!l[j] && j == n)
+				return true;
+		}
+		return false;
+	case MLG_SYSFS_WRITE_POWER_PROFILE:
+		if (n > 2)
+			return false;
+		for (size_t i = 0; i < n; ++i)
+			if (value[i] < '0' || value[i] > '9')
+				return false;
+		return true;
+	default:
+		return false;
+	}
+}
+
 /* DrmSelfTest: the kernel-queue command submission self-test
  * (linuxu/headers/rt/cs_selftest.h) on the GPU, in a Linux process of its
  * own: render node, AMDGPU_INFO, a context, GEM buffers mapped in its own
@@ -539,6 +614,9 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_DRM_INFO:
 		return input && input_count == 2 && input[1] &&
 		       input[1] <= MLG_SYSFS_CHUNK_MAX;
+	case MLG_SELECTOR_SYSFS_WRITE: /* entitlement-checked in the handler */
+		return input && input_count == 2 && input[0] < MLG_SYSFS_WRITE_ATTRS &&
+		       input[1] && input[1] <= MLG_SYSFS_WRITE_VALUE_MAX;
 	case MLG_SELECTOR_DRM_SELFTEST:
 		return input && input_count == 1 && input[0] == MLG_DRM_SELFTEST_CONFIRM;
 	case MLG_SELECTOR_DISPLAY:
@@ -628,7 +706,8 @@ static inline bool mlg_call_is_synchronous(uint64_t selector, const uint64_t *in
 		return true;
 	if (selector >= MLG_CALL_LX_FIRST && selector <= MLG_CALL_LX_LAST)
 		return selector != MLG_CALL_LX_IOCTL_ASYNC && selector != MLG_CALL_LX_CALL_ASYNC;
-	if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
+	if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO ||
+	    selector == MLG_SELECTOR_SYSFS_WRITE)
 		return true;
 	return selector == MLG_SELECTOR_DISPLAY && input && input_count >= 1 &&
 	       (input[0] == MLG_DISPLAY_OP_PRESENT || input[0] == MLG_DISPLAY_OP_RESULT);

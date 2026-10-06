@@ -3307,6 +3307,31 @@ static kern_return_t observer_sysfs_read(IOUserClientMethodArguments *arguments)
     return kIOReturnSuccess;
 }
 
+// SysfsWrite (session_state.h): an allowlisted value, through upstream's
+// store(), on the bounded runner's thread. Admission as for reads.
+static kern_return_t observer_sysfs_write(IOUserClientMethodArguments *arguments)
+{
+    const uint64_t *in = arguments->scalarInput;
+    uint64_t *out = arguments->scalarOutput;
+    const OSData *valueData = arguments->structureInput;
+    char value[MLG_SYSFS_WRITE_VALUE_MAX + 1];
+    if (!in || arguments->scalarInputCount != 2 || !out ||
+        arguments->scalarOutputCount < MLG_SYSFS_WRITE_WORDS || !valueData ||
+        valueData->getLength() != in[1] || !mlg_sysfs_write_path(in[0]))
+        return kIOReturnBadArgument;
+    if (!mlg_sysfs_write_value(in[0], static_cast<const char *>(valueData->getBytesNoCopy()),
+                               valueData->getLength(), value))
+        return kIOReturnNotPermitted;
+    if (!s_observerReads.enter()) return kIOReturnNotReady;
+    const long r = linuxu_sysfs_write(rt_device_kobject(s_rtDevice), mlg_sysfs_write_path(in[0]),
+                                      value, strlen(value));
+    s_observerReads.leave();
+    MACLINUXGPU_LOG("sysfs write: %s = %s -> %ld", mlg_sysfs_write_path(in[0]), value, r);
+    out[0] = (uint64_t)(int64_t)r;
+    arguments->scalarOutputCount = MLG_SYSFS_WRITE_WORDS;
+    return kIOReturnSuccess;
+}
+
 // The render file is opened on first use within a session and closed by
 // close_session before the upstream driver is removed.
 static struct rt_drm_info *observer_drm(int *error)
@@ -4036,8 +4061,9 @@ static void bounded_read_main(void *arg)
     a.scalarOutput = r->out;
     a.scalarOutputCount = MLG_SYSFS_READ_WORDS;
     a.structureOutputMaximumSize = r->outputMax;
-    r->result = r->selector == MLG_SELECTOR_SYSFS_READ ? observer_sysfs_read(&a)
-                                                        : observer_drm_info(&a);
+    r->result = r->selector == MLG_SELECTOR_SYSFS_READ ? observer_sysfs_read(&a) :
+                r->selector == MLG_SELECTOR_SYSFS_WRITE ? observer_sysfs_write(&a) :
+                                                          observer_drm_info(&a);
     r->outCount = a.scalarOutputCount;
     r->output = a.structureOutput;
 }
@@ -4411,6 +4437,18 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                 return kIOReturnNotPermitted;
             if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
                 return bounded_read(selector, arguments);
+            if (selector == MLG_SELECTOR_SYSFS_WRITE) {
+                // The performance controls: the host app, entitled as for
+                // Retire and the quarantine release.
+                OSDictionary *entitlements = nullptr;
+                bool entitled = false;
+                if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
+                    entitled = entitlements->getObject(MLG_SESSION_RELEASE_ENTITLEMENT) == kOSBooleanTrue;
+                    entitlements->release();
+                }
+                if (!entitled) return kIOReturnNotPrivileged;
+                return bounded_read(selector, arguments);
+            }
             if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
         } else if (ivars->linuxFile) {
             // Its session was closed by Disconnect GPU (as for session

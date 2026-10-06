@@ -43,6 +43,13 @@ long linuxu_sysfs_read(struct kobject *root, const char *path, void *buf, size_t
  * attribute callback runs. */
 long linuxu_sysfs_list(struct kobject *root, const char *path, void *buf, size_t count,
                        long long pos, size_t *length);
+/* A write of an attribute file, as a Linux sysfs write: its store() runs
+ * once with @count bytes (less than a page) in a zeroed, NUL-terminated
+ * page. Returns store()'s result (the bytes taken, or its negative errno),
+ * -EACCES for a file without write permission or store operation, or a
+ * binary attribute, -E2BIG for a page or more, and the path errors of
+ * linuxu_sysfs_read. Runs on the caller's thread; may sleep. */
+long linuxu_sysfs_write(struct kobject *root, const char *path, const void *buf, size_t count);
 #ifdef __cplusplus
 }
 #endif

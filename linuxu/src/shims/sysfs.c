@@ -498,6 +498,36 @@ long linuxu_sysfs_read(struct kobject *root, const char *path, void *buf, size_t
     read_done(at.file);
     return result;
 }
+/* fs/sysfs/file.c sysfs_kf_write: one store() of @count bytes, from a
+ * zeroed page so the buffer is NUL-terminated as kernfs makes it. Binary
+ * attributes are not written. */
+long linuxu_sysfs_write(struct kobject *root, const char *path, const void *buf, size_t count)
+{
+    struct sysfs_where at;
+    if (!path || !buf || !count) return -EINVAL;
+    if (count >= PAGE_SIZE) return -E2BIG;
+    pthread_mutex_lock(&sysfs_lock);
+    int error = walk_locked(root, path, &at);
+    if (!error && !at.file) error = -EISDIR;
+    /* kernfs_fop_open: writing needs a write permission bit. */
+    if (!error && (at.file->kind == SYSFS_BIN || !(at.file->mode & 0222))) error = -EACCES;
+    if (!error) ++at.file->active;
+    pthread_mutex_unlock(&sysfs_lock);
+    if (error) return error;
+    const struct sysfs_ops *ops = at.file->kobj->ktype ? at.file->kobj->ktype->sysfs_ops : NULL;
+    ssize_t result = -EACCES;
+    if (ops && ops->store) {
+        char *page = calloc(1, PAGE_SIZE);
+        result = -ENOMEM;
+        if (page) {
+            memcpy(page, buf, count);
+            result = ops->store(at.file->kobj, (struct attribute *)at.file->attr, page, count);
+            free(page);
+        }
+    }
+    read_done(at.file);
+    return result;
+}
 struct sysfs_listing { char type; const char *name; };
 static int listing_order(const void *a, const void *b)
 {

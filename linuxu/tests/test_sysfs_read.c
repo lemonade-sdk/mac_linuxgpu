@@ -67,8 +67,15 @@ static ssize_t overflow_show(struct device *dev, struct device_attribute *attr, 
 	return PAGE_SIZE;	/* bad count: clamped to PAGE_SIZE - 1 */
 }
 static DEVICE_ATTR_RO(overflow);
+static char secret_value[16];
 static ssize_t secret_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t n)
-{ (void)dev; (void)attr; (void)buf; return n; }
+{
+	(void)dev; (void)attr;
+	if (strlen(buf) != n) return -EINVAL;	/* NUL-terminated, as kernfs gives it */
+	if (!strcmp(buf, "refuse")) return -EINVAL;
+	snprintf(secret_value, sizeof(secret_value), "%s", buf);
+	return n;
+}
 static DEVICE_ATTR_WO(secret);
 static struct device_attribute dev_attr_noshow = { .attr = { .name = "noshow", .mode = 0444 } };
 
@@ -317,11 +324,35 @@ static void pci_attributes(void)
 	assert(!linuxu_sysfs_count(NULL));
 }
 
+/* Writes: store() with a NUL-terminated page; its errno comes back. */
+static void writes(void)
+{
+	static struct fixture fx;
+	struct device *dev = &fx.dev;
+
+	device_initialize(dev);
+	dev->release = release_fixture;
+	assert(!dev_set_name(dev, "card1"));
+	assert(!device_add(dev));
+	assert(!device_create_file(dev, &dev_attr_secret) &&
+	       !device_create_file(dev, &dev_attr_gpu_busy_percent));
+	assert(linuxu_sysfs_write(&dev->kobj, "secret", "high", 4) == 4 && !strcmp(secret_value, "high"));
+	assert(linuxu_sysfs_write(&dev->kobj, "secret", "refuse", 6) == -EINVAL);
+	assert(linuxu_sysfs_write(&dev->kobj, "gpu_busy_percent", "1", 1) == -EACCES);	/* read-only */
+	assert(linuxu_sysfs_write(&dev->kobj, "missing", "1", 1) == -ENOENT);
+	assert(linuxu_sysfs_write(&dev->kobj, "secret", "", 0) == -EINVAL);
+	device_remove_file(dev, &dev_attr_secret);
+	device_remove_file(dev, &dev_attr_gpu_busy_percent);
+	device_del(dev);
+	put_device(dev);
+}
+
 int main(void)
 {
+	writes();
 	paths_and_reads();
 	drain();
 	pci_attributes();
-	puts("PASS sysfs: path walk, groups, links, hwmon class directory, show/bin read, errnos, listing, removal drain, PCI attributes and configuration space");
+	puts("PASS sysfs: writes through store(), path walk, groups, links, hwmon class directory, show/bin read, errnos, listing, removal drain, PCI attributes and configuration space");
 	return 0;
 }

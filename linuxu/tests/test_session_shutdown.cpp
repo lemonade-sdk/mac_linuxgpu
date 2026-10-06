@@ -580,6 +580,39 @@ static void checkObserverPolicy() {
     assert(mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, info, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, huge, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, info, 1));
+    // SysfsWrite: an allowlisted attribute and a value size within bounds
+    // (the entitlement and the value are checked in the handler);
+    // synchronous, like the bounded reads.
+    const uint64_t perf[] = {MLG_SYSFS_WRITE_PERF_LEVEL, 4}, profile[] = {MLG_SYSFS_WRITE_POWER_PROFILE, 1};
+    const uint64_t badAttr[] = {MLG_SYSFS_WRITE_ATTRS, 4}, empty[] = {MLG_SYSFS_WRITE_PERF_LEVEL, 0};
+    const uint64_t long_[] = {MLG_SYSFS_WRITE_PERF_LEVEL, MLG_SYSFS_WRITE_VALUE_MAX + 1};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, perf, 2));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, profile, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, badAttr, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, empty, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, long_, 2));
+    assert(!mlg_observer_selector_allowed(MLG_SELECTOR_SYSFS_WRITE, perf, 1));
+    assert(mlg_call_is_synchronous(MLG_SELECTOR_SYSFS_WRITE, perf, 2));
+    assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_SYSFS_WRITE, perf, 2));
+    assert(!strcmp(mlg_sysfs_write_path(MLG_SYSFS_WRITE_PERF_LEVEL), "power_dpm_force_performance_level"));
+    assert(!strcmp(mlg_sysfs_write_path(MLG_SYSFS_WRITE_POWER_PROFILE), "pp_power_profile_mode"));
+    assert(!mlg_sysfs_write_path(MLG_SYSFS_WRITE_ATTRS));
+    {
+        char value[MLG_SYSFS_WRITE_VALUE_MAX + 1];
+        const auto ok = [&](uint64_t attr, const char *v) { return mlg_sysfs_write_value(attr, v, strlen(v), value); };
+        for (const char *level : {"auto", "low", "high", "profile_peak", "high\n"})
+            assert(ok(MLG_SYSFS_WRITE_PERF_LEVEL, level));
+        assert(ok(MLG_SYSFS_WRITE_PERF_LEVEL, "high\n") && !strcmp(value, "high"));
+        for (const char *level : {"manual", "profile_standard", "profile_min_sclk", "hig", "highx",
+                                  "auto\n\n", "\n", "AUTO", "high 1", "peak"})
+            assert(!ok(MLG_SYSFS_WRITE_PERF_LEVEL, level));
+        for (const char *index : {"0", "5", "15", "99", "7\n"})
+            assert(ok(MLG_SYSFS_WRITE_POWER_PROFILE, index));
+        for (const char *index : {"100", "-1", "5 1 2", "a", "", "6 0 1 2 3 4 5 6 7 8"})
+            assert(!ok(MLG_SYSFS_WRITE_POWER_PROFILE, index));
+        assert(!mlg_sysfs_write_value(MLG_SYSFS_WRITE_ATTRS, "1", 1, value));
+        assert(!mlg_sysfs_write_value(MLG_SYSFS_WRITE_PERF_LEVEL, nullptr, 4, value));
+    }
     // Display: an explicit confirmation word, a known op, a pattern only
     // for SHOW.
     const uint64_t displayProbe[] = {MLG_DISPLAY_OP_PROBE, 0, MLG_DISPLAY_CONFIRM};
