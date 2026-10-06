@@ -70,6 +70,9 @@ uint32_t waitSignals(bool all, uint32_t count, hsa_signal_t *handles,
                 std::chrono::steady_clock::now() - start).count());
             if (elapsed >= timeout) return UINT32_MAX;
             if (hint == HSA_WAIT_STATE_ACTIVE) { std::this_thread::yield(); continue; }
+            // A blocked wait polls first, as a single-signal wait does
+            // (signal_wait_policy.h): only past the spin does it sleep.
+            if (elapsed < mac_hsa::signalWaitSpinNs()) { std::this_thread::yield(); continue; }
             // Asleep on the signals still pending: their events in the
             // driver when every one has one (sleepOnSignals).
             std::vector<mac_hsa::Signal *> pending;
