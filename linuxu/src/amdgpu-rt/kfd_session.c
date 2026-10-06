@@ -1666,7 +1666,9 @@ static bool va_in_bo(const struct rt_kfd_bo *bo, uint64_t va, uint64_t bytes)
 	return va >= bo->va && va - bo->va <= bo->size && bytes <= bo->size - (va - bo->va);
 }
 
-/* libhsakmt's fill_cwsr_header for each XCC's save area. */
+/* libhsakmt's fill_cwsr_header for each XCC's save area. The area is in
+ * VRAM, so the header goes through the staging buffer and SDMA; the rest of
+ * the area is zero (KFD clears VRAM before MAP_MEMORY_TO_GPU returns). */
 static int fill_ctx_header(struct rt_kfd_session *s, struct rt_kfd_bo *ctx)
 {
 	const struct rt_kfd_queue_limits *l = &s->limits;
@@ -1683,12 +1685,8 @@ static int fill_ctx_header(struct rt_kfd_session *s, struct rt_kfd_bo *ctx)
 
 		header.debug_offset = (l->xcc_count - i) * l->ctx_save_bytes;
 		header.debug_size = l->debug_bytes * l->xcc_count;
-		r = amdgpu_bo_reserve(ctx->abo, false);
-		if (r)
-			return r;
-		r = cpu_transfer(ctx->abo, (uint64_t)i * l->ctx_save_bytes, &header,
-				 sizeof(header), true);
-		amdgpu_bo_unreserve(ctx->abo);
+		r = bo_host_transfer(s, ctx, (uint64_t)i * l->ctx_save_bytes, &header,
+				     sizeof(header), true);
 		if (r)
 			return r;
 	}
@@ -1759,8 +1757,12 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 	if (s->limits.eop_bytes)
 		r = bo_alloc_locked(s, s->limits.eop_bytes, 0, RT_KFD_VRAM,
 				    RT_KFD_PLACE_PRIVATE, &q->eop);
+	/* The context-save area lives in VRAM, where libhsakmt's SVM save area
+	 * starts (prefetched to the GPU node). In GTT its ~30 MB of host pages
+	 * cost ~6 ms to populate and map at every queue create, ~3 ms to
+	 * release, and a CWSR save would write it across the link. */
 	if (!r)
-		r = bo_alloc_locked(s, s->limits.ctx_area_bytes, 0, RT_KFD_GTT,
+		r = bo_alloc_locked(s, s->limits.ctx_area_bytes, 0, RT_KFD_VRAM,
 				    RT_KFD_PLACE_PRIVATE, &q->ctx);
 	if (!r)
 		r = fill_ctx_header(s, q->ctx);

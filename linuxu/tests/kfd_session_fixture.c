@@ -64,7 +64,6 @@ static struct amdgpu_reset_domain reset_domain;
 static struct drm_minor render_minor = { .index = 128 };
 uint64_t doorbell_bar[TEST_DOORBELL_BYTES / 8];
 static uint8_t *vram;	/* host backing of the fake VRAM */
-static uint64_t vram_next;
 
 /* ---- the command processor: AQL dispatches of MES-added queues ---- */
 /* A queue on an HQD (its index in cp_queues is its pipe * queues-per-pipe +
@@ -372,6 +371,29 @@ static void bo_destroy(struct fake_bo *f)
 	free(f);
 }
 
+/* The lowest @block-aligned offset of @block bytes no live VRAM BO uses
+ * (freed VRAM is reused, as the VRAM manager does); UINT64_MAX when full. */
+static uint64_t vram_first_fit(uint64_t block)
+{
+	for (uint64_t at = 0; at + block <= TEST_VRAM_BYTES; at += block) {
+		bool used = false;
+
+		for (unsigned int i = 0; i < MAX_BOS && !used; ++i) {
+			const struct fake_bo *o = bos[i];
+			uint64_t start, end;
+
+			if (!o || o->bo.tbo.resource != &o->vres.base)
+				continue;
+			start = o->block.header & GPU_BUDDY_HEADER_OFFSET;
+			end = start + ((uint64_t)PAGE_SIZE << (o->block.header & GPU_BUDDY_HEADER_ORDER));
+			used = start < at + block && at < end;
+		}
+		if (!used)
+			return at;
+	}
+	return UINT64_MAX;
+}
+
 /* A BO whose placement is @domain; GTT ones get system pages. */
 static struct fake_bo *bo_create(uint64_t size, uint32_t domain)
 {
@@ -395,17 +417,17 @@ static struct fake_bo *bo_create(uint64_t size, uint32_t domain)
 		unsigned int order = 0;
 		while (((uint64_t)PAGE_SIZE << order) < size)
 			order++;
-		if (ALIGN(vram_next, (uint64_t)PAGE_SIZE << order) + ((uint64_t)PAGE_SIZE << order) >
-		    TEST_VRAM_BYTES) {
+		const uint64_t block = (uint64_t)PAGE_SIZE << order;
+		uint64_t at = vram_first_fit(block);
+
+		if (at == UINT64_MAX) {
 			/* Out of VRAM, as TTM would report. */
 			dma_resv_fini(&f->bo.tbo.base._resv);
 			free(f);
 			return NULL;
 		}
-		vram_next = ALIGN(vram_next, (uint64_t)PAGE_SIZE << order);
-		f->block.header = vram_next | order;
+		f->block.header = at | order;
 		list_add(&f->block.link, &f->vres.blocks);
-		vram_next += (uint64_t)PAGE_SIZE << order;
 		f->bo.tbo.resource = &f->vres.base;
 	} else {
 		f->res.mem_type = domain == AMDGPU_GEM_DOMAIN_DOORBELL ?
