@@ -16,8 +16,12 @@
 namespace mac_hsa {
 class Connection;
 // AMD's 64-byte signal layout (amd_hsa_signal.h). This backing currently
-// uses CPU atomics for host-only signals. GPU-backed signals route all value
-// changes through the GPU atomic domain; CPU access is acquire observation.
+// uses CPU atomics for host-only signals. A GPU-backed signal's word lives in
+// coherent (uncached on the GPU) shared memory: a CPU store reaches it as
+// ROCr's plain store does on Linux, and loads are acquire observation. Its
+// read-modify-writes go through the GPU atomic domain (gpuAtomic): CPU and
+// GPU RMW on one word are not qualified on this platform
+// (synchronization_policy.h).
 struct alignas(64) SignalABI {
     int64_t kind = 1;
     int64_t value = 0;
@@ -68,8 +72,14 @@ struct Signal {
             }
             return result;
         }
+        // A store is no read-modify-write: the CPU writes the coherent word
+        // (the GPU reads it uncached, after the release that orders it
+        // before the doorbell), with no driver call and no GPU work, as on
+        // Linux. A store racing a GPU decrement of the same signal is the
+        // application's race there too; RMWs below stay GPU-mediated.
         void store(int64_t value,std::memory_order order=std::memory_order_seq_cst) const {
-            if (signal.gpuAtomic) gpu(1,value);else host().store(value,order);
+            if (signal.gpuAtomic && !signal.alive.load()) return;
+            host().store(value,order);
         }
         int64_t exchange(int64_t value,std::memory_order order=std::memory_order_seq_cst) const {
             return signal.gpuAtomic ? gpu(7,value) : host().exchange(value,order);
