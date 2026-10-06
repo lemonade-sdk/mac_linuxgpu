@@ -1792,6 +1792,8 @@ static void queue_free_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 static void kick_lock(struct rt_kfd_session *s);
 static void kick_unlock(struct rt_kfd_session *s);
 
+void (*rt_kfd_after_queue_create)(struct amdgpu_device *adev);
+
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out)
 {
@@ -1918,6 +1920,9 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 	linuxu_process_leave(&saved);
 	pthread_mutex_unlock(&s->lock);
 	*out = q;
+	/* MES mapped the queue and compute is active (rt/wptr_poll.h). */
+	if (rt_kfd_after_queue_create)
+		rt_kfd_after_queue_create(s->adev);
 	return 0;
 }
 

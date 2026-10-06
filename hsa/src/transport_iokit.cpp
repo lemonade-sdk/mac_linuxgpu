@@ -616,6 +616,23 @@ public:
         if (state!=State::Ready) return HSA_STATUS_ERROR;
         if (faulted) return kMemoryFaultStatus;
         if (!hardwareQueues.contains(handle) || !handle || packet==UINT64_MAX) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        // The CP write-pointer polling experiment (linuxu/headers/rt/wptr_poll.h):
+        // with MAC_HSA_DOORBELL=poll the command processor reads the write
+        // index itself, and no doorbell is sent. Only when the driver says
+        // it polls; otherwise the queue fails, said once.
+        static const bool pollRequested = [] {
+            const char *mode = std::getenv("MAC_HSA_DOORBELL");
+            return mode && std::strcmp(mode, "poll") == 0;
+        }();
+        if (pollRequested) {
+            if (wptrPoll < 0) wptrPoll = (sessionFlags(service) & MLG_SESSION_FLAG_WPTR_POLL) ? 1 : 0;
+            if (wptrPoll > 0) return HSA_STATUS_SUCCESS;
+            static std::atomic_flag said = ATOMIC_FLAG_INIT;
+            if (!said.test_and_set())
+                std::fprintf(stderr, "mac_hsa: MAC_HSA_DOORBELL=poll, but the driver does not poll queue write "
+                             "pointers (its personality sets no MacLinuxGPUWptrPollPeriod): no doorbell is sent\n");
+            return HSA_STATUS_ERROR;
+        }
         if (syncKickLocked()) {
             // From kSyncKickDriverBuild: the driver rings it on its delivery
             // thread and answers at once, one trip through the driver.
@@ -1096,6 +1113,8 @@ private:
     };
     // Whether the driver rings doorbells synchronously (kSyncKickDriverBuild), asked once.
     int syncKick = -1;
+    // Whether the CP polls write pointers (MAC_HSA_DOORBELL=poll), asked once.
+    int wptrPoll = -1;
     bool syncKickLocked() {
         if (syncKick < 0 && state == State::Ready) {
             std::array<uint64_t,3> build{};

@@ -81,6 +81,7 @@
 #include <rt/lx_files.h>
 #include <rt/lx_timing.h>
 #include <rt/kfd_session.h>
+#include <rt/wptr_poll.h>
 #include <rt/wait_pool.h>
 #include <rt/bounded.h>
 #include <rt/recovery.h>
@@ -717,6 +718,7 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
     if (s_closeWhenIdle) flags |= MLG_SESSION_FLAG_CLOSE_WHEN_IDLE;
+    if (rt_wptr_poll_active()) flags |= MLG_SESSION_FLAG_WPTR_POLL;
     {
         uint64_t reset[MLG_RESET_STATE_WORDS];
         reset_state(reset);
@@ -2025,13 +2027,23 @@ IMPL(MacLinuxGPU, Start)
         OSDictionary *properties = nullptr;
         bool kfdSessions = true;
         bool display = false;
+        uint32_t wptrPoll = 0;
         if (CopyProperties(&properties) == kIOReturnSuccess && properties) {
             if (properties->getObject("MacLinuxGPUKFDSessions") == kOSBooleanFalse)
                 kfdSessions = false;
             if (properties->getObject("MacLinuxGPUDisplay") == kOSBooleanTrue)
                 display = true;
+            // The CP write-pointer polling experiment (rt/wptr_poll.h): off
+            // unless a personality sets a period.
+            if (auto *period = OSDynamicCast(OSNumber, properties->getObject("MacLinuxGPUWptrPollPeriod")))
+                wptrPoll = period->unsigned32BitValue();
             properties->release();
         }
+        rt_wptr_poll_configure(wptrPoll);
+        rt_kfd_after_queue_create = rt_wptr_poll_observe;
+        if (wptrPoll)
+            MACLINUXGPU_EVENT("wptr poll: experiment on (MacLinuxGPUWptrPollPeriod %u): the CP polls queue "
+                              "write pointers once a KFD queue is mapped", wptrPoll);
         dext_compute_set_kfd_policy(kfdSessions);
         MACLINUXGPU_LOG("KFD compute sessions %s", kfdSessions ? "enabled when supported" : "disabled");
         const int displayRet = linuxu_driver_set_display(display ? 1 : 0);

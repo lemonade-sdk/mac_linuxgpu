@@ -43,6 +43,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
 	MLG_SESSION_FLAG_GPU_WEDGED          = 1u << 13, /* recovery failed: power-cycle the GPU */
 	MLG_SESSION_FLAG_CLOSE_WHEN_IDLE     = 1u << 14, /* ShutdownGPU waits: the last client's leaving closes */
+	MLG_SESSION_FLAG_WPTR_POLL           = 1u << 15, /* the CP polls write pointers (rt/wptr_poll.h) */
 };
 
 /* Which close/probe step quarantined the session. */

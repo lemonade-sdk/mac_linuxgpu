@@ -197,6 +197,9 @@ struct rt_kfd_queue_info {
 };
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out);
+/* Called after each queue creation that succeeded, outside the session
+ * lock (the dext sets it: rt_wptr_poll_observe). NULL: nothing. */
+extern void (*rt_kfd_after_queue_create)(struct amdgpu_device *adev);
 int rt_kfd_queue_info(struct rt_kfd_session *s, struct rt_kfd_queue *q,
 		      struct rt_kfd_queue_info *out);
 /* Write @value to the queue's doorbell (64-bit doorbells on SOC15). A

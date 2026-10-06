@@ -197,6 +197,8 @@ static int rt_lx_client_retire(rt_lx_client *, void (*)(void *), void *) { asser
 // the driver runs, after observer admission drained, never in quarantine.
 static bool displayShowing;
 static int rt_display_showing() { return displayShowing; }
+/* The write-pointer polling experiment is off (rt/wptr_poll.h). */
+static bool rt_wptr_poll_active() { return false; }
 static void rt_display_stop();
 // A display agent's imported surfaces are released with the display.
 static unsigned surfacesImported;
