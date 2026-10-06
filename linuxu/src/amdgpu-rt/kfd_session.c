@@ -55,6 +55,13 @@
 #define RT_KFD_EVENT_PAGE_BYTES	((uint64_t)KFD_SIGNAL_EVENT_LIMIT * 8)
 /* GART-mapped staging for SDMA transfers to and from VRAM. */
 #define RT_KFD_STAGING_BYTES	(1ULL << 20)
+/* From this size a copy between system pages and VRAM goes through TTM's
+ * GART windows (bo_sdma_copy); below it through the staging buffer, whose
+ * one SDMA job beats the windows' mapping job plus copy (measured on build
+ * 262: 4 KiB 108 vs 126 us, 64 KiB 121 vs 138 us; 1 MiB 380 vs 282 us). */
+#ifndef RT_KFD_WINDOW_MIN_BYTES
+#define RT_KFD_WINDOW_MIN_BYTES	(256ULL << 10)
+#endif
 #define RT_KFD_LARGE_PAGE	(2ULL << 20)
 /* libhsakmt's priority_map[] entry for HSA_QUEUE_PRIORITY_NORMAL. */
 #define RT_KFD_PRIORITY_NORMAL	7
@@ -1394,7 +1401,7 @@ int rt_kfd_bo_copy(struct rt_kfd_session *s, struct rt_kfd_bo *src,
 	if (!r && sk == ACCESS_VRAM && dk == ACCESS_VRAM) {
 		r = vram_to_vram(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
 		bytes = 0;
-	} else if (!r && (sk == ACCESS_VRAM || dk == ACCESS_VRAM) &&
+	} else if (!r && (sk == ACCESS_VRAM || dk == ACCESS_VRAM) && bytes >= RT_KFD_WINDOW_MIN_BYTES &&
 		   sdma_reachable(src->abo) && sdma_reachable(dst->abo)) {
 		/* System pages and VRAM: SDMA directly, at the link's speed. */
 		r = bo_sdma_copy(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
