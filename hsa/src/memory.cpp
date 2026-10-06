@@ -220,26 +220,35 @@ hsa_status_t copyBytes(void *dst, const void *src, size_t size,
     }
     const auto srcOffset = source ? reinterpret_cast<uintptr_t>(src) - reinterpret_cast<uintptr_t>(source->base) : 0;
     const auto dstOffset = destination ? reinterpret_cast<uintptr_t>(dst) - reinterpret_cast<uintptr_t>(destination->base) : 0;
+    // The driver's copy, in calls of at most its limit. Both buffers stay
+    // retained throughout; the first failure ends the copy (retrying through
+    // another engine cannot prove the first completed).
+    const auto driverCopy = [&](const std::shared_ptr<Connection> &gpu) {
+        const size_t limit = size_t(gpu->maxCopyBytes());
+        for (size_t offset = 0; offset < size;) {
+            const auto bytes = std::min(limit, size - offset);
+            const auto status = gpu->copyBuffers(source->buffer, srcOffset + offset,
+                destination->buffer, dstOffset + offset, bytes);
+            if (status != HSA_STATUS_SUCCESS) return status;
+            offset += bytes;
+        }
+        return HSA_STATUS_SUCCESS;
+    };
+    // A host end that is a shared buffer of the same device is system memory
+    // the GPU already maps: the driver copies between it and the device
+    // buffer itself (SDMA), with no CPU copy through a staging buffer.
+    const auto shared = [](const std::shared_ptr<Allocation> &a, const std::shared_ptr<Connection> &gpu) {
+        return a && a->shared.host && a->connection == gpu && a->buffer.handle;
+    };
+    if (srcGPU && !dstGPU && shared(destination, srcGPU)) return driverCopy(srcGPU);
+    if (dstGPU && !srcGPU && shared(source, dstGPU)) return driverCopy(dstGPU);
     if (srcGPU && !dstGPU) return srcGPU->readBuffer(source->buffer, srcOffset, dst, size);
     if (!srcGPU) return dstGPU->writeBuffer(destination->buffer, dstOffset, src, size);
     if (srcGPU == dstGPU) {
         if (src == dst) return HSA_STATUS_SUCCESS;
         const bool overlap = source->buffer.handle == destination->buffer.handle &&
             srcOffset < dstOffset + size && dstOffset < srcOffset + size;
-        if (!overlap) {
-            // The bounded driver copy RPC accepts at most 4 MiB. Keep both BOs
-            // retained throughout all chunks and propagate the first failure;
-            // retrying through another engine cannot prove the first completed.
-            constexpr size_t maxCopy = 4 * 1024 * 1024;
-            for (size_t offset = 0; offset < size;) {
-                const auto bytes = std::min(maxCopy, size - offset);
-                const auto status = srcGPU->copyBuffers(source->buffer, srcOffset + offset,
-                    destination->buffer, dstOffset + offset, bytes);
-                if (status != HSA_STATUS_SUCCESS) return status;
-                offset += bytes;
-            }
-            return HSA_STATUS_SUCCESS;
-        }
+        if (!overlap) return driverCopy(srcGPU);
     }
     std::array<uint8_t, 4096> staging;
     const bool backwards = srcGPU == dstGPU && source->buffer.handle == destination->buffer.handle &&

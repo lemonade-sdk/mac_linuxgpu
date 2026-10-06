@@ -32,6 +32,11 @@ constexpr uint64_t kQueueFaultDriverBuild=256;
 // marks the connection's code pending, and one sync runs before the next
 // doorbell of its queues (flushPendingCodeSync).
 constexpr uint64_t kCodeSyncDriverBuild=258;
+// First driver build whose BOCopy (selector 48) copies between system pages
+// and VRAM by SDMA through TTM's GART windows, with no CPU copy, and takes up
+// to kWindowedCopyBytes in one call (kLegacyCopyBytes before).
+constexpr uint64_t kWindowedCopyDriverBuild=262;
+constexpr uint64_t kLegacyCopyBytes=4ull<<20, kWindowedCopyBytes=16ull<<20;
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.
@@ -279,6 +284,8 @@ public:
     virtual hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t copyBuffers(const DeviceBuffer &, uint64_t, const DeviceBuffer &, uint64_t, size_t) { return HSA_STATUS_ERROR; }
+    // The most copyBuffers takes in one call.
+    virtual uint64_t maxCopyBytes() { return kLegacyCopyBytes; }
     virtual hsa_status_t exportBuffer(const DeviceBuffer &, BufferToken &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t importBuffer(const BufferToken &, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     // Device power (power.h): the driver's power snapshot, and a request

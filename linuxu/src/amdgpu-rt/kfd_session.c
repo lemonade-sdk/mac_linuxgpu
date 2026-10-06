@@ -1143,19 +1143,13 @@ static int cpu_transfer(struct amdgpu_bo *abo, uint64_t offset, void *buf,
 	return 0;
 }
 
-static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint64_t bytes)
+/* Waits for a session copy's last @fence (@r its submission's result). A
+ * copy that failed or outlived RT_KFD_COPY_TIMEOUT_MS may still run: the
+ * buffers it names (and the staging) stay retained until its fence signals
+ * (settle_copy_locked). Copies on one ring complete in order, so the latest
+ * covers every earlier one. Caller holds s->lock. Drops @fence. */
+static int copy_wait(struct rt_kfd_session *s, struct dma_fence *fence, int r, uint64_t bytes)
 {
-	struct amdgpu_device *adev = s->adev;
-	struct dma_fence *fence = NULL;
-	int r;
-
-	if (!adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
-	    !adev->mman.buffer_funcs_ring->sched.ready)
-		return -ENODEV;
-	mutex_lock(&adev->mman.default_entity.lock);
-	r = amdgpu_copy_buffer(adev, &adev->mman.default_entity, src, dst,
-			       (uint32_t)bytes, NULL, &fence, false, 0);
-	mutex_unlock(&adev->mman.default_entity.lock);
 	if (!r && !fence)
 		r = -EIO;
 	if (!r) {
@@ -1167,9 +1161,6 @@ static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint6
 		r = r > 0 ? 0 : (r == 0 ? -EIO : r);
 	}
 	if (r && fence) {
-		/* The copy may still run: staging and the BO stay retained until
-		 * its fence signals (settle_copy_locked). Copies on the entity
-		 * complete in order, so the latest one covers every earlier one. */
 		pr_err("kfd session %d: SDMA copy of %llu bytes did not complete (%d); "
 		       "keeping the staging and the buffer\n", session_pid(s),
 		       (unsigned long long)bytes, r);
@@ -1180,6 +1171,67 @@ static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint6
 	}
 	dma_fence_put(fence);
 	return r;
+}
+
+static bool copy_engine_ready(struct amdgpu_device *adev)
+{
+	return adev->mman.buffer_funcs_enabled && adev->mman.buffer_funcs_ring &&
+	       adev->mman.buffer_funcs_ring->sched.ready;
+}
+
+static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint64_t bytes)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct dma_fence *fence = NULL;
+	int r;
+
+	if (!copy_engine_ready(adev))
+		return -ENODEV;
+	mutex_lock(&adev->mman.default_entity.lock);
+	r = amdgpu_copy_buffer(adev, &adev->mman.default_entity, src, dst,
+			       (uint32_t)bytes, NULL, &fence, false, 0);
+	mutex_unlock(&adev->mman.default_entity.lock);
+	return copy_wait(s, fence, r, bytes);
+}
+
+/* Whether SDMA reaches @abo's pages through TTM (amdgpu_ttm_copy_mem_to_mem):
+ * VRAM, or system pages in GTT with their DMA addresses, which TTM maps
+ * through a GART window. */
+static bool sdma_reachable(struct amdgpu_bo *abo)
+{
+	struct ttm_resource *res = abo->tbo.resource;
+	struct ttm_tt *ttm = abo->tbo.ttm;
+
+	if (!res)
+		return false;
+	if (res->mem_type == TTM_PL_VRAM)
+		return true;
+	return res->mem_type == TTM_PL_TT && ttm && ttm->dma_address &&
+	       ttm_tt_is_populated(ttm);
+}
+
+/* One SDMA copy between two BO ranges, as TTM moves a buffer on Linux
+ * (amdgpu_move_blit): system pages through the move entity's GART windows,
+ * no CPU copy, one fence for the whole range. Caller holds s->lock and both
+ * reservations. */
+static int bo_sdma_copy(struct rt_kfd_session *s, struct amdgpu_bo *src, uint64_t src_offset,
+			struct amdgpu_bo *dst, uint64_t dst_offset, uint64_t bytes)
+{
+	struct amdgpu_device *adev = s->adev;
+	const struct amdgpu_copy_mem from = {
+		.bo = &src->tbo, .mem = src->tbo.resource, .offset = (unsigned long)src_offset,
+	};
+	const struct amdgpu_copy_mem to = {
+		.bo = &dst->tbo, .mem = dst->tbo.resource, .offset = (unsigned long)dst_offset,
+	};
+	struct dma_fence *fence = NULL;
+	int r;
+
+	if (!copy_engine_ready(adev) || !adev->mman.num_move_entities)
+		return -ENODEV;
+	r = amdgpu_ttm_copy_mem_to_mem(adev, &adev->mman.move_entities[0], &from, &to,
+				       bytes, false, NULL, &fence);
+	return copy_wait(s, fence, r, bytes);
 }
 
 /* SDMA between a VRAM BO range and a contiguous MC range, segment by
@@ -1339,9 +1391,16 @@ int rt_kfd_bo_copy(struct rt_kfd_session *s, struct rt_kfd_bo *src,
 	r = bo_access_kind(src->abo, &sk);
 	if (!r)
 		r = bo_access_kind(dst->abo, &dk);
-	if (!r && sk == ACCESS_VRAM && dk == ACCESS_VRAM)
+	if (!r && sk == ACCESS_VRAM && dk == ACCESS_VRAM) {
 		r = vram_to_vram(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
-	while (!r && bytes && !(sk == ACCESS_VRAM && dk == ACCESS_VRAM)) {
+		bytes = 0;
+	} else if (!r && (sk == ACCESS_VRAM || dk == ACCESS_VRAM) &&
+		   sdma_reachable(src->abo) && sdma_reachable(dst->abo)) {
+		/* System pages and VRAM: SDMA directly, at the link's speed. */
+		r = bo_sdma_copy(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
+		bytes = 0;
+	}
+	while (!r && bytes) {
 		uint64_t n = bytes < RT_KFD_STAGING_BYTES ? bytes : RT_KFD_STAGING_BYTES;
 
 		if (sk == ACCESS_CPU && dk == ACCESS_CPU) {

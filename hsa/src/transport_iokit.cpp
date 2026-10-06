@@ -852,7 +852,7 @@ public:
         const DeviceBuffer &destination, uint64_t destinationOffset, size_t bytes) override {
         std::lock_guard lock(sessionMutex);
         if (state != State::Ready) return HSA_STATUS_ERROR;
-        if (!bytes || bytes > 4 * 1024 * 1024 || sourceOffset > source.size || bytes > source.size - sourceOffset ||
+        if (!bytes || bytes > copyLimitLocked() || sourceOffset > source.size || bytes > source.size - sourceOffset ||
             destinationOffset > destination.size || bytes > destination.size - destinationOffset ||
             (source.handle == destination.handle && sourceOffset < destinationOffset + bytes &&
              destinationOffset < sourceOffset + bytes))
@@ -861,6 +861,10 @@ public:
         const auto status = copyRaw(source.handle, sourceOffset, destination.handle, destinationOffset, bytes);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return status;
+    }
+    uint64_t maxCopyBytes() override {
+        std::lock_guard lock(sessionMutex);
+        return copyLimitLocked();
     }
     hsa_status_t exportBuffer(const DeviceBuffer &buffer, BufferToken &token) override {
         std::lock_guard lock(sessionMutex);
@@ -1064,6 +1068,16 @@ private:
         EventWaiter() : port(IONotificationPortCreate(kIOMainPortDefault)) {}
         ~EventWaiter() { if (port) IONotificationPortDestroy(port); }
     };
+    // BOCopy's limit for this driver (kWindowedCopyDriverBuild), asked once.
+    uint64_t copyLimit = 0;
+    uint64_t copyLimitLocked() {
+        if (!copyLimit && state == State::Ready) {
+            std::array<uint64_t,3> build{};
+            if (scalar(43,{},build) == HSA_STATUS_SUCCESS)
+                copyLimit = linuxShim && build[2] >= kWindowedCopyDriverBuild ? kWindowedCopyBytes : kLegacyCopyBytes;
+        }
+        return copyLimit ? copyLimit : kLegacyCopyBytes;
+    }
     // Doorbells sent and not yet answered (kickQueue), oldest first: the
     // session queue answers them in order. Drained under sessionMutex.
     struct SentKick { uint64_t token, handle, packet; };

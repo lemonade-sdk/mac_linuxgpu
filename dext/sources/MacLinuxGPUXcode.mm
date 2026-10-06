@@ -5218,9 +5218,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodBOCopy: {
+        // Up to 16 MiB a call (the HSA runtime's kWindowedCopyBytes from
+        // build 262): between system pages and VRAM one SDMA copy through
+        // TTM's GART windows (rt_kfd_bo_copy), a few milliseconds of the
+        // session queue at the link's speed.
         if (!in || arguments->scalarInputCount != 5 || !out ||
             arguments->scalarOutputCount < 1 || in[4] == 0 ||
-            in[4] > 4 * 1024 * 1024 || arguments->structureInput ||
+            in[4] > 16 * 1024 * 1024 || arguments->structureInput ||
             arguments->structureInputDescriptor || arguments->structureOutputDescriptor)
             return kIOReturnBadArgument;
         int r = dext_compute_bo_copy(in[0], in[2], in[1], in[3], (uint32_t)in[4]);

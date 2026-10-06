@@ -11,11 +11,14 @@
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 258u /* 192: KFD compute sessions, QueryInfo tag 12;
+#define DEXT_RUNTIME_BUILD 262u /* 192: KFD compute sessions, QueryInfo tag 12;
                                    243: session calls are async (session_state.h);
                                    256: AQLQueueService reports a GPU memory fault
                                    (kIOReturnVMError, flags and address);
-                                   258: CodeSync (90) */
+                                   258: CodeSync (90);
+                                   262: BOCopy (48) takes up to 16 MiB, and copies
+                                   between system pages and VRAM by SDMA through
+                                   TTM's GART windows */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u
