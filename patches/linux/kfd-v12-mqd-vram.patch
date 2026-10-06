@@ -1,0 +1,93 @@
+drm/amdkfd: place GFX12 compute queue MQDs in CPU-visible VRAM
+
+KFD sub-allocates every user compute queue's MQD from its GTT pool.
+The command processor accesses the MQD while the queue runs, and a
+dispatch that fills a shader engine exactly (no workgroup left
+waiting) is retired only after such accesses. With the MQD in host
+memory that dispatch pays the host-link latency: +45 us per dispatch
+behind Thunderbolt on an R9700, against ~+12 us with the MQD in VRAM.
+
+amdgpu already keeps its kernel compute queue MQDs in VRAM on GFX10+,
+and KFD does so for GFX 9.4.3 (mqd_on_vram, with an HDP flush after
+CPU writes). Do the same for GFX12 compute queues on a dGPU, through
+amdgpu_bo_create_kernel() so the BO lands in the CPU-visible window
+(the CPU writes the MQD; with a 256 MiB BAR a top-down VRAM BO would
+be outside it), and flush HDP at the end of update_mqd(), which
+init_mqd() also ends with.
+
+diff --git a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c
+index b3e122d..2480747 100644
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c
+@@ -92,6 +92,50 @@ static struct kfd_mem_obj *allocate_mqd(struct mqd_manager *mm,
+ 	return mqd_mem_obj;
+ }
+ 
++/*
++ * Compute user-queue MQDs live in VRAM on a dGPU, as amdgpu's own kernel
++ * compute queue MQDs do on GFX10+ (amdgpu_gfx_mqd_sw_init) and KFD's do on
++ * GFX 9.4.3 (mqd_on_vram in kfd_mqd_manager_v9.c). The command processor
++ * reads and writes the MQD while it runs the queue; in GTT every such access
++ * crosses the host link. A dispatch that fills a shader engine exactly, with
++ * no workgroup left waiting, is retired by the CP through a path that does a
++ * round of MQD accesses, so with a GTT MQD that dispatch pays the link
++ * latency: ~45 us extra behind Thunderbolt, ~12 us with the MQD in VRAM.
++ * The MQD is written by the CPU, so it must be CPU visible:
++ * amdgpu_bo_create_kernel() places it inside the visible VRAM window
++ * (CPU_ACCESS_REQUIRED).
++ */
++static bool mqd_on_vram(struct amdgpu_device *adev)
++{
++	return !adev->apu_prefer_gtt;
++}
++
++static struct kfd_mem_obj *allocate_cp_mqd(struct mqd_manager *mm,
++		struct queue_properties *q)
++{
++	u32 mqd_size = AMDGPU_MQD_SIZE_ALIGN(mm->mqd_size);
++	struct kfd_node *node = mm->dev;
++	struct kfd_mem_obj *mqd_mem_obj;
++	struct amdgpu_bo *bo = NULL;
++
++	if (!mqd_on_vram(node->adev))
++		return allocate_mqd(mm, q);
++
++	mqd_mem_obj = kzalloc_obj(struct kfd_mem_obj);
++	if (!mqd_mem_obj)
++		return NULL;
++	if (amdgpu_bo_create_kernel(node->adev, mqd_size, PAGE_SIZE,
++				    AMDGPU_GEM_DOMAIN_VRAM, &bo,
++				    &mqd_mem_obj->gpu_addr,
++				    (void **)&mqd_mem_obj->cpu_ptr)) {
++		kfree(mqd_mem_obj);
++		return NULL;
++	}
++	/* kfd_free_mqd_cp() releases it with amdgpu_amdkfd_free_kernel_mem(). */
++	mqd_mem_obj->mem = bo;
++	return mqd_mem_obj;
++}
++
+ static void init_mqd(struct mqd_manager *mm, void **mqd,
+ 			struct kfd_mem_obj *mqd_mem_obj, uint64_t *gart_addr,
+ 			struct queue_properties *q)
+@@ -238,6 +282,11 @@ static void update_mqd(struct mqd_manager *mm, void *mqd,
+ 	set_priority(m, q);
+ 
+ 	q->is_active = QUEUE_IS_ACTIVE(*q);
++
++	/* Make CPU writes to a VRAM MQD visible before MES maps it. init_mqd()
++	 * ends here too. */
++	if (mqd_on_vram(mm->dev->adev))
++		amdgpu_device_flush_hdp(mm->dev->adev, NULL);
+ }
+ 
+ static bool check_preemption_failed(struct mqd_manager *mm, void *mqd)
+@@ -393,7 +442,7 @@ struct mqd_manager *mqd_manager_init_v12(enum KFD_MQD_TYPE type,
+ 	switch (type) {
+ 	case KFD_MQD_TYPE_CP:
+ 		pr_debug("%s@%i\n", __func__, __LINE__);
+-		mqd->allocate_mqd = allocate_mqd;
++		mqd->allocate_mqd = allocate_cp_mqd;
+ 		mqd->init_mqd = init_mqd;
+ 		mqd->free_mqd = kfd_free_mqd_cp;
+ 		mqd->load_mqd = load_mqd;
