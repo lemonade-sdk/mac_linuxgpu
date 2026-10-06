@@ -23,8 +23,17 @@ struct GPUSignalContext {
     std::array<bool,256> used{};
     std::atomic<bool> faulted{false};
     std::array<std::weak_ptr<Signal>,256> signals;
+    // Each slot's interrupt event, made the first time the slot is used and
+    // kept with it (a signal create or destroy is then no driver call). A
+    // late completion of a packet naming a reused slot's old signal writes
+    // the slot's own mailbox and wakes its sleepers spuriously; waits check
+    // the value again, as for any wakeup.
+    struct SlotEvent { bool made=false; SignalEvent event; };
+    std::array<SlotEvent,256> slotEvents{};
+    bool interruptSignals=true; // false once the connection declined an event
     explicit GPUSignalContext(std::shared_ptr<Connection> c):connection(std::move(c)) {}
     ~GPUSignalContext() {
+        for (auto &slot:slotEvents) if (slot.made) (void)connection->destroySignalEvent(slot.event.id);
         if (service && !service->shutdown()) return; // retain arena/code if retirement is uncertain
         if (arguments.handle) connection->freeBuffer(arguments);
         if (code.handle) connection->freeBuffer(code);
@@ -162,14 +171,7 @@ struct SignalSlot {
     uint32_t event=0;
     SignalSlot(std::shared_ptr<GPUSignalContext> c,unsigned i):context(std::move(c)),index(i) {}
     ~SignalSlot() {
-        if (hasEvent) {
-            // The command processor must not write the mailbox of a slot
-            // that goes back to the pool.
-            auto *abi=static_cast<SignalABI *>(context->arena.host)+index;
-            abi->eventMailbox=0;abi->eventID=0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            (void)context->connection->destroySignalEvent(event);
-        }
+        // The slot's event stays with the slot (GPUSignalContext::slotEvents).
         std::lock_guard lock(context->slotsMutex);context->signals[index].reset();context->used[index]=false;
     }
 };
@@ -211,21 +213,20 @@ void invalidateGPUSignals(const std::shared_ptr<Connection> &connection) {
     if (context) context->fail();
 }
 hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connection,int64_t initial,const std::shared_ptr<Signal> &signal) {
-    {
-        // A device that reports no queue slots can run no GPU work at all
-        // (no queue, no bounded launch): its signals are only ever touched
-        // by CPU threads, so they stay host signals instead of failing.
-        DeviceSnapshot snapshot;
-        const auto status=connection->read(snapshot);
-        if (status!=HSA_STATUS_SUCCESS) return status;
-        if (snapshot.queueSlotsReported && !snapshot.queueSlots) return HSA_STATUS_SUCCESS;
-    }
     std::shared_ptr<GPUSignalContext> context;
     {
         std::lock_guard lock(contextsMutex);
         std::erase_if(contexts,[](const auto &entry) {return entry.second.expired();});
         context=contexts[connection.get()].lock();
         if (!context) {
+            // A device that reports no queue slots can run no GPU work at
+            // all (no queue, no bounded launch): its signals are only ever
+            // touched by CPU threads, so they stay host signals instead of
+            // failing. Asked once, when the connection's context is made.
+            DeviceSnapshot snapshot;
+            const auto read=connection->read(snapshot);
+            if (read!=HSA_STATUS_SUCCESS) return read;
+            if (snapshot.queueSlotsReported && !snapshot.queueSlots) return HSA_STATUS_SUCCESS;
             context=std::make_shared<GPUSignalContext>(connection);
             const auto status=context->initialize();
             if (status!=HSA_STATUS_SUCCESS) return status;
@@ -244,15 +245,25 @@ hsa_status_t createGPUSignalBacking(const std::shared_ptr<Connection> &connectio
     *abi={};abi->kind=1;abi->value=initial;
     {
         // An interrupt signal, as ROCr makes by default: the completion of
-        // a packet naming it raises the event a blocked wait sleeps on.
-        SignalEvent event;std::string why;
-        const auto status=context->connection->createSignalEvent(event,&why);
-        if (status==HSA_STATUS_SUCCESS) {
-            backing->hasEvent=true;backing->event=event.id;
-            abi->eventMailbox=event.mailbox;abi->eventID=event.trigger;
-            signal->hasEvent=true;signal->eventID=event.id;
-        } else {
-            reportNoInterruptSignals(why.empty() ? "status "+std::to_string(int(status)) : why);
+        // a packet naming it raises the event a blocked wait sleeps on. The
+        // slot holds this thread's claim, so its event entry is ours.
+        auto &slotEvent=context->slotEvents[slot];
+        if (!slotEvent.made && context->interruptSignals) {
+            std::string why;
+            const auto status=context->connection->createSignalEvent(slotEvent.event,&why);
+            if (status==HSA_STATUS_SUCCESS) slotEvent.made=true;
+            else {
+                // A connection without signal events (the legacy path, an
+                // older driver) declines once; a refusal on one that has
+                // them (out of events) is said and leaves this signal polled.
+                if (status==HSA_STATUS_ERROR_INVALID_ARGUMENT) context->interruptSignals=false;
+                reportNoInterruptSignals(why.empty() ? "status "+std::to_string(int(status)) : why);
+            }
+        }
+        if (slotEvent.made) {
+            backing->hasEvent=true;backing->event=slotEvent.event.id;
+            abi->eventMailbox=slotEvent.event.mailbox;abi->eventID=slotEvent.event.trigger;
+            signal->hasEvent=true;signal->eventID=slotEvent.event.id;
         }
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);

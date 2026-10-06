@@ -15,7 +15,7 @@ public:
     // mailboxCode: the signal_mailbox_service object selected for this ISA.
     GPUSignalService(std::shared_ptr<Connection> connection,const SharedBuffer &arena,
         const IsaTarget &isa,std::span<const uint8_t> mailboxCode,
-        std::chrono::milliseconds idle=std::chrono::milliseconds(50));
+        std::chrono::milliseconds idle=std::chrono::milliseconds(1000));
     ~GPUSignalService();
     SignalServiceResult execute(unsigned slot,unsigned operation,int64_t value,int64_t compare,int64_t &old);
     bool reclaim(); // releases an internal queue before a public queue allocation
