@@ -1,5 +1,4 @@
-/* Every IOPCIDevice call the dext makes is one the kernel guarantees safe,
- * and a dext that dies closes its PCI session first.
+/* Every IOPCIDevice call the dext makes is one the kernel guarantees safe.
  *
  * dext/sources/dext_main.mm compiled whole against pci_call_mocks.h, whose
  * IOPCIDevice counts every call and flags any outside the kernel's contract
@@ -10,18 +9,11 @@
  *            BAR, aperture accesses outside BAR0, and every accessor after
  *            Close: refused before any call, a transport fault recorded;
  *   race     Close waits for an admitted access and a raw config read in
- *            flight, and admits nothing new meanwhile;
- *   crash    a child process dies of SIGSEGV, SIGTRAP, SIGABRT and SIGTERM
- *            (also with the PCI control lock held by another thread): its
- *            session is closed before it dies, and it still dies of that
- *            signal; with the session closed normally first, no second
- *            Close. */
+ *            flight, and admits nothing new meanwhile. */
 #include "pci_call_mocks.h"
 #include "../../dext/sources/dext_main.mm"
 #include <mach/mach.h>
 #include <stdarg.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <thread>
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
@@ -238,113 +230,11 @@ static void race(void)
 	       "in flight, admits nothing new meanwhile, and a new session opens after it\n");
 }
 
-/* ---- crash close, in child processes ---- */
-enum crash_kind { CRASH_SEGV, CRASH_TRAP, CRASH_ABORT, CRASH_TERM, CRASH_SEGV_LOCKED, CRASH_AFTER_CLOSE };
-
-static void run_child(crash_kind kind, int fd)
-{
-	/* No crash report for a death the test asks for. */
-	task_set_exception_ports(mach_task_self(), EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY,
-				 MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
-	IOPCIDevice *pci = session();
-	struct closer {
-		static void note(IOPCIDevice *p, int out) {
-			/* 'C': a Close of the open session, nothing in flight. */
-			const char c = p->violations ? 'V' : (p->open ? 'C' : 'X');
-			(void)write(out, &c, 1);
-		}
-	};
-	static IOPCIDevice *g_child_pci;
-	static int g_child_fd;
-	g_child_pci = pci;
-	g_child_fd = fd;
-	/* Report from inside the provider's Close (the mock's last step). */
-	struct hook { static void before_close() { closer::note(g_child_pci, g_child_fd); } };
-	pci->during_close = &hook::before_close;
-	switch (kind) {
-	case CRASH_SEGV:
-		*(volatile int *)(uintptr_t)8 = 1;
-		break;
-	case CRASH_TRAP:
-		__builtin_trap();
-	case CRASH_ABORT:
-		abort();
-	case CRASH_TERM:
-		kill(getpid(), SIGTERM);
-		for (;;) pause();
-	case CRASH_SEGV_LOCKED: {
-		std::atomic<bool> held{false};
-		std::thread([&] {
-			dext_pci_control_guard control;
-			held = true;
-			for (;;) pause();
-		}).detach();
-		while (!held) std::this_thread::yield();
-		*(volatile int *)(uintptr_t)8 = 1;
-		break;
-	}
-	case CRASH_AFTER_CLOSE:
-		dext_close();
-		*(volatile int *)(uintptr_t)8 = 1;
-		break;
-	}
-	_exit(0);
-}
-
-static void crash_case(crash_kind kind, int expected_signal, const char *name)
-{
-	int fds[2];
-	CHECK(pipe(fds) == 0);
-	fflush(nullptr);
-	const pid_t child = fork();
-	CHECK(child >= 0);
-	if (child == 0) {
-		close(fds[0]);
-		run_child(kind, fds[1]);
-	}
-	close(fds[1]);
-	char notes[8] = {};
-	ssize_t n = 0, r;
-	while (n < (ssize_t)sizeof(notes) && (r = read(fds[0], notes + n, sizeof(notes) - n)) > 0)
-		n += r;
-	close(fds[0]);
-	int status = 0;
-	CHECK(waitpid(child, &status, 0) == child);
-	if (!WIFSIGNALED(status) || WTERMSIG(status) != expected_signal || n != 1 || notes[0] != 'C')
-		fprintf(stderr, "%s: status %#x (signal %d), Close notes \"%.*s\"\n", name, status,
-			WIFSIGNALED(status) ? WTERMSIG(status) : 0, (int)n, notes);
-	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == expected_signal);
-	/* Exactly one Close, of an open session with nothing in flight. */
-	CHECK(n == 1 && notes[0] == 'C');
-}
-
-static void crash(void)
-{
-	/* Every default-action signal is taken over in a process that has no
-	 * handler of its own. */
-	CHECK(dext_crash_close_install(nullptr) == 0);
-	const uint32_t armed = dext_crash_close_armed();
-	for (int sig : { SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGEMT, SIGFPE, SIGBUS,
-			 SIGSEGV, SIGSYS, SIGTERM, SIGXCPU, SIGXFSZ })
-		CHECK(armed & (1u << sig));
-	CHECK(!(armed & (1u << SIGKILL)) && !(armed & (1u << SIGCHLD)) && !(armed & (1u << SIGPIPE)));
-	crash_case(CRASH_SEGV, SIGSEGV, "SIGSEGV");
-	crash_case(CRASH_TRAP, SIGTRAP, "SIGTRAP");
-	crash_case(CRASH_ABORT, SIGABRT, "SIGABRT");
-	crash_case(CRASH_TERM, SIGTERM, "SIGTERM");
-	crash_case(CRASH_SEGV_LOCKED, SIGSEGV, "SIGSEGV with the PCI control lock held");
-	crash_case(CRASH_AFTER_CLOSE, SIGSEGV, "SIGSEGV after a normal Close");
-	printf("PASS PCI crash close: on SIGSEGV, SIGTRAP, SIGABRT and SIGTERM (also with the PCI "
-	       "control lock held elsewhere) the session closes once before the process dies of "
-	       "the signal; a session closed normally is not closed again\n");
-}
-
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "guards";
 	if (!strcmp(mode, "guards")) guards();
 	else if (!strcmp(mode, "race")) race();
-	else if (!strcmp(mode, "crash")) crash();
-	else { fprintf(stderr, "usage: %s guards|race|crash\n", argv[0]); return 2; }
+	else { fprintf(stderr, "usage: %s guards|race\n", argv[0]); return 2; }
 	return 0;
 }

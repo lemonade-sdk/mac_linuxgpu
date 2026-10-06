@@ -24,7 +24,6 @@ extern "C" int linuxu_aperture_is_gone(void);
 #import <DriverKit/IOInterruptDispatchSource.h>
 #import <PCIDriverKit/IOPCIDevice.h>
 #import <PCIDriverKit/IOPCIFamilyDefinitions.h>
-#include "pci_crash_close.h"
 
 /* The DMA seam (iokit_bridge.m) needs the same IOPCIDevice; dext_set_pci
  * hands it to both seams so init order between them does not matter. */
@@ -111,7 +110,6 @@ struct dext_bar_record {
 };
 static dext_bar_record g_bars[6];
 static void dext_aperture_install(void);
-static void dext_pci_crash_close(void);
 /* Primary fake-MMIO token for the register BAR.  0 until dext_open mints
  * it.  Its window is the whole BAR as assigned (see dext_open). */
 static uint32_t     g_reg_token;
@@ -275,39 +273,12 @@ extern "C" int dext_set_pci(void *pci_device, void *client)
 	__atomic_store_n(&g_transport_sentinel_offset, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&g_transport_sentinel, DEXT_PCI_SENTINEL_NONE,
 		__ATOMIC_RELEASE);
-	/* Before the session can open: a dext that dies with it open panics
-	 * the Mac (pci_crash_close.h). */
-	static bool crash_close_reported;
-	const int refused = dext_crash_close_install(dext_pci_crash_close);
-	if (!crash_close_reported) {
-		crash_close_reported = true;
-		const uint32_t armed = dext_crash_close_armed();
-		if (refused)
-			IOLog("MacLinuxGPU: ERROR: the PCI session cannot be closed on a crash (signal %d refused, "
-			      "armed %#x); a crash of this driver panics the Mac\n", refused, armed);
-		else
-			IOLog("MacLinuxGPU: a fatal signal closes the PCI session first (signals %#x)\n", armed);
-	}
 	g_pci = static_cast<IOPCIDevice *>(pci_device);
 	g_pci_client = static_cast<IOService *>(client);
 	g_pci_open = false;
 	memset(g_bars, 0, sizeof(g_bars));
 	dext_aperture_install();	/* VRAM only through the kernel, before any mapping */
 	return 0;
-}
-
-/* The crash close (pci_crash_close.h): on a fatal signal, on any thread,
- * with any lock held. Cached state only, no lock: admission closes, the
- * session is marked closed, then the provider is closed. An access already
- * in flight then fails in the kernel (not open), as it would after a normal
- * Close. Exactly one Close: dext_close takes the same open flag. */
-static void dext_pci_crash_close(void)
-{
-	g_pci_access.block();
-	IOPCIDevice *pci = __atomic_load_n(&g_pci, __ATOMIC_ACQUIRE);
-	IOService *client = __atomic_load_n(&g_pci_client, __ATOMIC_ACQUIRE);
-	if (pci && client && __atomic_exchange_n(&g_pci_open, false, __ATOMIC_ACQ_REL))
-		pci->Close(client, 0);
 }
 
 /* Close the provider once nothing can reach it: admission closes, every
