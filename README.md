@@ -33,28 +33,30 @@ Linux/ROCm runs on a Mac with nothing Mac-specific.
 
 ## Performance
 
-**[LemonSeed Engine](https://github.com/Geramy/LSE), Qwen3.8-27B Q4 with DFlash2
-speculative decoding, on an AMD Radeon AI PRO R9700 over Thunderbolt 5
-(MacBook Pro, Apple M5 Max), running on this driver:**
+**[LemonSeed Engine](https://github.com/Geramy/LSE) v0.5.4, Qwen3.8-27B Q4 with
+the Q8 DFlash2 draft, on an AMD Radeon AI PRO R9700 over Thunderbolt 5
+(MacBook Pro, Apple M5 Max), driver build 262:**
 
 | | Measured |
 |---|---:|
-| Decode, warm (DFlash2, 74% draft acceptance) | **43.3 tok/s** |
-| Prefill, 73-token prompt, warm | 60.0 tok/s |
+| Prefill, 137-token prompt (time to first token, warm) | **0.17 s** |
+| Prefill, 1060 / 2118 / 4230-token prompt (warm) | **1,421 / 1,490 / 1,496 tok/s** |
+| First request after server start (137 tokens) | 0.34 s |
+| Decode, DFlash2 speculative (640 tokens) | **50.5 tok/s** |
+| Decode, MTP=3 speculative (640 tokens) | 46.7–50.8 tok/s |
+| Decode, plain | 27.7 tok/s |
+| Model load (Q4 + DFlash2) | 3.4 s |
 | Operations that fell back to the CPU | **0** |
 
-Speculative decoding speed scales with how many drafted tokens are accepted,
-which depends on the text being generated. With the measured 80 ms per
-speculative step, the same setup gives:
+llama.cpp (Vulkan through RADV, Qwen3.6-27B Q4_K_XL): pp512 **1,100 tok/s**,
+tg128 24.8 tok/s.
 
-| Draft acceptance | 74% (measured) | 80% | 90% | 96% |
-|---|---:|---:|---:|---:|
-| Decode tok/s | 43 | ~52 | ~71 | ~87 |
-
-These are first-run numbers. Nothing in the driver has been tuned for
-throughput yet: each doorbell write and each completion poll still crosses
-into the driver. Mapping doorbells into the client and using KFD events are
-the next steps.
+**Against stock Linux on the same GPU model** (amdgpu + ROCm 7.13, PCIe 5.0
+x16, same LSE v0.5.4 build and model files), this driver over Thunderbolt is
+12–43% faster on LSE decode, at parity on prefill from 532 to 2118 tokens, and
+8% faster at 4K. Linux remains faster on per-dispatch host cost (doorbell and
+signal writes are direct memory writes there) and on bulk copies (an 8x wider
+link).
 
 ## What works
 
