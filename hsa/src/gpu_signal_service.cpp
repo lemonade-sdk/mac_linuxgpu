@@ -42,6 +42,17 @@ struct GPUSignalService::State {
         auto *signal=reinterpret_cast<SignalABI *>(static_cast<char *>(metadata.host)+completionOffset);
         return uint64_t(std::atomic_ref<int64_t>(signal->value).load(std::memory_order_acquire));
     }
+    // The service can no longer apply signal operations: every GPU signal
+    // of this connection fails from here on (GPUSignalContext::fail), and a
+    // wait on one returns at once. Said once per process, whatever the
+    // trace setting, so a program that sees its waits return knows why.
+    void fault(const char *when,const char *why) {
+        faulted=true;
+        static std::atomic<bool> said{false};
+        if(!said.exchange(true))
+            std::fprintf(stderr,"mac_hsa: the GPU signal service failed (%s: %s); this process's GPU "
+                         "signals are invalid from now on\n",when,why);
+    }
     bool initialize() {
         if(initializationAttempted)return initialized;
         initializationAttempted=true;
@@ -74,7 +85,7 @@ struct GPUSignalService::State {
             if(trace)std::fprintf(stderr,"signal-mailbox: unavailable reason=queue-slots\n");
             return SignalServiceResult::Unavailable;
         }
-        if(status || !handle) {faulted=true;return SignalServiceResult::Failed;}
+        if(status || !handle) {fault("start","its queue could not be created");return SignalServiceResult::Failed;}
         auto *args=static_cast<uint64_t *>(arguments.host);
         args[0]=mailbox.device.address;args[1]=arena.device.address;args[2]=256;args[3]=100000000;
         hsa_kernel_dispatch_packet_t packet{};
@@ -92,7 +103,8 @@ struct GPUSignalService::State {
         std::atomic_ref<uint64_t>(const_cast<uint64_t &>(q->write_dispatch_id)).store(1,std::memory_order_release);
         if(connection->kickQueue(handle,0)!=0 ||
             client->await(MAC_MAILBOX_READY,1,Clock::now()+std::chrono::milliseconds(250))!=MailboxResult::Success) {
-            faulted=true;retire("startup-failure");return SignalServiceResult::Failed;
+            fault("start","its kernel did not report ready within 250 ms");retire("startup-failure");
+            return SignalServiceResult::Failed;
         }
         completedRequests=0;
         if(trace)std::fprintf(stderr,"signal-mailbox: ready queue=%llu\n",(unsigned long long)handle);
@@ -102,24 +114,33 @@ struct GPUSignalService::State {
     bool retire(const char *reason) {
         if(!handle)return !faulted;
         if(client)client->cancel();
+        // The kernel exits once it reads the cancel, and the command
+        // processor then writes the completion. The queue service call can
+        // wait on the session lock for as long as another thread's transfer
+        // holds it (hundreds of milliseconds for a large buffer), so the
+        // completion is read again after every call, including the one that
+        // outlasted the deadline: the kernel had the whole wait to exit.
         const auto deadline=Clock::now()+std::chrono::milliseconds(100);
         bool healthyCompletion=false;
-        while(Clock::now()<deadline) {
+        for(;;) {
             if(!completion()) {healthyCompletion=true;break;}
+            if(Clock::now()>=deadline)break;
             uint64_t inactive=0;
-            if(connection->serviceQueue(handle,inactive)!=0 || inactive)break;
+            if(connection->serviceQueue(handle,inactive)!=0 || inactive) {
+                healthyCompletion=!completion();break;
+            }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
         // Even on a fault attempt verified unmap. If it cannot be confirmed,
         // every buffer and the borrowed signal arena must remain retained.
         if(connection->destroyQueue(handle)!=0) {
             if(trace)std::fprintf(stderr,"signal-mailbox: retirement-failed reason=%s queue=%llu\n",reason,(unsigned long long)handle);
-            faulted=true;return false;
+            fault(reason,"its queue could not be destroyed");return false;
         }
         if(trace)std::fprintf(stderr,"signal-mailbox: retired reason=%s queue=%llu completed-requests=%llu completion=%s\n",
             reason,(unsigned long long)handle,(unsigned long long)completedRequests,healthyCompletion ? "confirmed" : "unconfirmed");
         handle=0;client.reset();
-        if(!healthyCompletion)faulted=true;
+        if(!healthyCompletion)fault(reason,"its kernel did not complete within 100 ms of the cancel");
         return healthyCompletion && !faulted;
     }
     void run() {
@@ -141,10 +162,10 @@ struct GPUSignalService::State {
         // after a failed map. Do not free borrowed/owned DMA or executable bytes.
         if(faulted)return false;
         for(auto *buffer:{&metadata,&ring,&arguments,&mailbox})if(buffer->host) {
-            if(connection->freeSharedBuffer(*buffer)!=0) {faulted=true;return false;}
+            if(connection->freeSharedBuffer(*buffer)!=0) {fault("shutdown","a buffer could not be freed");return false;}
             *buffer={};
         }
-        if(code.handle && connection->freeBuffer(code)!=0) {faulted=true;return false;}
+        if(code.handle && connection->freeBuffer(code)!=0) {fault("shutdown","its code could not be freed");return false;}
         code={};released=true;return clean;
     }
 };
@@ -166,12 +187,16 @@ SignalServiceResult GPUSignalService::execute(unsigned slot,unsigned operation,i
     state_->client->store(MAC_MAILBOX_SLOT,slot,std::memory_order_relaxed);
     const SignalOperation request{operation,uint64_t(value),uint64_t(compare)};uint64_t result=0;
     const auto status=state_->client->execute({&request,1},{&result,1},State::Clock::now()+std::chrono::milliseconds(100));
-    if(status!=MailboxResult::Success) {state_->faulted=true;state_->retire("request-failure");return SignalServiceResult::Failed;}
+    if(status!=MailboxResult::Success) {
+        state_->fault("request","a signal operation did not complete within 100 ms");
+        state_->retire("request-failure");return SignalServiceResult::Failed;
+    }
     if(!state_->completedRequests && state_->trace)std::fprintf(stderr,"signal-mailbox: backend=mailbox first-request-completed queue=%llu\n",(unsigned long long)state_->handle);
     ++state_->completedRequests;
     old=int64_t(result);state_->lastRequest=State::Clock::now();state_->changed.notify_all();return SignalServiceResult::Success;
     } catch (const std::bad_alloc &) {
-        state_->faulted=true;state_->retire("allocation-failure");return SignalServiceResult::Failed;
+        state_->fault("request","out of memory");state_->retire("allocation-failure");
+        return SignalServiceResult::Failed;
     }
 }
 }

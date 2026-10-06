@@ -129,6 +129,15 @@ if(BUILD_TESTING)
   add_test(NAME hsa-code-sync COMMAND hsa-code-sync-test)
   set_tests_properties(hsa-code-sync PROPERTIES ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
 
+  # The GPU signal service retiring while another thread holds the session
+  # (a large transfer): internal code, against a connection whose "GPU" is a
+  # thread running the service kernel's mailbox protocol.
+  add_executable(hsa-signal-service-test tests/test_signal_service.cpp src/gpu_signal_service.cpp
+    src/code_object.cpp src/signal_kernels.cpp src/isa_target.cpp)
+  target_compile_options(hsa-signal-service-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-signal-service-test PRIVATE src include third_party/hsa/include)
+  add_test(NAME hsa-signal-service COMMAND hsa-signal-service-test)
+
   add_executable(hsa-memory-test tests/test_memory.cpp)
   target_link_libraries(hsa-memory-test PRIVATE hsa-runtime64)
   target_compile_options(hsa-memory-test PRIVATE -Wall -Wextra -Werror)
