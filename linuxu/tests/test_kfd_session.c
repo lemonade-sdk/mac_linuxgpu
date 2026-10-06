@@ -534,12 +534,14 @@ static void vm_fault_isolation(void)
 		usleep(100);
 	}
 	assert(fixture_vm_faults() == faults + 1);
-	assert(fault.va == ((doomed_info.va + 8) & ~(uint64_t)(PAGE_SIZE - 1)));
+	/* The faulting 4 KiB GPU page, not the CPU page. */
+	assert(fault.va == ((doomed_info.va + 8) & ~(uint64_t)(AMDGPU_GPU_PAGE_SIZE - 1)));
 	assert(fault.not_present);
 	/* KFD took the faulting process's queue off MES, and only that one. */
 	assert(mes_removes == removes + 1);
 	assert(rt_kfd_queue_kick(a, qa.q, 5) == -EFAULT);
 	assert(rt_kfd_session_fault(a, NULL) == 1);	/* sticky */
+	assert(hqd_dumps > 0 && !fixture_cp_stuck());	/* HQDs read, nothing left on them */
 	assert(!rt_kfd_session_uncertain(a));
 
 	/* The other client neither sees the fault nor stops. */
@@ -556,6 +558,116 @@ static void vm_fault_isolation(void)
 	puts("KFD GPU page fault: the faulting process's queues evicted and its memory event "
 	     "signaled, the fault reported and sticky, its close ordinary; the other client ran "
 	     "throughout");
+}
+
+/* ---- a faulted queue left on the command processor ----
+ * What wedged the R9700 twice: KFD evicted the faulting process's queue
+ * and MES confirmed removing it, yet the CP, stalled on the faulting
+ * access, kept running it on its HQD, and nothing else on that pipe
+ * completed again. The session reads the HQDs when it sees the fault and
+ * again at close: a queue still there is reset through MES's hung-queue
+ * reset, and one that survives that makes it request a GPU reset and keep
+ * its memory until the HQDs are clear. */
+static struct rt_kfd_session *faulting_client(const char *comm, struct queue_set *q,
+					      uint64_t *signal_va)
+{
+	struct rt_kfd_bo *vram, *doomed;
+	struct rt_kfd_bo_info info;
+	struct rt_kfd_session *s = dying_client(comm, q, &vram);
+	uint64_t next = 0;
+
+	assert(!rt_kfd_bo_alloc(s, 16384, 0, RT_KFD_GTT, RT_KFD_PLACE_WINDOW, &doomed));
+	assert(!rt_kfd_bo_info(s, doomed, &info));
+	assert(!rt_kfd_bo_free(s, doomed));
+	*signal_va = info.va;
+	dispatch_to(s, q, &next, info.va);
+	return s;
+}
+
+static void wait_for_fault_interrupt(unsigned int before)
+{
+	const uint64_t start = now_ms();
+
+	while (fixture_vm_faults() == before) {
+		assert(now_ms() - start < 2000);
+		usleep(100);
+	}
+}
+
+static void vm_fault_stuck_on_cp(void)
+{
+	struct queue_set qa, qb, qc;
+	struct rt_kfd_bo *vram_b, *host_b;
+	struct rt_kfd_session *a, *b;
+	struct rt_kfd_fault fault;
+	uint64_t next_b = 0, va;
+	unsigned int resets, hang_resets, faults, dumps;
+	int error = 0;
+
+	fixture_cp_start();
+	b = dying_client("bystander", &qb, &vram_b);
+	assert(!rt_kfd_bo_alloc(b, 16384, 0, RT_KFD_GTT, RT_KFD_PLACE_WINDOW, &host_b));
+
+	/* 1. Stuck through MES's removal, cleared by its hung-queue reset when
+	 * the fault is first seen. */
+	fixture_cp_fault_sticks(true, false);
+	resets = gpu_reset_requests;
+	hang_resets = mes_hang_resets;
+	faults = fixture_vm_faults();
+	dumps = hqd_dumps;
+	a = faulting_client("stuck-mes-reset", &qa, &va);
+	wait_for_fault_interrupt(faults);
+	assert(fixture_cp_stuck() == 1);	/* MES said removed; the HQD still runs it */
+	assert(rt_kfd_session_fault(a, &fault) == 1);
+	assert(hqd_dumps > dumps && mes_hang_resets == hang_resets + 1);
+	assert(fixture_cp_stuck() == 0 && gpu_reset_requests == resets);
+	assert(!rt_kfd_session_uncertain(a));
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+	assert(!rt_kfd_session_close(a));
+
+	/* 2. Stuck through MES's reset too: a GPU reset is requested, the
+	 * session keeps its memory (uncertain, close refused) until a settle
+	 * finds the HQDs clear. */
+	fixture_cp_fault_sticks(true, true);
+	fixture_gpu_reset_defer(true);
+	faults = fixture_vm_faults();
+	a = faulting_client("stuck-gpu-reset", &qa, &va);
+	wait_for_fault_interrupt(faults);
+	resets = gpu_reset_requests;
+	assert(rt_kfd_session_fault(a, &fault) == 1);
+	assert(gpu_reset_requests == resets + 1);	/* requested once */
+	assert(rt_kfd_session_failure(a, &error) == RT_KFD_STEP_CP_STUCK);
+	assert(rt_kfd_session_uncertain(a) && fixture_cp_stuck() == 1);
+	/* While the reset has not happened: the close keeps everything, a
+	 * settle too, and no second reset is asked for. */
+	assert(rt_kfd_session_close(a) == -EBUSY);
+	assert(rt_kfd_session_settle(a, 0) == -EBUSY && gpu_reset_requests == resets + 1);
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+	fixture_gpu_reset_finish();
+	fixture_gpu_reset_defer(false);
+	assert(!rt_kfd_session_settle(a, 0) && !rt_kfd_session_uncertain(a));
+	assert(!rt_kfd_session_close(a));
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+
+	/* 3. The fault never polled before the program leaves: the close
+	 * itself finds the queue on its HQD and resets it first. */
+	fixture_cp_fault_sticks(true, false);
+	faults = fixture_vm_faults();
+	hang_resets = mes_hang_resets;
+	a = faulting_client("stuck-at-close", &qc, &va);
+	wait_for_fault_interrupt(faults);
+	assert(fixture_cp_stuck() == 1);
+	assert(!rt_kfd_session_close(a));
+	assert(mes_hang_resets == hang_resets + 1 && fixture_cp_stuck() == 0);
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+
+	fixture_cp_fault_sticks(false, false);
+	assert(!rt_kfd_session_close(b));
+	fixture_cp_stop();
+	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+	puts("KFD faulted queue left on the CP: found on its HQD when the fault is seen and at "
+	     "close, cleared by MES's hung-queue reset, or by a GPU reset with the session kept "
+	     "until the HQDs are clear; the other client ran throughout");
 }
 
 int main(void)
@@ -738,6 +850,7 @@ int main(void)
 	process_death();
 	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
 	vm_fault_isolation();
+	vm_fault_stuck_on_cp();
 	/* kfd_exit order: the release work frees the KFD process, which drops
 	 * the render file ACQUIRE_VM kept. */
 	fixture_kfd_release_processes();

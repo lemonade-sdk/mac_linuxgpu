@@ -40,6 +40,8 @@
 #include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_topology.h"
+#include "v12_structs.h"
+#include "gc/gc_12_0_0_sh_mask.h"
 
 /* CPU-side VAs the session's own mappings use: argument blocks and the
  * doorbell mmap. They lie above every GPUVM aperture (gpuvm_limit < 2^47)
@@ -96,7 +98,10 @@ struct rt_kfd_queue {
 	 * KFD's queue when it was created. */
 	uint32_t mes_doorbell;
 	uint64_t mes_gang_ctx;
+	uint64_t mes_mqd;	/* the MQD's GPU address, CP_MQD_BASE_ADDR of its HQD */
 	bool mes_known;
+	/* Found active on an HQD after KFD let go of it (cp_clear_locked). */
+	bool on_cp;
 	/* DESTROY_QUEUE failed: MES may still run the queue. */
 	bool failed;
 	/* ... after KFD had already let go of it (destroy_queue_cpsch takes
@@ -151,6 +156,10 @@ struct rt_kfd_session {
 	struct kfd_event *memory_ev;	/* KFD's, alive until the process exits */
 	bool faulted;
 	struct rt_kfd_fault fault;
+	/* A faulted queue stayed on its HQD through MES's reset: a GPU reset
+	 * was requested, and the session stays uncertain until the HQDs are
+	 * clear (cp_clear_locked). */
+	bool cp_stuck;
 };
 
 struct rt_kfd_wait {
@@ -664,7 +673,7 @@ static void reassess_locked(struct rt_kfd_session *s)
 
 	for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
 		failed |= q->failed;
-	s->uncertain = s->pending_copy || failed;
+	s->uncertain = s->pending_copy || failed || s->cp_stuck;
 }
 
 /* A copy that outlived its timeout holds the staging and its BO until its
@@ -1397,6 +1406,116 @@ int rt_kfd_bo_cpu_ranges(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
 	return r;
 }
 
+/* ---- queues still on the command processor ---- */
+
+/* Where, in a kfd2kgd hqd_dump, the fields we read are: the dump is the
+ * HQD's registers from CP_MQD_BASE_ADDR on, in order, which is the
+ * register image of the compute MQD from cp_mqd_base_addr_lo (GFX 11 and
+ * GFX 12 share it). */
+#define HQD_DUMP_INDEX(field) \
+	((offsetof(struct v12_compute_mqd, field) - \
+	  offsetof(struct v12_compute_mqd, cp_mqd_base_addr_lo)) / sizeof(uint32_t))
+
+/* Mark every queue of @s active on an HQD; returns how many, or a negative
+ * errno when the HQDs cannot be read. Caller holds s->lock. */
+static int queues_on_cp_locked(struct rt_kfd_session *s)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct kfd_node *node = session_node(adev);
+	const unsigned int gc = IP_VERSION_MAJ(amdgpu_ip_version(adev, GC_HWIP, 0));
+	const unsigned int pipes = adev->gfx.mec.num_mec * adev->gfx.mec.num_pipe_per_mec;
+	const unsigned int per_pipe = adev->gfx.mec.num_queue_per_pipe;
+	int found = 0;
+
+	for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
+		q->on_cp = false;
+	if (!node || !node->kfd2kgd || !node->kfd2kgd->hqd_dump || (gc != 11 && gc != 12) ||
+	    !pipes || !per_pipe)
+		return -ENODEV;
+	for (unsigned int pipe = 0; pipe < pipes; ++pipe) {
+		for (unsigned int queue = 0; queue < per_pipe; ++queue) {
+			uint32_t (*dump)[2] = NULL, n = 0, active, doorbell;
+			uint64_t mqd;
+			int r = node->kfd2kgd->hqd_dump(adev, pipe, queue, &dump, &n,
+							ffs(node->xcc_mask) - 1);
+
+			if (r)
+				return r;
+			if (n <= HQD_DUMP_INDEX(cp_hqd_pq_doorbell_control)) {
+				kfree(dump);
+				return -EIO;
+			}
+			active = dump[HQD_DUMP_INDEX(cp_hqd_active)][1];
+			doorbell = dump[HQD_DUMP_INDEX(cp_hqd_pq_doorbell_control)][1];
+			mqd = dump[HQD_DUMP_INDEX(cp_mqd_base_addr_lo)][1] |
+			      (uint64_t)dump[HQD_DUMP_INDEX(cp_mqd_base_addr_hi)][1] << 32;
+			kfree(dump);
+			if (!(active & CP_HQD_ACTIVE__ACTIVE_MASK))
+				continue;
+			doorbell = (doorbell & CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK) >>
+				   CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT;
+			for (struct rt_kfd_queue *q = s->queues; q; q = q->next) {
+				if (!q->mes_known || q->mes_doorbell != doorbell ||
+				    (mqd & ~0xffULL) != (q->mes_mqd & ~0xffULL))
+					continue;
+				pr_err("kfd session %d: queue %u (MES doorbell %#x) still active on "
+				       "HQD pipe %u queue %u\n", session_pid(s), q->queue_id,
+				       q->mes_doorbell, pipe, queue);
+				q->on_cp = true;
+				found++;
+			}
+		}
+	}
+	return found;
+}
+
+/* A faulted session's queues off the command processor (rt/kfd_session.h).
+ * Caller holds s->lock and is inside the process. 0 when the HQDs are
+ * clear (now or after MES's hung-queue reset), -EBUSY when a GPU reset was
+ * requested and the session stays uncertain. */
+static int cp_clear_locked(struct rt_kfd_session *s, const char *when)
+{
+	int found;
+
+	if (rt_removal_active(s->adev)) {
+		s->cp_stuck = false;	/* nothing runs on a removed device */
+		return 0;
+	}
+	found = queues_on_cp_locked(s);
+	if (!found) {
+		if (s->cp_stuck)
+			pr_warn("kfd session %d: the HQDs are clear again (%s)\n", session_pid(s), when);
+		s->cp_stuck = false;
+		reassess_locked(s);
+		return 0;
+	}
+	if (found > 0 && !s->cp_stuck) {
+		pr_err("kfd session %d: %d queue(s) of a process whose GPU work faulted still on "
+		       "the command processor after KFD and MES let go (%s); resetting them "
+		       "through MES\n", session_pid(s), found, when);
+		for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
+			if (q->on_cp)
+				(void)queue_recover(s, q);
+		found = queues_on_cp_locked(s);
+		if (!found) {
+			pr_warn("kfd session %d: MES's hung-queue reset took them off\n",
+				session_pid(s));
+			return 0;
+		}
+	}
+	if (!s->cp_stuck) {
+		pr_err("kfd session %d: %s; requesting a GPU reset and keeping the session's "
+		       "memory until the HQDs are clear\n", session_pid(s),
+		       found < 0 ? "the HQDs cannot be read" :
+				   "a faulted queue survived MES's hung-queue reset");
+		note_failure(s, RT_KFD_STEP_CP_STUCK, found < 0 ? found : -EIO);
+		s->cp_stuck = true;
+		amdgpu_amdkfd_gpu_reset(s->adev);
+	}
+	reassess_locked(s);
+	return -EBUSY;
+}
+
 /* ---- GPU memory faults ---- */
 
 /* A zero-timeout WAIT_EVENTS on the memory event: KFD copies the exception
@@ -1430,8 +1549,12 @@ static int fault_poll_locked(struct rt_kfd_session *s)
 		return 0;
 	data = &wait.event.memory_exception_data;
 	s->faulted = true;
+	/* KFD's GFX 11/12 handler (kfd_int_process_v11) shifts the IH's page
+	 * number, which counts 4 KiB GPU pages, by the CPU's PAGE_SHIFT. On a
+	 * 16 KiB-page kernel (linuxu, as arm64 Linux with 16K pages) that is
+	 * four times the address; undo it with the GPU page size. */
 	s->fault = (struct rt_kfd_fault){
-		.va = data->va,
+		.va = data->va >> (PAGE_SHIFT - AMDGPU_GPU_PAGE_SHIFT),
 		.not_present = data->failure.NotPresent,
 		.read_only = data->failure.ReadOnly,
 		.no_execute = data->failure.NoExecute,
@@ -1443,6 +1566,7 @@ static int fault_poll_locked(struct rt_kfd_session *s)
 	       s->fault.not_present ? "page not present" : "protection",
 	       s->fault.read_only ? ", write to read-only" : "",
 	       s->fault.no_execute ? ", no execute" : "");
+	(void)cp_clear_locked(s, "when the fault was seen");
 	return 1;
 }
 
@@ -1574,6 +1698,7 @@ static void queue_identity(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 	if (kq) {
 		q->mes_doorbell = kq->properties.doorbell_off;
 		q->mes_gang_ctx = kq->gang_ctx_gpu_addr;
+		q->mes_mqd = kq->gart_mqd_addr;
 		q->mes_known = true;
 	}
 	mutex_unlock(&s->process->mutex);
@@ -1893,6 +2018,8 @@ int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q)
  * Caller holds s->lock and is inside the process. */
 static void settle_locked(struct rt_kfd_session *s, unsigned int wait_ms)
 {
+	if (s->cp_stuck)
+		(void)cp_clear_locked(s, "settle");
 	settle_copy_locked(s, wait_ms);
 	for (struct rt_kfd_queue *q = s->queues; q; q = q->next)
 		if (q->failed)
@@ -2167,6 +2294,15 @@ int rt_kfd_session_close(struct rt_kfd_session *s)
 	/* Waits end first: destroying the events wakes each with FAIL, and
 	 * none may still be inside the process when it exits. */
 	end_waits_locked(s);
+	/* A process whose GPU work faulted, seen now or before: its queues off
+	 * the command processor before any is destroyed or memory freed. */
+	if ((fault_poll_locked(s) == 1 || s->cp_stuck) && cp_clear_locked(s, "close")) {
+		pr_err("kfd session %d: close kept the session: a faulted queue is still on the "
+		       "command processor, GPU reset requested\n", session_pid(s));
+		linuxu_process_leave(&saved);
+		pthread_mutex_unlock(&s->lock);
+		return -EBUSY;
+	}
 	/* What a previous call left uncertain first: a copy that outlived its
 	 * timeout gets one more bounded wait. */
 	settle_copy_locked(s, RT_KFD_SETTLE_MS);

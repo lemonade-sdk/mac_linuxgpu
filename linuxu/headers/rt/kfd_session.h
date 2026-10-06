@@ -105,6 +105,10 @@ enum rt_kfd_step {
 	RT_KFD_STEP_DESTROY_QUEUE = 2,	/* DESTROY_QUEUE failed, KFD kept the queue */
 	RT_KFD_STEP_MES_RESET = 3,	/* MES hung-queue detection/reset failed */
 	RT_KFD_STEP_MES_REMOVE = 4,	/* MES did not remove the queue after reset */
+	/* A queue of a process whose GPU work faulted was still on an HQD after
+	 * KFD evicted it and MES confirmed, and stayed there through MES's
+	 * hung-queue reset: a GPU reset was requested. */
+	RT_KFD_STEP_CP_STUCK = 5,
 };
 /* The first failed step (RT_KFD_STEP_*) and its error, even after recovery
  * succeeded; RT_KFD_STEP_NONE when no step failed. */
@@ -219,6 +223,15 @@ struct rt_kfd_fault {
 	uint32_t not_present, read_only, no_execute, imprecise;
 };
 int rt_kfd_session_fault(struct rt_kfd_session *s, struct rt_kfd_fault *out);
+/* After a fault, KFD's eviction and its later DESTROY_QUEUE take the queues
+ * off MES, and MES confirms. A command processor stalled on the faulting
+ * access can keep running the queue on its HQD anyway, and then nothing
+ * else on that pipe completes. So when the fault is first seen, and again
+ * at close before any queue is destroyed, every compute HQD is read
+ * (kfd2kgd hqd_dump): one still active with one of the session's queues
+ * (its doorbell and MQD) is reset through MES's hung-queue reset; one that
+ * survives that makes the session request a GPU reset and stay uncertain,
+ * keeping its memory, until a settle or close finds the HQDs clear. */
 
 /* Signal events: what an interrupt-driven wait sleeps on, as ROCr's
  * interrupt signals use them through libhsakmt.

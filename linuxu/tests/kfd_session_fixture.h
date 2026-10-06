@@ -74,6 +74,14 @@ uint32_t fixture_pasid_of(uint64_t va);
  * fixture's CP raises one itself, from a workqueue, when a completion
  * signal it must write is not mapped; that queue then stalls. */
 void fixture_vm_fault(uint32_t pasid, uint64_t va, bool write);
+/* A faulted queue stays on its HQD after MES removes it (and says so);
+ * MES's hung-queue reset takes it off unless @through_mes_reset, when only
+ * a GPU reset (amdgpu_amdkfd_gpu_reset) does. fixture_cp_stuck counts them. */
+void fixture_cp_fault_sticks(bool sticks, bool through_mes_reset);
+unsigned int fixture_cp_stuck(void);
+/* GPU resets that wait for fixture_gpu_reset_finish to take stuck queues off. */
+void fixture_gpu_reset_defer(bool defer);
+void fixture_gpu_reset_finish(void);
 unsigned int fixture_vm_faults(void);
 /* Prints every BO still alive; returns how many. */
 unsigned int fixture_report_bos(void);
@@ -98,7 +106,7 @@ extern unsigned int bo_restores;
 extern unsigned int live_bos, gart_maps, render_opens, render_releases, vm_acquires;
 extern unsigned int kgd_allocs, kgd_frees, kgd_maps, kgd_unmaps, kernel_allocs;
 extern unsigned int sdma_copies, mes_shader_debugger_sets, mes_shader_debugger_flushes;
-extern unsigned int cp_dispatches;
+extern unsigned int cp_dispatches, hqd_dumps;
 extern size_t kmemcheck_live_bytes(void);
 /* MES failure modes (kfd_session_fixture.c). */
 extern bool mes_dead;

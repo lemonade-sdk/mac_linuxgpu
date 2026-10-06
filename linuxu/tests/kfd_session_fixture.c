@@ -41,6 +41,8 @@ extern int usleep(unsigned int usec);
 #include "kfd_device_queue_manager.h"
 #include "kfd_topology.h"
 #include "soc15_int.h"
+#include "v12_structs.h"
+#include "gc/gc_12_0_0_sh_mask.h"
 #include "soc15_ih_clientid.h"
 #include "ivsrcid/vmc/irqsrcs_vmc_1_0.h"
 #include "kfd_session_fixture.h"
@@ -65,7 +67,15 @@ static uint8_t *vram;	/* host backing of the fake VRAM */
 static uint64_t vram_next;
 
 /* ---- the command processor: AQL dispatches of MES-added queues ---- */
-struct cp_queue { bool live, faulted; uint32_t doorbell; uint64_t wptr; uint32_t pasid; };
+/* A queue on an HQD (its index in cp_queues is its pipe * queues-per-pipe +
+ * queue). stuck: MES removed it, but the CP still runs it (cp_fault_sticks). */
+struct cp_queue { bool live, faulted, stuck; uint32_t doorbell; uint64_t wptr, mqd; uint32_t pasid; };
+/* A CP stalled on a faulting access keeps running the queue on its HQD
+ * after MES removes it (and reports success); MES's hung-queue reset takes
+ * it off, unless it sticks through that too, when only a GPU reset does. */
+static bool cp_fault_sticks, cp_sticks_through_mes_reset;
+/* A GPU reset that has not finished yet (fixture_gpu_reset_finish). */
+static bool gpu_reset_deferred;
 static struct cp_queue cp_queues[16];
 static struct workqueue_struct *fault_wq;	/* GPU page faults to KFD */
 static pthread_mutex_t cp_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -74,19 +84,19 @@ static volatile bool cp_running;
 unsigned int cp_dispatches;
 static volatile bool cp_drop_interrupts;
 static unsigned int cp_interrupts, cp_interrupts_dropped;
-static void cp_add(uint32_t doorbell, uint64_t wptr, uint32_t pasid)
+static void cp_add(uint32_t doorbell, uint64_t wptr, uint64_t mqd, uint32_t pasid)
 {
 	pthread_mutex_lock(&cp_lock);
 	/* A queue MES never removed (a failed removal) is mapped once. */
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell) {
-			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .pasid = pasid };
+			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .mqd = mqd, .pasid = pasid };
 			pthread_mutex_unlock(&cp_lock);
 			return;
 		}
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (!cp_queues[i].live) {
-			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .pasid = pasid };
+			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .mqd = mqd, .pasid = pasid };
 			break;
 		}
 	pthread_mutex_unlock(&cp_lock);
@@ -95,9 +105,48 @@ static void cp_remove(uint32_t doorbell)
 {
 	pthread_mutex_lock(&cp_lock);
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
-		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell)
-			cp_queues[i].live = false;
+		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell) {
+			if (cp_queues[i].faulted && cp_fault_sticks)
+				cp_queues[i].stuck = true;	/* MES let go; the CP did not */
+			else
+				cp_queues[i].live = false;
+		}
 	pthread_mutex_unlock(&cp_lock);
+}
+/* Stuck queues the hung-queue reset (or a GPU reset, @all) takes off;
+ * writes their doorbells to @db (up to @max) and returns how many. */
+static unsigned int cp_reset_stuck(bool all, uint32_t *db, unsigned int max)
+{
+	unsigned int n = 0;
+
+	pthread_mutex_lock(&cp_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i) {
+		if (!cp_queues[i].live || !cp_queues[i].stuck || (!all && cp_sticks_through_mes_reset))
+			continue;
+		if (db && n < max)
+			db[n] = cp_queues[i].doorbell;
+		n++;
+		cp_queues[i] = (struct cp_queue){ 0 };
+	}
+	pthread_mutex_unlock(&cp_lock);
+	return n;
+}
+void fixture_cp_fault_sticks(bool sticks, bool through_mes_reset)
+{
+	cp_fault_sticks = sticks;
+	cp_sticks_through_mes_reset = through_mes_reset;
+}
+void fixture_gpu_reset_defer(bool defer) { gpu_reset_deferred = defer; }
+void fixture_gpu_reset_finish(void) { (void)cp_reset_stuck(true, NULL, 0); }
+unsigned int fixture_cp_stuck(void)
+{
+	unsigned int n = 0;
+
+	pthread_mutex_lock(&cp_lock);
+	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
+		n += cp_queues[i].live && cp_queues[i].stuck;
+	pthread_mutex_unlock(&cp_lock);
+	return n;
 }
 
 /* ---- MES ----
@@ -163,7 +212,7 @@ static int fake_add_hw_queue(struct amdgpu_mes *mes, struct mes_add_queue_input 
 	mes_hung[mes_adds] = mes_hang_new;
 	mes_was_reset[mes_adds] = false;
 	mes_adds++;
-	cp_add(in->doorbell_offset, in->wptr_addr, in->process_id);
+	cp_add(in->doorbell_offset, in->wptr_addr, in->mqd_addr, in->process_id);
 	return 0;
 }
 static int fake_remove_hw_queue(struct amdgpu_mes *mes, struct mes_remove_queue_input *in)
@@ -207,6 +256,8 @@ static int fake_detect_and_reset_hung_queues(struct amdgpu_mes *mes,
 			mes_hung_db_array[n++] = mes_doorbells[i];
 		}
 	}
+	/* A queue still on its HQD after its removal is hung too. */
+	n += cp_reset_stuck(false, mes_hung_db_array + n, 4 - n);
 	mes_hang_resets++;
 	return 0;
 }
@@ -979,9 +1030,13 @@ int amdgpu_amdkfd_criu_resume(void *p) { (void)p; TRIPWIRE("criu_resume"); }
 void amdgpu_amdkfd_gpu_reset(struct amdgpu_device *a)
 {
 	(void)a;
-	if (!mes_failed_removes && !mes_dead)
+	/* Requested only after a failed MES call, or for a faulted queue that
+	 * stayed on its HQD; this reset takes every stuck queue off. */
+	if (!mes_failed_removes && !mes_dead && !fixture_cp_stuck())
 		TRIPWIRE("gpu_reset");
 	gpu_reset_requests++;
+	if (!gpu_reset_deferred)
+		(void)cp_reset_stuck(true, NULL, 0);
 	fprintf(stderr, "kfd fixture: GPU reset requested; GPU recovery disabled.\n");
 }
 int amdgpu_amdkfd_send_close_event_drain_irq(struct amdgpu_device *a, uint32_t *payload)
@@ -1066,7 +1121,45 @@ static uint32_t kgd_enable_debug_trap(struct amdgpu_device *a, bool restore, uin
 { (void)a; (void)restore; (void)vmid; return 0; }
 static uint32_t kgd_disable_debug_trap(struct amdgpu_device *a, bool keep, uint32_t vmid)
 { (void)a; (void)keep; (void)vmid; return 0; }
+/* hqd_dump_v12: an HQD's registers from CP_MQD_BASE_ADDR on, as pairs, the
+ * layout of the compute MQD's register image. Built from the CP model. */
+unsigned int hqd_dumps;
+static int kgd_hqd_dump(struct amdgpu_device *a, uint32_t pipe_id, uint32_t queue_id,
+			uint32_t (**dump)[2], uint32_t *n_regs, uint32_t inst)
+{
+	const unsigned int n = (offsetof(struct v12_compute_mqd, cp_hqd_pq_wptr_hi) -
+				offsetof(struct v12_compute_mqd, cp_mqd_base_addr_lo)) / 4 + 1;
+	const unsigned int hqd = pipe_id * a->gfx.mec.num_queue_per_pipe + queue_id;
+	struct v12_compute_mqd image;
+	const uint32_t *regs = &image.cp_mqd_base_addr_lo;
+
+	(void)inst;
+	assert(pipe_id < a->gfx.mec.num_mec * a->gfx.mec.num_pipe_per_mec &&
+	       queue_id < a->gfx.mec.num_queue_per_pipe);
+	memset(&image, 0, sizeof(image));
+	pthread_mutex_lock(&cp_lock);
+	if (hqd < ARRAY_SIZE(cp_queues) && cp_queues[hqd].live) {
+		image.cp_mqd_base_addr_lo = lower_32_bits(cp_queues[hqd].mqd);
+		image.cp_mqd_base_addr_hi = upper_32_bits(cp_queues[hqd].mqd);
+		image.cp_hqd_active = CP_HQD_ACTIVE__ACTIVE_MASK;
+		image.cp_hqd_pq_doorbell_control =
+			cp_queues[hqd].doorbell << CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT |
+			CP_HQD_PQ_DOORBELL_CONTROL__DOORBELL_EN_MASK;
+	}
+	pthread_mutex_unlock(&cp_lock);
+	*dump = kmalloc_array(n, sizeof(**dump), GFP_KERNEL);
+	if (!*dump)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < n; ++i) {
+		(*dump)[i][0] = (0x1f80 + i) << 2;	/* a register offset; not read */
+		(*dump)[i][1] = regs[i];
+	}
+	*n_regs = n;
+	hqd_dumps++;
+	return 0;
+}
 static const struct kfd2kgd_calls kfd2kgd = {
+	.hqd_dump = kgd_hqd_dump,
 	.init_interrupts = kgd_init_interrupts,
 	.enable_debug_trap = kgd_enable_debug_trap,
 	.disable_debug_trap = kgd_disable_debug_trap,
@@ -1123,6 +1216,9 @@ void fixture_device_init(void)
 	kfd.device_info.max_no_of_hqd = 24;
 	kfd.device_info.event_interrupt_class = &event_interrupt_class_v11;
 	kfd.shared_resources.enable_mes = true;
+	adev->gfx.mec.num_mec = 1;
+	adev->gfx.mec.num_pipe_per_mec = 4;
+	adev->gfx.mec.num_queue_per_pipe = 8;
 	kfd.shared_resources.num_pipe_per_mec = 4;
 	kfd.shared_resources.num_queue_per_pipe = 8;
 	kfd.shared_resources.gpuvm_size = 1ULL << 47;
@@ -1289,7 +1385,7 @@ static void fault_work_fn(struct work_struct *work)
 }
 static void fault_entry(uint32_t entry[8], uint32_t pasid, uint64_t va, bool write)
 {
-	const uint64_t page = va >> PAGE_SHIFT;
+	const uint64_t page = va >> AMDGPU_GPU_PAGE_SHIFT;	/* the IH counts 4 KiB GPU pages */
 	/* ring_id: the protection fault status bits KFD decodes (valid, read,
 	 * write). */
 	const uint32_t ring = 0x08 | (write ? 0x20 : 0x10);
