@@ -678,3 +678,19 @@ do {
     check(bad.append(["x"])?.hasPrefix("could not open") == true, "a write failure is said")
 }
 print("PASS driver trail: ring chunks as read-driver-log.py reads them, whole lines, overwritten bytes counted, state line, fsynced file rotation")
+
+// An upgrade's handover through ShutdownGPU (UpgradeHandover): the
+// reference phases, a refusal for other clients, and calls that failed.
+do {
+    let busy = Int32(bitPattern: 0xe00002d5), error = UInt64(0xe00002bc)
+    check(UpgradeHandover.evaluate(kr: 0, status: 0, phase: 6) == .closed)
+    check(UpgradeHandover.evaluate(kr: 0, status: 0xe00002d5, phase: 2) == .closing)
+    check(UpgradeHandover.evaluate(kr: busy, status: .max, phase: .max) == .clientsRemain,
+          "other clients: the call itself is refused Busy")
+    check(UpgradeHandover.evaluate(kr: 0, status: error, phase: 5) == .quarantined)
+    check(UpgradeHandover.evaluate(kr: Int32(bitPattern: 0xe00002d9), status: .max, phase: .max) ==
+          .refused(Int32(bitPattern: 0xe00002d9)), "an instance that is leaving")
+    check(UpgradeHandover.evaluate(kr: 0, status: 0, phase: 1) == .refused(0), "an unknown phase is not taken as closed")
+    check(UpgradeHandover.clientsRemain.summary.contains("closes when the last of them quits"))
+}
+print("PASS upgrade handover: ShutdownGPU answers read as closed, closing, waiting for clients, quarantined or refused")

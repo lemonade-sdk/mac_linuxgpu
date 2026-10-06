@@ -42,6 +42,7 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
 	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
 	MLG_SESSION_FLAG_GPU_WEDGED          = 1u << 13, /* recovery failed: power-cycle the GPU */
+	MLG_SESSION_FLAG_CLOSE_WHEN_IDLE     = 1u << 14, /* ShutdownGPU waits: the last client's leaving closes */
 };
 
 /* Which close/probe step quarantined the session. */

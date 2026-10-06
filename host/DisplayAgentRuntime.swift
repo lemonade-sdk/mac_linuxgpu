@@ -2103,9 +2103,24 @@ enum GPUDisconnect {
         let host = MacLinuxGPUHost()
         host.quiet = true
         guard host.openUserClient(observer: true) else { return false }
-        defer { _ = host.closeUserClient() }
-        guard let result = host.retire(kRetireOpDisconnect) else { return false }
-        return result.status == kIOReturnSuccess || result.state == RetireResult.closing
+        if let result = host.retire(kRetireOpDisconnect) {
+            _ = host.closeUserClient()
+            return result.status == kIOReturnSuccess || result.state == RetireResult.closing
+        }
+        let refused = host.lastStatus
+        _ = host.closeUserClient()
+        // Not authorized to end other programs' sessions: ShutdownGPU closes
+        // the session once none uses it (at once when none does; from build
+        // 263 on, when the last of them quits).
+        guard refused == kern_return_t(bitPattern: 0xe00002c1) else { return false }
+        let session = MacLinuxGPUHost()
+        session.quiet = true
+        guard session.openUserClient(observer: false) else { return false }
+        defer { _ = session.closeUserClient() }
+        switch session.shutdownSession() {
+        case .closed, .closing: return true
+        default: return false
+        }
     }
 
     /// Asks, then waits up to @timeout for the GPU to be free; the last look.

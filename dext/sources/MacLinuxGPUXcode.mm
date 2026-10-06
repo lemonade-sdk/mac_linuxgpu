@@ -331,6 +331,11 @@ static bool             s_deviceRemoved = false;
 // new session is admitted; with s_retireTerminate this instance asks IOKit
 // to terminate it once its session is gone, so its process exits.
 static bool             s_retiring = false;
+// ShutdownGPU found other clients in the session (an upgrade's handover:
+// the installer asks the previous instance, which then must not stay up
+// for clients that come and go): the last client's leaving closes the
+// session (last_leave_closes). Cleared with the session.
+static bool             s_closeWhenIdle = false;
 static bool             s_retireTerminate = false;
 // The session Disconnect GPU closed (retire_driver): its clients' calls fail
 // with kIOReturnNoDevice. 0 for none.
@@ -711,6 +716,7 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
+    if (s_closeWhenIdle) flags |= MLG_SESSION_FLAG_CLOSE_WHEN_IDLE;
     {
         uint64_t reset[MLG_RESET_STATE_WORDS];
         reset_state(reset);
@@ -771,6 +777,7 @@ static void complete_session_close(MacLinuxGPU *driver)
     s_pciOpen = false;
     s_token = 0;
     s_participants = 0;
+    s_closeWhenIdle = false;
     __atomic_store_n(&s_deviceLost, false, __ATOMIC_RELEASE);
     ++s_sessionGeneration;
     s_sessionClosing = false;
@@ -2581,7 +2588,10 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // release or an uncertain GPU: s_dmaQuarantined), or when the last client
 // leaves a session that must end with it (last_leave_closes).
 //
-// The last client's leaving ends the session when the device left the bus
+// The last client's leaving ends the session when ShutdownGPU asked for
+// it while other clients used the GPU (s_closeWhenIdle: an upgrade's
+// handover, whose previous instance can leave only once its session is
+// closed), when the device left the bus
 // or no longer answers this driver (a transport fault: s_deviceLost),
 // when a raw BAR mapping's revocation is not proved, or when what the
 // session set up was that client's own: a session that never brought the
@@ -2591,7 +2601,7 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // its window again, as before).
 static bool last_leave_closes(bool legacyClient)
 {
-    return s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE) ||
+    return s_closeWhenIdle || s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE) ||
            s_rawBARLease.hasMappings() || !s_modulesRunning || legacyClient;
 }
 static bool session_leave_closes(bool participant, bool legacyClient)
@@ -5087,7 +5097,19 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutputCount < 2) return kIOReturnBadArgument;
         if (s_rawBARLease.hasMappings()) return kIOReturnBusy;
         const bool participant = ivars->sessionGeneration == s_sessionGeneration;
-        if (s_participants > (participant ? 1u : 0u)) return kIOReturnBusy;
+        if (s_participants > (participant ? 1u : 0u)) {
+            // Other clients use the GPU: the session closes when the last
+            // of them leaves (an upgrade's handover asks this of the
+            // previous instance, which can go only once its session is
+            // closed; the device otherwise stays up across clients).
+            if (s_pciOpen && !s_sessionClosing && !s_closeWhenIdle) {
+                s_closeWhenIdle = true;
+                MACLINUXGPU_EVENT("shutdown: %u client(s) still use the GPU; the session closes "
+                                  "when the last of them leaves",
+                                  s_participants - (participant ? 1u : 0u));
+            }
+            return kIOReturnBusy;
+        }
         if (s_pciOpen && !s_sessionClosing) close_session(ivars->ownerDriver);
         out[0] = s_dmaQuarantined ? kIOReturnError :
                  (s_sessionClosing ? kIOReturnBusy : kIOReturnSuccess);

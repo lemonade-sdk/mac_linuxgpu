@@ -1213,6 +1213,51 @@ static void upgradeStop(const std::string &kind) {
     std::puts("PASS production upgrade stop: uncertain session keeps its owners, Stop pending, restart reported");
 }
 
+// An upgrade's handover when Retire is refused (the installer is not
+// entitled): the installer opens a session client on the previous instance
+// and asks ShutdownGPU, which closes the session the device kept up across
+// clients; the instance can leave only once its session is closed. "idle":
+// the last client already left, the session stayed up; ShutdownGPU closes
+// it at once and IOKit's Stop then finds nothing. "clients": a client still
+// uses the GPU; ShutdownGPU is refused and remembered, and that client's
+// leaving closes the session, with no further call.
+static void upgradeHandover(const std::string &kind) {
+    UpgradeRig rig(true);
+    uint64_t output[2]{};
+    IOUserClientMethodArguments arguments{0, output, 2};
+    if (kind == "idle") {
+        // The only client leaves: what it owned goes, the device stays up.
+        assert(rig.client.Stop(&rig.driver) == kIOReturnSuccess);
+        assert(s_pciOpen && !s_sessionClosing && s_participants == 0 && clientStops == 1);
+        // The installer's session client (never a participant) asks.
+        assert(rig.next.shutdown(&arguments) == kIOReturnSuccess);
+        assert(output[0] == kIOReturnBusy && output[1] == 2 && s_sessionClosing);
+    } else {
+        // A client uses the GPU: refused, remembered, said once.
+        assert(rig.next.shutdown(&arguments) == kIOReturnBusy);
+        assert(s_pciOpen && !s_sessionClosing && s_closeWhenIdle);
+        assert(state()[1] & MLG_SESSION_FLAG_CLOSE_WHEN_IDLE);
+        expectLog("shutdown: 1 client(s) still use the GPU; the session closes when the last of them leaves");
+        assert(rig.next.shutdown(&arguments) == kIOReturnBusy && s_closeWhenIdle);
+        // Its leaving closes the session (it releases nothing itself: the
+        // close releases everything).
+        assert(rig.client.Stop(&rig.driver) == kIOReturnSuccess);
+        assert(s_sessionClosing && s_participants == 0 && !saw("release_client"));
+    }
+    rig.deliverIRQDrain();
+    assert(!s_sessionClosing && !s_pciOpen && saw("pci_close") && !saw("pci_quarantine"));
+    assert(!s_closeWhenIdle && !(state()[1] & MLG_SESSION_FLAG_CLOSE_WHEN_IDLE));
+    assert(rig.next.shutdown(&arguments) == kIOReturnSuccess && output[0] == kIOReturnSuccess && output[1] == 6);
+    // IOKit now terminates the instance: its Stop finishes at once.
+    assert(rig.observer.Stop(&rig.driver) == kIOReturnSuccess);
+    assert(rig.driver.Stop(&rig.provider) == kIOReturnSuccess);
+    expectLog("stop: no session; provider released at once");
+    rig.assertReleased();
+    std::printf("PASS production upgrade handover: %s\n", kind == "idle" ?
+                "previous instance with no client closes on ShutdownGPU and stops" :
+                "ShutdownGPU with a client waits; its leaving closes the session; the instance stops");
+}
+
 static void retireScenario(const std::string &kind) {
     if (kind == "idle") {
         UpgradeRig rig(false);
@@ -1611,6 +1656,10 @@ int main(int argc, char **argv) {
     }
     if (scenario.rfind("upgrade-stop-", 0) == 0) {
         upgradeStop(scenario.substr(13));
+        return 0;
+    }
+    if (scenario.rfind("upgrade-handover-", 0) == 0) {
+        upgradeHandover(scenario.substr(17));
         return 0;
     }
     if (scenario.rfind("retire-", 0) == 0) {

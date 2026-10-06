@@ -1406,3 +1406,50 @@ struct TrailLineBuffer {
         return pending.isEmpty ? nil : String(decoding: pending, as: UTF8.self) + " [cut off]"
     }
 }
+
+/// An upgrade's handover when the previous driver refuses Retire (this app
+/// lacks the session-release authorization): the previous instance can
+/// leave only once its session is closed, so the installer asks it with
+/// ShutdownGPU (selector 42) from a session client of its own, which never
+/// joins the session. One answer, read here.
+enum UpgradeHandover: Equatable {
+    /// The session is closed: the instance leaves once IOKit stops it.
+    case closed
+    /// The close runs; ask again to follow it.
+    case closing
+    /// Other programs use the GPU. A driver from build 263 on remembers the
+    /// request and closes the session when the last of them leaves; an
+    /// older one must be asked again after they leave.
+    case clientsRemain
+    /// The session's close is uncertain: a restart (never a kill) ends it.
+    case quarantined
+    /// No answer to act on (the instance is leaving, or refused the call).
+    case refused(Int32)
+
+    static let busy = Int32(bitPattern: 0xe00002d5)   // kIOReturnBusy
+    static let error = Int32(bitPattern: 0xe00002bc)  // kIOReturnError
+
+    /// @kr: the call's IOReturn; @status, @phase: ShutdownGPU's out[0] and
+    /// out[1] (session_state.h's reference layout: phase 2 closing, 5
+    /// quarantined, 6 closed).
+    static func evaluate(kr: Int32, status: UInt64, phase: UInt64) -> UpgradeHandover {
+        if kr == busy { return .clientsRemain }
+        guard kr == 0 else { return .refused(kr) }
+        let result = Int32(bitPattern: UInt32(truncatingIfNeeded: status))
+        if phase == 5 || result == error { return .quarantined }
+        if phase == 6 && result == 0 { return .closed }
+        if phase == 2 { return .closing }
+        return .refused(result)
+    }
+
+    var summary: String {
+        switch self {
+        case .closed: return "its session is closed; it leaves once macOS stops it"
+        case .closing: return "closing its session through the normal close"
+        case .clientsRemain:
+            return "programs still use the GPU; its session closes when the last of them quits"
+        case .quarantined: return "its session could not close cleanly: restart the Mac, do not kill the driver"
+        case .refused(let kr): return String(format: "did not take ShutdownGPU (kr=%#x)", UInt32(bitPattern: kr))
+        }
+    }
+}
