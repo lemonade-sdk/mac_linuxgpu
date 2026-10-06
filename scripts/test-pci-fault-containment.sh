@@ -40,10 +40,14 @@ PY
 clang -w -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
   -ffunction-sections -fdata-sections -Ilinuxu/headers \
   -c linuxu/src/shims/printk.c -o "$work/printk.o"
+# The VRAM aperture the BAR0 mapping publishes (rt/device_string.h).
+clang -w -std=gnu11 -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all \
+  -ffunction-sections -fdata-sections -Ilinuxu/headers \
+  -c linuxu/src/kmem/device_string.c -o "$work/device_string.o"
 clang++ -x objective-c++ -std=c++17 -fno-exceptions -fno-objc-exceptions \
   -g -O1 -fsanitize=address,undefined -fno-sanitize-recover=all -DLINUXU_DEXT=1 \
   -I"$work/include" -I"$work" -Ilinuxu/tests -Idext/sources -idirafter linuxu/headers \
-  linuxu/tests/test_pci_fault_containment.cpp -x none "$work/printk.o" \
+  linuxu/tests/test_pci_fault_containment.cpp -x none "$work/printk.o" "$work/device_string.o" \
   -Wl,-dead_strip -o "$work/test"
 "$work/test"
 "$work/test" prepare
