@@ -20,7 +20,17 @@ def section(start, end, limit):
         raise SystemExit("display async extraction exceeded its bounded section")
     return text
 stops = section("/* Stopped clients whose imports and output are still to release", "static void observer_display_client_stop_now(uint64_t clientID)\n{", 70)
-calls = section("// A client's last display op result (MacLinuxGPUUserClient_IVars::displayResults).", "// ----------------------------------------------------------------\n// ExternalMethod", 370)
+# display_call is the section's last function: it ends at its own closing
+# brace, so whatever the dext places after it (build 263's kick_on_delivery)
+# stays out of the extraction.
+calls_last = "static kern_return_t display_call(MacLinuxGPUUserClient *client, uint64_t clientID,"
+if source.count(calls_last) != 1:
+    raise SystemExit(f"display async extraction markers changed: {calls_last!r}")
+calls = section("// A client's last display op result (MacLinuxGPUUserClient_IVars::displayResults).", calls_last, 370)
+calls_end = source.index("\n}\n", source.index(calls_last)) + 3
+calls += source[source.index(calls_last):calls_end]
+if len(calls.splitlines()) > 370:
+    raise SystemExit("display async extraction exceeded its bounded section")
 pathlib.Path(sys.argv[1], "display_async_production.inc").write_text(stops + calls)
 PY
 # The host app's call (host/display_call.h) against the driver's own

@@ -59,19 +59,53 @@ assert not {'___memset_chk', '___memcpy_chk', '___memmove_chk'} & symbols, symbo
 PY
 
 # Check real arm64 DriverKit code generation, including optimized builds.
+# Device memory reaches these functions only through the VRAM aperture
+# (linuxu_aperture_*): its accesses stay in general registers, one aligned
+# access at a time. Normal memory is copied with NEON (LD1/ST1, byte
+# elements), and nothing uses the cache-zeroing instruction (DC ZVA).
+# The DriverKit target's default stack protector guards the bounce buffers:
+# its references are the only external ones, ___stack_chk_fail bound to the
+# dext's own close-first handler (dext/sources/fatal_close.h) and
+# ___stack_chk_guard, the canary DriverKit's libSystem exports.
+driverkit_sdk=$(xcrun --sdk driverkit --show-sdk-path)
 for optimization in 0 2; do
   xcrun clang "${production_flags[@]}" -O"$optimization" \
     -c linuxu/src/kmem/device_string.c -o "$work/backend.o"
   xcrun llvm-objdump --macho --disassemble "$work/backend.o" > "$work/backend.s"
   xcrun nm -u "$work/backend.o" > "$work/undefined.txt"
-  python3 - "$work" <<'PY'
+  python3 - "$work" "$driverkit_sdk" <<'PY'
 from pathlib import Path
 import re, sys
 p = Path(sys.argv[1])
+sdk = Path(sys.argv[2])
 asm = p.joinpath('backend.s').read_text()
-assert not re.search(r'\bdc\s+zva\b|\b[qlv][0-9]+\b|\bv[0-9]+\.', asm), asm
-assert not p.joinpath('undefined.txt').read_text().strip(), 'backend calls another library'
+assert not re.search(r'\bdc\s+zva\b', asm), 'cache-zeroing instruction in the memory backend'
+functions, name = {}, None
+for line in asm.splitlines():
+    label = re.match(r'^(_\w+):$', line)
+    if label:
+        name = label[1]
+        functions[name] = []
+    elif name and re.match(r'^\s+[0-9a-f]+:\t', line):
+        functions[name].append(line.split('\t', 2)[-1].strip())
+aperture = ['_linuxu_aperture_read', '_linuxu_aperture_write', '_linuxu_aperture_copy_in',
+            '_linuxu_aperture_copy_out', '_linuxu_aperture_fill']
+assert set(aperture) <= set(functions), sorted(functions)
+simd = re.compile(r'\b[bhsdq][0-9]+\b|\bv[0-9]+(\.|\b)')
+memory = re.compile(r'^(ld|st)\S*\s.*\[(\w+)')
+for function in aperture + ['_aperture_access']:
+    for instruction in functions.get(function, []):
+        access = memory.match(instruction)
+        if access and simd.search(instruction):
+            assert access[2] in ('sp', 'x29'), f'{function}: vector access off the stack: {instruction}'
+undefined = set(p.joinpath('undefined.txt').read_text().split())
+assert undefined <= {'___stack_chk_fail', '___stack_chk_guard'}, f'backend calls another library: {undefined}'
+handler = Path('dext/sources/fatal_close.h').read_text()
+assert re.search(r'__attribute__\(\(no_stack_protector\)\) void __stack_chk_fail\(void\)\n\{', handler), \
+    'the dext no longer defines __stack_chk_fail'
+assert '___stack_chk_guard' in sdk.joinpath('System/DriverKit/usr/lib/libSystem.tbd').read_text(), \
+    'DriverKit libSystem does not export ___stack_chk_guard'
 PY
 done
 echo 'Production PSP object: shim memset/memcpy calls, no fortified libc bulk calls'
-echo 'DriverKit memory backend: scalar instructions only; no external calls at -O0/-O2'
+echo 'DriverKit memory backend: aperture accesses in general registers, no DC ZVA; only the stack protector is external, at -O0/-O2'
