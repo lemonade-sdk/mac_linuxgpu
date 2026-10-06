@@ -42,6 +42,14 @@
         "drivers/gpu/buddy.c"
       ],
       "reason": "Honour GPU_BUDDY_TOPDOWN_ALLOCATION when a clear allocation falls back to the dirty tree. Without it amdgpu's VRAM_CLEARED top-down KFD BOs fill the low VRAM, the CPU-visible window of a 256 MiB BAR, and every CPU-access allocation must evict them; scripts/test-gpu-buddy.sh checks the placement. Drop when the pin has upstream's dirty-tracker rework of the buddy allocator."
+    },
+    {
+      "patch": "patches/linux/kfd-v12-mqd-vram.patch",
+      "sha256": "1770489e520b5530fa3a8e851cd637698db3dc104633ab73b951ae671c1fb58d",
+      "files": [
+        "drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c"
+      ],
+      "reason": "Allocate GFX12 compute user-queue MQDs in CPU-visible VRAM on a dGPU (amdgpu_bo_create_kernel) and flush HDP after update_mqd, as amdgpu does for its kernel queue MQDs on GFX10+ and KFD for GFX 9.4.3. A dispatch that fills a shader engine exactly is retired only after CP accesses to the MQD; with KFD's GTT MQD behind Thunderbolt that costs +45 us per dispatch (253-256 x 256-thread workgroups on an R9700: 51 us instead of 5), with the VRAM MQD +12 us. Drop if upstream moves GFX12 KFD MQDs to VRAM."
     }
   ],
   "verified_copies": {
