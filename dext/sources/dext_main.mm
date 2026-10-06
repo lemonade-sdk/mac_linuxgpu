@@ -24,6 +24,7 @@ extern "C" int linuxu_aperture_is_gone(void);
 #import <DriverKit/IOInterruptDispatchSource.h>
 #import <PCIDriverKit/IOPCIDevice.h>
 #import <PCIDriverKit/IOPCIFamilyDefinitions.h>
+#include "fatal_close.h"
 
 /* The DMA seam (iokit_bridge.m) needs the same IOPCIDevice; dext_set_pci
  * hands it to both seams so init order between them does not matter. */
@@ -110,6 +111,7 @@ struct dext_bar_record {
 };
 static dext_bar_record g_bars[6];
 static void dext_aperture_install(void);
+static void dext_pci_crash_close(void);
 /* Primary fake-MMIO token for the register BAR.  0 until dext_open mints
  * it.  Its window is the whole BAR as assigned (see dext_open). */
 static uint32_t     g_reg_token;
@@ -251,6 +253,9 @@ static void                       *g_irq_drain_context;
 __attribute__((constructor)) static void dext_fatal_register(void)
 {
 	linuxu_fatal_set_hook(dext_fatal_contain);
+	/* Before any session can open: a dext that ends itself closes it
+	 * first (fatal_close.h). */
+	dext_fatal_close_install(dext_pci_crash_close);
 }
 
 /* The IOService (MacLinuxGPU) hands the claimed IOPCIDevice to this seam
@@ -258,6 +263,7 @@ __attribute__((constructor)) static void dext_fatal_register(void)
 extern "C" int dext_set_pci(void *pci_device, void *client)
 {
 	linuxu_fatal_set_hook(dext_fatal_contain);
+	dext_fatal_close_install(dext_pci_crash_close);
 	dext_pci_control_guard control;
 	if (!pci_device || !client)
 		return -1;
@@ -281,6 +287,20 @@ extern "C" int dext_set_pci(void *pci_device, void *client)
 	return 0;
 }
 
+/* The fatal-path close (fatal_close.h): on any thread, with any lock held.
+ * Cached state only, no lock: admission closes, the session is marked
+ * closed, then the provider is closed. An access already in flight then
+ * fails in the kernel (not open), as it would after a normal Close. Exactly
+ * one Close: dext_close takes the same open flag. */
+static void dext_pci_crash_close(void)
+{
+	g_pci_access.block();
+	IOPCIDevice *pci = __atomic_load_n(&g_pci, __ATOMIC_ACQUIRE);
+	IOService *client = __atomic_load_n(&g_pci_client, __ATOMIC_ACQUIRE);
+	if (pci && client && __atomic_exchange_n(&g_pci_open, false, __ATOMIC_ACQ_REL))
+		pci->Close(client, 0);
+}
+
 /* Close the provider once nothing can reach it: admission closes, every
  * admitted operation and raw call must leave (at most a second), and only
  * then the session closes and admission reopens for the next one. Refused,
@@ -294,9 +314,12 @@ extern "C" void dext_close(void)
 		dext_pci_control_guard control;
 		if (g_pci_access.closed() ||
 		    __atomic_load_n(&g_pci_resetting, __ATOMIC_ACQUIRE)) {
-			if (g_pci_open)
-				IOLog("MacLinuxGPU: dext_close refused: PCI admission is %s; the provider stays open\n",
-				      g_pci_access.closed() ? "closed by a fault" : "held by a reset");
+			if (g_pci_open && g_pci_access.closed())
+				IOLog("MacLinuxGPU: dext_close refused: PCI admission is closed by a fault; "
+				      "the provider stays open\n");
+			else if (g_pci_open)
+				IOLog("MacLinuxGPU: dext_close refused: PCI admission is held by a reset; "
+				      "the provider stays open\n");
 			return;
 		}
 		if (__atomic_load_n(&g_irq_draining, __ATOMIC_ACQUIRE) ||
