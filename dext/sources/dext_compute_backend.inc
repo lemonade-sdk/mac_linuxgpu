@@ -11,10 +11,11 @@
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 256u /* 192: KFD compute sessions, QueryInfo tag 12;
+#define DEXT_RUNTIME_BUILD 258u /* 192: KFD compute sessions, QueryInfo tag 12;
                                    243: session calls are async (session_state.h);
                                    256: AQLQueueService reports a GPU memory fault
-                                   (kIOReturnVMError, flags and address) */
+                                   (kIOReturnVMError, flags and address);
+                                   258: CodeSync (90) */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u
@@ -1159,6 +1160,20 @@ static int dispatch_cache_sync(void *arg)
 int dext_compute_rsrc1_clamp_ieee(void)
 {
     return production_ready() && dext_aql_rsrc1_clamp_ieee(production.ctx);
+}
+
+/* CodeSync (90): only the cache work a code-object load needs. It touches
+ * no client memory, so a ring that does not finish in time is the ring's
+ * own timeout and recovery to handle, not a reason to freeze the device. */
+int dext_compute_code_sync(uint64_t timeout_us)
+{
+    uint64_t sequence = 0;
+    if (!timeout_us || timeout_us > 1000000u) return -EINVAL_L;
+    if (!production_ready()) return -ENOTREADY_L;
+    const int r = rt_compute_cache_sync(production.ctx, (uint32_t)timeout_us, &sequence);
+    if (!r) return 0;
+    if (r == -EINVAL) return -EINVAL_L;
+    return r == -ETIMEDOUT ? -EBUSY_L : -ENOTREADY_L;
 }
 
 /* A raw shader launch, run as a one-shot AQL dispatch on a DriverKit HQD

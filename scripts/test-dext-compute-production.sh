@@ -11,7 +11,7 @@ for stage in 1 2 3 4 5 6 7; do
   "$test_dir/test_dext_compute_production" startup "$stage" 0
   "$test_dir/test_dext_compute_production" startup "$stage" 1
 done
-for scenario in open-failure dispatch-timeout dispatch bounded-timeout bounded-oom \
+for scenario in open-failure dispatch-timeout dispatch code-sync bounded-timeout bounded-oom \
   bounded-nospc create-nospc query-topology geometry legacy-one-hqd kfd-two-queues \
   kfd-open-failure kfd-stop kfd-destroy-retained kfd-death-recovered kfd-death-kept \
   kfd-fault-isolated \

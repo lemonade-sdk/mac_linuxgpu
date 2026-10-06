@@ -560,6 +560,13 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
     return -ENOENT_L;
 }
 
+/* The reference backend has no cache to invalidate. */
+int dext_compute_code_sync(uint64_t timeout_us)
+{
+    if (!timeout_us || timeout_us > 1000000u) return -EINVAL_L;
+    return compute_backend_ready() ? 0 : -ENOTREADY_L;
+}
+
 /* The reference backend's queues never fault. */
 int dext_compute_aql_queue_fault(uint64_t handle, uint64_t *out_flags, uint64_t *out_va)
 {

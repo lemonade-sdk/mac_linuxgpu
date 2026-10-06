@@ -476,7 +476,7 @@ int main(int argc, char **argv)
         uint64_t words[8], window[3], ring, meta, q, status;
         startup_failure=7; kfd_supported_error=0;
         assert(dext_compute_start(&pdev)==0);
-        assert(dext_compute_runtime_build(words)==0 && words[2]==256);
+        assert(dext_compute_runtime_build(words)==0 && words[2]==258);
         dext_compute_set_kfd_policy(false);
         dext_compute_select_client(3);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==1 && !words[2]);
@@ -560,6 +560,18 @@ int main(int argc, char **argv)
         code_after_sync_error=-ETIMEDOUT;
         assert(dext_compute_dispatch(&raw,sizeof(raw),out)==-EBUSY_L);
         expect_frozen(payload);
+    } else if (!strcmp(argv[1],"code-sync")) {
+        /* CodeSync: the cache sync alone; no queue, no launch. A ring that
+         * does not finish is an error for the caller, never a freeze. */
+        dispatch_sequence=5;
+        assert(dext_compute_code_sync(100000)==0 && syncs==1 && kfd_dispatches==0);
+        assert(dext_compute_code_sync(0)==-EINVAL_L && dext_compute_code_sync(1000001)==-EINVAL_L);
+        assert(syncs==1);
+        dispatch_error=-ETIMEDOUT;
+        assert(dext_compute_code_sync(100)==-EBUSY_L && syncs==2);
+        dispatch_error=0;
+        assert(dext_compute_query_info(1,out,10)==3);	/* not frozen */
+        assert(!dext_compute_bo_free(payload));
     } else if (!strcmp(argv[1],"query-topology")) {
         uint64_t words[16];
         /* Tag 6 word 8: waves per CU from the reported SIMD count. */

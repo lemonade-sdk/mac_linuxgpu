@@ -5256,6 +5256,19 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         return kIOReturnSuccess;
     }
 
+    case MLG_SELECTOR_CODE_SYNC: {
+        if (!in || arguments->scalarInputCount != 1 || !out || arguments->scalarOutputCount < 1 ||
+            arguments->structureInput || arguments->structureInputDescriptor ||
+            !in[0] || in[0] > MLG_CODE_SYNC_TIMEOUT_MAX_US)
+            return kIOReturnBadArgument;
+        const int r = dext_compute_code_sync(in[0]);
+        if (r == -EINVAL_L) return kIOReturnBadArgument;
+        if (r == -ENOTREADY_L) return kIOReturnNotReady;
+        out[0] = r == -EBUSY_L ? (uint64_t)(int64_t)-110 /* ETIMEDOUT */ : 0;
+        arguments->scalarOutputCount = 1;
+        return kIOReturnSuccess;
+    }
+
     case kMacAMDGPUMethodBOExport:
     case kMacAMDGPUMethodBOImport: {
         if (!in || arguments->scalarInputCount != 3 || !out ||

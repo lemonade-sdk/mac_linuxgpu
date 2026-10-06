@@ -122,6 +122,17 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
 #define MLG_SELECTOR_EVENT_WAIT          87u
 #define MLG_SELECTOR_OWNER_RESULT        88u
 #define MLG_SELECTOR_SYSFS_WRITE         89u
+/* CodeSync: the GPU caches (instruction, scalar, vector, GL1, GL2)
+ * invalidated and written back by the compute ring's ACQUIRE_MEM
+ * (rt_compute_cache_sync), waited for: what a code-object load needs before
+ * its code runs. A session client's async call.
+ *   scalar in:  [0] timeout in microseconds, 1 to 1000000
+ *   scalar out: [0] 0, or a negative Linux errno, sign-extended (ETIMEDOUT
+ *               when the ring did not finish in time)
+ * Unlike a ComputeDispatch used for the same purpose, no queue is created
+ * and nothing is launched. */
+#define MLG_SELECTOR_CODE_SYNC           90u
+#define MLG_CODE_SYNC_TIMEOUT_MAX_US     1000000u
 
 /* Calls that never sleep, and every other call.
  *

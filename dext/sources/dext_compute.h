@@ -193,6 +193,11 @@ int dext_compute_bo_write(uint64_t handle, uint64_t offset,
                           const void *source, size_t bytes);
 int dext_compute_bo_read(uint64_t handle, uint64_t offset,
                          void *destination, size_t bytes);
+/* CodeSync (90): the compute ring's cache invalidate and writeback, waited
+ * for up to @timeout_us. 0, -ETIMEDOUT style errors as -EBUSY_L (the ring
+ * did not finish), -ENOTREADY_L. */
+int dext_compute_code_sync(uint64_t timeout_us);
+
 int dext_compute_dispatch(const void *request, size_t request_size,
                           uint64_t *out /* 3 */);
 /* ComputeDispatch (51) validation: whether the device's COMPUTE_PGM_RSRC1
