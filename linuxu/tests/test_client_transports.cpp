@@ -265,6 +265,7 @@ int dext_compute_runtime_build_cached(uint64_t *out)
     return 0;
 }
 static kern_return_t observer_sysfs_read(IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
+static kern_return_t observer_sysfs_write(IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
 static kern_return_t observer_drm_info(IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
 static kern_return_t display_call(MacLinuxGPUUserClient *, uint64_t, IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
 int dext_compute_bo_memory(uint32_t, void **, uint64_t *) { return -ENOENT_L; }

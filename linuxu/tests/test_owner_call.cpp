@@ -183,6 +183,13 @@ static std::mutex smuLock;
 static std::condition_variable smuAnswer;
 static bool smuAnswers;
 static std::atomic<int> readsRun;
+// SysfsWrite runs on the same bounded thread; not exercised here.
+static kern_return_t observer_sysfs_write(IOUserClientMethodArguments *a)
+{
+    a->scalarOutput[0] = 0;
+    a->scalarOutputCount = MLG_SYSFS_WRITE_WORDS;
+    return kIOReturnSuccess;
+}
 static kern_return_t observer_sysfs_read(IOUserClientMethodArguments *a)
 {
     ++readsRun;

@@ -38,7 +38,7 @@ sources=(linuxu/tests/test_kfd_power.c linuxu/tests/kfd_session_fixture.c linuxu
   $amdkfd/kfd_device_queue_manager.c $amdkfd/kfd_device_queue_manager_v12.c
   $amdkfd/kfd_mqd_manager.c $amdkfd/kfd_mqd_manager_v12.c
   $amdkfd/kfd_queue.c $amdkfd/kfd_doorbell.c $amdkfd/kfd_flat_memory.c
-  $amdkfd/kfd_events.c $amdkfd/kfd_debug.c $amdkfd/kfd_smi_events.c $amdkfd/kfd_debugfs.c
+  $amdkfd/kfd_events.c $amdkfd/kfd_debug.c $amdkfd/kfd_smi_events.c $amdkfd/kfd_debugfs.c $amdkfd/kfd_int_process_v11.c
   linuxu/src/shims/process.c linuxu/src/shims/task.c linuxu/src/shims/fd.c
   linuxu/src/shims/chrdev.c linuxu/src/shims/module.c linuxu/src/shims/sysinfo.c
   linuxu/src/drm/dma_resv.c linuxu/src/sync/ww_mutex.c

@@ -103,6 +103,10 @@ int kfd_gtt_sa_allocate(struct kfd_node *node, unsigned int size,
 { (void)node; (void)size; (void)mem_obj; abort(); }
 int kfd_gtt_sa_free(struct kfd_node *node, struct kfd_mem_obj *mem_obj)
 { (void)node; (void)mem_obj; abort(); }
+/* The VRAM MQD allocation (patches/linux/kfd-v12-mqd-vram.patch). */
+int amdgpu_bo_create_kernel(struct amdgpu_device *adev, unsigned long size, int align,
+			    u32 domain, struct amdgpu_bo **bo_ptr, u64 *gpu_addr, void **cpu_addr)
+{ (void)adev; (void)size; (void)align; (void)domain; (void)bo_ptr; (void)gpu_addr; (void)cpu_addr; abort(); }
 void seq_hex_dump(struct seq_file *m, const char *prefix_str, int prefix_type,
 		  int rowsize, int groupsize, const void *buf, size_t len, bool ascii)
 { (void)m; (void)prefix_str; (void)prefix_type; (void)rowsize; (void)groupsize;
