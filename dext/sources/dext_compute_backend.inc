@@ -11,8 +11,10 @@
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 243u /* 192: KFD compute sessions, QueryInfo tag 12;
-                                   243: session calls are async (session_state.h) */
+#define DEXT_RUNTIME_BUILD 256u /* 192: KFD compute sessions, QueryInfo tag 12;
+                                   243: session calls are async (session_state.h);
+                                   256: AQLQueueService reports a GPU memory fault
+                                   (kIOReturnVMError, flags and address) */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u

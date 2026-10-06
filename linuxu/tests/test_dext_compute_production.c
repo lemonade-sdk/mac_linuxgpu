@@ -470,7 +470,7 @@ int main(int argc, char **argv)
         uint64_t words[8], window[3], ring, meta, q, status;
         startup_failure=7; kfd_supported_error=0;
         assert(dext_compute_start(&pdev)==0);
-        assert(dext_compute_runtime_build(words)==0 && words[2]==243);
+        assert(dext_compute_runtime_build(words)==0 && words[2]==256);
         dext_compute_set_kfd_policy(false);
         dext_compute_select_client(3);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==1 && !words[2]);
