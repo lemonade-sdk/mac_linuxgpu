@@ -37,6 +37,7 @@
 #include "amdgpu_reset.h"
 #include "amdgpu_ttm.h"
 #include "kfd_priv.h"
+#include "kfd_events.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_topology.h"
 
@@ -147,6 +148,7 @@ struct rt_kfd_session {
 	/* The process's memory event (rt_kfd_session_fault) and, once KFD
 	 * signaled it, what it reported. */
 	uint32_t memory_event;
+	struct kfd_event *memory_ev;	/* KFD's, alive until the process exits */
 	bool faulted;
 	struct rt_kfd_fault fault;
 };
@@ -461,6 +463,15 @@ static int session_handshake(struct rt_kfd_session *s)
 		if (r)
 			return (int)r;
 		s->memory_event = event.event_id;
+		/* The event object itself: the queue service checks for a fault
+		 * at 1 kHz per queue, and its signaled flag answers without a
+		 * call. KFD frees it only with the process (the session never
+		 * destroys it). */
+		mutex_lock(&s->process->event_mutex);
+		s->memory_ev = idr_find(&s->process->event_idr, event.event_id);
+		mutex_unlock(&s->process->event_mutex);
+		if (!s->memory_ev)
+			return -ENOENT;
 	}
 	r = read_limits(s);
 	if (r)
@@ -1402,6 +1413,10 @@ static int fault_poll_locked(struct rt_kfd_session *s)
 
 	if (s->faulted)
 		return 1;
+	/* Not signaled: no fault, and no call. Once KFD signaled it, the
+	 * zero-timeout wait reads what it reported. */
+	if (!READ_ONCE(s->memory_ev->signaled))
+		return 0;
 	memset(&wait, 0, sizeof(wait));
 	wait.args.events_ptr = arena_address(&wait, &wait.event);
 	wait.args.num_events = 1;
