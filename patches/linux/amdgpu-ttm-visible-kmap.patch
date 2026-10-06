@@ -1,0 +1,34 @@
+drm/amdgpu: no kernel mapping pointer for VRAM outside the visible window
+
+amdgpu_ttm_io_mem_reserve hands TTM a premapped address, aper_base_kaddr
+plus the resource offset, for any contiguous VRAM resource. aper_base_kaddr
+maps only the CPU-visible part of VRAM (amdgpu_ttm_init ioremaps
+visible_vram_size), so for a contiguous BO placed past it (a kernel BO
+without AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED, which top-down placement
+puts at the end of VRAM) ttm_bo_kmap and ttm_bo_vmap return a pointer past
+the end of the mapping, and the first CPU store through it lands in
+whatever follows. Give a premapped address only when the whole resource is
+CPU visible (amdgpu_res_cpu_visible); otherwise TTM ioremaps the bus range,
+which fails for VRAM past the BAR, and the kmap fails with an error.
+
+On the dext, the pointer past the 256 MiB BAR0 mapping was treated as
+process memory; a store through it crashed the driver process, and a dext
+that dies with its PCI session open panics the Mac (IOPCIFamily crash
+recovery). The upstream behaviour for visible VRAM is unchanged.
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index 3d2e00e..4cc6ba7 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -633,8 +633,10 @@ static int amdgpu_ttm_io_mem_reserve(struct ttm_device *bdev,
+ 	case TTM_PL_VRAM:
+ 		mem->bus.offset = mem->start << PAGE_SHIFT;
+ 
++		/* The kernel mapping covers the CPU-visible window only. */
+ 		if (adev->mman.aper_base_kaddr &&
+-		    mem->placement & TTM_PL_FLAG_CONTIGUOUS)
++		    mem->placement & TTM_PL_FLAG_CONTIGUOUS &&
++		    amdgpu_res_cpu_visible(adev, mem))
+ 			mem->bus.addr = (u8 *)adev->mman.aper_base_kaddr +
+ 					mem->bus.offset;
+ 

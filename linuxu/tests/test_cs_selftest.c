@@ -81,6 +81,7 @@ int main(int argc, char **argv)
 	}
 
 	ttm_evict_check();
+	visible_kmap_check();
 
 	/* A compute queue that does not run: the wait times out, the rest is
 	 * skipped, and the test's process is kept (tearing it down would wait

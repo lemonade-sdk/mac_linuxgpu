@@ -42,6 +42,14 @@
         "drivers/gpu/buddy.c"
       ],
       "reason": "Honour GPU_BUDDY_TOPDOWN_ALLOCATION when a clear allocation falls back to the dirty tree. Without it amdgpu's VRAM_CLEARED top-down KFD BOs fill the low VRAM, the CPU-visible window of a 256 MiB BAR, and every CPU-access allocation must evict them; scripts/test-gpu-buddy.sh checks the placement. Drop when the pin has upstream's dirty-tracker rework of the buddy allocator."
+    },
+    {
+      "patch": "patches/linux/amdgpu-ttm-visible-kmap.patch",
+      "sha256": "f3f80418d797477a1b86eab0ad6f405aa066f3b3affe76be426e338c3d29e434",
+      "files": [
+        "drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c"
+      ],
+      "reason": "amdgpu_ttm_io_mem_reserve gave contiguous VRAM a premapped kernel address, aper_base_kaddr plus the offset, even past the CPU-visible window that aper_base_kaddr maps; a kmap of such a BO pointed past the 256 MiB BAR0 mapping, which the dext treats as process memory, and a store through it crashed the driver process (a dext that dies with its PCI session open panics the Mac). The premapped address is now given only when amdgpu_res_cpu_visible holds; otherwise TTM ioremaps the bus range, rt_ioremap refuses it loudly and the kmap fails. linuxu/tests/visible_kmap_check.c checks both cases. Drop when upstream bounds the premapped address itself."
     }
   ],
   "verified_copies": {

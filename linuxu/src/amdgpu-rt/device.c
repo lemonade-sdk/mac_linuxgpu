@@ -385,6 +385,10 @@ void *rt_ioremap(struct rt_device *dev, uint64_t phys, uint64_t size)
 		return pci_iomap_range(&dev->pdev, bar,
 					(uintptr_t)(phys - start), (uintptr_t)size);
 	}
+	/* Nothing the CPU can reach: VRAM past the BAR (a kmap of invisible
+	 * VRAM, amdgpu_ttm_io_mem_reserve gives it no pointer), or no BAR. */
+	dev_err(&dev->pdev.dev, "ioremap of %#llx bytes at %#llx refused: outside every BAR\n",
+		(unsigned long long)size, (unsigned long long)phys);
 	return NULL;
 #else
 	uint32_t token;

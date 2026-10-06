@@ -59,6 +59,9 @@ void *cs_fixture_host_view(const void *driver_pointer);
 /* TTM moves VRAM <-> GTT through the upstream code on this device
  * (ttm_evict_check.c). */
 void ttm_evict_check(void);
+/* No kernel mapping of VRAM past the CPU-visible window
+ * (visible_kmap_check.c). */
+void visible_kmap_check(void);
 /* Surprise removal with work outstanding (removal_check.c); the device
  * stays removed. */
 void removal_check(struct pci_dev *pdev);
