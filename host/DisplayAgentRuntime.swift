@@ -1258,6 +1258,155 @@ private final class DriverWatch {
     }
 }
 
+/// The driver trail (TrailFile, DisplayAgent.swift): once a second, on its
+/// own queue, the driver instances present, and over its own observer
+/// client the driver's cached state and the new bytes of its log ring,
+/// appended to ~/Library/Logs/MacLinuxGPU-driver-trail.log and fsynced, so
+/// the last second before a panic is on disk. Observer reads are cached
+/// and never claim PCI. After "Disconnect GPU" it holds no client, as the
+/// rest of the agent does, and records only instances coming and going.
+private final class DriverTrail {
+    private let queue = DispatchQueue(label: "MacLinuxGPU.display-agent.driver-trail", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private let file = TrailFile(url: TrailFile.defaultURL, maxBytes: 4 << 20)
+    private var known: [UInt64: String] = [:]          // registry ID -> label
+    private var host: MacLinuxGPUHost?
+    private var attached: UInt64?
+    private var cursor: UInt64 = 0
+    private var buffer = TrailLineBuffer()
+    private var state: TrailState?
+    private var paused = false
+    private var lastHeartbeat = Date.distantPast
+    private var lastFileError: String?
+    private var lastOpenFailure: String?
+    private let stamp: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    func start() {
+        queue.async { [self] in
+            write(["---- display agent \(getpid()) started the driver trail"])
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now(), repeating: .seconds(1), leeway: .milliseconds(100))
+            timer.setEventHandler { [weak self] in self?.tick() }
+            self.timer = timer
+            timer.resume()
+        }
+    }
+
+    func stop() {
+        queue.sync {
+            timer?.cancel(); timer = nil
+            detach("the display agent is stopping")
+            write(["---- display agent \(getpid()) stopped the driver trail"])
+        }
+    }
+
+    private func write(_ lines: [String]) {
+        let now = stamp.string(from: Date())
+        let error = file.append(lines.map { "\(now) \($0)" })
+        if error != lastFileError {
+            lastFileError = error
+            if let error { agentLog("display-agent: driver trail: \(error)") }
+        }
+    }
+
+    private func detach(_ why: String) {
+        guard let host else { return }
+        var lines: [String] = []
+        if let rest = buffer.reset() { lines.append("log: \(rest)") }
+        _ = host.closeUserClient()
+        self.host = nil
+        lines.append(String(format: "trail: detached from instance %#llx (%@) at ring byte %llu",
+                            attached ?? 0, why, cursor))
+        attached = nil
+        state = nil
+        write(lines)
+    }
+
+    private func tick() {
+        var lines: [String] = []
+        // Instances coming and going: the line that says the driver died.
+        let instances = DriverInstances.list()
+        let present = Dictionary(instances.map { ($0.registryID, $0.label) }, uniquingKeysWith: { a, _ in a })
+        for (id, label) in known where present[id] == nil {
+            var line = "INSTANCE GONE: \(label) left the registry (its process ended or IOKit terminated it)"
+            if id == attached, let state { line += "; last state: \(state.summary)" }
+            if id == attached { line += String(format: "; last ring byte %llu", cursor) }
+            lines.append(line)
+        }
+        for instance in instances where known[instance.registryID] == nil {
+            lines.append("instance appeared: \(instance.label), clients \(instance.clients)")
+        }
+        known = present
+        if !lines.isEmpty { write(lines); lines = [] }
+        if let attached, present[attached] == nil { detach("the instance is gone") }
+
+        // After "Disconnect GPU", no client of the driver at all.
+        let disconnected = DisplayPrefs.load(from: DisplayControl.prefsURL).disconnected
+        if disconnected != paused {
+            paused = disconnected
+            if disconnected { detach("Disconnect GPU") }
+            write([disconnected ? "trail: paused (Disconnect GPU): instances only"
+                                : "trail: resumed (the GPU is connected)"])
+        }
+        if paused { return }
+
+        if host == nil {
+            let bundled = DriverInstances.bundledCDHash()
+            guard let pick = instances.first(where: { $0.cdhash == bundled }) ?? instances.first else { return }
+            let h = MacLinuxGPUHost()
+            h.quiet = true
+            guard h.openUserClient(observer: true, registryID: pick.registryID) else {
+                let failure = "trail: observer open failed for \(pick.label): \(h.log.last ?? "?")"
+                if failure != lastOpenFailure { write([failure]) }
+                lastOpenFailure = failure
+                return
+            }
+            lastOpenFailure = nil
+            host = h
+            attached = pick.registryID
+            cursor = 0
+            buffer = TrailLineBuffer()
+            write(["trail: attached to \(pick.label)"])
+        }
+        guard let host else { return }
+
+        func words(_ tag: UInt64, _ count: Int) -> [UInt64]? {
+            let (kr, values) = host.callScalar(21, inScalars: [tag], outScalars: count)
+            return kr == kIOReturnSuccess && values.count == count ? values : nil
+        }
+        let now = TrailState(session: words(0x4c534553, 9), probe: words(0x4c50524f, 5),
+                             power: words(0x4c505752, 12), reset: words(0x4c525354, 6))
+        if now != state {
+            lines.append("state: \(now.summary)")
+            state = now
+        }
+        let result = TrailLogReader.read(from: cursor) { at in
+            let (kr, values) = host.callScalar(21, inScalars: [TrailLogReader.tag, at], outScalars: 16)
+            return (kr, values)
+        }
+        switch result {
+        case .success(let (data, next, dropped)):
+            if dropped > 0 { lines.append("log: \(dropped) byte(s) overwritten in the ring before they were read") }
+            lines += buffer.lines(data).map { "log: \($0)" }
+            cursor = next
+        case .failure(let failure):
+            lines.append("trail: log read failed (\(failure)); the instance is \(present[attached ?? 0] != nil ? "still listed" : "gone")")
+            write(lines)
+            detach("log read failed")
+            return
+        }
+        if Date().timeIntervalSince(lastHeartbeat) >= 30 {
+            lastHeartbeat = Date()
+            lines.append(String(format: "alive: instance %#llx, ring byte %llu", attached ?? 0, cursor))
+        }
+        write(lines)
+    }
+}
+
 /// One monitor's mirroring process, as the daemon follows it.
 private final class MirrorChild {
     let connector: String
@@ -1295,6 +1444,10 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         agentLog("display-agent: could not watch for the driver (IOKit notifications)")
         return 1
     }
+    // What the driver was doing, on disk every second (survives a panic).
+    let trail = DriverTrail()
+    trail.start()
+    defer { trail.stop() }
     guard let executable = Bundle.main.executablePath else {
         agentLog("display-agent: the app's executable path is unknown")
         return 1

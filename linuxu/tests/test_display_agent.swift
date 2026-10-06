@@ -617,3 +617,64 @@ do {
     check(SysfsWriteAttribute.performanceLevel.rawValue == 0 && SysfsWriteAttribute.powerProfile.rawValue == 1)
 }
 print("PASS performance controls: levels, the card's profile list, the live line, persistence and the reapply plan")
+
+// The driver trail: the ring read as read-driver-log.py reads it, whole
+// lines only, the state line, and an fsynced file that rotates.
+do {
+    // A synthetic ring: bytes [base, end) of `text`, served 104 at a time.
+    let text = Array("first line\nsecond line\nthird".utf8)
+    func ring(base: UInt64) -> (UInt64) -> (Int32, [UInt64]) {
+        let end = base + UInt64(text.count)
+        return { cursor in
+            let start = max(cursor, base)
+            let size = min(UInt64(104), end - min(start, end))
+            var words: [UInt64] = [end, start + size, size]
+            var bytes = Array(text[Int(start - base)..<Int(start - base + size)])
+            while bytes.count % 8 != 0 { bytes.append(0) }
+            for i in stride(from: 0, to: bytes.count, by: 8) {
+                words.append(bytes[i..<i + 8].enumerated().reduce(UInt64(0)) { $0 | UInt64($1.element) << (8 * UInt64($1.offset)) })
+            }
+            return (0, words)
+        }
+    }
+    guard case .success(let (data, next, dropped)) = TrailLogReader.read(from: 0, query: ring(base: 0)) else {
+        check(false, "ring read"); exit(1)
+    }
+    check(data == Data(text) && next == UInt64(text.count) && dropped == 0, "the whole ring, in order")
+    var buffer = TrailLineBuffer()
+    check(buffer.lines(data) == ["first line", "second line"], "whole lines only")
+    check(buffer.lines(Data(" goes on\n".utf8)) == ["third goes on"], "a partial line waits for the rest")
+    check(buffer.reset() == nil)
+    // The ring moved past the cursor: the gap is counted, never hidden.
+    guard case .success(let (_, _, lost)) = TrailLogReader.read(from: 10, query: ring(base: 100)) else {
+        check(false, "clamped read"); exit(1)
+    }
+    check(lost == 90, "overwritten bytes are reported")
+    func failure(_ r: Result<(Data, UInt64, UInt64), TrailLogReader.Failure>) -> TrailLogReader.Failure? {
+        if case .failure(let f) = r { return f }
+        return nil
+    }
+    check(failure(TrailLogReader.read(from: 0, query: { _ in (Int32(bitPattern: 0xe00002c0), []) })) ==
+          .query(Int32(bitPattern: 0xe00002c0)), "a failed query is a failure")
+    check(failure(TrailLogReader.read(from: 0, query: { _ in (0, [5, 9, 200]) })) == .invalid("byte count"))
+
+    let state = TrailState(session: [1, 0b1000 | 0b10000, 0, 0, 0, 0, 0, 3, 2], probe: [1, 1, 0, 0, 0],
+                           power: nil, reset: nil)
+    check(state.summary.hasPrefix("session [pci_open,modules_running] cause 0 code 0 blocker 0 generation 3 participants 2"),
+          state.summary)
+    check(TrailState().summary == "session unavailable")
+
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("trail-\(getpid())")
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let file = TrailFile(url: dir.appendingPathComponent("t.log"), maxBytes: 64)
+    check(file.append(["one", "two"]) == nil)
+    check((try? String(contentsOf: file.url, encoding: .utf8)) == "one\ntwo\n")
+    check(file.append([String(repeating: "x", count: 70)]) == nil)
+    check(file.append(["after"]) == nil, "rotates past maxBytes")
+    check((try? String(contentsOf: file.url, encoding: .utf8)) == "after\n")
+    check((try? String(contentsOf: URL(fileURLWithPath: file.url.path + ".1"), encoding: .utf8))?.hasPrefix("one\ntwo\n") == true)
+    let bad = TrailFile(url: dir.appendingPathComponent("missing/t.log"), maxBytes: 64)
+    check(bad.append(["x"])?.hasPrefix("could not open") == true, "a write failure is said")
+}
+print("PASS driver trail: ring chunks as read-driver-log.py reads them, whole lines, overwritten bytes counted, state line, fsynced file rotation")
