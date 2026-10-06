@@ -580,7 +580,16 @@ public:
         if (!hardwareQueues.contains(handle) || !handle || packet==UINT64_MAX) return HSA_STATUS_ERROR_INVALID_QUEUE;
         const std::array<uint64_t,2> input={handle,packet};std::array<uint64_t,1> output{};
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        const auto status=scalar(57,input,output);
+        uint32_t raw=0;
+        const auto status=call(ownerPort,57,input.data(),uint32_t(input.size()),output.data(),
+                               uint32_t(output.size()),&raw);
+        // The process's GPU work faulted: KFD evicted its queues. The
+        // queue service call says where.
+        if (raw==uint32_t(kIOReturnVMError)) {
+            uint64_t inactive=0;
+            (void)serviceQueueLocked(handle,inactive);
+            return kMemoryFaultStatus;
+        }
         if (status==kDeviceSuspendedStatus) return status; // nothing rung; replayed after resume
         if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
         return HSA_STATUS_SUCCESS;
@@ -596,13 +605,42 @@ public:
         hardwareQueues.erase(handle);return HSA_STATUS_SUCCESS;
     }
     hsa_status_t serviceQueue(uint64_t handle,uint64_t &inactive) override {
-        std::lock_guard lock(sessionMutex);inactive=0;
+        std::lock_guard lock(sessionMutex);
+        return serviceQueueLocked(handle,inactive);
+    }
+    bool memoryFault(MemoryFault &out) override {
+        std::lock_guard lock(sessionMutex);
+        if (!faulted) return false;
+        out=fault;return true;
+    }
+    hsa_status_t serviceQueueLocked(uint64_t handle,uint64_t &inactive) {
+        inactive=0;
+        if (faulted) return kMemoryFaultStatus;
         if (state!=State::Ready) return HSA_STATUS_ERROR;
         if (!handle || !hardwareQueues.contains(handle)) return HSA_STATUS_ERROR_INVALID_QUEUE;
-        std::array<uint64_t,2> output{};
-        const auto status=scalar(59,{&handle,1},output);
+        // A driver from kQueueFaultDriverBuild on also says where a GPU
+        // memory fault of this process was. Asked once per connection.
+        if (!serviceOutputs) {
+            std::array<uint64_t,3> build{};
+            const auto status=scalar(43,{},build);
+            if (status!=HSA_STATUS_SUCCESS) return status;
+            serviceOutputs=build[2]>=kQueueFaultDriverBuild ? 4 : 2;
+        }
+        std::array<uint64_t,4> output{};
+        const auto status=scalar(59,{&handle,1},{output.data(),serviceOutputs});
         if (status==kDeviceSuspendedStatus) return status;
         if (status!=HSA_STATUS_SUCCESS) {state=State::Faulted;return status;}
+        if (output[0]==uint32_t(kIOReturnVMError)) {
+            const uint64_t flags=output[2];
+            faulted=true;
+            fault.address=output[3];
+            fault.reason=(flags&1 ? HSA_AMD_MEMORY_FAULT_PAGE_NOT_PRESENT : 0) |
+                         (flags&2 ? HSA_AMD_MEMORY_FAULT_READ_ONLY : 0) |
+                         (flags&4 ? HSA_AMD_MEMORY_FAULT_NX : 0) |
+                         (flags&8 ? HSA_AMD_MEMORY_FAULT_IMPRECISE : 0);
+            if (!(flags&(1ull<<31))) fault.reason|=HSA_AMD_MEMORY_FAULT_IMPRECISE;
+            return kMemoryFaultStatus;
+        }
         inactive=output[1];
         // A suspended queue can still be removed safely after a resource error.
         if (output[0]==uint32_t(kIOReturnNoMemory) || output[0]==uint32_t(kIOReturnNoResources))
@@ -997,6 +1035,11 @@ private:
     std::atomic<uint64_t> lostGeneration{1};
     const bool linuxShim;
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
+    // Selector 59's outputs (2, or 4 from kQueueFaultDriverBuild on; 0 until
+    // asked), and the GPU memory fault of this connection's KFD process.
+    size_t serviceOutputs = 0;
+    bool faulted = false;
+    MemoryFault fault;
     std::mutex sessionMutex;
     std::mutex codeSyncMutex;
     DeviceBuffer codeSyncBuffer;
@@ -1249,7 +1292,7 @@ private:
                 hostWindowBase=result.hostBase;
                 hostWindowSize=result.hostBytes;
                 sessionMode=result.sessionMode;
-                state=State::Ready;
+                state=State::Ready;faulted=false;fault={};serviceOutputs=0;
                 reserveHostWindowLocked();
                 if (const char *trace=std::getenv("MAC_HSA_SESSION_TRACE"); trace && trace[0]=='1')
                     std::fprintf(stderr, "mac_linuxgpu: compute session %s, host window %#llx+%#llx\n",

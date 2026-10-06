@@ -21,6 +21,8 @@ namespace mac_hsa {
 
 constexpr hsa_status_t kDeviceSuspendedStatus = hsa_status_t(HSA_STATUS_ERROR_RESOURCE_BUSY);
 constexpr hsa_status_t kDeviceLostStatus = HSA_STATUS_ERROR_FATAL;
+// The process's GPU work faulted (transport.h MemoryFault): KFD evicted its queues.
+constexpr hsa_status_t kMemoryFaultStatus = hsa_status_t(HSA_STATUS_ERROR_MEMORY_FAULT);
 
 struct PowerSnapshot {
     std::array<uint64_t, amdgpu::power::kWords> words{};

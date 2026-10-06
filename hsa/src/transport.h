@@ -23,6 +23,13 @@ constexpr uint64_t kComputeSessionDriverBuild=192;
 // First driver build with KFD signal events and interrupt waits (selectors
 // 86 and 87, dext/sources/session_state.h).
 constexpr uint64_t kSignalEventDriverBuild=235;
+// First driver build whose queue service (selector 59) reports a GPU memory
+// fault of the client's process with its address (four outputs).
+constexpr uint64_t kQueueFaultDriverBuild=256;
+// A GPU memory fault of this process's GPU work: KFD evicted every queue
+// of the process, which never runs again. reason uses the
+// hsa_amd_memory_fault_reason_t bits.
+struct MemoryFault { uint64_t address = 0; uint32_t reason = 0; };
 
 // Compute-session QueryInfo tag: which path the driver gave this client.
 // Legacy: VMID0 buffers and the driver's legacy HQDs (one queue per HQD).
@@ -220,7 +227,10 @@ public:
     virtual hsa_status_t spec(std::array<uint64_t, kDeviceSpecDwords> &) {
         return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
+    // HSA_STATUS_ERROR_MEMORY_FAULT once the process's GPU work faulted;
+    // memoryFault then says where.
     virtual hsa_status_t serviceQueue(uint64_t, uint64_t &inactive) { inactive=0;return HSA_STATUS_SUCCESS; }
+    virtual bool memoryFault(MemoryFault &) { return false; }
     virtual bool supportsSharedBuffers() const { return false; }
     virtual hsa_status_t sharedMemoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t memoryCapacity(uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

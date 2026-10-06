@@ -97,6 +97,7 @@ public:
     hsa_status_t kickQueue(uint64_t handle, uint64_t doorbell) override;
     hsa_status_t destroyQueue(uint64_t handle) override;
     hsa_status_t serviceQueue(uint64_t handle, uint64_t &inactive) override;
+    bool memoryFault(MemoryFault &out) override;
 
     // ---- Connection: dispatch ----
     hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &fence) override;
@@ -152,6 +153,10 @@ public:
     // the last RESUME makes it active again. Every change bumps the
     // generation.
     void setPowerState(amdgpu::power::PowerState state, bool vramPreserved = true);
+    // The process's GPU work faults at @address (KFD evicts its queues, as
+    // the driver reports from kQueueFaultDriverBuild on): queue service and
+    // kicks answer kMemoryFaultStatus from now on, and nothing runs.
+    void injectMemoryFault(uint64_t address, uint32_t reason);
     uint64_t powerRequests(uint64_t op) const;
     const FakeDeviceConfig &config() const { return config_; }
 
@@ -190,6 +195,8 @@ private:
     bool queueSlotsExhaustedLocked() const;
     void processQueueLocked(Queue &queue);
     PowerSnapshot power_;
+    bool faulted_ = false;
+    MemoryFault fault_;
     uint64_t powerRequests_[4]{};
     // kDeviceSuspendedStatus or HSA_STATUS_ERROR when the power state
     // refuses GPU work, HSA_STATUS_SUCCESS otherwise.

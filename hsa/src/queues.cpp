@@ -8,10 +8,47 @@
 #include <thread>
 #include <condition_variable>
 #include <system_error>
+#include <string>
+#include <mutex>
+#include <vector>
 
 namespace mac_hsa::detail {
 struct RuntimeQueue;
 static bool pausedNow(const std::weak_ptr<RuntimeQueue> &weak);
+
+// A GPU memory fault of this process's GPU work: KFD evicted every queue of
+// the process and nothing of it runs again, as on Linux. Said once per
+// connection, in ROCr's words, and handed to a registered system event
+// handler (HSA_AMD_GPU_MEMORY_FAULT_EVENT); each queue's error callback then
+// gets HSA_STATUS_ERROR_MEMORY_FAULT. Other processes keep the GPU.
+static void reportMemoryFault(const std::shared_ptr<Connection> &connection, hsa_agent_t agent) {
+    static std::mutex saidMutex;
+    static std::vector<const Connection *> said;
+    {
+        std::lock_guard lock(saidMutex);
+        if (std::find(said.begin(), said.end(), connection.get()) != said.end()) return;
+        said.push_back(connection.get());
+    }
+    MemoryFault fault{};
+    const bool known = connection->memoryFault(fault);
+    std::string reason;
+    const auto add = [&](uint32_t bit, const char *text) {
+        if (fault.reason & bit) reason += (reason.empty() ? "" : ", ") + std::string(text);
+    };
+    add(HSA_AMD_MEMORY_FAULT_PAGE_NOT_PRESENT, "Page not present or supervisor privilege");
+    add(HSA_AMD_MEMORY_FAULT_READ_ONLY, "Write access to a read-only page");
+    add(HSA_AMD_MEMORY_FAULT_NX, "Execute access to a non-executable page");
+    add(HSA_AMD_MEMORY_FAULT_IMPRECISE, "Imprecise address");
+    if (reason.empty()) reason = known ? "Unknown" : "Not reported by this driver";
+    std::fprintf(stderr, "mac_hsa: Memory access fault by GPU agent %#llx on address %#llx. Reason: %s. "
+                 "This process's GPU queues were stopped and run nothing again; other programs "
+                 "keep the GPU.\n", (unsigned long long)agent.handle,
+                 (unsigned long long)fault.address, reason.c_str());
+    hsa_amd_event_t event{};
+    event.event_type = HSA_AMD_GPU_MEMORY_FAULT_EVENT;
+    event.memory_fault = {agent, fault.address, fault.reason};
+    (void)deliverSystemEvent(event);
+}
 struct RuntimeQueue {
     amd_queue_t hostABI{};
     amd_queue_t *abi=&hostABI;
@@ -72,7 +109,8 @@ struct RuntimeQueue {
         // Callbacks may query or destroy this queue; never hold its mutex here.
         if (notify) {
             if (serviceState) serviceState->stop=true;
-            status=deviceStatus(connection,status);
+            if (status==kMemoryFaultStatus) reportMemoryFault(connection,agent);
+            else status=deviceStatus(connection,status);
             invalidateGPUSignals(connection);
             if (errorCallback) errorCallback(status,&abi->hsa_queue,errorData);
         }
@@ -117,6 +155,7 @@ struct RuntimeQueue {
     }
     void ringDoorbell(int64_t value) {
         bool notify=false;
+        hsa_status_t status=HSA_STATUS_SUCCESS;
         {
             std::lock_guard lock(mutex);
             if (!active || !hardwareHandle || errorDelivered) return;
@@ -126,12 +165,17 @@ struct RuntimeQueue {
             if (paused || submissionsHeld(connection.get())) {
                 pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;
             }
-            const auto status=connection->kickQueue(hardwareHandle,uint64_t(value));
+            status=connection->kickQueue(hardwareHandle,uint64_t(value));
             if (status==kDeviceSuspendedStatus) {pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;}
             if (status!=HSA_STATUS_SUCCESS) {errorDelivered=true;notify=true;}
             else lastKicked=std::max(lastKicked,value);
         }
-        if (notify && errorCallback) errorCallback(deviceStatus(connection,HSA_STATUS_ERROR),&abi->hsa_queue,errorData);
+        if (!notify) return;
+        if (status==kMemoryFaultStatus) {
+            reportMemoryFault(connection,agent);
+            invalidateGPUSignals(connection);
+        } else status=deviceStatus(connection,HSA_STATUS_ERROR);
+        if (errorCallback) errorCallback(status,&abi->hsa_queue,errorData);
     }
     std::shared_ptr<Signal> doorbell;
     bool active = true;

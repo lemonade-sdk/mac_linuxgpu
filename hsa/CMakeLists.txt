@@ -108,7 +108,7 @@ if(BUILD_TESTING)
   # Agent/ISA info and queue-slot degradation against configurable fake
   # devices of several generations, and device power (suspend, resume, lost
   # device memory) against the fake's power model.
-  foreach(name device-info queue-slots power signal-wait)
+  foreach(name device-info queue-slots power signal-wait memory-fault)
     string(REPLACE "-" "_" source ${name})
     add_executable(hsa-${name}-test tests/test_${source}.cpp)
     target_link_libraries(hsa-${name}-test PRIVATE hsa-runtime64)

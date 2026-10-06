@@ -247,6 +247,7 @@ hsa_status_t FakeConnection::kickQueue(uint64_t handle, uint64_t doorbell) {
     if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
     const auto it = queues_.find(handle);
     if (it == queues_.end() || !it->second.active) return HSA_STATUS_ERROR;
+    if (faulted_) return kMemoryFaultStatus;
     it->second.doorbell = doorbell;
     it->second.kicks++;
     processQueueLocked(it->second);
@@ -319,7 +320,20 @@ hsa_status_t FakeConnection::serviceQueue(uint64_t handle, uint64_t &inactive) {
     const auto it = queues_.find(handle);
     if (it == queues_.end()) return HSA_STATUS_ERROR;
     inactive = 0; // queue is "active" (not idle)
-    return HSA_STATUS_SUCCESS;
+    return faulted_ ? kMemoryFaultStatus : HSA_STATUS_SUCCESS;
+}
+
+bool FakeConnection::memoryFault(MemoryFault &out) {
+    std::lock_guard lock(mutex_);
+    if (!faulted_) return false;
+    out = fault_;
+    return true;
+}
+
+void FakeConnection::injectMemoryFault(uint64_t address, uint32_t reason) {
+    std::lock_guard lock(mutex_);
+    faulted_ = true;
+    fault_ = {address, reason};
 }
 
 hsa_status_t FakeConnection::dispatchAQL(const amdgpu::AQLDispatchRequest &request, uint64_t &fence) {
