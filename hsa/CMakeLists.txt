@@ -61,7 +61,10 @@ target_include_directories(hsa-runtime64 PUBLIC include third_party/hsa/include)
 # host/selector_call.h (async session calls, with the driver's selector
 # rules from dext/sources/session_state.h) is shared with the host app.
 target_include_directories(hsa-runtime64 PRIVATE ${FW_SERVICER_DIR})
-target_compile_options(hsa-runtime64 PRIVATE -Wall -Wextra -Werror)
+# Optimized whatever the build type: `make hsa` configures Debug for the
+# tests' asserts, and this library is the one the installer ships. Every
+# signal load, queue index update and doorbell runs through it.
+target_compile_options(hsa-runtime64 PRIVATE -Wall -Wextra -Werror -O2)
 target_link_libraries(hsa-runtime64 PRIVATE "-framework IOKit" "-framework CoreFoundation")
 if(HSA_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
   set_target_properties(hsa-runtime64 PROPERTIES VERSION 0.1.0 SOVERSION 1)
