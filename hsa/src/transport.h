@@ -270,6 +270,11 @@ public:
     virtual bool queueSlotsExhausted() { return false; }
     virtual hsa_status_t createQueue(const SharedBuffer &, const SharedBuffer &, uint32_t, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t kickQueue(uint64_t, uint64_t) { return HSA_STATUS_ERROR; }
+    // A transport whose doorbells are not waited for (kickQueue returns once
+    // the doorbell is queued): true, with the highest one, when the driver
+    // refused doorbells of @handle because the device was suspending. The
+    // queue rings it again on resume, as it does a doorbell refused at once.
+    virtual bool takeRefusedKick(uint64_t, uint64_t &) { return false; }
     virtual hsa_status_t destroyQueue(uint64_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

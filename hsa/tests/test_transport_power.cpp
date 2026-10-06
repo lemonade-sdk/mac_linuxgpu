@@ -10,6 +10,10 @@
 #define IOServiceClose test_service_close
 #define IOConnectCallScalarMethod test_scalar
 #define IOConnectCallMethod test_method
+/* Doorbells are sent async and answered later (kickQueue, drainKicksLocked). */
+#define IOConnectCallAsyncScalarMethod test_async_scalar
+#define mach_msg test_mach_msg
+#define IODispatchCalloutFromMessage test_dispatch_callout
 #define mlg_fw_service_start_connection test_fw_start
 #define mlg_fw_service_stop test_fw_stop
 /* The IOKit calls are replaced: every selector reaches them synchronously. */
@@ -17,6 +21,7 @@
 #include "../src/transport_iokit.cpp"
 #include <cassert>
 #include <cstdio>
+#include <deque>
 
 extern "C" int test_fw_start(uint32_t, const char *, struct mlg_fw_service **) { assert(false); return -1; }
 extern "C" void test_fw_stop(struct mlg_fw_service *service) { assert(!service); }
@@ -59,6 +64,38 @@ extern "C" kern_return_t test_scalar(mach_port_t port, uint32_t selector, const 
     default: assert(false); return kIOReturnUnsupported;
     }
 }
+/* A doorbell: the delivery thread queues it (or refuses a dead session at
+ * once); the session queue's answer, gpu_result, arrives as a completion. */
+struct KickAnswer { io_user_reference_t function, refcon; uint64_t token; kern_return_t result; };
+static std::deque<KickAnswer> kick_answers;
+static uint64_t kick_token = 100;
+extern "C" kern_return_t test_async_scalar(mach_port_t port, uint32_t selector, mach_port_t wake,
+    uint64_t *reference, uint32_t references, const uint64_t *in, uint32_t inputs, uint64_t *out,
+    uint32_t *count) {
+    assert(port == test_port && selector == 57 && wake && references == kIOAsyncCalloutCount &&
+           inputs == 2 && in[0] == 9 && *count == 1);
+    ++gpu_calls;
+    if (gpu_result == kIOReturnNotAttached || gpu_result == MACH_SEND_INVALID_DEST) return gpu_result;
+    out[0] = ++kick_token;
+    kick_answers.push_back({reference[kIOAsyncCalloutFuncIndex], reference[kIOAsyncCalloutRefconIndex],
+                            out[0], gpu_result});
+    return KERN_SUCCESS;
+}
+extern "C" mach_msg_return_t test_mach_msg(mach_msg_header_t *, mach_msg_option_t option, mach_msg_size_t,
+    mach_msg_size_t, mach_port_name_t, mach_msg_timeout_t timeout, mach_port_name_t) {
+    assert((option & MACH_RCV_MSG) && (option & MACH_RCV_TIMEOUT) && !timeout);
+    return kick_answers.empty() ? MACH_RCV_TIMED_OUT : MACH_MSG_SUCCESS;
+}
+extern "C" void test_dispatch_callout(void *, mach_msg_header_t *, void *) {
+    assert(!kick_answers.empty());
+    const auto answer = kick_answers.front();
+    kick_answers.pop_front();
+    void *args[5] = {reinterpret_cast<void *>(uintptr_t(answer.token)),
+                     reinterpret_cast<void *>(uintptr_t(uint32_t(answer.result))),
+                     reinterpret_cast<void *>(uintptr_t(answer.result == KERN_SUCCESS)), nullptr, nullptr};
+    reinterpret_cast<IOAsyncCallback>(answer.function)(reinterpret_cast<void *>(answer.refcon),
+                                                         kIOReturnSuccess, args, 5);
+}
 extern "C" kern_return_t test_method(mach_port_t port, uint32_t selector, const uint64_t *, uint32_t,
     const void *, size_t, uint64_t *out, uint32_t *count, void *, size_t *) {
     assert(port == test_port && selector == 51 && *count == 3);
@@ -81,7 +118,12 @@ struct IdleDiagnosticAccess {
         /* Suspended: every GPU call is refused, nothing submitted, healthy. */
         gpu_result = kIOReturnOffline;
         connection.hardwareQueues.emplace(9, std::array<uint64_t, 2>{1, 2});
-        assert(connection.kickQueue(9, 5) == kDeviceSuspendedStatus && ready());
+        /* A doorbell is queued, not waited for: the refusal arrives with
+         * its answer and is handed to the queue, which rings it on resume. */
+        assert(connection.kickQueue(9, 5) == HSA_STATUS_SUCCESS && ready());
+        uint64_t refused = 0;
+        assert(connection.takeRefusedKick(9, refused) && refused == 5 && ready());
+        assert(!connection.takeRefusedKick(9, refused));
         uint64_t inactive = 7;
         assert(connection.serviceQueue(9, inactive) == kDeviceSuspendedStatus && ready() && !inactive);
         DeviceBuffer buffer;
@@ -98,7 +140,8 @@ struct IdleDiagnosticAccess {
         /* Resumed: the same calls go through. */
         gpu_result = KERN_SUCCESS;
         assert(connection.kickQueue(9, 5) == HSA_STATUS_SUCCESS);
-        assert(connection.serviceQueue(9, inactive) == HSA_STATUS_SUCCESS);
+        assert(connection.serviceQueue(9, inactive) == HSA_STATUS_SUCCESS && kick_answers.empty());
+        assert(!connection.takeRefusedKick(9, refused) && ready());
         assert(connection.dispatch(request, fence) == HSA_STATUS_SUCCESS && fence == 1);
 
         /* The power snapshot and requests. */
@@ -127,7 +170,10 @@ struct IdleDiagnosticAccess {
         power_result = KERN_SUCCESS;
         power_state = uint64_t(amdgpu::power::PowerState::Lost);
         gpu_result = kIOReturnNotOpen;
-        assert(connection.kickQueue(9, 6) == HSA_STATUS_ERROR && !ready());
+        /* The doorbell is queued; its answer faults the session, which the
+         * queue service reports. */
+        assert(connection.kickQueue(9, 6) == HSA_STATUS_SUCCESS);
+        assert(connection.serviceQueue(9, inactive) == HSA_STATUS_ERROR && !ready());
         assert(connection.powerState(snapshot) == HSA_STATUS_SUCCESS && snapshot.lost());
         /* The GPU left the bus: the driver's session (or the driver) is
          * gone, so calls fail with kIOReturnNotAttached or a dead port. The
