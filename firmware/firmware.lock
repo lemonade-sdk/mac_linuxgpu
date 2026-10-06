@@ -18,46 +18,46 @@
 # To move to a newer linux-firmware release, change "tag" and "commit" and run
 #   scripts/fetch-firmware.sh --relock
 
-tag     20260622
-commit  b2722d241309a1872446c1d00c2e812bad055f89
+tag     20260916
+commit  ab23307cfe7f9366c819025ca3e4778299bc2db2
 url     https://gitlab.com/kernel-firmware/linux-firmware/-/raw/{commit}/{path}
 url     https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/{path}?id={commit}
 repo    https://gitlab.com/kernel-firmware/linux-firmware.git
 
 # file  <path>  <sha256>  <size>
-file  WHENCE                            855b6592910c87ba6a73c2543436830775dd0f622d4b82c0cfa6f9406bec3f64  449378
-file  LICENSES/LICENSE.amdgpu           572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee  2938
-file  amdgpu/gc_12_0_0_imu.bin          aa15e5b3156bffc45e0c50bccbcd364fbd3f958531b695b7487a803d780b8328  132352
-file  amdgpu/gc_12_0_0_me.bin           1fbb97678cba5f18590ce1e13c8d0057eaafcca7654bc578e840aac465137eb3  459840
-file  amdgpu/gc_12_0_0_mec.bin          fb03a3077febd8b0884288bb7d86824eeffa4721f4088025c80d6dd917e22a68  455648
-file  amdgpu/gc_12_0_0_mes.bin          f8d4abff1de7c7c4be111aba44769e69cdae1819ab34800eb27ae25edd1847db  636048
-file  amdgpu/gc_12_0_0_mes1.bin         0db493cc00ca19b90278284235e4714f15dc2cc49bb86d276feadeb17a5c6c82  609840
-file  amdgpu/gc_12_0_0_pfp.bin          1bec9d532b2d3c1f309d44fbabacda96d5cbfad186023f13358765948fa1ac4f  353536
-file  amdgpu/gc_12_0_0_rlc.bin          6436b582734a413456fff3d3c7195e71cc9e78a7ed31ee21c83ffd6fae1ad186  150704
-file  amdgpu/gc_12_0_0_toc.bin          edad661e1c7bd350a86285513fbdeeb33ca4e80c06f1ea7f37d344ba1e2761dd  2048
-file  amdgpu/gc_12_0_0_uni_mes.bin      bf26e0300989ebd011e991d76396e2c1673e1caa502fb6d8413e387eb1456676  727680
-file  amdgpu/gc_12_0_1_imu.bin          b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd  132352
-file  amdgpu/gc_12_0_1_me.bin           5549655093724b3e3b5fa016e8f1ef6ce3976209432230852cd94acbc1c245cb  459840
-file  amdgpu/gc_12_0_1_mec.bin          72b25088072d630d115748ee3607d0db481b22a15260af3d0d599e516a0d7abb  455648
-file  amdgpu/gc_12_0_1_mes.bin          306c99718564ff613813b0c15a8e0dd1797488fac01de60702fac0d079c1731d  643536
-file  amdgpu/gc_12_0_1_mes1.bin         b873c0e354b94e6ae10831dd883013689a4fb04259c4cd46a9b9ddef4c29ddd5  611920
-file  amdgpu/gc_12_0_1_pfp.bin          6dc9e6d22e0f9ddd04f12eedb5d1f6affae6d76d2993567aafde0e1619071c15  353536
-file  amdgpu/gc_12_0_1_rlc.bin          6ba4459532246a5c415d3cb33c9b1248294e48f67b827e2accb292a8d1a5c0ec  150848
-file  amdgpu/gc_12_0_1_toc.bin          edad661e1c7bd350a86285513fbdeeb33ca4e80c06f1ea7f37d344ba1e2761dd  2048
-file  amdgpu/gc_12_0_1_uni_mes.bin      bf26e0300989ebd011e991d76396e2c1673e1caa502fb6d8413e387eb1456676  727680
-file  amdgpu/psp_14_0_0_ta.bin          773401f9a1e9eaf45db4869ea08050fec9ce8d7807afb3bf406b55e27dccf750  254976
-file  amdgpu/psp_14_0_0_toc.bin         da82e510ba90b3939656ecd2092870e5eef1c1b71ad2a4b776bc9e57bae1f05f  2560
-file  amdgpu/psp_14_0_2_sos.bin         7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2c5f1fa243  421216
-file  amdgpu/psp_14_0_2_ta.bin          5d45532c0e75b79c72ac3a4e06a7cc36c9d4ca5dbb59d98f94106db606aae1cf  274432
-file  amdgpu/psp_14_0_3_sos.bin         23bea01a0c6f36d00759d0765d46cb4cb4aa87398b2fbccacbf547a890c0bf51  435632
-file  amdgpu/psp_14_0_3_sos_kicker.bin  a78043400757b4d0be701bacaf1ddbc57df9aa5d58736a9608d65bf16ce6ebd9  435968
-file  amdgpu/psp_14_0_3_ta.bin          38d6691bf64232946cd5ce5735363c7c2877830ff640b9b95516403257fe2922  287040
-file  amdgpu/psp_14_0_3_ta_kicker.bin   b3dbe9a69dfb3df071856927f686c0c8329f338c7d445bb11535cb7509317093  270624
-file  amdgpu/sdma_7_0_0.bin             beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38  47872
-file  amdgpu/sdma_7_0_1.bin             73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59  47104
-file  amdgpu/smu_14_0_2.bin             1fe947dbcca7bfdb3597cdeab0fce1597ffb673ebc9332eb9072981c89d9f9a9  333236
-file  amdgpu/smu_14_0_3.bin             3221ef2ddb341570eeb727e1e16f170bfb2ea1230be4a7eb248d0b183fbfbf15  333236
-file  amdgpu/smu_14_0_3_kicker.bin      0decd44fc95c5bf71a4f3905b5e125e39cd99d63ce38073d9843d5c0ed137efb  327424
-file  amdgpu/vcn_5_0_0.bin              52180adaa4692d5c84e825b7e6ccc77ff925f87208b85ca49217dca9b65fe0a0  438288
-file  amdgpu/vcn_5_0_1.bin              b9d53491d5d23a3391a677ff4ff4c7fa8d58b88087a96f990696def92ab48199  217680
-file  amdgpu/dcn_4_0_1_dmcub.bin       4195d418c212e6e02b6db4ff5aeaabc2f418df98eb7eedc316c50c0d5eaea564  368160
+file  WHENCE  9350832c1e9afc35df50fa8b9793b31d60d78ef963152eec903fc0dbc6b4a559  474322
+file  LICENSES/LICENSE.amdgpu  572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee  2938
+file  amdgpu/gc_12_0_0_imu.bin  aa15e5b3156bffc45e0c50bccbcd364fbd3f958531b695b7487a803d780b8328  132352
+file  amdgpu/gc_12_0_0_me.bin  17487eb283d479ddb6331bc850a623e3f1217907e25aa5acf89602fb3eaeaf94  463392
+file  amdgpu/gc_12_0_0_mec.bin  28b1e5bae440044887bab53a374db7bb971f7cc2780ab2b55c561e19f24d7fac  455648
+file  amdgpu/gc_12_0_0_mes.bin  f8d4abff1de7c7c4be111aba44769e69cdae1819ab34800eb27ae25edd1847db  636048
+file  amdgpu/gc_12_0_0_mes1.bin  0db493cc00ca19b90278284235e4714f15dc2cc49bb86d276feadeb17a5c6c82  609840
+file  amdgpu/gc_12_0_0_pfp.bin  5ec7a4341c22676da98d64cbc8dc5d820f3f13f199ea7e572f4064de406e715c  354912
+file  amdgpu/gc_12_0_0_rlc.bin  6436b582734a413456fff3d3c7195e71cc9e78a7ed31ee21c83ffd6fae1ad186  150704
+file  amdgpu/gc_12_0_0_toc.bin  edad661e1c7bd350a86285513fbdeeb33ca4e80c06f1ea7f37d344ba1e2761dd  2048
+file  amdgpu/gc_12_0_0_uni_mes.bin  ee058438467479d05d3d54ec9b0a592cac50bfa3834e65c6e90bd0e675c087d1  734432
+file  amdgpu/gc_12_0_1_imu.bin  b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd  132352
+file  amdgpu/gc_12_0_1_me.bin  f47fc72ade16f6bd67dc798c8668f620fde1acf6d9e9e9e5627164d312687347  463424
+file  amdgpu/gc_12_0_1_mec.bin  b59371dc5185beba02eb2bf53061e2d2dd3792b278bc2199fd51db1b1888677a  451552
+file  amdgpu/gc_12_0_1_mes.bin  306c99718564ff613813b0c15a8e0dd1797488fac01de60702fac0d079c1731d  643536
+file  amdgpu/gc_12_0_1_mes1.bin  b873c0e354b94e6ae10831dd883013689a4fb04259c4cd46a9b9ddef4c29ddd5  611920
+file  amdgpu/gc_12_0_1_pfp.bin  585c0d3aa40378b55d576a667a91209dc72696ea2569b42473d62bc2ff76d60d  354912
+file  amdgpu/gc_12_0_1_rlc.bin  6ba4459532246a5c415d3cb33c9b1248294e48f67b827e2accb292a8d1a5c0ec  150848
+file  amdgpu/gc_12_0_1_toc.bin  edad661e1c7bd350a86285513fbdeeb33ca4e80c06f1ea7f37d344ba1e2761dd  2048
+file  amdgpu/gc_12_0_1_uni_mes.bin  ee058438467479d05d3d54ec9b0a592cac50bfa3834e65c6e90bd0e675c087d1  734432
+file  amdgpu/psp_14_0_0_ta.bin  d54846f099aaa5f4f93c024cc64ce476ff569a2eacc033bee022f25391f9b19c  254976
+file  amdgpu/psp_14_0_0_toc.bin  da82e510ba90b3939656ecd2092870e5eef1c1b71ad2a4b776bc9e57bae1f05f  2560
+file  amdgpu/psp_14_0_2_sos.bin  7b538448b57d4f9dd06b2eea90d4f86a16e65e3027cdecee8db71c2c5f1fa243  421216
+file  amdgpu/psp_14_0_2_ta.bin  81d55b4e59bbb91c95ce4edf546c3870275ef426d0279970c3e7e33e62a68115  274668
+file  amdgpu/psp_14_0_3_sos.bin  28469a0857c813c54a0492423cdf0b0caf757428400036377e19c47e5af62478  435632
+file  amdgpu/psp_14_0_3_sos_kicker.bin  1406eb4c19f2e7a11fa4426736f4f4871e4d9f1f7bd7e569e9cf04062edaad69  435968
+file  amdgpu/psp_14_0_3_ta.bin  6ad94a3350a1f2cb04ed1bd962bcb233a64b6dc42a04a6e593167db1539bdda0  287276
+file  amdgpu/psp_14_0_3_ta_kicker.bin  b3dbe9a69dfb3df071856927f686c0c8329f338c7d445bb11535cb7509317093  270624
+file  amdgpu/sdma_7_0_0.bin  beaafb53993a106edd392392d5896245ae2a957c6d0f495d0002eec72ad8ad38  47872
+file  amdgpu/sdma_7_0_1.bin  73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59  47104
+file  amdgpu/smu_14_0_2.bin  1b2054e3f710d1ab8dbdf6ff35914ad376b51caa6337831260c955add874b2ee  333236
+file  amdgpu/smu_14_0_3.bin  7624724231b0986b59f59705e7c854c482193f6b3b591ebdda58cb62af81c010  333236
+file  amdgpu/smu_14_0_3_kicker.bin  c9b0cbef51cc2bfcf28238b904b3e9e089e3e43b226b2bae9d5fcd7be76253e5  327424
+file  amdgpu/vcn_5_0_0.bin  52180adaa4692d5c84e825b7e6ccc77ff925f87208b85ca49217dca9b65fe0a0  438288
+file  amdgpu/vcn_5_0_1.bin  b9d53491d5d23a3391a677ff4ff4c7fa8d58b88087a96f990696def92ab48199  217680
+file  amdgpu/dcn_4_0_1_dmcub.bin  c03367d86e6283b02d25bb3251e1dde8aa3e49d27a1abc7e2437694579e330e4  368032
