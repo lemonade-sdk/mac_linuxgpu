@@ -630,6 +630,19 @@ public:
         const auto status=scalar(59,{&handle,1},{output.data(),serviceOutputs});
         if (status==kDeviceSuspendedStatus) return status;
         if (status!=HSA_STATUS_SUCCESS) {state=State::Faulted;return status;}
+        // The CP stopped the queue with an error code. A fault it hit is
+        // reported as kIOReturnVMError once KFD's interrupt work signaled
+        // the process's memory event, a little later: keep asking, up to
+        // kQueueErrorSettle, then report the code.
+        if (output[0]==uint32_t(kIOReturnIOError) && serviceOutputs==4) {
+            const auto now=std::chrono::steady_clock::now();
+            auto [entry,first]=queueErrorSince.try_emplace(handle,now);
+            if (now-entry->second<kQueueErrorSettle) return HSA_STATUS_SUCCESS;
+            std::fprintf(stderr,"mac_hsa: the GPU stopped queue %llu with error code %#llx "
+                         "(no memory fault reported)\n",(unsigned long long)handle,
+                         (unsigned long long)output[1]);
+            return HSA_STATUS_ERROR_EXCEPTION;
+        }
         if (output[0]==uint32_t(kIOReturnVMError)) {
             const uint64_t flags=output[2];
             faulted=true;
@@ -1040,6 +1053,9 @@ private:
     size_t serviceOutputs = 0;
     bool faulted = false;
     MemoryFault fault;
+    // Queues the CP stopped with an error code, since when (serviceQueueLocked).
+    static constexpr auto kQueueErrorSettle = std::chrono::milliseconds(250);
+    std::map<uint64_t,std::chrono::steady_clock::time_point> queueErrorSince;
     std::mutex sessionMutex;
     std::mutex codeSyncMutex;
     DeviceBuffer codeSyncBuffer;

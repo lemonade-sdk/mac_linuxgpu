@@ -5102,7 +5102,9 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         // for (build 256 on), [2]=fault flags (DEXT_KFD_FAULT_*), [3]=the
         // faulting page's GPU address. A GPU memory fault of the queue's
         // process answers status kIOReturnVMError: KFD evicted its queues,
-        // which never run again; the session and other clients go on.
+        // which never run again; the session and other clients go on. A
+        // queue the CP stopped with another error code answers
+        // kIOReturnIOError with that code in [1].
         if (arguments->scalarInput == nullptr || arguments->scalarInputCount != 1 ||
             !arguments->scalarOutput || arguments->scalarOutputCount < 2 ||
             arguments->structureInput) return kIOReturnBadArgument;
@@ -5114,6 +5116,12 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                 return kIOReturnNotReady;
             status = (uint32_t)kIOReturnVMError;
             inactive = 0;
+            r = 0;
+        } else if (r == -EQUEUE_L) {
+            // The CP stopped the queue with an error code (in [1]). A fault
+            // it hit becomes kIOReturnVMError on a later poll, once KFD's
+            // interrupt work signaled the process's memory event.
+            status = (uint32_t)kIOReturnIOError;
             r = 0;
         }
         if (r == -ENOENT_L) return kIOReturnBadArgument;

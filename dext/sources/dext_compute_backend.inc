@@ -1410,6 +1410,7 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
         struct dext_kfd_client *c = owner_kfd(q->owner);
         int r = dext_kfd_queue_service(q->kfd, &inactive);
         if (r == -EFAULT) return -EFAULT_L;
+        if (r == -ENOEXEC) { *out_inactive = inactive; return -EQUEUE_L; }
         if (r) return kfd_error(c, r) == -EBUSY_L ? -EBUSY_L : -ENOTREADY_L;
         *out_status = 0;
         *out_inactive = inactive;

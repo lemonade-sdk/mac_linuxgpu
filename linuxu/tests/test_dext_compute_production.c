@@ -368,10 +368,16 @@ int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
  * answers -EFAULT for them from then on). */
 static struct dext_kfd_client *kfd_faulted;
 static int kfd_code_after_sync_error;
+static uint64_t kfd_stopped_code;	/* the CP stopped queues with this error code */
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet)
 { assert(q && q->live); if (q->c==kfd_faulted) return -EFAULT; q->last=packet; ++kfd_kicks; return 0; }
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive)
-{ assert(q && q->live); *inactive=0; return q->c==kfd_faulted ? -EFAULT : 0; }
+{
+    assert(q && q->live); *inactive=0;
+    if (q->c==kfd_faulted) return -EFAULT;
+    if (kfd_stopped_code) { *inactive=kfd_stopped_code; return -ENOEXEC; }
+    return 0;
+}
 int dext_kfd_fault(struct dext_kfd_client *c, uint32_t *flags, uint64_t *va)
 {
     assert(c && c->live && flags && va);
@@ -974,6 +980,12 @@ int main(int argc, char **argv)
         dispatch_sequence=9; kfd_code_after_sync_error=-ETIMEDOUT;
         assert(dext_compute_dispatch(&sync_launch,sizeof(sync_launch),out)==-ENOTREADY_L);
         kfd_code_after_sync_error=0;
+        assert(dext_compute_query_info(1,out,10)==3);	/* not frozen */
+        /* The CP stops 21's queue first, with an error code: reported
+         * with the code, not as a failed call. */
+        kfd_stopped_code=0x80;
+        assert(dext_compute_aql_queue_service(qa,out,out+1)==-EQUEUE_L && out[1]==0x80);
+        kfd_stopped_code=0;
         assert(dext_compute_query_info(1,out,10)==3);	/* not frozen */
         /* The fault: KFD evicted 21's queues for good. */
         kfd_faulted=faulting;

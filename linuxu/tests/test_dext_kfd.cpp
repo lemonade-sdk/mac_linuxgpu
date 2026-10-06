@@ -174,8 +174,10 @@ int main()
     assert(!dext_kfd_queue_service(q1.queue, &pending) && !pending && !inactive->value);
     assert(m1->scratch_backing_memory_location >= (3ULL << 45) &&
            m1->scratch_wave64_lane_byte_size == 64 && m1->compute_tmpring_size);
+    /* An error code the CP wrote (not a scratch request): reported, with
+     * the code, for the runtime to wait briefly for a fault report. */
     inactive->value = 0x2;
-    assert(dext_kfd_queue_service(q1.queue, &pending) == -EIO);
+    assert(dext_kfd_queue_service(q1.queue, &pending) == -ENOEXEC && pending == 0x2);
     inactive->value = 0;
 
     /* Bounded launch (selector 55) on a short-lived KFD queue. */

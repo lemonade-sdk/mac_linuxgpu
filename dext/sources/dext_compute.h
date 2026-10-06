@@ -34,6 +34,7 @@ extern "C" {
 #define ENOMEM_L      11005
 #define EBUSY_L       11006
 #define EFAULT_L      11007	/* the client's process took a GPU memory fault */
+#define EQUEUE_L      11008	/* the CP stopped the queue with an error code */
 
 /* QueryInfo diagnostic namespace: attempted, bound, signed probe result,
  * transport fault, and transport fault offset. */
@@ -214,7 +215,8 @@ int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status);
 
 /* AQLQueueService (59): in handle, out status/inactive. -EFAULT_L when the
  * queue's process took a GPU memory fault (its queues were evicted for
- * good); dext_compute_aql_queue_fault says where. */
+ * good); dext_compute_aql_queue_fault says where. -EQUEUE_L when the CP
+ * stopped the queue with an error code, in *out_inactive. */
 int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
                                    uint64_t *out_inactive);
 /* The fault of the queue's process: *flags DEXT_KFD_FAULT_* (0 for none)

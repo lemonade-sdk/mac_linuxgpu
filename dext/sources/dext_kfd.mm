@@ -408,7 +408,9 @@ int dext_kfd_queue_service(dext_kfd_queue *q, uint64_t *inactive)
     if (r) return r;
     r = rt_kfd_bo_read(c->session, q->storage, kAQLInactiveOffset + 8, inactive, 8);
     if (r || !*inactive) return r;
-    if (!(*inactive & 0x401) || (*inactive & ~uint64_t(0x401))) return -EIO;
+    // Not a scratch request: the CP stopped the queue and wrote its error
+    // code (a fault it hit, a bad packet). The code stays in *inactive.
+    if (!(*inactive & 0x401) || (*inactive & ~uint64_t(0x401))) return -ENOEXEC;
     amd_queue_t m{};
     r = rt_kfd_bo_read(c->session, q->metadata, 0, &m, sizeof(m));
     if (r) return r;

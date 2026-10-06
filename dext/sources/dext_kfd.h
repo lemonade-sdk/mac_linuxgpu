@@ -80,7 +80,10 @@ int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
                           struct dext_kfd_queue **out);
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet);
 /* -EFAULT once the client's process took a GPU memory fault: KFD evicted
- * its queues, which never run again (dext_kfd_fault says where). */
+ * its queues, which never run again (dext_kfd_fault says where).
+ * -ENOEXEC when the CP stopped the queue with an error code (left in
+ * *inactive) that is not a scratch request; a fault it hit is reported as
+ * -EFAULT once KFD's interrupt work signaled the process's memory event. */
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive);
 int dext_kfd_queue_destroy(struct dext_kfd_queue *q);
 unsigned int dext_kfd_queue_count(struct dext_kfd_client *c);
