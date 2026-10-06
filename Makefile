@@ -202,6 +202,8 @@ $(BUILD)/driver/display/dmub/src/dmub_srv.o: linuxu/headers/rt/dmub_inbox.h
 
 # These upstream BUILD_BUG_ON checks fold table accesses or sizeof-derived
 # local variables. Linux uses optimization; -O0 cannot prove the conditions.
+# (Every object now builds with KERNEL_OPTFLAGS; the list keeps them -O2 should
+# a debugging build drop the level.)
 FOLDED_ASSERT_OBJECTS := drm-core/drm_edid.o \
 	pm/swsmu/smu11/arcturus_ppt.o pm/swsmu/smu11/navi10_ppt.o \
 	pm/swsmu/smu11/sienna_cichlid_ppt.o pm/swsmu/smu13/aldebaran_ppt.o
@@ -245,11 +247,20 @@ DK_LIB     := $(DK_BUILD)/libmacamgdu-dk.a
 # driverKit platform flags for the KMD objects (parallel to HOSTCFLAGS but
 # -target driverKit + C headers from the MacOSX SDK).
 # -ftrivial-auto-var-init=zero: CONFIG_INIT_STACK_ALL_ZERO, as HOSTCFLAGS.
-DK_HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
+DK_HOSTCFLAGS := $(KERNEL_OPTFLAGS) -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_DEXT_DK=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
 DK_CFLAGS     := -target arm64-apple-driverkit -isystem $(MSDK)/usr/include $(DK_HOSTCFLAGS)
+# The printf-family and string-copy builtins are off: at -O2 clang
+# otherwise rewrites such calls into others (sprintf, strcpy, strncpy,
+# vsnprintf, fwrite) that the DriverKit runtime does not export, and the
+# dext would not link.
 DK_CFLAGS += -include rt/device_string.h -mstrict-align \
 	-fno-builtin-memset -fno-builtin-memcpy -fno-builtin-memmove \
-	-fno-builtin-memcmp -fno-builtin-bzero
+	-fno-builtin-memcmp -fno-builtin-bzero \
+	-fno-builtin-printf -fno-builtin-fprintf -fno-builtin-vprintf -fno-builtin-vfprintf \
+	-fno-builtin-sprintf -fno-builtin-snprintf -fno-builtin-vsprintf -fno-builtin-vsnprintf \
+	-fno-builtin-puts -fno-builtin-fputs -fno-builtin-fputc -fno-builtin-putchar -fno-builtin-fwrite \
+	-fno-builtin-strcpy -fno-builtin-strncpy -fno-builtin-stpcpy -fno-builtin-stpncpy \
+	-fno-builtin-strcat -fno-builtin-strncat
 
 # Changing the memory backend must rebuild every KMD object, including ones
 # whose old depfiles predate the forced header.
