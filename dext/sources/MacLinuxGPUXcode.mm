@@ -3935,9 +3935,12 @@ static kern_return_t owner_call(MacLinuxGPUUserClient *client, uint64_t selector
     client->retain();
     job->action->retain();
     if (job->inputDescriptor) job->inputDescriptor->retain();
+    // The job is the queue's once dispatched (it may run and be freed
+    // before DispatchAsync returns): its token is read before.
+    const uint64_t token = job->token;
     client->ivars->ownerQueue->DispatchAsync(^{ owner_job_main(job); });
     if (a->scalarOutput && a->scalarOutputCount) {
-        a->scalarOutput[0] = selector == MLG_SELECTOR_EVENT_WAIT ? 0 : job->token;
+        a->scalarOutput[0] = selector == MLG_SELECTOR_EVENT_WAIT ? 0 : token;
         a->scalarOutputCount = 1;
     }
     return kIOReturnSuccess;
@@ -4435,17 +4438,11 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (ivars->observer) {
             if (!mlg_observer_selector_allowed(selector, in, nin))
                 return kIOReturnNotPermitted;
-            if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
+            // SysfsWrite: any observer (session_state.h), logged with its client.
+            if (selector == MLG_SELECTOR_SYSFS_WRITE) MACLINUXGPU_LOG("client %llu: sysfs write", ivars->clientID);
+            if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO ||
+                selector == MLG_SELECTOR_SYSFS_WRITE)
                 return bounded_read(selector, arguments);
-            if (selector == MLG_SELECTOR_SYSFS_WRITE) {
-                // The performance controls. Any observer client, as any
-                // process may already run GPU work through a session
-                // client; the allowlist bounds what it can set, and each
-                // write is logged with the client that made it.
-                MACLINUXGPU_LOG("client %llu: sysfs write (attribute %llu)", ivars->clientID,
-                                (unsigned long long)in[0]);
-                return bounded_read(selector, arguments);
-            }
             if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
         } else if (ivars->linuxFile) {
             // Its session was closed by Disconnect GPU (as for session
