@@ -147,11 +147,13 @@ public:
 #import <DriverKit/IOMemoryMap.h>
 #import <DriverKit/IOLib.h>
 #import <PCIDriverKit/IOPCIDevice.h>
+#include <os/log.h>
 #include "retained_log.h"
 
 // Routine DMA lines stay in the retained ring; only events reach the
 // unified log (retained_log.h).
-static void dext_dma_event_sink(const char *text) { IOLog("%s", text); }
+// As data (%{public}s): an IOLog("%s") argument reads <private> in the log.
+static void dext_dma_event_sink(const char *text) { os_log(OS_LOG_DEFAULT, "%{public}s", text); }
 #define DEXT_DMA_LOG(...) maclinuxgpu::RetainedLog(nullptr, __VA_ARGS__)
 #define DEXT_DMA_EVENT(...) maclinuxgpu::RetainedEvent(dext_dma_event_sink, __VA_ARGS__)
 

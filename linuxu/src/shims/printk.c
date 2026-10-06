@@ -15,8 +15,16 @@
 #include <rt/fatal.h>
 
 #ifdef LINUXU_DEXT_DK
-/* Public DriverKit logging entry point; no stdio stream exists in a dext. */
-extern int IOLog(const char *format, ...) __attribute__((format(printf, 1, 2)));
+/* No stdio stream exists in a dext. Events go to the sink the dext
+ * registers (klog_set_event_sink): the unified log, with the text as data
+ * (%{public}s), so it reads there instead of <private>. os/log.h cannot be
+ * included next to the Linux headers, so the dext owns that call. */
+static void (*klog_event_sink)(const char *text);
+
+void klog_set_event_sink(void (*sink)(const char *text))
+{
+	__atomic_store_n(&klog_event_sink, sink, __ATOMIC_RELEASE);
+}
 #endif
 
 /* ---- debug level gate (0=emerg .. 7=debug) ---- */
@@ -163,7 +171,10 @@ static int klog_vemit(int level, const char *f, va_list ap)
 	if (length >= sizeof(record))
 		length = sizeof(record) - 1;
 	record[length] = '\0';
-	return IOLog("mac.linuxgpu: EVENT %s", record);
+	void (*sink)(const char *) = __atomic_load_n(&klog_event_sink, __ATOMIC_ACQUIRE);
+	if (sink)
+		sink(record);
+	return (int)length;
 #else
 	pthread_mutex_lock(&klog_lock);
 	fprintf(stderr, "%s ", level_tag(level));

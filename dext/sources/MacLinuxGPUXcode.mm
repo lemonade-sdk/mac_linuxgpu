@@ -266,6 +266,17 @@ static void maclinuxgpu_event_sink(const char *text)
 #define MACLINUXGPU_LOG(...) maclinuxgpu::RetainedLog(nullptr, __VA_ARGS__)
 #define MACLINUXGPU_EVENT(...) \
     maclinuxgpu::RetainedEvent(maclinuxgpu_event_sink, __VA_ARGS__)
+// Upstream errors and worse (printk level <= 3) reach the unified log the
+// same way, readable rather than <private>; registered before any driver
+// code can print.
+static void maclinuxgpu_printk_event_sink(const char *text)
+{
+    os_log(OS_LOG_DEFAULT, "mac.linuxgpu: EVENT %{public}s", text);
+}
+__attribute__((constructor)) static void maclinuxgpu_register_printk_sink(void)
+{
+    klog_set_event_sink(maclinuxgpu_printk_event_sink);
+}
 
 // ----------------------------------------------------------------
 // MacLinuxGPU (IOService) — the OSMetaClass method bodies.
@@ -2083,6 +2094,13 @@ kern_return_t
 IMPL(MacLinuxGPU, Stop)
 {
     if (s_driver != this) return Stop(provider, SUPERDISPATCH);
+    // DriverKit has no willTerminate: Stop is how the driver learns that it
+    // or its PCI provider is being terminated. A breadcrumb that outlives
+    // the process (the unified log and the host's driver trail).
+    MACLINUXGPU_EVENT("stop: the driver's Stop arrived (termination of the driver or its PCI provider: "
+                      "an upgrade, a deactivation or an unplug); session %s, quarantine %d",
+                      s_sessionClosing ? "closing" : s_modulesRunning ? "running" : "idle",
+                      (int)s_dmaQuarantined);
     retain();
     provider->retain();
     s_stopQueue->DispatchAsync(^{
@@ -2194,6 +2212,7 @@ MacLinuxGPU::FinishSession()
 void
 MacLinuxGPU::FinishStop(IOService *provider)
 {
+    MACLINUXGPU_EVENT("stop: provider let go; the driver process ends once IOKit releases it");
     Stop(provider, SUPERDISPATCH);
     provider->release();
     release();
@@ -2233,6 +2252,10 @@ kern_return_t
 IMPL(MacLinuxGPU, SetPowerState)
 {
     if (s_driver != this) return SetPowerState(powerFlags, SUPERDISPATCH);
+    // Rare (sleep, wake, device power): an event, so a death around a power
+    // change shows it.
+    MACLINUXGPU_EVENT("power: SetPowerState(%#x) arrived in state %s", powerFlags,
+                      power_state_name(s_power.state));
     // The power state is the session queue's: the change runs there, and
     // is acknowledged from there, at once or after its work.
     retain();
