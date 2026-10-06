@@ -14,6 +14,7 @@ done
 for scenario in open-failure dispatch-timeout dispatch bounded-timeout bounded-oom \
   bounded-nospc create-nospc query-topology geometry legacy-one-hqd kfd-two-queues \
   kfd-open-failure kfd-stop kfd-destroy-retained kfd-death-recovered kfd-death-kept \
+  kfd-fault-isolated \
   allocation-cleanup create-retained create-oom service-retained kick-poison \
   destroy-retained stop-retained stop-removed ordinary-errors close-retained device-spec \
   client-churn-close client-churn client-records-full host-window-no-session; do

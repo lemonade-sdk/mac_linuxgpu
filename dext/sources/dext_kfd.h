@@ -79,9 +79,19 @@ int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
                           struct rt_kfd_bo *metadata, uint32_t packets,
                           struct dext_kfd_queue **out);
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet);
+/* -EFAULT once the client's process took a GPU memory fault: KFD evicted
+ * its queues, which never run again (dext_kfd_fault says where). */
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive);
 int dext_kfd_queue_destroy(struct dext_kfd_queue *q);
 unsigned int dext_kfd_queue_count(struct dext_kfd_client *c);
+/* The client's GPU memory fault (rt_kfd_session_fault): 1 with *flags
+ * (DEXT_KFD_FAULT_*) and *va once its process faulted, 0 while not. */
+#define DEXT_KFD_FAULT_VALID		(1u << 31)
+#define DEXT_KFD_FAULT_NOT_PRESENT	(1u << 0)
+#define DEXT_KFD_FAULT_READ_ONLY	(1u << 1)
+#define DEXT_KFD_FAULT_NO_EXECUTE	(1u << 2)
+#define DEXT_KFD_FAULT_IMPRECISE	(1u << 3)
+int dext_kfd_fault(struct dext_kfd_client *c, uint32_t *flags, uint64_t *va);
 
 /* Signal events of the client's KFD process and waits on them
  * (rt_kfd_event_create, rt_kfd_wait_begin/run). */

@@ -560,6 +560,17 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
     return -ENOENT_L;
 }
 
+/* The reference backend's queues never fault. */
+int dext_compute_aql_queue_fault(uint64_t handle, uint64_t *out_flags, uint64_t *out_va)
+{
+    if (!out_flags || !out_va) return -EINVAL_L;
+    *out_flags = 0;
+    *out_va = 0;
+    for (int i = 0; i < DEXT_COMPUTE_MAX_AQL; i++)
+        if (g_compute.aql[i].in_use && g_compute.aql[i].handle == handle) return 0;
+    return -ENOENT_L;
+}
+
 /* AQLDispatch (55): in the AQLDispatchRequest struct, out 5 scalars. */
 int dext_compute_rsrc1_clamp_ieee(void) { return 0; }
 

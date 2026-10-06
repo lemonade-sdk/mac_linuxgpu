@@ -378,12 +378,35 @@ int dext_kfd_queue_kick(dext_kfd_queue *q, uint64_t packet)
     return r;
 }
 
+int dext_kfd_fault(dext_kfd_client *c, uint32_t *flags, uint64_t *va)
+{
+    struct rt_kfd_fault fault{};
+    if (!c || !flags || !va) return -EINVAL;
+    *flags = 0;
+    *va = 0;
+    const int r = rt_kfd_session_fault(c->session, &fault);
+    if (r != 1) return r;
+    *flags = DEXT_KFD_FAULT_VALID |
+             (fault.not_present ? DEXT_KFD_FAULT_NOT_PRESENT : 0) |
+             (fault.read_only ? DEXT_KFD_FAULT_READ_ONLY : 0) |
+             (fault.no_execute ? DEXT_KFD_FAULT_NO_EXECUTE : 0) |
+             (fault.imprecise ? DEXT_KFD_FAULT_IMPRECISE : 0);
+    *va = fault.va;
+    return 1;
+}
+
 int dext_kfd_queue_service(dext_kfd_queue *q, uint64_t *inactive)
 {
     using namespace amdgpu;
     if (!q || !inactive || q->retained) return -ENODEV;
     dext_kfd_client *c = q->client;
-    int r = rt_kfd_bo_read(c->session, q->storage, kAQLInactiveOffset + 8, inactive, 8);
+    *inactive = 0;
+    // A GPU memory fault of the process: its queues are off the GPU for
+    // good. Reported before anything else, on the poll the runtime makes.
+    int r = rt_kfd_session_fault(c->session, nullptr);
+    if (r == 1) return -EFAULT;
+    if (r) return r;
+    r = rt_kfd_bo_read(c->session, q->storage, kAQLInactiveOffset + 8, inactive, 8);
     if (r || !*inactive) return r;
     if (!(*inactive & 0x401) || (*inactive & ~uint64_t(0x401))) return -EIO;
     amd_queue_t m{};

@@ -462,6 +462,102 @@ static void events_and_waits(struct rt_kfd_session *s, struct queue_set *set, st
 	fixture_cp_stop();
 }
 
+/* ---- a GPU page fault of one client while another runs ----
+ * The faulting client destroyed a completion signal (freed its memory)
+ * while a dispatch naming it was still queued: the CP's signal write
+ * faults. As on Linux, KFD's interrupt handler evicts that process's
+ * queues and signals its memory event; the session reports the fault, its
+ * queues never run again, and closing it is an ordinary close. The other
+ * client's queue keeps running before, during and after. */
+static void dispatch_to(struct rt_kfd_session *s, struct queue_set *set, uint64_t *next_id,
+			uint64_t signal)
+{
+	struct rt_kfd_bo_info ring;
+	uint8_t packet[64] = {0};
+	uint64_t id = (*next_id)++;
+	uint32_t packets;
+
+	assert(!rt_kfd_bo_info(s, set->ring, &ring));
+	packets = (uint32_t)(ring.size / 64);
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_RING_BASE, &ring.va, 8));
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_RING_SIZE, &packets, 4));
+	packet[0] = FIXTURE_AQL_PACKET_DISPATCH;
+	memcpy(packet + FIXTURE_AQL_COMPLETION, &signal, 8);
+	assert(!rt_kfd_bo_write(s, set->ring, (id % packets) * 64, packet, sizeof(packet)));
+	id++;
+	assert(!rt_kfd_bo_write(s, set->meta, FIXTURE_AQL_WRITE_ID, &id, 8));
+	assert(!rt_kfd_queue_kick(s, set->q, id - 1));
+}
+
+static bool bystander_completes(struct rt_kfd_session *s, struct queue_set *set, uint64_t *next_id,
+				struct rt_kfd_bo *host)
+{
+	const uint64_t start = now_ms();
+
+	dispatch_with_signal(s, set, next_id, host, 0, NULL);
+	while (signal_value(s, host, 0) != 0)
+		if (now_ms() - start > 2000)
+			return false;
+		else
+			usleep(100);
+	return true;
+}
+
+static void vm_fault_isolation(void)
+{
+	struct queue_set qa, qb;
+	struct rt_kfd_bo *vram_a, *vram_b, *host_b, *doomed;
+	struct rt_kfd_bo_info doomed_info;
+	struct rt_kfd_session *a, *b;
+	struct rt_kfd_fault fault;
+	uint64_t next_a = 0, next_b = 0, start;
+	unsigned int removes, faults;
+
+	fixture_cp_start();
+	a = dying_client("faulting", &qa, &vram_a);
+	b = dying_client("bystander", &qb, &vram_b);
+	assert(!rt_kfd_bo_alloc(b, 16384, 0, RT_KFD_GTT, RT_KFD_PLACE_WINDOW, &host_b));
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+	assert(rt_kfd_session_fault(a, &fault) == 0 && rt_kfd_session_fault(b, &fault) == 0);
+
+	/* Destroy before completion: the signal's memory goes, then the
+	 * dispatch that names it runs. */
+	assert(!rt_kfd_bo_alloc(a, 16384, 0, RT_KFD_GTT, RT_KFD_PLACE_WINDOW, &doomed));
+	assert(!rt_kfd_bo_info(a, doomed, &doomed_info));
+	assert(!rt_kfd_bo_free(a, doomed));
+	removes = mes_removes;
+	faults = fixture_vm_faults();
+	dispatch_to(a, &qa, &next_a, doomed_info.va);
+	start = now_ms();
+	while (rt_kfd_session_fault(a, &fault) == 0) {
+		assert(now_ms() - start < 2000);
+		usleep(100);
+	}
+	assert(fixture_vm_faults() == faults + 1);
+	assert(fault.va == ((doomed_info.va + 8) & ~(uint64_t)(PAGE_SIZE - 1)));
+	assert(fault.not_present);
+	/* KFD took the faulting process's queue off MES, and only that one. */
+	assert(mes_removes == removes + 1);
+	assert(rt_kfd_queue_kick(a, qa.q, 5) == -EFAULT);
+	assert(rt_kfd_session_fault(a, NULL) == 1);	/* sticky */
+	assert(!rt_kfd_session_uncertain(a));
+
+	/* The other client neither sees the fault nor stops. */
+	assert(rt_kfd_session_fault(b, &fault) == 0 && !rt_kfd_session_uncertain(b));
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+
+	/* The faulting client leaves: an ordinary close, nothing kept. */
+	assert(!rt_kfd_session_close(a));
+	assert(mes_removes == removes + 1);	/* its queue was already off MES */
+	assert(bystander_completes(b, &qb, &next_b, host_b));
+	assert(!rt_kfd_session_close(b));
+	fixture_cp_stop();
+	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+	puts("KFD GPU page fault: the faulting process's queues evicted and its memory event "
+	     "signaled, the fault reported and sticky, its close ordinary; the other client ran "
+	     "throughout");
+}
+
 int main(void)
 {
 	struct rt_kfd_session *s, *second;
@@ -641,6 +737,7 @@ int main(void)
 
 	process_death();
 	assert(kgd_frees == kgd_allocs && kgd_unmaps == kgd_maps);
+	vm_fault_isolation();
 	/* kfd_exit order: the release work frees the KFD process, which drops
 	 * the render file ACQUIRE_VM kept. */
 	fixture_kfd_release_processes();

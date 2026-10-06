@@ -1202,9 +1202,17 @@ int dext_compute_dispatch(const void *request, size_t request_size, uint64_t *ou
                                    &wire, sizeof(wire), dispatch_cache_sync, &sync,
                                    aql, &uncertain);
     }
-    /* A submitted cache sync that did not complete may still be running. */
+    /* A launch whose queue removal was not confirmed may still run. */
     if (uncertain) freeze(code->kfd != NULL);
-    if (r && sync.submitted) freeze(false);
+    /* A failed launch after its cache sync was submitted: on a DriverKit
+     * HQD, that HQD's state is unknown. On a KFD queue the launch's queue
+     * was destroyed through KFD (an unconfirmed destroy is the uncertain
+     * case above), and the cache sync is an upstream kernel-ring job that
+     * touches no client memory, tracked by its fence and the ring's own
+     * timeout and recovery: one client's failed launch (a process whose
+     * GPU work faulted, say) does not freeze the device for every other
+     * client. */
+    if (r && sync.submitted && !code->kfd) freeze(false);
     if (r) {
         if (production.uncertain) return -EBUSY_L;
         if (r == -EINVAL) return -EINVAL_L;
@@ -1349,6 +1357,7 @@ int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
     if (q->kfd) {
         struct dext_kfd_client *c = owner_kfd(q->owner);
         int r = dext_kfd_queue_kick(q->kfd, wptr);
+        if (r == -EFAULT) return -EFAULT_L;
         if (r) return kfd_error(c, r) == -EBUSY_L ? -EBUSY_L : -ENOTREADY_L;
         *out_status = 0;
         return 0;
@@ -1398,6 +1407,7 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
     if (q->kfd) {
         struct dext_kfd_client *c = owner_kfd(q->owner);
         int r = dext_kfd_queue_service(q->kfd, &inactive);
+        if (r == -EFAULT) return -EFAULT_L;
         if (r) return kfd_error(c, r) == -EBUSY_L ? -EBUSY_L : -ENOTREADY_L;
         *out_status = 0;
         *out_inactive = inactive;
@@ -1411,6 +1421,22 @@ int dext_compute_aql_queue_service(uint64_t handle, uint64_t *out_status,
     if (r) return -ENOTREADY_L;
     *out_status = 0;
     *out_inactive = inactive;
+    return 0;
+}
+
+int dext_compute_aql_queue_fault(uint64_t handle, uint64_t *out_flags, uint64_t *out_va)
+{
+    struct production_queue *q = production_queue_lookup(handle);
+    uint32_t flags = 0;
+    if (!q || !out_flags || !out_va) return -ENOENT_L;
+    *out_flags = 0;
+    *out_va = 0;
+    if (!q->kfd) return 0;
+    struct dext_kfd_client *c = owner_kfd(q->owner);
+    if (!c) return -ENOTREADY_L;
+    const int r = dext_kfd_fault(c, &flags, out_va);
+    if (r < 0) return -ENOTREADY_L;
+    *out_flags = flags;
     return 0;
 }
 

@@ -857,9 +857,15 @@ static void note_device_removed(const char *where)
 static void transport_lost(int fault)
 {
     if (__atomic_exchange_n(&s_deviceLost, true, __ATOMIC_ACQ_REL)) return;
-    const int lost = rt_device_lost_active("PCI transport fault");
-    MACLINUXGPU_EVENT("PCI transport fault %d: the GPU no longer answers this driver; "
-                      "its work completes with -ECANCELED%s", fault,
+    // Fault 4 is this driver's own isolation of a quarantined session
+    // (dext_pci_quarantine): the GPU may still answer, the driver no longer
+    // asks it anything.
+    const bool isolated = fault == DEXT_PCI_FAULT_QUARANTINE;
+    const int lost = rt_device_lost_active(isolated ? "the driver isolated the device (quarantine)"
+                                                    : "PCI transport fault: the device no longer answers");
+    MACLINUXGPU_EVENT("PCI transport fault %d: %s; its work completes with -ECANCELED%s", fault,
+                      isolated ? "the driver isolated the GPU itself (its session was quarantined)"
+                               : "the GPU no longer answers this driver",
                       lost ? " (but its completion thread did not start)" : "");
 }
 
@@ -5082,6 +5088,9 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
                        dext_compute_aql_queue_destroy(arguments->scalarInput[0], &status);
         if (r == -ENOENT_L) return kIOReturnBadArgument;
         if (r == -EBUSY_L) return kIOReturnBusy;
+        // The queue's process took a GPU memory fault: its queues are off
+        // the GPU for good (AQLQueueService says where).
+        if (r == -EFAULT_L) return kIOReturnVMError;
         if (r != 0) return kIOReturnNotReady;
         arguments->scalarOutput[0] = status;
         arguments->scalarOutputCount = 1;
@@ -5089,18 +5098,34 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodAQLQueueService: {
-        // in[0]=handle; out[0]=status, [1]=inactive
+        // in[0]=handle; out[0]=status, [1]=inactive; with 4 outputs asked
+        // for (build 256 on), [2]=fault flags (DEXT_KFD_FAULT_*), [3]=the
+        // faulting page's GPU address. A GPU memory fault of the queue's
+        // process answers status kIOReturnVMError: KFD evicted its queues,
+        // which never run again; the session and other clients go on.
         if (arguments->scalarInput == nullptr || arguments->scalarInputCount != 1 ||
             !arguments->scalarOutput || arguments->scalarOutputCount < 2 ||
             arguments->structureInput) return kIOReturnBadArgument;
-        uint64_t status = 0, inactive = 0;
+        const uint32_t outputs = arguments->scalarOutputCount >= 4 ? 4 : 2;
+        uint64_t status = 0, inactive = 0, flags = 0, va = 0;
         int r = dext_compute_aql_queue_service(arguments->scalarInput[0], &status, &inactive);
+        if (r == -EFAULT_L) {
+            if (dext_compute_aql_queue_fault(arguments->scalarInput[0], &flags, &va) != 0)
+                return kIOReturnNotReady;
+            status = (uint32_t)kIOReturnVMError;
+            inactive = 0;
+            r = 0;
+        }
         if (r == -ENOENT_L) return kIOReturnBadArgument;
         if (r == -EBUSY_L) return kIOReturnBusy;
         if (r != 0) return kIOReturnNotReady;
         arguments->scalarOutput[0] = status;
         arguments->scalarOutput[1] = inactive;
-        arguments->scalarOutputCount = 2;
+        if (outputs == 4) {
+            arguments->scalarOutput[2] = flags;
+            arguments->scalarOutput[3] = va;
+        }
+        arguments->scalarOutputCount = outputs;
         return kIOReturnSuccess;
     }
 

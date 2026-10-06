@@ -144,6 +144,11 @@ struct rt_kfd_session {
 	unsigned int waits;
 	pthread_cond_t waits_done;
 	bool closing;
+	/* The process's memory event (rt_kfd_session_fault) and, once KFD
+	 * signaled it, what it reported. */
+	uint32_t memory_event;
+	bool faulted;
+	struct rt_kfd_fault fault;
 };
 
 struct rt_kfd_wait {
@@ -444,6 +449,18 @@ static int session_handshake(struct rt_kfd_session *s)
 
 		runtime.mode_mask = KFD_RUNTIME_ENABLE_MODE_ENABLE_MASK;
 		(void)session_ioctl(s, AMDKFD_IOC_RUNTIME_ENABLE, &runtime, sizeof(runtime));
+	}
+	/* ROCr's memory-exception event: KFD signals it when the process's
+	 * GPU work faults, after evicting its queues. */
+	{
+		struct kfd_ioctl_create_event_args event = {0};
+
+		event.event_type = KFD_IOC_EVENT_MEMORY;
+		event.auto_reset = 0;
+		r = session_ioctl(s, AMDKFD_IOC_CREATE_EVENT, &event, sizeof(event));
+		if (r)
+			return (int)r;
+		s->memory_event = event.event_id;
 	}
 	r = read_limits(s);
 	if (r)
@@ -1369,6 +1386,76 @@ int rt_kfd_bo_cpu_ranges(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
 	return r;
 }
 
+/* ---- GPU memory faults ---- */
+
+/* A zero-timeout WAIT_EVENTS on the memory event: KFD copies the exception
+ * data of a signaled memory event into the wait's event record. Caller
+ * holds s->lock and is inside the process. */
+static int fault_poll_locked(struct rt_kfd_session *s)
+{
+	struct {
+		struct kfd_ioctl_wait_events_args args;
+		struct kfd_event_data event;
+	} wait;
+	const struct kfd_hsa_memory_exception_data *data;
+	long r;
+
+	if (s->faulted)
+		return 1;
+	memset(&wait, 0, sizeof(wait));
+	wait.args.events_ptr = arena_address(&wait, &wait.event);
+	wait.args.num_events = 1;
+	wait.args.wait_for_all = 1;
+	wait.args.timeout = 0;
+	wait.event.event_id = s->memory_event;
+	r = session_ioctl(s, AMDKFD_IOC_WAIT_EVENTS, &wait, sizeof(wait));
+	if (r)
+		return (int)r;
+	if (wait.args.wait_result != KFD_IOC_WAIT_RESULT_COMPLETE)
+		return 0;
+	data = &wait.event.memory_exception_data;
+	s->faulted = true;
+	s->fault = (struct rt_kfd_fault){
+		.va = data->va,
+		.not_present = data->failure.NotPresent,
+		.read_only = data->failure.ReadOnly,
+		.no_execute = data->failure.NoExecute,
+		.imprecise = data->failure.imprecise,
+	};
+	pr_err("kfd session %d: GPU memory fault at %#llx (%s%s%s); KFD evicted the process's "
+	       "queues, which do not run again\n", session_pid(s),
+	       (unsigned long long)s->fault.va,
+	       s->fault.not_present ? "page not present" : "protection",
+	       s->fault.read_only ? ", write to read-only" : "",
+	       s->fault.no_execute ? ", no execute" : "");
+	return 1;
+}
+
+int rt_kfd_session_fault(struct rt_kfd_session *s, struct rt_kfd_fault *out)
+{
+	struct linuxu_process_saved saved;
+	int r;
+
+	if (!s)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	if (s->faulted) {
+		r = 1;
+	} else if (s->closing) {
+		r = -ESHUTDOWN;
+	} else {
+		r = session_enter(s, &saved);
+		if (!r) {
+			r = fault_poll_locked(s);
+			linuxu_process_leave(&saved);
+		}
+	}
+	if (r == 1 && out)
+		*out = s->fault;
+	pthread_mutex_unlock(&s->lock);
+	return r;
+}
+
 /* ---- queues ---- */
 
 /* libhsakmt maps the process doorbell slice once per GPU before the first
@@ -1505,6 +1592,16 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 		r = -ENOSPC;
 	else
 		r = session_enter(s, &saved);
+	/* A process whose GPU work faulted runs nothing again: KFD keeps a new
+	 * queue of it evicted, so creating one is refused. */
+	if (!r) {
+		const int faulted = fault_poll_locked(s);
+
+		if (faulted) {
+			linuxu_process_leave(&saved);
+			r = faulted == 1 ? -EFAULT : faulted;
+		}
+	}
 	if (r) {
 		pthread_mutex_unlock(&s->lock);
 		kfree(q);
@@ -1638,6 +1735,8 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 		r = -ENOENT;
 	else if (q->gone || q->failed)
 		r = -ENODEV;
+	else if (s->faulted)
+		r = -EFAULT;
 	else if (!adev->doorbell.cpu_addr ||
 		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
 		r = -ERANGE;

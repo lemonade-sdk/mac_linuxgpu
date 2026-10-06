@@ -40,7 +40,7 @@ sources=(linuxu/tests/test_kfd_session.c linuxu/tests/kfd_session_fixture.c linu
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_queue.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_doorbell.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_flat_memory.c
   third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_events.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_debug.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_smi_events.c
-  third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c
+  third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_debugfs.c third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_int_process_v11.c
   linuxu/src/shims/process.c linuxu/src/shims/task.c linuxu/src/shims/fd.c
   linuxu/src/shims/chrdev.c linuxu/src/shims/module.c linuxu/src/shims/sysinfo.c
   linuxu/src/drm/dma_resv.c linuxu/src/sync/ww_mutex.c

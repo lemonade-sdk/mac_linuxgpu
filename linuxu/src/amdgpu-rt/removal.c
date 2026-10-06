@@ -107,7 +107,7 @@ int rt_device_lost(struct pci_dev *pdev, const char *why)
 			removal_thread = NULL;
 			r = -ENOMEM;
 		}
-		dev_err(adev->dev, "%s: the device no longer answers; no hardware access, "
+		dev_err(adev->dev, "%s: no hardware access from now on, "
 			"GPU work completes with -ECANCELED\n", why ? why : "device lost");
 	}
 	pthread_mutex_unlock(&removal_lock);

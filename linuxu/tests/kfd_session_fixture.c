@@ -40,6 +40,9 @@ extern int usleep(unsigned int usec);
 #include "kfd_priv.h"
 #include "kfd_device_queue_manager.h"
 #include "kfd_topology.h"
+#include "soc15_int.h"
+#include "soc15_ih_clientid.h"
+#include "ivsrcid/vmc/irqsrcs_vmc_1_0.h"
 #include "kfd_session_fixture.h"
 
 
@@ -62,8 +65,9 @@ static uint8_t *vram;	/* host backing of the fake VRAM */
 static uint64_t vram_next;
 
 /* ---- the command processor: AQL dispatches of MES-added queues ---- */
-struct cp_queue { bool live; uint32_t doorbell; uint64_t wptr; uint32_t pasid; };
+struct cp_queue { bool live, faulted; uint32_t doorbell; uint64_t wptr; uint32_t pasid; };
 static struct cp_queue cp_queues[16];
+static struct workqueue_struct *fault_wq;	/* GPU page faults to KFD */
 static pthread_mutex_t cp_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t cp_thread;
 static volatile bool cp_running;
@@ -76,13 +80,13 @@ static void cp_add(uint32_t doorbell, uint64_t wptr, uint32_t pasid)
 	/* A queue MES never removed (a failed removal) is mapped once. */
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (cp_queues[i].live && cp_queues[i].doorbell == doorbell) {
-			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
+			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .pasid = pasid };
 			pthread_mutex_unlock(&cp_lock);
 			return;
 		}
 	for (unsigned int i = 0; i < ARRAY_SIZE(cp_queues); ++i)
 		if (!cp_queues[i].live) {
-			cp_queues[i] = (struct cp_queue){ true, doorbell, wptr, pasid };
+			cp_queues[i] = (struct cp_queue){ .live = true, .doorbell = doorbell, .wptr = wptr, .pasid = pasid };
 			break;
 		}
 	pthread_mutex_unlock(&cp_lock);
@@ -1088,6 +1092,8 @@ void fixture_device_init(void)
 	adev->reset_domain = &reset_domain;
 	init_rwsem(&reset_domain.sem);
 	reset_domain.wq = alloc_ordered_workqueue("test-reset", 0);
+	fault_wq = alloc_ordered_workqueue("test-vm-fault", 0);
+	assert(fault_wq);
 	assert(reset_domain.wq);
 	adev->vm_manager.max_pfn = 1ULL << (48 - AMDGPU_GPU_PAGE_SHIFT);
 	adev->gmc.vram_start = TEST_VRAM_START;
@@ -1115,6 +1121,7 @@ void fixture_device_init(void)
 	kfd.device_info.doorbell_size = 8;
 	kfd.device_info.num_sdma_queues_per_engine = 8;
 	kfd.device_info.max_no_of_hqd = 24;
+	kfd.device_info.event_interrupt_class = &event_interrupt_class_v11;
 	kfd.shared_resources.enable_mes = true;
 	kfd.shared_resources.num_pipe_per_mec = 4;
 	kfd.shared_resources.num_queue_per_pipe = 8;
@@ -1160,6 +1167,7 @@ void fixture_device_fini(void)
 	node.dqm = NULL;
 	ida_destroy(&kfd.doorbell_ida);
 	destroy_workqueue(reset_domain.wq);
+	destroy_workqueue(fault_wq);
 	free(vram);
 	free(adev);
 }
@@ -1254,14 +1262,86 @@ uint32_t fixture_pasid_of(uint64_t va)
 	return 0;
 }
 
+/* ---- GPU page faults ----
+ * A UTCL2 fault as the IH ring delivers it (client GFX, source
+ * UTCL2_1_0__SRCID__FAULT, the faulting page in dwords 4 and 5) goes to
+ * KFD's GFX 11/12 interrupt class: its ISR filter, then its work handler on
+ * a workqueue, as kgd2kfd_interrupt hands it over. The handler evicts the
+ * process's queues through MES, which takes the CP lock, so a fault the CP
+ * raises is delivered from the workqueue, never from the CP thread. */
+struct fault_work { struct work_struct work; uint32_t entry[8]; };
+unsigned int vm_faults_delivered;
+static void fault_deliver(const uint32_t *entry)
+{
+	uint32_t patched[8];
+	bool flag = false;
+
+	if (event_interrupt_class_v11.interrupt_isr(&node, entry, patched, &flag))
+		event_interrupt_class_v11.interrupt_wq(&node, flag ? patched : entry);
+	__atomic_fetch_add(&vm_faults_delivered, 1, __ATOMIC_RELEASE);
+}
+static void fault_work_fn(struct work_struct *work)
+{
+	struct fault_work *f = container_of(work, struct fault_work, work);
+
+	fault_deliver(f->entry);
+	kfree(f);
+}
+static void fault_entry(uint32_t entry[8], uint32_t pasid, uint64_t va, bool write)
+{
+	const uint64_t page = va >> PAGE_SHIFT;
+	/* ring_id: the protection fault status bits KFD decodes (valid, read,
+	 * write). */
+	const uint32_t ring = 0x08 | (write ? 0x20 : 0x10);
+
+	memset(entry, 0, 8 * sizeof(*entry));
+	entry[0] = SOC21_IH_CLIENTID_GFX | UTCL2_1_0__SRCID__FAULT << 8 | ring << 16 |
+		   node.vm_info.first_vmid_kfd << 24;
+	entry[3] = pasid;
+	entry[4] = (uint32_t)page;
+	entry[5] = (uint32_t)(page >> 32) & 0xf;
+}
+void fixture_vm_fault(uint32_t pasid, uint64_t va, bool write)
+{
+	uint32_t entry[8];
+
+	fault_entry(entry, pasid, va, write);
+	fault_deliver(entry);
+}
+static void fault_raise(uint32_t pasid, uint64_t va, bool write)
+{
+	struct fault_work *f = kzalloc(sizeof(*f), GFP_KERNEL);
+
+	assert(f);
+	fault_entry(f->entry, pasid, va, write);
+	INIT_WORK(&f->work, fault_work_fn);
+	queue_work(fault_wq, &f->work);
+}
+/* What KFD's fault and exception paths reach in amdgpu besides the
+ * eviction: the module parameter (default: evict on a VM fault), the SMI
+ * event's task lookup (no task recorded here), and RAS and bad-opcode
+ * handling, which no test raises. */
+int amdgpu_no_queue_eviction_on_vm_fault;
+struct amdgpu_task_info *amdgpu_vm_get_task_info_pasid(struct amdgpu_device *a, u32 pasid)
+{
+	(void)a; (void)pasid;
+	return NULL;
+}
+void amdgpu_amdkfd_ras_poison_consumption_handler(struct amdgpu_device *a,
+						  enum amdgpu_ras_block block, uint32_t reset)
+{ (void)a; (void)block; (void)reset; TRIPWIRE("RAS poison consumption"); }
+int amdgpu_mes_suspend(struct amdgpu_device *a)
+{ (void)a; TRIPWIRE("MES suspend (a bad queue)"); }
+unsigned int fixture_vm_faults(void) { return __atomic_load_n(&vm_faults_delivered, __ATOMIC_ACQUIRE); }
+
 /* amd_queue_t / AQL layout the CP reads (checked by the C++ test). */
 static void cp_service(struct cp_queue *q)
 {
 	uint64_t *write, *read, ring, packets;
 	char *queue;
 
-	if (fixture_doorbell(q->doorbell) == UINT64_MAX)
-		return;	/* never kicked */
+	if (q->faulted || fixture_doorbell(q->doorbell) == UINT64_MAX)
+		return;	/* stalled on a fault, or never kicked */
 	queue = fixture_va_to_host(q->pasid, q->wptr - FIXTURE_AQL_WRITE_ID, FIXTURE_AQL_QUEUE_BYTES);
 	if (!queue)
 		return;
@@ -1282,6 +1362,15 @@ static void cp_service(struct cp_queue *q)
 		if ((header & 0xff) == FIXTURE_AQL_PACKET_DISPATCH) {
 			uint64_t signal = *(uint64_t *)(packet + FIXTURE_AQL_COMPLETION);
 			int64_t *value = signal ? fixture_va_to_host(q->pasid, signal + 8, 8) : NULL;
+
+			/* A completion signal whose page is not mapped: the CP's
+			 * write faults and the queue stalls on the packet, as the
+			 * hardware's does. */
+			if (signal && !value) {
+				q->faulted = true;
+				fault_raise(q->pasid, signal + 8, true);
+				return;
+			}
 
 			if (value) {
 				uint64_t *abi = fixture_va_to_host(q->pasid, signal, 32);

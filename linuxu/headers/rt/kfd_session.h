@@ -204,6 +204,22 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 int rt_kfd_queue_destroy(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 unsigned int rt_kfd_session_queue_count(struct rt_kfd_session *s);
 
+/* GPU memory faults. A page fault of the process's GPU work (its PASID)
+ * reaches KFD's interrupt handler, which evicts every queue of the process
+ * and signals its memory events (kfd_set_dbg_ev_from_interrupt), as on
+ * Linux, where ROCr waits on such an event and reports the fault. Every
+ * session creates one at open (CREATE_EVENT, KFD_IOC_EVENT_MEMORY, manual
+ * reset). rt_kfd_session_fault returns 1 with what KFD reported once the
+ * process faulted, 0 while it has not, or a negative errno; it does not
+ * sleep. A faulted session's queues never run again: kicks fail with
+ * -EFAULT, and a close tears it down as any other. Other sessions and the
+ * device are not affected. */
+struct rt_kfd_fault {
+	uint64_t va;		/* the faulting page's GPU address */
+	uint32_t not_present, read_only, no_execute, imprecise;
+};
+int rt_kfd_session_fault(struct rt_kfd_session *s, struct rt_kfd_fault *out);
+
 /* Signal events: what an interrupt-driven wait sleeps on, as ROCr's
  * interrupt signals use them through libhsakmt.
  *

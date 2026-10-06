@@ -69,6 +69,12 @@ unsigned int fixture_render_balance(void);
 uint64_t fixture_doorbell(uint32_t dword_index);
 void *fixture_va_to_host(uint32_t pasid, uint64_t va, uint64_t bytes);
 uint32_t fixture_pasid_of(uint64_t va);
+/* A GPU page fault of process @pasid at @va, delivered to KFD as the IH
+ * delivers one (kfd_int_process_v11's ISR, then its work handler). The
+ * fixture's CP raises one itself, from a workqueue, when a completion
+ * signal it must write is not mapped; that queue then stalls. */
+void fixture_vm_fault(uint32_t pasid, uint64_t va, bool write);
+unsigned int fixture_vm_faults(void);
 /* Prints every BO still alive; returns how many. */
 unsigned int fixture_report_bos(void);
 #ifdef __cplusplus

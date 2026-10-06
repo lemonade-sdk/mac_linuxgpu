@@ -364,10 +364,21 @@ int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
     }
     return -ENOSPC;
 }
+/* A client whose GPU work faulted: KFD evicted its queues (dext_kfd.mm
+ * answers -EFAULT for them from then on). */
+static struct dext_kfd_client *kfd_faulted;
+static int kfd_code_after_sync_error;
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet)
-{ assert(q && q->live); q->last=packet; ++kfd_kicks; return 0; }
+{ assert(q && q->live); if (q->c==kfd_faulted) return -EFAULT; q->last=packet; ++kfd_kicks; return 0; }
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive)
-{ assert(q && q->live); *inactive=0; return 0; }
+{ assert(q && q->live); *inactive=0; return q->c==kfd_faulted ? -EFAULT : 0; }
+int dext_kfd_fault(struct dext_kfd_client *c, uint32_t *flags, uint64_t *va)
+{
+    assert(c && c->live && flags && va);
+    *flags=0; *va=0;
+    if (c!=kfd_faulted) return 0;
+    *flags=DEXT_KFD_FAULT_VALID|DEXT_KFD_FAULT_NOT_PRESENT; *va=0x1235d4000ULL; return 1;
+}
 int dext_kfd_queue_destroy(struct dext_kfd_queue *q)
 {
     assert(q && q->live); ++kfd_queue_destroys;
@@ -389,6 +400,9 @@ int dext_kfd_dispatch_code(struct dext_kfd_client *c, uint64_t code, const void 
     memset(out,0,5*sizeof(*out)); *uncertain=0;
     int r=before_map(arg);
     if (r) return r;
+    /* The launch timed out after its cache sync was submitted; its queue
+     * was destroyed through KFD, so nothing is uncertain. */
+    if (kfd_code_after_sync_error) return kfd_code_after_sync_error;
     out[2]=5; ++kfd_dispatches; return 0;
 }
 static int count_range(void *arg, void *cpu, uint64_t bytes)
@@ -934,6 +948,53 @@ int main(int argc, char **argv)
             kfd_destroy_error=0;
         }
         assert(dext_compute_stop()==0 && kfd_closes==1 && dext_compute_quiescent());
+    } else if (!strcmp(argv[1],"kfd-fault-isolated")) {
+        /* Client 21's GPU work faults while client 22 runs: 21's failed
+         * launch and its evicted queues are 21's alone. Nothing freezes the
+         * device, 22 runs throughout, and both leave with ordinary
+         * releases. */
+        uint64_t words[8], window[3], ra, ma, qa, rb, mb, qb, status, code, flags=1, va=1;
+        kfd_supported_error=0;
+        dext_compute_select_client(21);
+        assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        assert(!dext_compute_host_window(1ULL<<37,window));
+        ra=alloc_bo(2); ma=alloc_bo(2); code=alloc_bo(3);
+        assert(!dext_compute_aql_queue_create(ra,ma,64,&status,&qa));
+        struct dext_kfd_client *faulting=&kfd_clients[0];
+        dext_compute_select_client(22);
+        assert(dext_compute_query_info(12,words,8)==8 && words[1]==2);
+        assert(!dext_compute_host_window(2ULL<<37,window));
+        rb=alloc_bo(2); mb=alloc_bo(2);
+        assert(!dext_compute_aql_queue_create(rb,mb,64,&status,&qb));
+        /* 21's code-object sync launch times out after the cache sync went
+         * to the kernel ring: an error for 21, no device freeze. */
+        dext_compute_select_client(21);
+        struct rt_dispatch_request sync_launch={.version=2,.code_handle=code,.code_bytes=64,
+            .timeout_us=100000};
+        dispatch_sequence=9; kfd_code_after_sync_error=-ETIMEDOUT;
+        assert(dext_compute_dispatch(&sync_launch,sizeof(sync_launch),out)==-ENOTREADY_L);
+        kfd_code_after_sync_error=0;
+        assert(dext_compute_query_info(1,out,10)==3);	/* not frozen */
+        /* The fault: KFD evicted 21's queues for good. */
+        kfd_faulted=faulting;
+        assert(dext_compute_aql_queue_service(qa,out,out+1)==-EFAULT_L);
+        assert(!dext_compute_aql_queue_fault(qa,&flags,&va) &&
+               flags==(DEXT_KFD_FAULT_VALID|DEXT_KFD_FAULT_NOT_PRESENT) && va==0x1235d4000ULL);
+        assert(dext_compute_aql_queue_kick(qa,0,out)==-EFAULT_L);
+        /* 22 neither sees it nor stops. */
+        dext_compute_select_client(22);
+        assert(!dext_compute_aql_queue_kick(qb,0,out) && !dext_compute_aql_queue_service(qb,out,out+1));
+        assert(!dext_compute_aql_queue_fault(qb,&flags,&va) && !flags && !va);
+        /* 21 leaves; the device and 22 go on; then 22 leaves. */
+        dext_compute_select_client(0);
+        assert(dext_compute_release_client(21)==0 && kfd_closes==1);
+        kfd_faulted=NULL;
+        assert(!dext_compute_bo_free(payload));
+        dext_compute_select_client(22);
+        assert(!dext_compute_aql_queue_kick(qb,1,out));
+        dext_compute_select_client(0);
+        assert(dext_compute_release_client(22)==0 && kfd_closes==2);
+        assert(dext_compute_stop()==0 && dext_compute_quiescent());
     } else if (!strcmp(argv[1],"allocation-cleanup")) {
         alloc_info_error=-EIO; free_error=-EBUSY;
         assert(dext_compute_bo_alloc(4096,1,4096,0,out,NULL,NULL)==-ENOTREADY_L);
