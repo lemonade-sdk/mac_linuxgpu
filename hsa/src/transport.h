@@ -37,6 +37,9 @@ constexpr uint64_t kCodeSyncDriverBuild=258;
 // to kWindowedCopyBytes in one call (kLegacyCopyBytes before).
 constexpr uint64_t kWindowedCopyDriverBuild=262;
 constexpr uint64_t kLegacyCopyBytes=4ull<<20, kWindowedCopyBytes=16ull<<20;
+// First driver build that serves AQLQueueKick (selector 57) synchronously,
+// on its delivery thread (session_state.h's MLG_SYNC_KICK_BUILD).
+constexpr uint64_t kSyncKickDriverBuild=263;
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.

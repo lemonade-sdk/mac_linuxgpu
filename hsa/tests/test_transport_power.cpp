@@ -31,6 +31,9 @@ static kern_return_t gpu_result = KERN_SUCCESS;   // what selectors 16/56/57/59/
 static kern_return_t power_result = KERN_SUCCESS; // what tag LPWR and selector 83 answer
 static uint64_t power_state = 0, power_generation = 1, last_power_op = UINT64_MAX;
 static unsigned gpu_calls;
+static uint64_t driver_build = 219;          // RuntimeBuild's out[2]
+static kern_return_t sync_kick_result = KERN_SUCCESS; // selector 57 called synchronously (build 263)
+static unsigned sync_kicks;
 
 extern "C" kern_return_t test_service_close(io_connect_t port) {
     assert(port == test_port); return KERN_SUCCESS;
@@ -40,7 +43,7 @@ extern "C" kern_return_t test_scalar(mach_port_t port, uint32_t selector, const 
     assert(port == test_port);
     if (selector == 43) {
         assert(!inputs && *count == 3);
-        out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = 219;
+        out[0] = 0x414d444750554142ull; out[1] = 1; out[2] = driver_build;
         return KERN_SUCCESS;
     }
     if ((selector == 21 && inputs == 1 && in[0] == amdgpu::power::kQueryTag) || selector == 83) {
@@ -59,7 +62,11 @@ extern "C" kern_return_t test_scalar(mach_port_t port, uint32_t selector, const 
     switch (selector) {
     case 16: out[0] = 0x10001; out[1] = 0x200000000ull; out[2] = 0; return KERN_SUCCESS; // BOAlloc
     case 56: out[0] = 0; out[1] = 9; return KERN_SUCCESS;                               // AQLQueueCreate
-    case 57: out[0] = 0; return KERN_SUCCESS;                                           // AQLQueueKick
+    case 57:                                                                            // AQLQueueKick, sync (263)
+        assert(driver_build >= 263 && inputs == 2 && in[0] == 9 && *count == 1);
+        ++sync_kicks;
+        if (sync_kick_result != KERN_SUCCESS) return sync_kick_result;
+        out[0] = 0; return KERN_SUCCESS;
     case 59: out[0] = 0; out[1] = 0; return KERN_SUCCESS;                               // AQLQueueService
     default: assert(false); return kIOReturnUnsupported;
     }
@@ -154,6 +161,34 @@ struct IdleDiagnosticAccess {
                last_power_op == amdgpu::power::Prepare);
         assert(connection.requestPower(amdgpu::power::Resume, snapshot) == HSA_STATUS_SUCCESS &&
                last_power_op == amdgpu::power::Resume);
+        {
+            /* A driver from build 263 rings the doorbell on its delivery
+             * thread: one synchronous call, no async one. What it cannot
+             * vouch for (Unsupported) goes as the async call; Offline waits
+             * for resume; VMError is the process's memory fault. */
+            IOKitConnection sync(OriginalAtomicCaps{}, true);
+            sync.ownerPort = test_port;
+            sync.state = IOKitConnection::State::Ready;
+            sync.hardwareQueues.emplace(9, std::array<uint64_t, 2>{1, 2});
+            driver_build = 263;
+            const auto asyncBefore = kick_answers.size();
+            assert(sync.kickQueue(9, 11) == HSA_STATUS_SUCCESS && sync_kicks == 1);
+            assert(kick_answers.size() == asyncBefore);
+            sync_kick_result = kIOReturnUnsupported;
+            assert(sync.kickQueue(9, 12) == HSA_STATUS_SUCCESS && sync_kicks == 2);
+            assert(kick_answers.size() == asyncBefore + 1);
+            uint64_t idle = 0;
+            assert(sync.serviceQueue(9, idle) == HSA_STATUS_SUCCESS && kick_answers.empty());
+            sync_kick_result = kIOReturnOffline;
+            assert(sync.kickQueue(9, 13) == kDeviceSuspendedStatus &&
+                   sync.state == IOKitConnection::State::Ready);
+            sync_kick_result = kIOReturnVMError;
+            assert(sync.kickQueue(9, 14) == kMemoryFaultStatus);
+            sync_kick_result = kIOReturnNotAttached;
+            assert(sync.kickQueue(9, 15) == HSA_STATUS_ERROR && sync.state == IOKitConnection::State::Faulted);
+            sync_kick_result = KERN_SUCCESS;
+            driver_build = 219;
+        }
         assert(connection.requestPower(amdgpu::power::Query, snapshot) == HSA_STATUS_ERROR_INVALID_ARGUMENT);
         /* A malformed snapshot is an error, not a state. */
         power_state = 9;

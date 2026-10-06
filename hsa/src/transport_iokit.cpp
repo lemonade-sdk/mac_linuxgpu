@@ -616,6 +616,32 @@ public:
         if (state!=State::Ready) return HSA_STATUS_ERROR;
         if (faulted) return kMemoryFaultStatus;
         if (!hardwareQueues.contains(handle) || !handle || packet==UINT64_MAX) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        if (syncKickLocked()) {
+            // From kSyncKickDriverBuild: the driver rings it on its delivery
+            // thread and answers at once, one trip through the driver.
+            const uint64_t input[2]={handle,packet};
+            uint64_t output=UINT64_MAX;uint32_t outputs=1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const auto kr=IOConnectCallScalarMethod(ownerPort,57,input,2,&output,&outputs);
+            if (kr==KERN_SUCCESS && outputs==1 && !output) return HSA_STATUS_SUCCESS;
+            if (kr==kIOReturnVMError) {
+                uint64_t inactive=0;
+                (void)serviceQueueLocked(handle,inactive);
+                return kMemoryFaultStatus;
+            }
+            if (kr==kIOReturnOffline) return kDeviceSuspendedStatus;	// nothing rung; replayed after resume
+            if (kr!=kIOReturnUnsupported) {
+                if (kr==kIOReturnNoDevice || kr==kIOReturnNotAttached || kr==MACH_SEND_INVALID_DEST) {
+                    static std::atomic_flag said=ATOMIC_FLAG_INIT;
+                    if (!said.test_and_set())
+                        std::fprintf(stderr,"mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
+                                     "this program's GPU session is gone: restart it to use the GPU again\n");
+                }
+                state=State::Faulted;return HSA_STATUS_ERROR;
+            }
+            // Unsupported: the driver leaves this doorbell to its session
+            // queue (a queue it cannot vouch for on the delivery thread).
+        }
         if (!kickPort) {
             kickPort=IONotificationPortCreate(kIOMainPortDefault);
             if (!kickPort) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
@@ -1068,6 +1094,16 @@ private:
         EventWaiter() : port(IONotificationPortCreate(kIOMainPortDefault)) {}
         ~EventWaiter() { if (port) IONotificationPortDestroy(port); }
     };
+    // Whether the driver rings doorbells synchronously (kSyncKickDriverBuild), asked once.
+    int syncKick = -1;
+    bool syncKickLocked() {
+        if (syncKick < 0 && state == State::Ready) {
+            std::array<uint64_t,3> build{};
+            if (scalar(43,{},build) == HSA_STATUS_SUCCESS)
+                syncKick = linuxShim && build[2] >= kSyncKickDriverBuild;
+        }
+        return syncKick > 0;
+    }
     // BOCopy's limit for this driver (kWindowedCopyDriverBuild), asked once.
     uint64_t copyLimit = 0;
     uint64_t copyLimitLocked() {

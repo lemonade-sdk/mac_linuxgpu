@@ -1623,6 +1623,9 @@ static void power_set(uint32_t state, uint32_t cause, int error)
                         power_state_name(state), cause);
         return;
     }
+    // Doorbells on the delivery thread only while the device takes work;
+    // closing waits for one in progress (kick_table.h).
+    dext_compute_kick_gate(state == MLG_POWER_ACTIVE);
     MACLINUXGPU_LOG("power: %s -> %s (cause %u, error %d, flags %#x, holds %u, generation %llu%s)",
                     power_state_name(from), power_state_name(state), cause, error, s_power.flags,
                     s_power.holds, s_power.generation,
@@ -4443,6 +4446,35 @@ static kern_return_t display_call(MacLinuxGPUUserClient *client, uint64_t client
 }
 
 
+// AQLQueueKick called synchronously (session_state.h, from build 263): the
+// doorbell rung here, on the delivery thread, which must never sleep. Only
+// published state and the kick table's spinlock (kick_table.h): anything
+// the fast path cannot vouch for is left to the session queue's
+// AQLQueueKick, which the client then calls async (kIOReturnUnsupported).
+static kern_return_t kick_on_delivery(MacLinuxGPUUserClient *client, IOUserClientMethodArguments *a)
+{
+    auto *ivars = client->ivars;
+    if (!a->scalarInput || a->scalarInputCount != 2 || !a->scalarOutput || a->scalarOutputCount < 1 ||
+        a->structureInput || a->structureInputDescriptor || a->scalarInput[1] == UINT64_MAX)
+        return kIOReturnBadArgument;
+    const uint64_t generation = __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE);
+    const uint64_t closed = __atomic_load_n(&s_disconnectedGeneration, __ATOMIC_ACQUIRE);
+    if (closed && __atomic_load_n(&ivars->sessionGeneration, __ATOMIC_RELAXED) == closed)
+        return kIOReturnNoDevice;
+    if (__atomic_load_n(&s_stopping, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&s_sessionClosing, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&ivars->sessionGeneration, __ATOMIC_RELAXED) != generation)
+        return kIOReturnUnsupported;
+    if (!mlg_power_admits(__atomic_load_n(&s_power.state, __ATOMIC_ACQUIRE), kMacAMDGPUMethodAQLQueueKick))
+        return kIOReturnOffline;
+    const int r = dext_compute_aql_queue_kick_direct(ivars->clientID, a->scalarInput[0], a->scalarInput[1]);
+    if (r == -EFAULT_L) return kIOReturnVMError;
+    if (r) return kIOReturnUnsupported;
+    a->scalarOutput[0] = 0;
+    a->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
 // ----------------------------------------------------------------
 // ExternalMethod — the selector-RPC dispatch.
 //
@@ -4496,6 +4528,9 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (mlg_call_runs_on_delivery(selector, in, nin))
             return direct_call(this, selector, arguments);
         if (selector == MLG_SELECTOR_OWNER_RESULT) return kIOReturnBadArgument;
+        if (selector == kMacAMDGPUMethodAQLQueueKick && !arguments->completion &&
+            !ivars->observer && !ivars->linuxFile)
+            return kick_on_delivery(this, arguments);
         if (!arguments->completion) return refuse_sync(this, selector);
         // A Retire queues behind any session call: watch that one returns.
         if (selector == MLG_SELECTOR_RETIRE) session_watchdog_start(ivars->ownerDriver, "Retire", true);

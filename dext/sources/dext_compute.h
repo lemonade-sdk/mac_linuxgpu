@@ -214,6 +214,15 @@ int dext_compute_aql_queue_create(uint64_t ring_handle,
 /* AQLQueueKick (57): in handle/wptr, out status. */
 int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
                                 uint64_t *out_status);
+/* AQLQueueKick's synchronous form, on the delivery thread: never sleeps
+ * (kick_table.h). 0; -EAGAIN_L when the session queue's AQLQueueKick must
+ * answer (not a published KFD queue of @client, the device not ready, the
+ * queue's session busy); -EFAULT_L after a GPU memory fault of the
+ * client's process. */
+int dext_compute_aql_queue_kick_direct(uint64_t client, uint64_t handle, uint64_t packet);
+/* Admit or refuse that form (power transitions); refusing waits for a
+ * doorbell write in progress. */
+void dext_compute_kick_gate(bool open);
 
 /* AQLQueueDestroy (58): in handle, out status. */
 int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status);

@@ -378,6 +378,14 @@ int dext_kfd_queue_kick(dext_kfd_queue *q, uint64_t packet)
     return r;
 }
 
+int dext_kfd_queue_kick_direct(dext_kfd_queue *q, uint64_t packet)
+{
+    if (!q || !q->client || !q->client->session || !q->queue) return -EAGAIN;
+    const int r = rt_kfd_queue_kick_nowait(q->client->session, q->queue, packet);
+    if (r == -EFAULT) return -EFAULT;
+    return r ? -EAGAIN : 0;
+}
+
 int dext_kfd_fault(dext_kfd_client *c, uint32_t *flags, uint64_t *va)
 {
     struct rt_kfd_fault fault{};

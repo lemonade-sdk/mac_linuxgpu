@@ -118,6 +118,12 @@ struct rt_kfd_queue {
 	/* Off the GPU (destroyed, or recovered by a settle) but still linked
 	 * until its owner destroys it or the session closes. */
 	bool gone;
+	/* Doorbells (rt_kfd_queue_kick and rt_kfd_queue_kick_nowait), under the
+	 * session's kick_lock: whether one may be written (from the queue's
+	 * creation until its DESTROY_QUEUE), and the highest value written,
+	 * which a lower one never follows. */
+	bool kickable, rung;
+	uint64_t last_kick;
 };
 
 struct rt_kfd_session {
@@ -129,6 +135,11 @@ struct rt_kfd_session {
 	struct rt_kfd_apertures ap;
 	struct rt_kfd_queue_limits limits;
 	pthread_mutex_t lock;
+	/* A spinlock, never held across anything that sleeps: the doorbell
+	 * write and the queue fields above, so a doorbell can be rung from a
+	 * thread that must not sleep (the dext's delivery thread) without
+	 * the session lock. Taken after lock, never before it. */
+	bool kick_lock;
 	struct rt_kfd_bo *bos;
 	struct rt_kfd_queue *queues;
 	unsigned int queue_count;
@@ -1778,6 +1789,8 @@ static void queue_identity(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 
 static int queue_destroy_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 static void queue_free_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
+static void kick_lock(struct rt_kfd_session *s);
+static void kick_unlock(struct rt_kfd_session *s);
 
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out)
@@ -1898,6 +1911,10 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 		pthread_mutex_unlock(&s->lock);
 		return (int)r;
 	}
+	/* Its doorbell may be rung from here until its DESTROY_QUEUE. */
+	kick_lock(s);
+	q->kickable = true;
+	kick_unlock(s);
 	linuxu_process_leave(&saved);
 	pthread_mutex_unlock(&s->lock);
 	*out = q;
@@ -1936,6 +1953,65 @@ static bool queue_owned(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 	return false;
 }
 
+static void kick_lock(struct rt_kfd_session *s)
+{
+	while (__atomic_test_and_set(&s->kick_lock, __ATOMIC_ACQUIRE))
+		cpu_relax();
+}
+
+static void kick_unlock(struct rt_kfd_session *s)
+{
+	__atomic_clear(&s->kick_lock, __ATOMIC_RELEASE);
+}
+
+/* No doorbell of @q is written from here on (its DESTROY_QUEUE releases
+ * the doorbell, which another queue may then be given). Waits only for a
+ * doorbell write in progress. */
+static void queue_unkick(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	kick_lock(s);
+	q->kickable = false;
+	kick_unlock(s);
+}
+
+/* Writes @value to @q's doorbell unless a higher one was written. Caller
+ * holds kick_lock; @q is kickable. */
+static void doorbell_write_kicklocked(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
+{
+	if (q->rung && value <= q->last_kick)
+		return;
+	/* Ring, packets and the write index are coherent host memory: order
+	 * them before the doorbell write, as ROCr's release store does.
+	 * 64-bit doorbells on SOC15 (device_info.doorbell_size). */
+	mb();
+	writeq(value, s->adev->doorbell.cpu_addr + q->doorbell_index);
+	q->rung = true;
+	q->last_kick = value;
+}
+
+int rt_kfd_queue_kick_nowait(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
+{
+	struct amdgpu_device *adev;
+	int r = 0;
+
+	if (!s || !q || value == UINT64_MAX)
+		return -EINVAL;
+	adev = s->adev;
+	kick_lock(s);
+	if (!q->kickable || __atomic_load_n(&s->uncertain, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&s->closing, __ATOMIC_ACQUIRE))
+		r = -EAGAIN;
+	else if (__atomic_load_n(&s->faulted, __ATOMIC_ACQUIRE))
+		r = -EFAULT;
+	else if (!adev->doorbell.cpu_addr ||
+		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
+		r = -ERANGE;
+	else
+		doorbell_write_kicklocked(s, q, value);
+	kick_unlock(s);
+	return r;
+}
+
 int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
 {
 	struct amdgpu_device *adev;
@@ -1957,11 +2033,12 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
 		r = -ERANGE;
 	if (!r) {
-		/* Ring, packets and the write index are coherent host memory:
-		 * order them before the doorbell write, as ROCr's release store
-		 * does. 64-bit doorbells on SOC15 (device_info.doorbell_size). */
-		mb();
-		writeq(value, adev->doorbell.cpu_addr + q->doorbell_index);
+		kick_lock(s);
+		if (q->kickable)
+			doorbell_write_kicklocked(s, q, value);
+		else
+			r = -ENODEV;
+		kick_unlock(s);
 	}
 	pthread_mutex_unlock(&s->lock);
 	return r;
@@ -1979,6 +2056,7 @@ static int queue_release_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q
 
 	if (q->gone)
 		return 0;
+	queue_unkick(s, q);
 	if (!q->detached) {
 		struct kfd_ioctl_destroy_queue_args destroy = { .queue_id = q->queue_id };
 

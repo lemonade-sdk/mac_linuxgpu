@@ -79,6 +79,11 @@ int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
                           struct rt_kfd_bo *metadata, uint32_t packets,
                           struct dext_kfd_queue **out);
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet);
+/* The doorbell without sleeping (rt_kfd_queue_kick_nowait), for the
+ * delivery thread; the caller keeps @q alive (kick_table.h). 0, -EAGAIN
+ * when the session queue's path must answer, -EFAULT after a GPU memory
+ * fault of the process. */
+int dext_kfd_queue_kick_direct(struct dext_kfd_queue *q, uint64_t packet);
 /* -EFAULT once the client's process took a GPU memory fault: KFD evicted
  * its queues, which never run again (dext_kfd_fault says where).
  * -ENOEXEC when the CP stopped the queue with an error code (left in

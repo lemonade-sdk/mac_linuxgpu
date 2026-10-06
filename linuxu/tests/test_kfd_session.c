@@ -244,9 +244,13 @@ static void process_death(void)
 	mes_dead = true;
 	assert(rt_kfd_queue_destroy(s, q.q) == -ETIMEDOUT);
 	assert(rt_kfd_session_uncertain(s));
+	/* From its DESTROY_QUEUE on, the delivery thread's kick leaves the
+	 * queue to the session lock's path, which answers. */
+	assert(rt_kfd_queue_kick_nowait(s, q.q, 2) == -EAGAIN);
 	mes_dead = false;
 	assert(!rt_kfd_session_settle(s, 0) && !rt_kfd_session_uncertain(s));
 	assert(rt_kfd_queue_kick(s, q.q, 3) == -ENODEV);	/* off the GPU */
+	assert(rt_kfd_queue_kick_nowait(s, q.q, 3) == -EAGAIN);
 	assert(!rt_kfd_queue_destroy(s, q.q));
 	assert(rt_kfd_session_queue_count(s) == 0);
 	assert(!rt_kfd_bo_free(s, q.ring) && !rt_kfd_bo_free(s, q.meta));
@@ -558,6 +562,7 @@ static void vm_fault_isolation(void)
 	/* KFD took the faulting process's queue off MES, and only that one. */
 	assert(mes_removes == removes + 1);
 	assert(rt_kfd_queue_kick(a, qa.q, 5) == -EFAULT);
+	assert(rt_kfd_queue_kick_nowait(a, qa.q, 5) == -EFAULT);
 	assert(rt_kfd_session_fault(a, NULL) == 1);	/* sticky */
 	assert(hqd_dumps > 0 && !fixture_cp_stuck());	/* HQDs read, nothing left on them */
 	assert(!rt_kfd_session_uncertain(a));
@@ -830,6 +835,14 @@ int main(void)
 	assert(!rt_kfd_queue_kick(s, q0.q, 5));
 	assert(!rt_kfd_queue_kick(s, q1.q, 9));
 	assert(doorbell_bar[mes_doorbells[0] / 2] == 5 && doorbell_bar[mes_doorbells[1] / 2] == 9);
+	/* The same without the session lock (the dext's delivery thread): the
+	 * doorbell written, and neither path writes a value below the highest
+	 * one written. */
+	assert(!rt_kfd_queue_kick_nowait(s, q0.q, 7) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick(s, q0.q, 6) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick_nowait(s, q0.q, 6) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick(s, q0.q, 8) && doorbell_bar[mes_doorbells[0] / 2] == 8);
+	assert(rt_kfd_queue_kick_nowait(s, q0.q, UINT64_MAX) == -EINVAL);
 	/* The queue's buffers cannot go while it exists. */
 	assert(rt_kfd_bo_free(s, q0.ring) == -EBUSY && rt_kfd_bo_free(s, q0.meta) == -EBUSY);
 

@@ -32,7 +32,7 @@ parts = [
     section("// Session calls off the delivery thread", "// A client's last display op result", 520, "owner calls"),
 ]
 (out / "lx_transport_production.inc").write_text("\n".join(parts))
-delivery = section("    if (reference != &kOwnerJob) {", "    // On the owner's queue (owner_job_main)", 40, "delivery")
+delivery = section("    if (reference != &kOwnerJob) {", "    // On the owner's queue (owner_job_main)", 45, "delivery")
 (out / "lx_transport_delivery.inc").write_text(delivery)
 PY
 fake=linuxu/tests/client_transport_iokit_fake.h

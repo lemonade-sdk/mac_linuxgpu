@@ -920,6 +920,9 @@ test: test-owner-call test-bounded test-selector-call test-client-transports
 test-session-shutdown:
 	bash scripts/test-session-shutdown.sh
 
+test-kick-table:
+	bash scripts/test-kick-table.sh
+
 test-klog:
 	bash scripts/test-klog.sh
 
@@ -1099,8 +1102,8 @@ test: test-dma-buf-lifetime test-hwmon-lifetime test-hsa-shim-init test-shmem-ow
 .PHONY: test-dma-buf-lifetime test-hwmon-lifetime test-hsa-shim-init test-shmem-ownership \
 	test-kthread-worker test-waitqueue-tasks test-timer-service test-devres-concurrency test-hmm-ownership
 
-test: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown
-.PHONY: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown
+test: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table
+.PHONY: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table
 
 test: test-klog test-read-driver-log test-upstream-pci-matching
 .PHONY: test-klog test-read-driver-log test-upstream-pci-matching

@@ -162,6 +162,12 @@ int main()
     assert(wait_value(&signal->value, int64_t(0)) && fixture_cp_dispatches() == 1);
     assert(wait_value(&m0->read_dispatch_id, uint64_t(1)));
     assert(!dext_kfd_queue_kick(q0.queue, 0)); /* already published: no rewrite */
+    /* The delivery thread's form rings the next packet the same way. */
+    signal->value = 1;
+    publish(q0, 1, codeVA, signalsVA, 0);
+    assert(!dext_kfd_queue_kick_direct(q0.queue, 1));
+    assert(wait_value(&signal->value, int64_t(0)) && fixture_cp_dispatches() == 2);
+    assert(wait_value(&m0->read_dispatch_id, uint64_t(2)));
 
     /* A scratch request on q1 (never kicked, so the CP leaves it alone):
      * the dext allocates KFD VRAM scratch and fills the SRD fields. */
@@ -199,10 +205,10 @@ int main()
     assert(!launched);
     assert(!uncertain && out[0] == 0 && out[1] == 0 && out[2] == 5 && out[3] == 0 && out[4] == 1);
     assert(fixture_mes_adds() == adds + 1 && fixture_mes_removes() == removes + 1);
-    assert(fixture_cp_dispatches() == 2);
+    assert(fixture_cp_dispatches() == 3);
     /* Again on the same launch buffers. */
     assert(!dext_kfd_dispatch_bounded(c, codeVA, kernargVA, &request, sizeof(request), out, &uncertain));
-    assert(out[2] == 5 && fixture_cp_dispatches() == 3);
+    assert(out[2] == 5 && fixture_cp_dispatches() == 4);
     /* A launch nobody executes times out; DESTROY_QUEUE takes the queue off
      * MES, so the session stays healthy. */
     fixture_cp_stop();
