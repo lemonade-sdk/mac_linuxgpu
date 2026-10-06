@@ -147,9 +147,18 @@ hsa_status_t FakeConnection::invalidateCodeCaches() {
     // bounded launch that borrows a queue slot: with every slot held it is
     // refused before anything is submitted (not a fault).
     std::lock_guard lock(mutex_);
-    if (queueSlotsExhaustedLocked()) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    // A driver with CodeSync (kCodeSyncDriverBuild) launches nothing, so
+    // it needs no slot.
+    if (config_.build < kCodeSyncDriverBuild && queueSlotsExhaustedLocked())
+        return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     ++codeSyncs_;
+    kicksAtCodeSync_ = 0;
+    for (const auto &[handle, queue] : queues_) { (void)handle; kicksAtCodeSync_ += queue.kicks; }
     return HSA_STATUS_SUCCESS;
+}
+uint64_t FakeConnection::kicksAtLastCodeSync() const {
+    std::lock_guard lock(mutex_);
+    return kicksAtCodeSync_;
 }
 
 hsa_status_t FakeConnection::exportBuffer(const DeviceBuffer &buffer, BufferToken &token) {

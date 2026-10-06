@@ -78,6 +78,14 @@ static hsa_status_t synchronizeCode(const std::shared_ptr<mac_hsa::Connection> &
     if (status != HSA_STATUS_SUCCESS) return status;
     return connection->invalidateCodeCaches();
 }
+hsa_status_t flushPendingCodeSync(const std::shared_ptr<mac_hsa::Connection> &connection) {
+    if (!connection || !connection->codeSyncPending.exchange(false, std::memory_order_seq_cst))
+        return HSA_STATUS_SUCCESS;
+    const auto status = synchronizeCode(connection);
+    // Still owed: the next doorbell tries again (and fails the same way).
+    if (status != HSA_STATUS_SUCCESS) connection->codeSyncPending.store(true, std::memory_order_seq_cst);
+    return status;
+}
 static hsa_status_t findExecutable(hsa_executable_t handle, std::shared_ptr<Executable> &out) {
     std::lock_guard lock(runtimeMutex);
     if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
@@ -296,8 +304,16 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
         // ROCr RegionMemory::Freeze invalidates agent code caches after upload.
         // AQL acquire fences alone do not retire stale instructions when a
         // destroyed executable's allocation is reused by a different image.
-        status = synchronizeCode(connection);
-        if (status != HSA_STATUS_SUCCESS) return status;
+        // A driver with CodeSync takes one sync for every load since the
+        // last, before the next doorbell of this connection's queues (no
+        // packet runs before its doorbell): a program loading dozens of
+        // code objects pays once. Older drivers sync each load, as before.
+        if (device.build >= mac_hsa::kCodeSyncDriverBuild) {
+            connection->codeSyncPending.store(true, std::memory_order_seq_cst);
+        } else {
+            status = synchronizeCode(connection);
+            if (status != HSA_STATUS_SUCCESS) return status;
+        }
         std::vector<std::shared_ptr<ExecutableSymbol>> prepared;
         for (size_t i = 0; i < image->object.kernels.size(); ++i)
             prepared.push_back(std::make_shared<ExecutableSymbol>(ExecutableSymbol{executable, image, i}));

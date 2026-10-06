@@ -93,6 +93,9 @@ void stopQueueServices(RetiredQueueSet &);
 // HSA_STATUS_ERROR_OUT_OF_RESOURCES, having submitted nothing, when the
 // connection has no usable queue.
 hsa_status_t codeSyncOnRuntimeQueue(const std::shared_ptr<Connection> &connection);
+// The code sync owed for code loaded since the last one (transport.h,
+// kCodeSyncDriverBuild), run now if any: before a doorbell.
+hsa_status_t flushPendingCodeSync(const std::shared_ptr<Connection> &connection);
 size_t hostPageSize();
 void clearVirtualMemory(); // caller holds runtimeMutex; allocation pins retain mappings
 void clearHostLocks();

@@ -156,6 +156,20 @@ struct RuntimeQueue {
     void ringDoorbell(int64_t value) {
         bool notify=false;
         hsa_status_t status=HSA_STATUS_SUCCESS;
+        // Code loaded since the last sync runs only after this doorbell:
+        // its caches are synced first, outside this queue's mutex.
+        if (connection && connection->codeSyncPending.load(std::memory_order_seq_cst)) {
+            status=flushPendingCodeSync(connection);
+            if (status!=HSA_STATUS_SUCCESS) {
+                {
+                    std::lock_guard lock(mutex);
+                    if (!active || errorDelivered) return;
+                    errorDelivered=true;
+                }
+                if (errorCallback) errorCallback(deviceStatus(connection,status),&abi->hsa_queue,errorData);
+                return;
+            }
+        }
         {
             std::lock_guard lock(mutex);
             if (!active || !hardwareHandle || errorDelivered) return;

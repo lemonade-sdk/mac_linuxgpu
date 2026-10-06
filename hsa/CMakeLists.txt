@@ -138,6 +138,14 @@ if(BUILD_TESTING)
   target_include_directories(hsa-signal-service-test PRIVATE src include third_party/hsa/include)
   add_test(NAME hsa-signal-service COMMAND hsa-signal-service-test)
 
+  add_executable(hsa-code-sync-coalesce-test tests/test_code_sync_coalesce.cpp src/signal_kernels.cpp
+    src/isa_target.cpp src/code_object.cpp)
+  target_link_libraries(hsa-code-sync-coalesce-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-code-sync-coalesce-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-code-sync-coalesce-test PRIVATE src third_party/hsa/include)
+  add_test(NAME hsa-code-sync-coalesce COMMAND hsa-code-sync-coalesce-test)
+  set_tests_properties(hsa-code-sync-coalesce PROPERTIES ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
+
   add_executable(hsa-memory-test tests/test_memory.cpp)
   target_link_libraries(hsa-memory-test PRIVATE hsa-runtime64)
   target_compile_options(hsa-memory-test PRIVATE -Wall -Wextra -Werror)

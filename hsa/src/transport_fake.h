@@ -145,6 +145,8 @@ public:
     // executed on a runtime queue.
     uint64_t codeSyncCount() const;
     uint64_t queueCodeSyncCount() const;
+    // Doorbells rung on every queue when the last code sync ran.
+    uint64_t kicksAtLastCodeSync() const;
     // Device power, as the driver reports it. While the state is
     // suspending, suspended or resuming, GPU work (kicks, queue service and
     // creation, allocation, launches) is refused with
@@ -186,7 +188,7 @@ private:
     std::vector<FirmwareFile> preparedFirmware_;
     std::vector<std::string> uploadedFirmware_;
     uint64_t aqlDispatches_ = 0;
-    uint64_t codeSyncs_ = 0, queueCodeSyncs_ = 0;
+    uint64_t codeSyncs_ = 0, queueCodeSyncs_ = 0, kicksAtCodeSync_ = 0;
     FakeDeviceConfig config_;
     DeviceSnapshot snapshot_;
     std::array<uint64_t, kTopologyQueryWords> topology_{};

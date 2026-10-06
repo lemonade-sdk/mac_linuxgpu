@@ -2,6 +2,7 @@
 
 #include <hsa/hsa.h>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -26,6 +27,11 @@ constexpr uint64_t kSignalEventDriverBuild=235;
 // First driver build whose queue service (selector 59) reports a GPU memory
 // fault of the client's process with its address (four outputs).
 constexpr uint64_t kQueueFaultDriverBuild=256;
+// First driver build with CodeSync (selector 90): the compute ring's cache
+// invalidate alone, no queue and no launch. With it a code-object load only
+// marks the connection's code pending, and one sync runs before the next
+// doorbell of its queues (flushPendingCodeSync).
+constexpr uint64_t kCodeSyncDriverBuild=258;
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.
@@ -221,6 +227,9 @@ static_assert(sizeof(BufferToken) == 32);
 class Connection {
 public:
     virtual ~Connection() = default;
+    // Code loaded since the last code sync (kCodeSyncDriverBuild): synced
+    // before the next doorbell of this connection's queues.
+    std::atomic<bool> codeSyncPending{false};
     virtual hsa_status_t read(DeviceSnapshot &snapshot) = 0;
     virtual bool supportsBuffers() const { return false; }
     virtual hsa_status_t properties(DeviceProperties &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }

@@ -438,6 +438,29 @@ public:
         // Keep its small allocation for this connection's lifetime; it never
         // aliases a released executable and is reclaimed when ownerPort closes.
         std::lock_guard utilityLock(codeSyncMutex);
+        // CodeSync (selector 90, kCodeSyncDriverBuild): the cache work
+        // alone, a kernel-ring ACQUIRE_MEM waited for in the driver.
+        if (!codeSyncSelectorKnown) {
+            std::array<uint64_t,3> build{};
+            const auto status = [&] { std::lock_guard lock(sessionMutex); return scalar(43, {}, build); }();
+            if (status != HSA_STATUS_SUCCESS) return status;
+            codeSyncSelector = build[2] >= kCodeSyncDriverBuild;
+            codeSyncSelectorKnown = true;
+        }
+        if (codeSyncSelector) {
+            std::lock_guard lock(sessionMutex);
+            if (state != State::Ready) return HSA_STATUS_ERROR;
+            const uint64_t timeoutUS = 100000;
+            std::array<uint64_t,1> result{};
+            const auto status = scalar(90, {&timeoutUS, 1}, result);
+            if (status != HSA_STATUS_SUCCESS) return status;
+            if (int64_t(result[0]) == -110) {
+                std::fprintf(stderr, "mac_hsa: the GPU's cache invalidate after a code-object load did not "
+                             "finish within %llu ms\n", (unsigned long long)(timeoutUS / 1000));
+                return HSA_STATUS_ERROR;
+            }
+            return result[0] ? HSA_STATUS_ERROR : HSA_STATUS_SUCCESS;
+        }
         if (!codeSyncBuffer.handle) {
             const auto status = allocateBuffer(sizeof(uint32_t), codeSyncBuffer);
             if (status != HSA_STATUS_SUCCESS) return status;
@@ -1050,6 +1073,8 @@ private:
     enum class State { Unclaimed, Initializing, Ready, Faulted } state = State::Unclaimed;
     // Selector 59's outputs (2, or 4 from kQueueFaultDriverBuild on; 0 until
     // asked), and the GPU memory fault of this connection's KFD process.
+    // Whether the driver serves CodeSync (asked once, kCodeSyncDriverBuild).
+    bool codeSyncSelectorKnown = false, codeSyncSelector = false;
     size_t serviceOutputs = 0;
     bool faulted = false;
     MemoryFault fault;
