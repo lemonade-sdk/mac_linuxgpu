@@ -1022,6 +1022,16 @@ CRASH_PATH_TESTS += test-stub-policy
 test-pci-fault-containment:
 	bash scripts/test-pci-fault-containment.sh
 
+# Every IOPCIDevice call validated before it is made (memory index from
+# GetBARInfo, access inside the BAR, session open), Close fenced against
+# calls in flight, and the session closed before a dext dies of a signal.
+CRASH_PATH_TESTS += test-pci-call-guards
+test: test-pci-call-guards
+test-pci-call-guards:
+	bash scripts/test-pci-call-guards.sh
+
+.PHONY: test-pci-call-guards
+
 # Fail-safe generated-stub policy, stub reachability from probe/open/KFD
 # roots, and the Linux contracts of services that replaced former stubs.
 test-stub-policy: lib
