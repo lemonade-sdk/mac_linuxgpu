@@ -64,7 +64,6 @@ static struct amdgpu_reset_domain reset_domain;
 static struct drm_minor render_minor = { .index = 128 };
 uint64_t doorbell_bar[TEST_DOORBELL_BYTES / 8];
 static uint8_t *vram;	/* host backing of the fake VRAM */
-static uint64_t vram_next;
 
 /* ---- the command processor: AQL dispatches of MES-added queues ---- */
 /* A queue on an HQD (its index in cp_queues is its pipe * queues-per-pipe +
@@ -366,10 +365,34 @@ static void bo_destroy(struct fake_bo *f)
 				__free_pages(f->pages[i], 0);
 		free(f->pages);
 	}
+	free(f->tt.dma_address);
 	dma_resv_fini(&f->bo.tbo.base._resv);
 	free(f->cpu);
 	untrack(f);
 	free(f);
+}
+
+/* The lowest @block-aligned offset of @block bytes no live VRAM BO uses
+ * (freed VRAM is reused, as the VRAM manager does); UINT64_MAX when full. */
+static uint64_t vram_first_fit(uint64_t block)
+{
+	for (uint64_t at = 0; at + block <= TEST_VRAM_BYTES; at += block) {
+		bool used = false;
+
+		for (unsigned int i = 0; i < MAX_BOS && !used; ++i) {
+			const struct fake_bo *o = bos[i];
+			uint64_t start, end;
+
+			if (!o || o->bo.tbo.resource != &o->vres.base)
+				continue;
+			start = o->block.header & GPU_BUDDY_HEADER_OFFSET;
+			end = start + ((uint64_t)PAGE_SIZE << (o->block.header & GPU_BUDDY_HEADER_ORDER));
+			used = start < at + block && at < end;
+		}
+		if (!used)
+			return at;
+	}
+	return UINT64_MAX;
 }
 
 /* A BO whose placement is @domain; GTT ones get system pages. */
@@ -395,17 +418,17 @@ static struct fake_bo *bo_create(uint64_t size, uint32_t domain)
 		unsigned int order = 0;
 		while (((uint64_t)PAGE_SIZE << order) < size)
 			order++;
-		if (ALIGN(vram_next, (uint64_t)PAGE_SIZE << order) + ((uint64_t)PAGE_SIZE << order) >
-		    TEST_VRAM_BYTES) {
+		const uint64_t block = (uint64_t)PAGE_SIZE << order;
+		uint64_t at = vram_first_fit(block);
+
+		if (at == UINT64_MAX) {
 			/* Out of VRAM, as TTM would report. */
 			dma_resv_fini(&f->bo.tbo.base._resv);
 			free(f);
 			return NULL;
 		}
-		vram_next = ALIGN(vram_next, (uint64_t)PAGE_SIZE << order);
-		f->block.header = vram_next | order;
+		f->block.header = at | order;
 		list_add(&f->block.link, &f->vres.blocks);
-		vram_next += (uint64_t)PAGE_SIZE << order;
 		f->bo.tbo.resource = &f->vres.base;
 	} else {
 		f->res.mem_type = domain == AMDGPU_GEM_DOMAIN_DOORBELL ?
@@ -434,6 +457,10 @@ static struct fake_bo *bo_create(uint64_t size, uint32_t domain)
 				}
 			}
 			f->tt.pages = f->pages;
+			/* DMA addresses (unused by the fixture's SDMA, which copies
+			 * through the pages): what makes TTM's GART windows apply. */
+			f->tt.dma_address = calloc(f->tt.num_pages, sizeof(*f->tt.dma_address));
+			assert(f->tt.dma_address);
 			f->tt.page_flags = TTM_TT_FLAG_PRIV_POPULATED;
 			f->bo.tbo.ttm = &f->tt;
 		}
@@ -891,7 +918,13 @@ static struct {
 	struct dma_fence *fence;
 	uint64_t src, dst;
 	uint32_t bytes;
+	bool ttm;			/* amdgpu_ttm_copy_mem_to_mem: from, to */
+	struct amdgpu_copy_mem from, to;
+	uint64_t size;
 } sdma_pending[8];
+unsigned int sdma_window_copies;
+static void ttm_copy_run(const struct amdgpu_copy_mem *from, const struct amdgpu_copy_mem *to,
+			 uint64_t size);
 static unsigned int sdma_npending;
 static spinlock_t sdma_lock;
 static const char *sdma_name(struct dma_fence *f) { (void)f; return "sdma"; }
@@ -923,6 +956,63 @@ int amdgpu_copy_buffer(struct amdgpu_device *a, struct amdgpu_ttm_buffer_entity 
 	*fence = f;
 	return 0;
 }
+/* A TTM copy's bytes: VRAM through the BO's buddy block, GTT through its
+ * pages (what TTM's GART windows map on hardware). */
+static unsigned char *copy_mem_host(const struct amdgpu_copy_mem *m, uint64_t at, uint64_t *avail)
+{
+	struct fake_bo *f = container_of(m->bo, struct fake_bo, bo.tbo);
+	const uint64_t offset = m->offset + at;
+
+	assert(m->mem == m->bo->resource && offset < m->mem->size);
+	if (m->mem->mem_type == TTM_PL_VRAM) {
+		const uint64_t start = f->block.header & GPU_BUDDY_HEADER_OFFSET;
+
+		*avail = m->mem->size - offset;
+		assert(start + m->mem->size <= TEST_VRAM_BYTES);
+		return vram + start + offset;
+	}
+	assert(m->mem->mem_type == TTM_PL_TT && f->pages && f->tt.dma_address);
+	*avail = PAGE_SIZE - (offset & (PAGE_SIZE - 1));
+	return (unsigned char *)page_address(f->pages[offset >> PAGE_SHIFT]) + (offset & (PAGE_SIZE - 1));
+}
+static void ttm_copy_run(const struct amdgpu_copy_mem *from, const struct amdgpu_copy_mem *to,
+			 uint64_t size)
+{
+	for (uint64_t done = 0; done < size;) {
+		uint64_t a, b;
+		unsigned char *src = copy_mem_host(from, done, &a);
+		unsigned char *dst = copy_mem_host(to, done, &b);
+		const uint64_t n = MIN(MIN(a, b), size - done);
+
+		memmove(dst, src, n);
+		done += n;
+	}
+}
+/* amdgpu_ttm.c (made callable by patches/linux/amdgpu-ttm-copy-mem-export.patch). */
+int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *a, struct amdgpu_ttm_buffer_entity *entity,
+			       const struct amdgpu_copy_mem *src, const struct amdgpu_copy_mem *dst,
+			       uint64_t size, bool tmz, struct dma_resv *resv, struct dma_fence **fence)
+{
+	struct dma_fence *f = kzalloc(sizeof(*f), GFP_KERNEL);
+
+	assert(a == adev && entity == &adev->mman.move_entities[0] && !tmz && !resv && size);
+	assert(src->offset + size <= src->mem->size && dst->offset + size <= dst->mem->size);
+	dma_fence_init(f, &sdma_fence_ops, &sdma_lock, 2, ++sdma_copies);
+	++sdma_window_copies;
+	if (sdma_hold) {
+		assert(sdma_npending < ARRAY_SIZE(sdma_pending));
+		sdma_pending[sdma_npending].fence = dma_fence_get(f);
+		sdma_pending[sdma_npending].ttm = true;
+		sdma_pending[sdma_npending].from = *src;
+		sdma_pending[sdma_npending].to = *dst;
+		sdma_pending[sdma_npending++].size = size;
+	} else {
+		ttm_copy_run(src, dst, size);
+		dma_fence_signal(f);
+	}
+	*fence = f;
+	return 0;
+}
 /* The held engine catches up: every pending copy runs and signals. */
 void fixture_sdma_release(void)
 {
@@ -932,10 +1022,13 @@ void fixture_sdma_release(void)
 void fixture_sdma_finish(bool run)
 {
 	for (unsigned int i = 0; i < sdma_npending; ++i) {
-		if (run)
+		if (run && sdma_pending[i].ttm)
+			ttm_copy_run(&sdma_pending[i].from, &sdma_pending[i].to, sdma_pending[i].size);
+		else if (run)
 			memmove(mc_to_host(sdma_pending[i].dst, sdma_pending[i].bytes),
 				mc_to_host(sdma_pending[i].src, sdma_pending[i].bytes),
 				sdma_pending[i].bytes);
+		sdma_pending[i].ttm = false;
 		dma_fence_signal(sdma_pending[i].fence);
 		dma_fence_put(sdma_pending[i].fence);
 	}
@@ -1202,6 +1295,8 @@ void fixture_device_init(void)
 	adev->mman.buffer_funcs_ring = &sdma_ring;
 	sdma_ring.sched.ready = true;
 	mutex_init(&adev->mman.default_entity.lock);
+	adev->mman.num_move_entities = 1;	/* TTM's mover, with its GART windows */
+	mutex_init(&adev->mman.move_entities[0].lock);
 	adev->ddev.render = &render_minor;
 	adev->kfd.dev = &kfd;
 	spin_lock_init(&sdma_lock);

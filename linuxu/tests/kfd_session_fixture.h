@@ -105,7 +105,7 @@ extern bool fixture_restores_allowed;
 extern unsigned int bo_restores;
 extern unsigned int live_bos, gart_maps, render_opens, render_releases, vm_acquires;
 extern unsigned int kgd_allocs, kgd_frees, kgd_maps, kgd_unmaps, kernel_allocs;
-extern unsigned int sdma_copies, mes_shader_debugger_sets, mes_shader_debugger_flushes;
+extern unsigned int sdma_copies, sdma_window_copies, mes_shader_debugger_sets, mes_shader_debugger_flushes;
 extern unsigned int cp_dispatches, hqd_dumps;
 extern size_t kmemcheck_live_bytes(void);
 /* MES failure modes (kfd_session_fixture.c). */

@@ -450,6 +450,7 @@ private let kSelBOMap:            UInt32 = 36
 private let kSelReleaseQuarantine: UInt32 = 61 // entitled; see session_state.h
 private let kSelPower:            UInt32 = 83 // device power; see power_state.h
 private let kSelRetire:           UInt32 = 85 // entitled: hand the GPU to a new driver; see session_state.h
+private let kSelShutdownGPU:      UInt32 = 42 // close the session when no other client uses it (an upgrade's handover)
 private let kRetireOpQuiesce:   UInt64 = 0
 private let kRetireOpTerminate: UInt64 = 1
 private let kRetireOpResume:    UInt64 = 2
@@ -715,6 +716,18 @@ enum DriverUpgrade {
         return (result, status, session)
     }
 
+    /// The handover when the previous instance refuses Retire: ShutdownGPU
+    /// from a session client of its own (UpgradeHandover).
+    static func handOver(_ instance: DriverInstance) -> UpgradeHandover {
+        let host = MacLinuxGPUHost()
+        host.quiet = true
+        guard host.openUserClient(observer: false, registryID: instance.registryID) else {
+            return .refused(kIOReturnNotAttachedValue)
+        }
+        defer { _ = host.closeUserClient() }
+        return host.shutdownSession()
+    }
+
     private static func describe(_ instance: DriverInstance) -> String {
         instance.clients.isEmpty ? instance.label
             : instance.label + "; clients: " + instance.clients.joined(separator: "; ")
@@ -774,7 +787,7 @@ enum DriverUpgrade {
                 if status == kIOReturnUnsupportedValue {
                     report("Previous driver \(instance.label): " + legacyAdvice)
                 } else if status == kIOReturnNotPrivilegedValue {
-                    report("Previous driver \(instance.label) " + notPrivilegedAdvice + ".")
+                    report("Previous driver \(instance.label): " + handOver(instance).summary + ".")
                 } else if status == kIOReturnTimeout {
                     report("Previous driver \(instance.label) did not complete Retire QUIESCE within " +
                            "\(MacLinuxGPUHost.retireTimeoutMs / 1000) s (kIOReturnTimeout); its session may still be open. " +
@@ -837,7 +850,12 @@ enum DriverUpgrade {
                 } else if status == kIOReturnNotFoundValue || status == kIOReturnNotAttachedValue {
                     line = "Previous driver \(instance.label) is leaving."
                 } else if status == kIOReturnNotPrivilegedValue {
-                    line = "Previous driver \(instance.label) " + notPrivilegedAdvice + "."
+                    // Not authorized to end its sessions: ShutdownGPU closes
+                    // the session once no program uses it, which is all the
+                    // instance waits for to leave.
+                    let handover = handOver(instance)
+                    line = "Previous driver \(instance.label): " + handover.summary + "."
+                    if handover == .quarantined { stuck[instance.registryID] = line }
                 } else if status == kIOReturnTimeout {
                     line = "Previous driver \(instance.label) did not complete Retire TERMINATE within " +
                         "\(MacLinuxGPUHost.retireTimeoutMs / 1000) s (kIOReturnTimeout)."
@@ -1378,6 +1396,30 @@ final class MacLinuxGPUHost {
             return nil
         }
         append("retire: " + result.summary)
+        return result
+    }
+    /// ShutdownGPU (selector 42) from this session client, which never joined
+    /// the session: the session closes when no other client uses it; with
+    /// others, a driver from build 263 on closes it when the last of them
+    /// leaves. No authorization beyond being a client: it ends nobody's
+    /// session. An upgrade's handover when Retire is refused.
+    func shutdownSession() -> UpgradeHandover {
+        let (kr, values): (kern_return_t, [UInt64])
+        if asyncSessionCalls && isOpen {
+            var out = [UInt64](repeating: 0, count: 2)
+            var count = UInt32(out.count)
+            let status = out.withUnsafeMutableBufferPointer { outPtr in
+                mlg_owner_call_timed(ucConn, Self.retireTimeoutMs, kSelShutdownGPU, nil, 0, nil, 0,
+                                     outPtr.baseAddress, &count, nil, nil)
+            }
+            (kr, values) = (status, Array(out.prefix(Int(count))))
+        } else {
+            (kr, values) = callScalar(kSelShutdownGPU, inScalars: [], outScalars: 2)
+        }
+        lastStatus = kr
+        let result = UpgradeHandover.evaluate(kr: kr, status: values.count == 2 ? values[0] : UInt64.max,
+                                              phase: values.count == 2 ? values[1] : UInt64.max)
+        append("shutdown: " + result.summary)
         return result
     }
     private(set) var lastStatus: kern_return_t = kIOReturnSuccess

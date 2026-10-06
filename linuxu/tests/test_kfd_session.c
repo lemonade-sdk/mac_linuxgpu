@@ -244,9 +244,13 @@ static void process_death(void)
 	mes_dead = true;
 	assert(rt_kfd_queue_destroy(s, q.q) == -ETIMEDOUT);
 	assert(rt_kfd_session_uncertain(s));
+	/* From its DESTROY_QUEUE on, the delivery thread's kick leaves the
+	 * queue to the session lock's path, which answers. */
+	assert(rt_kfd_queue_kick_nowait(s, q.q, 2) == -EAGAIN);
 	mes_dead = false;
 	assert(!rt_kfd_session_settle(s, 0) && !rt_kfd_session_uncertain(s));
 	assert(rt_kfd_queue_kick(s, q.q, 3) == -ENODEV);	/* off the GPU */
+	assert(rt_kfd_queue_kick_nowait(s, q.q, 3) == -EAGAIN);
 	assert(!rt_kfd_queue_destroy(s, q.q));
 	assert(rt_kfd_session_queue_count(s) == 0);
 	assert(!rt_kfd_bo_free(s, q.ring) && !rt_kfd_bo_free(s, q.meta));
@@ -265,6 +269,24 @@ static void process_death(void)
 		assert(rt_kfd_session_failure(s, &error) == RT_KFD_STEP_COPY);
 		assert(rt_kfd_bo_read(s, vram, 0, word, sizeof(word)) == -EBUSY);
 		assert(rt_kfd_session_settle(s, 0) == -EBUSY);
+		assert(rt_kfd_session_close(s) == -EBUSY);	/* bounded */
+		fixture_sdma_release();
+		assert(!rt_kfd_session_settle(s, 0));
+		assert(!rt_kfd_bo_read(s, vram, 0, word, sizeof(word)));
+	}
+	assert(!rt_kfd_session_close(s));
+	assert(kgd_frees == kgd_allocs);
+	/* 5b. The same for a copy between GTT and VRAM through TTM's GART
+	 * windows: both buffers stay until the engine catches up. */
+	s = dying_client("window-copy-timeout", &q, &vram);
+	{
+		unsigned char word[64];
+
+		sdma_hold = true;
+		assert(rt_kfd_bo_copy(s, q.meta, 0, vram, 0, sizeof(word)) == -ETIMEDOUT);
+		assert(rt_kfd_session_uncertain(s));
+		assert(rt_kfd_session_failure(s, &error) == RT_KFD_STEP_COPY);
+		assert(rt_kfd_bo_copy(s, q.meta, 0, vram, 0, sizeof(word)) == -EBUSY);
 		assert(rt_kfd_session_close(s) == -EBUSY);	/* bounded */
 		fixture_sdma_release();
 		assert(!rt_kfd_session_settle(s, 0));
@@ -540,6 +562,7 @@ static void vm_fault_isolation(void)
 	/* KFD took the faulting process's queue off MES, and only that one. */
 	assert(mes_removes == removes + 1);
 	assert(rt_kfd_queue_kick(a, qa.q, 5) == -EFAULT);
+	assert(rt_kfd_queue_kick_nowait(a, qa.q, 5) == -EFAULT);
 	assert(rt_kfd_session_fault(a, NULL) == 1);	/* sticky */
 	assert(hqd_dumps > 0 && !fixture_cp_stuck());	/* HQDs read, nothing left on them */
 	assert(!rt_kfd_session_uncertain(a));
@@ -759,17 +782,39 @@ int main(void)
 	}
 	for (size_t i = 0; i < sizeof(pattern); ++i)
 		pattern[i] = (unsigned char)(i * 131 + 7);
-	/* GTT through its pages, VRAM through SDMA and the staging. */
+	/* GTT through its pages; VRAM through SDMA and the staging. A copy
+	 * between GTT and VRAM is one SDMA copy through TTM's GART windows,
+	 * with no CPU copy. */
 	assert(!rt_kfd_bo_write(s, host, 0, pattern, sizeof(pattern)));
-	assert(!rt_kfd_bo_copy(s, host, 0, code, 4096, sizeof(pattern)));
-	assert(sdma_copies);
+	{
+		const unsigned int copies = sdma_copies, windowed = sdma_window_copies;
+
+		assert(!rt_kfd_bo_copy(s, host, 0, code, 4096, sizeof(pattern)));
+		assert(sdma_copies == copies + 1 && sdma_window_copies == windowed + 1);
+	}
 	memset(back, 0, sizeof(back));
 	assert(!rt_kfd_bo_read(s, code, 4096, back, sizeof(back)));
 	assert(!memcmp(back, pattern, sizeof(pattern)));
 	assert(!rt_kfd_bo_write(s, code, 0, pattern, 100));
-	assert(!rt_kfd_bo_copy(s, code, 0, host, 1000, 100));
+	{
+		const unsigned int windowed = sdma_window_copies;
+
+		assert(!rt_kfd_bo_copy(s, code, 0, host, 1000, 100));
+		assert(sdma_window_copies == windowed + 1);
+	}
 	memset(back, 0, sizeof(back));
 	assert(!rt_kfd_bo_read(s, host, 1000, back, 100) && !memcmp(back, pattern, 100));
+	/* Across the GTT BO's page boundaries, from an offset in VRAM. */
+	{
+		static unsigned char big[3 * PAGE_SIZE + 123], seen[sizeof(big)];
+
+		for (size_t i = 0; i < sizeof(big); ++i)
+			big[i] = (unsigned char)(i * 7 + 3);
+		assert(host_info.size >= sizeof(big) + 77);
+		assert(!rt_kfd_bo_write(s, host, 77, big, sizeof(big)));
+		assert(!rt_kfd_bo_copy(s, host, 77, code, 8192 + 5, sizeof(big)));
+		assert(!rt_kfd_bo_read(s, code, 8192 + 5, seen, sizeof(seen)) && !memcmp(seen, big, sizeof(big)));
+	}
 	assert(rt_kfd_bo_read(s, host, host_info.size - 4, back, 8) == -ERANGE);
 
 	/* ---- queues: two CREATE_QUEUEs become two MES ADD_QUEUEs ---- */
@@ -790,6 +835,14 @@ int main(void)
 	assert(!rt_kfd_queue_kick(s, q0.q, 5));
 	assert(!rt_kfd_queue_kick(s, q1.q, 9));
 	assert(doorbell_bar[mes_doorbells[0] / 2] == 5 && doorbell_bar[mes_doorbells[1] / 2] == 9);
+	/* The same without the session lock (the dext's delivery thread): the
+	 * doorbell written, and neither path writes a value below the highest
+	 * one written. */
+	assert(!rt_kfd_queue_kick_nowait(s, q0.q, 7) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick(s, q0.q, 6) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick_nowait(s, q0.q, 6) && doorbell_bar[mes_doorbells[0] / 2] == 7);
+	assert(!rt_kfd_queue_kick(s, q0.q, 8) && doorbell_bar[mes_doorbells[0] / 2] == 8);
+	assert(rt_kfd_queue_kick_nowait(s, q0.q, UINT64_MAX) == -EINVAL);
 	/* The queue's buffers cannot go while it exists. */
 	assert(rt_kfd_bo_free(s, q0.ring) == -EBUSY && rt_kfd_bo_free(s, q0.meta) == -EBUSY);
 

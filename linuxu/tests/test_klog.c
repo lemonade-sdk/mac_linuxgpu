@@ -15,17 +15,16 @@ extern void klog_set_level(int);
 extern void dev_printk_impl(const char *, const char *, const char *, ...);
 
 #ifdef LINUXU_DEXT_DK
-int IOLog(const char *format, ...)
+/* The dext's event sink (MacLinuxGPUXcode.mm registers one that writes
+ * os_log "mac.linuxgpu: EVENT %{public}s"); this one writes the same text to
+ * stderr. */
+static void test_event_sink(const char *text)
 {
     // The platform sink may reenter diagnostics: the ring lock must already
     // be released.
     uint64_t cursor = UINT64_MAX, end;
     assert(!klog_read(&cursor, NULL, 0, &end) && cursor == end);
-    va_list arguments;
-    va_start(arguments, format);
-    int n = vfprintf(stderr, format, arguments);
-    va_end(arguments);
-    return n;
+    fprintf(stderr, "mac.linuxgpu: EVENT %s", text);
 }
 #endif
 
@@ -258,6 +257,9 @@ int main(int argc, char **argv)
     assert(argc == 2);
     alarm(20);
     assert(freopen(argv[1], "w+", stderr));
+#ifdef LINUXU_DEXT_DK
+    klog_set_event_sink(test_event_sink);
+#endif
     basic(); variadic_contract(); ratelimit_contract(); wrap(); truncation(); retained_only(); concurrent();
 #ifdef LINUXU_DEXT_DK
     puts("PASS DriverKit klog: sink preservation, wrap, cursor clamping, truncation, concurrent snapshots and sink reentry");

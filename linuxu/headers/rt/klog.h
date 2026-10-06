@@ -25,6 +25,9 @@ size_t klog_read(uint64_t *cursor, char *out, size_t capacity, uint64_t *end);
  * required or added. Oversized input retains its final ring-capacity bytes.
  * This is safe for platform log helpers whose sinks can reenter diagnostics. */
 void klog_write(const char *text, size_t length);
+/* DriverKit build only: where errors and worse also go (the unified log,
+ * registered by the dext before any driver code runs). */
+void klog_set_event_sink(void (*sink)(const char *text));
 #ifdef __cplusplus
 }
 #endif

@@ -1,12 +1,24 @@
-/* Scalar, aligned accesses for kernel buffers, including uncached PCI VRAM.
- * Volatile prevents loop recognition from reintroducing libc, vector accesses
- * or cache-zero instructions. No locks, allocation or mapping lookup here:
- * callers may hold allocator/PCI locks. Mapping ownership remains the caller's.
- * This deliberately uses the same access contract for RAM and device memory. */
+/* The dext's string functions. Device memory takes the VRAM aperture's
+ * accesses (below): BAR0 is the only device mapping the driver addresses
+ * by pointer, every access through it is a call into the kernel, and other
+ * MMIO (registers, doorbells) goes through ioremap tokens, never through
+ * these functions. Every other pointer is normal, cacheable memory (DMA
+ * buffers, TTM pages, kernel heap), copied here with 16-byte NEON loads and
+ * stores. They are byte-element accesses (LD1/ST1 .16B), so they need no
+ * alignment, which -mstrict-align and normal memory both allow, and nothing
+ * here uses the cache-zeroing instruction (DC ZVA). no_builtin keeps the
+ * compiler from turning these loops back into calls to themselves (in the
+ * dext they are memcpy, memset and memmove). No locks, allocation or mapping
+ * lookup here: callers may hold allocator/PCI locks. */
 #include <rt/device_string.h>
 #include <stdint.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
-typedef uint64_t device_word __attribute__((__may_alias__));
+#define RAM_STRING __attribute__((no_builtin))
+
+static void ram_copy_forward(unsigned char *d, const unsigned char *s, size_t n);
 
 /* ---- the VRAM aperture (rt/device_string.h) ---- */
 static uintptr_t aperture_lo, aperture_hi;
@@ -171,10 +183,7 @@ static void aperture_copy(void *destination, const void *source, size_t size)
 	unsigned char bounce[256];
 
 	if (!to && !from) {
-		volatile unsigned char *d = destination;
-		const volatile unsigned char *s = source;
-
-		while (size--) *d++ = *s++;
+		ram_copy_forward(destination, source, size);
 	} else if (to && !from) {
 		linuxu_aperture_copy_in(destination, source, size);
 	} else if (from && !to) {
@@ -190,54 +199,96 @@ static void aperture_copy(void *destination, const void *source, size_t size)
 	}
 }
 
-void *linuxu_device_memset(void *destination, int value, size_t size)
+#if defined(__aarch64__)
+/* 16 bytes with LD1/ST1 (.16B): byte elements, so no alignment needed. As
+ * target instructions they stay whole under -mstrict-align, which splits a
+ * plain unaligned vector load into byte loads. */
+static inline uint8x16_t ram_load16(const unsigned char *p)
+{
+	uint8x16_t v;
+
+	__asm__("ld1 {%0.16b}, [%1]" : "=w"(v) : "r"(p) : "memory");
+	return v;
+}
+static inline void ram_store16(unsigned char *p, uint8x16_t v)
+{
+	__asm__ volatile("st1 {%0.16b}, [%1]" : : "w"(v), "r"(p) : "memory");
+}
+#endif
+
+/* Normal memory, forward: @d may overlap @s only below it (memmove). */
+static RAM_STRING void ram_copy_forward(unsigned char *d, const unsigned char *s, size_t n)
+{
+#if defined(__aarch64__)
+	while (n >= 64) {
+		const uint8x16x4_t v = vld1q_u8_x4(s);
+
+		vst1q_u8_x4(d, v);
+		d += 64; s += 64; n -= 64;
+	}
+	while (n >= 16) {
+		ram_store16(d, ram_load16(s));
+		d += 16; s += 16; n -= 16;
+	}
+#endif
+	while (n--) *d++ = *s++;
+}
+
+/* Normal memory, backward: @d may overlap @s only above it (memmove). */
+static RAM_STRING void ram_copy_backward(unsigned char *d, const unsigned char *s, size_t n)
+{
+	d += n; s += n;
+#if defined(__aarch64__)
+	while (n >= 64) {
+		d -= 64; s -= 64; n -= 64;
+		const uint8x16x4_t v = vld1q_u8_x4(s);
+
+		vst1q_u8_x4(d, v);
+	}
+	while (n >= 16) {
+		d -= 16; s -= 16; n -= 16;
+		ram_store16(d, ram_load16(s));
+	}
+#endif
+	while (n--) *--d = *--s;
+}
+
+RAM_STRING void *linuxu_device_memset(void *destination, int value, size_t size)
 {
 	if (linuxu_aperture_contains(destination, size)) {
 		linuxu_aperture_fill(destination, value, size);
 		return destination;
 	}
-	volatile unsigned char *d = destination;
-	unsigned char byte = (unsigned char)value;
-	device_word word = (device_word)byte * UINT64_C(0x0101010101010101);
-	while (size && ((uintptr_t)d & 7)) {
-		*d++ = byte;
-		--size;
+	unsigned char *d = destination;
+	const unsigned char byte = (unsigned char)value;
+#if defined(__aarch64__)
+	const uint8x16_t v = vdupq_n_u8(byte);
+	const uint8x16x4_t v4 = {{v, v, v, v}};
+
+	while (size >= 64) {
+		vst1q_u8_x4(d, v4);
+		d += 64; size -= 64;
 	}
-	while (size >= sizeof(word)) {
-		*(volatile device_word *)d = word;
-		d += sizeof(word);
-		size -= sizeof(word);
+	while (size >= 16) {
+		ram_store16(d, v);
+		d += 16; size -= 16;
 	}
+#endif
 	while (size--) *d++ = byte;
 	return destination;
 }
 
-void *linuxu_device_memcpy(void *destination, const void *source, size_t size)
+RAM_STRING void *linuxu_device_memcpy(void *destination, const void *source, size_t size)
 {
 	if (linuxu_aperture_contains(destination, size) || linuxu_aperture_contains(source, size)) {
 		aperture_copy(destination, source, size);
 		return destination;
 	}
-	volatile unsigned char *d = destination;
-	const volatile unsigned char *s = source;
-	/* If the alignments differ, byte accesses avoid unaligned device loads. */
-	if (((uintptr_t)d & 7) == ((uintptr_t)s & 7)) {
-		while (size && ((uintptr_t)d & 7)) {
-			*d++ = *s++;
-			--size;
-		}
-		while (size >= sizeof(device_word)) {
-			*(volatile device_word *)d = *(const volatile device_word *)s;
-			d += sizeof(device_word);
-			s += sizeof(device_word);
-			size -= sizeof(device_word);
-		}
-	}
-	while (size--) *d++ = *s++;
+	ram_copy_forward(destination, source, size);
 	return destination;
 }
 
-void *linuxu_device_memmove(void *destination, const void *source, size_t size)
+RAM_STRING void *linuxu_device_memmove(void *destination, const void *source, size_t size)
 {
 	if (!size || destination == source) return destination;
 	if (linuxu_aperture_contains(destination, size) || linuxu_aperture_contains(source, size)) {
@@ -257,26 +308,13 @@ void *linuxu_device_memmove(void *destination, const void *source, size_t size)
 	}
 	if ((uintptr_t)destination < (uintptr_t)source ||
 	    (uintptr_t)destination - (uintptr_t)source >= size)
-		return linuxu_device_memcpy(destination, source, size);
-	volatile unsigned char *d = (volatile unsigned char *)destination + size;
-	const volatile unsigned char *s = (const volatile unsigned char *)source + size;
-	if (((uintptr_t)d & 7) == ((uintptr_t)s & 7)) {
-		while (size && ((uintptr_t)d & 7)) {
-			*--d = *--s;
-			--size;
-		}
-		while (size >= sizeof(device_word)) {
-			d -= sizeof(device_word);
-			s -= sizeof(device_word);
-			*(volatile device_word *)d = *(const volatile device_word *)s;
-			size -= sizeof(device_word);
-		}
-	}
-	while (size--) *--d = *--s;
+		ram_copy_forward(destination, source, size);
+	else
+		ram_copy_backward(destination, source, size);
 	return destination;
 }
 
-int linuxu_device_memcmp(const void *first, const void *second, size_t size)
+RAM_STRING int linuxu_device_memcmp(const void *first, const void *second, size_t size)
 {
 	if (linuxu_aperture_contains(first, size) || linuxu_aperture_contains(second, size)) {
 		unsigned char x[128], y[128];
@@ -294,9 +332,16 @@ int linuxu_device_memcmp(const void *first, const void *second, size_t size)
 		}
 		return 0;
 	}
-	const volatile unsigned char *a = first, *b = second;
+	const unsigned char *a = first, *b = second;
+#if defined(__aarch64__)
+	/* Equal 16-byte blocks skipped whole; the first that differs is compared
+	 * byte by byte below. */
+	while (size >= 16 && vminvq_u8(vceqq_u8(ram_load16(a), ram_load16(b))) == 0xff) {
+		a += 16; b += 16; size -= 16;
+	}
+#endif
 	while (size--) {
-		unsigned char av = *a++, bv = *b++;
+		const unsigned char av = *a++, bv = *b++;
 		if (av != bv) return (int)av - (int)bv;
 	}
 	return 0;

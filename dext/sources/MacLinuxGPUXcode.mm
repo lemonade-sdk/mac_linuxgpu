@@ -81,6 +81,7 @@
 #include <rt/lx_files.h>
 #include <rt/lx_timing.h>
 #include <rt/kfd_session.h>
+#include <rt/wptr_poll.h>
 #include <rt/wait_pool.h>
 #include <rt/bounded.h>
 #include <rt/recovery.h>
@@ -266,6 +267,17 @@ static void maclinuxgpu_event_sink(const char *text)
 #define MACLINUXGPU_LOG(...) maclinuxgpu::RetainedLog(nullptr, __VA_ARGS__)
 #define MACLINUXGPU_EVENT(...) \
     maclinuxgpu::RetainedEvent(maclinuxgpu_event_sink, __VA_ARGS__)
+// Upstream errors and worse (printk level <= 3) reach the unified log the
+// same way, readable rather than <private>; registered before any driver
+// code can print.
+static void maclinuxgpu_printk_event_sink(const char *text)
+{
+    os_log(OS_LOG_DEFAULT, "mac.linuxgpu: EVENT %{public}s", text);
+}
+__attribute__((constructor)) static void maclinuxgpu_register_printk_sink(void)
+{
+    klog_set_event_sink(maclinuxgpu_printk_event_sink);
+}
 
 // ----------------------------------------------------------------
 // MacLinuxGPU (IOService) — the OSMetaClass method bodies.
@@ -320,6 +332,11 @@ static bool             s_deviceRemoved = false;
 // new session is admitted; with s_retireTerminate this instance asks IOKit
 // to terminate it once its session is gone, so its process exits.
 static bool             s_retiring = false;
+// ShutdownGPU found other clients in the session (an upgrade's handover:
+// the installer asks the previous instance, which then must not stay up
+// for clients that come and go): the last client's leaving closes the
+// session (last_leave_closes). Cleared with the session.
+static bool             s_closeWhenIdle = false;
 static bool             s_retireTerminate = false;
 // The session Disconnect GPU closed (retire_driver): its clients' calls fail
 // with kIOReturnNoDevice. 0 for none.
@@ -700,6 +717,8 @@ static void session_state(uint64_t out[MLG_SESSION_STATE_WORDS])
     if (s_pciIsolationAttempted) flags |= MLG_SESSION_FLAG_ISOLATION_ATTEMPTED;
     if (s_deviceRemoved) flags |= MLG_SESSION_FLAG_DEVICE_REMOVED;
     if (s_retiring) flags |= MLG_SESSION_FLAG_RETIRING;
+    if (s_closeWhenIdle) flags |= MLG_SESSION_FLAG_CLOSE_WHEN_IDLE;
+    if (rt_wptr_poll_active()) flags |= MLG_SESSION_FLAG_WPTR_POLL;
     {
         uint64_t reset[MLG_RESET_STATE_WORDS];
         reset_state(reset);
@@ -760,6 +779,7 @@ static void complete_session_close(MacLinuxGPU *driver)
     s_pciOpen = false;
     s_token = 0;
     s_participants = 0;
+    s_closeWhenIdle = false;
     __atomic_store_n(&s_deviceLost, false, __ATOMIC_RELEASE);
     ++s_sessionGeneration;
     s_sessionClosing = false;
@@ -1605,6 +1625,9 @@ static void power_set(uint32_t state, uint32_t cause, int error)
                         power_state_name(state), cause);
         return;
     }
+    // Doorbells on the delivery thread only while the device takes work;
+    // closing waits for one in progress (kick_table.h).
+    dext_compute_kick_gate(state == MLG_POWER_ACTIVE);
     MACLINUXGPU_LOG("power: %s -> %s (cause %u, error %d, flags %#x, holds %u, generation %llu%s)",
                     power_state_name(from), power_state_name(state), cause, error, s_power.flags,
                     s_power.holds, s_power.generation,
@@ -2004,13 +2027,23 @@ IMPL(MacLinuxGPU, Start)
         OSDictionary *properties = nullptr;
         bool kfdSessions = true;
         bool display = false;
+        uint32_t wptrPoll = 0;
         if (CopyProperties(&properties) == kIOReturnSuccess && properties) {
             if (properties->getObject("MacLinuxGPUKFDSessions") == kOSBooleanFalse)
                 kfdSessions = false;
             if (properties->getObject("MacLinuxGPUDisplay") == kOSBooleanTrue)
                 display = true;
+            // The CP write-pointer polling experiment (rt/wptr_poll.h): off
+            // unless a personality sets a period.
+            if (auto *period = OSDynamicCast(OSNumber, properties->getObject("MacLinuxGPUWptrPollPeriod")))
+                wptrPoll = period->unsigned32BitValue();
             properties->release();
         }
+        rt_wptr_poll_configure(wptrPoll);
+        rt_kfd_after_queue_create = rt_wptr_poll_observe;
+        if (wptrPoll)
+            MACLINUXGPU_EVENT("wptr poll: experiment on (MacLinuxGPUWptrPollPeriod %u): the CP polls queue "
+                              "write pointers once a KFD queue is mapped", wptrPoll);
         dext_compute_set_kfd_policy(kfdSessions);
         MACLINUXGPU_LOG("KFD compute sessions %s", kfdSessions ? "enabled when supported" : "disabled");
         const int displayRet = linuxu_driver_set_display(display ? 1 : 0);
@@ -2083,6 +2116,13 @@ kern_return_t
 IMPL(MacLinuxGPU, Stop)
 {
     if (s_driver != this) return Stop(provider, SUPERDISPATCH);
+    // DriverKit has no willTerminate: Stop is how the driver learns that it
+    // or its PCI provider is being terminated. A breadcrumb that outlives
+    // the process (the unified log and the host's driver trail).
+    MACLINUXGPU_EVENT("stop: the driver's Stop arrived (termination of the driver or its PCI provider: "
+                      "an upgrade, a deactivation or an unplug); session %s, quarantine %d",
+                      s_sessionClosing ? "closing" : s_modulesRunning ? "running" : "idle",
+                      (int)s_dmaQuarantined);
     retain();
     provider->retain();
     s_stopQueue->DispatchAsync(^{
@@ -2194,6 +2234,7 @@ MacLinuxGPU::FinishSession()
 void
 MacLinuxGPU::FinishStop(IOService *provider)
 {
+    MACLINUXGPU_EVENT("stop: provider let go; the driver process ends once IOKit releases it");
     Stop(provider, SUPERDISPATCH);
     provider->release();
     release();
@@ -2233,6 +2274,10 @@ kern_return_t
 IMPL(MacLinuxGPU, SetPowerState)
 {
     if (s_driver != this) return SetPowerState(powerFlags, SUPERDISPATCH);
+    // Rare (sleep, wake, device power): an event, so a death around a power
+    // change shows it.
+    MACLINUXGPU_EVENT("power: SetPowerState(%#x) arrived in state %s", powerFlags,
+                      power_state_name(s_power.state));
     // The power state is the session queue's: the change runs there, and
     // is acknowledged from there, at once or after its work.
     retain();
@@ -2558,7 +2603,10 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // release or an uncertain GPU: s_dmaQuarantined), or when the last client
 // leaves a session that must end with it (last_leave_closes).
 //
-// The last client's leaving ends the session when the device left the bus
+// The last client's leaving ends the session when ShutdownGPU asked for
+// it while other clients used the GPU (s_closeWhenIdle: an upgrade's
+// handover, whose previous instance can leave only once its session is
+// closed), when the device left the bus
 // or no longer answers this driver (a transport fault: s_deviceLost),
 // when a raw BAR mapping's revocation is not proved, or when what the
 // session set up was that client's own: a session that never brought the
@@ -2568,7 +2616,7 @@ IMPL(MacLinuxGPUUserClient, Stop)
 // its window again, as before).
 static bool last_leave_closes(bool legacyClient)
 {
-    return s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE) ||
+    return s_closeWhenIdle || s_deviceRemoved || __atomic_load_n(&s_deviceLost, __ATOMIC_ACQUIRE) ||
            s_rawBARLease.hasMappings() || !s_modulesRunning || legacyClient;
 }
 static bool session_leave_closes(bool participant, bool legacyClient)
@@ -4410,6 +4458,35 @@ static kern_return_t display_call(MacLinuxGPUUserClient *client, uint64_t client
 }
 
 
+// AQLQueueKick called synchronously (session_state.h, from build 263): the
+// doorbell rung here, on the delivery thread, which must never sleep. Only
+// published state and the kick table's spinlock (kick_table.h): anything
+// the fast path cannot vouch for is left to the session queue's
+// AQLQueueKick, which the client then calls async (kIOReturnUnsupported).
+static kern_return_t kick_on_delivery(MacLinuxGPUUserClient *client, IOUserClientMethodArguments *a)
+{
+    auto *ivars = client->ivars;
+    if (!a->scalarInput || a->scalarInputCount != 2 || !a->scalarOutput || a->scalarOutputCount < 1 ||
+        a->structureInput || a->structureInputDescriptor || a->scalarInput[1] == UINT64_MAX)
+        return kIOReturnBadArgument;
+    const uint64_t generation = __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE);
+    const uint64_t closed = __atomic_load_n(&s_disconnectedGeneration, __ATOMIC_ACQUIRE);
+    if (closed && __atomic_load_n(&ivars->sessionGeneration, __ATOMIC_RELAXED) == closed)
+        return kIOReturnNoDevice;
+    if (__atomic_load_n(&s_stopping, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&s_sessionClosing, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&ivars->sessionGeneration, __ATOMIC_RELAXED) != generation)
+        return kIOReturnUnsupported;
+    if (!mlg_power_admits(__atomic_load_n(&s_power.state, __ATOMIC_ACQUIRE), kMacAMDGPUMethodAQLQueueKick))
+        return kIOReturnOffline;
+    const int r = dext_compute_aql_queue_kick_direct(ivars->clientID, a->scalarInput[0], a->scalarInput[1]);
+    if (r == -EFAULT_L) return kIOReturnVMError;
+    if (r) return kIOReturnUnsupported;
+    a->scalarOutput[0] = 0;
+    a->scalarOutputCount = 1;
+    return kIOReturnSuccess;
+}
+
 // ----------------------------------------------------------------
 // ExternalMethod — the selector-RPC dispatch.
 //
@@ -4463,6 +4540,9 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
         if (mlg_call_runs_on_delivery(selector, in, nin))
             return direct_call(this, selector, arguments);
         if (selector == MLG_SELECTOR_OWNER_RESULT) return kIOReturnBadArgument;
+        if (selector == kMacAMDGPUMethodAQLQueueKick && !arguments->completion &&
+            !ivars->observer && !ivars->linuxFile)
+            return kick_on_delivery(this, arguments);
         if (!arguments->completion) return refuse_sync(this, selector);
         // A Retire queues behind any session call: watch that one returns.
         if (selector == MLG_SELECTOR_RETIRE) session_watchdog_start(ivars->ownerDriver, "Retire", true);
@@ -5064,7 +5144,19 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutputCount < 2) return kIOReturnBadArgument;
         if (s_rawBARLease.hasMappings()) return kIOReturnBusy;
         const bool participant = ivars->sessionGeneration == s_sessionGeneration;
-        if (s_participants > (participant ? 1u : 0u)) return kIOReturnBusy;
+        if (s_participants > (participant ? 1u : 0u)) {
+            // Other clients use the GPU: the session closes when the last
+            // of them leaves (an upgrade's handover asks this of the
+            // previous instance, which can go only once its session is
+            // closed; the device otherwise stays up across clients).
+            if (s_pciOpen && !s_sessionClosing && !s_closeWhenIdle) {
+                s_closeWhenIdle = true;
+                MACLINUXGPU_EVENT("shutdown: %u client(s) still use the GPU; the session closes "
+                                  "when the last of them leaves",
+                                  s_participants - (participant ? 1u : 0u));
+            }
+            return kIOReturnBusy;
+        }
         if (s_pciOpen && !s_sessionClosing) close_session(ivars->ownerDriver);
         out[0] = s_dmaQuarantined ? kIOReturnError :
                  (s_sessionClosing ? kIOReturnBusy : kIOReturnSuccess);
@@ -5195,9 +5287,13 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
     }
 
     case kMacAMDGPUMethodBOCopy: {
+        // Up to 16 MiB a call (the HSA runtime's kWindowedCopyBytes from
+        // build 262): between system pages and VRAM one SDMA copy through
+        // TTM's GART windows (rt_kfd_bo_copy), a few milliseconds of the
+        // session queue at the link's speed.
         if (!in || arguments->scalarInputCount != 5 || !out ||
             arguments->scalarOutputCount < 1 || in[4] == 0 ||
-            in[4] > 4 * 1024 * 1024 || arguments->structureInput ||
+            in[4] > 16 * 1024 * 1024 || arguments->structureInput ||
             arguments->structureInputDescriptor || arguments->structureOutputDescriptor)
             return kIOReturnBadArgument;
         int r = dext_compute_bo_copy(in[0], in[2], in[1], in[3], (uint32_t)in[4]);

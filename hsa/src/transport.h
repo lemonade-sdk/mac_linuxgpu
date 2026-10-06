@@ -32,6 +32,14 @@ constexpr uint64_t kQueueFaultDriverBuild=256;
 // marks the connection's code pending, and one sync runs before the next
 // doorbell of its queues (flushPendingCodeSync).
 constexpr uint64_t kCodeSyncDriverBuild=258;
+// First driver build whose BOCopy (selector 48) copies between system pages
+// and VRAM by SDMA through TTM's GART windows, with no CPU copy, and takes up
+// to kWindowedCopyBytes in one call (kLegacyCopyBytes before).
+constexpr uint64_t kWindowedCopyDriverBuild=262;
+constexpr uint64_t kLegacyCopyBytes=4ull<<20, kWindowedCopyBytes=16ull<<20;
+// First driver build that serves AQLQueueKick (selector 57) synchronously,
+// on its delivery thread (session_state.h's MLG_SYNC_KICK_BUILD).
+constexpr uint64_t kSyncKickDriverBuild=263;
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.
@@ -270,10 +278,17 @@ public:
     virtual bool queueSlotsExhausted() { return false; }
     virtual hsa_status_t createQueue(const SharedBuffer &, const SharedBuffer &, uint32_t, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t kickQueue(uint64_t, uint64_t) { return HSA_STATUS_ERROR; }
+    // A transport whose doorbells are not waited for (kickQueue returns once
+    // the doorbell is queued): true, with the highest one, when the driver
+    // refused doorbells of @handle because the device was suspending. The
+    // queue rings it again on resume, as it does a doorbell refused at once.
+    virtual bool takeRefusedKick(uint64_t, uint64_t &) { return false; }
     virtual hsa_status_t destroyQueue(uint64_t) { return HSA_STATUS_ERROR; }
     virtual hsa_status_t dispatchAQL(const amdgpu::AQLDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t dispatch(const amdgpu::ComputeDispatchRequest &, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t copyBuffers(const DeviceBuffer &, uint64_t, const DeviceBuffer &, uint64_t, size_t) { return HSA_STATUS_ERROR; }
+    // The most copyBuffers takes in one call.
+    virtual uint64_t maxCopyBytes() { return kLegacyCopyBytes; }
     virtual hsa_status_t exportBuffer(const DeviceBuffer &, BufferToken &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t importBuffer(const BufferToken &, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     // Device power (power.h): the driver's power snapshot, and a request

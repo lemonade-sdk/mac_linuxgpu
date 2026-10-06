@@ -687,6 +687,14 @@ static kern_return_t owner_session_call(MacLinuxGPUUserClient *client, uint64_t 
     }
 }
 
+// AQLQueueKick's synchronous form (build 263): a client of this test's
+// driver build (243) never sends it.
+static kern_return_t kick_on_delivery(MacLinuxGPUUserClient *, IOUserClientMethodArguments *)
+{
+    std::fprintf(stderr, "test GPU: a synchronous AQLQueueKick from a client of build 243\n");
+    return kIOReturnUnsupported;
+}
+
 kern_return_t MacLinuxGPUUserClient::ExternalMethod(uint64_t selector, IOUserClientMethodArguments *arguments,
                                                 const IOUserClientMethodDispatch *dispatch,
                                                 OSObject *target, void *reference)

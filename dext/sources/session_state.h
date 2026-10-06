@@ -42,6 +42,8 @@ enum mlg_session_flag {
 	MLG_SESSION_FLAG_DEVICE_REMOVED      = 1u << 11, /* surprise removal: the GPU left the bus */
 	MLG_SESSION_FLAG_RETIRING            = 1u << 12, /* Retire: no new session (an upgrade) */
 	MLG_SESSION_FLAG_GPU_WEDGED          = 1u << 13, /* recovery failed: power-cycle the GPU */
+	MLG_SESSION_FLAG_CLOSE_WHEN_IDLE     = 1u << 14, /* ShutdownGPU waits: the last client's leaving closes */
+	MLG_SESSION_FLAG_WPTR_POLL           = 1u << 15, /* the CP polls write pointers (rt/wptr_poll.h) */
 };
 
 /* Which close/probe step quarantined the session. */
@@ -163,6 +165,18 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * stay synchronous, bounded: the read runs on a driver thread, and the
  * call waits at most MLG_BOUNDED_READ_MS for it (kIOReturnTimeout; while
  * it is still running another is kIOReturnBusy). */
+/* AQLQueueKick (57) is also served synchronously from build 263: a
+ * session client's IOConnectCallScalarMethod rings the doorbell on the
+ * delivery thread itself, with no session-queue hop (a sync call costs
+ * one trip through the driver, an async call about two). It takes only
+ * published state and a spinlock nothing holds across a sleep
+ * (kick_table.h); whatever it cannot vouch for (a legacy queue, a queue
+ * being created or destroyed, a busy or closing session) it answers
+ * kIOReturnUnsupported, and the client sends that doorbell as the async
+ * session call. kIOReturnOffline while the device suspends,
+ * kIOReturnVMError after a GPU memory fault of the client's process,
+ * kIOReturnNoDevice after Disconnect GPU, as the async call answers. */
+#define MLG_SYNC_KICK_BUILD 263u
 /* The first runtime build (RuntimeBuild's out[3], the compiled build) that
  * serves session calls this way: a client checks it before an async call,
  * since an older driver answers such a call synchronously and never

@@ -197,10 +197,24 @@ struct rt_kfd_queue_info {
 };
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out);
+/* Called after each queue creation that succeeded, outside the session
+ * lock (the dext sets it: rt_wptr_poll_observe). NULL: nothing. */
+extern void (*rt_kfd_after_queue_create)(struct amdgpu_device *adev);
 int rt_kfd_queue_info(struct rt_kfd_session *s, struct rt_kfd_queue *q,
 		      struct rt_kfd_queue_info *out);
-/* Write @value to the queue's doorbell (64-bit doorbells on SOC15). */
+/* Write @value to the queue's doorbell (64-bit doorbells on SOC15). A
+ * value below one already written is not written again. */
 int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value);
+/* The same without the session lock and without sleeping: only the
+ * session's kick spinlock, held across the doorbell write. For a caller
+ * that must not sleep (the dext's delivery thread); it must keep @s and @q
+ * alive itself. 0, or -EAGAIN when the session lock's path must answer
+ * (the queue is not ringable: before its creation finished, from its
+ * DESTROY_QUEUE on; the session is uncertain or closing), -EFAULT once the
+ * process's GPU work faulted, -ERANGE for a doorbell outside the BAR. As
+ * on Linux, where the process writes its doorbell page itself, the value
+ * is not checked against the queue's write index. */
+int rt_kfd_queue_kick_nowait(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value);
 /* DESTROY_QUEUE, then free the queue's EOP and context-save BOs. When MES
  * does not confirm the removal the queue is recovered as in
  * rt_kfd_session_close; if that fails too the session becomes uncertain and

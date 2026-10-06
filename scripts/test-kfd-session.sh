@@ -26,7 +26,7 @@ read -r -a hostcflags <<< "$host_string"
 # compiles with -fno-strict-overflow semantics; UBSan's shift-base check is
 # off for them, every other check stays fatal.
 # Short SDMA copy timeouts keep the timed-out-copy scenario quick.
-cflags=("${hostcflags[@]}" -DRT_KFD_COPY_TIMEOUT_MS=200 -DRT_KFD_SETTLE_MS=200
+cflags=("${hostcflags[@]}" -DRT_KFD_COPY_TIMEOUT_MS=200 -DRT_KFD_SETTLE_MS=200 -DRT_KFD_WINDOW_MIN_BYTES=1
   -g -O1 -fsanitize=address,undefined -fno-sanitize=shift-base
   -fno-sanitize-recover=all
   -ffunction-sections -fdata-sections "${includes[@]}")

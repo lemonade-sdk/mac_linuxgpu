@@ -55,6 +55,13 @@
 #define RT_KFD_EVENT_PAGE_BYTES	((uint64_t)KFD_SIGNAL_EVENT_LIMIT * 8)
 /* GART-mapped staging for SDMA transfers to and from VRAM. */
 #define RT_KFD_STAGING_BYTES	(1ULL << 20)
+/* From this size a copy between system pages and VRAM goes through TTM's
+ * GART windows (bo_sdma_copy); below it through the staging buffer, whose
+ * one SDMA job beats the windows' mapping job plus copy (measured on build
+ * 262: 4 KiB 108 vs 126 us, 64 KiB 121 vs 138 us; 1 MiB 380 vs 282 us). */
+#ifndef RT_KFD_WINDOW_MIN_BYTES
+#define RT_KFD_WINDOW_MIN_BYTES	(256ULL << 10)
+#endif
 #define RT_KFD_LARGE_PAGE	(2ULL << 20)
 /* libhsakmt's priority_map[] entry for HSA_QUEUE_PRIORITY_NORMAL. */
 #define RT_KFD_PRIORITY_NORMAL	7
@@ -111,6 +118,12 @@ struct rt_kfd_queue {
 	/* Off the GPU (destroyed, or recovered by a settle) but still linked
 	 * until its owner destroys it or the session closes. */
 	bool gone;
+	/* Doorbells (rt_kfd_queue_kick and rt_kfd_queue_kick_nowait), under the
+	 * session's kick_lock: whether one may be written (from the queue's
+	 * creation until its DESTROY_QUEUE), and the highest value written,
+	 * which a lower one never follows. */
+	bool kickable, rung;
+	uint64_t last_kick;
 };
 
 struct rt_kfd_session {
@@ -122,6 +135,11 @@ struct rt_kfd_session {
 	struct rt_kfd_apertures ap;
 	struct rt_kfd_queue_limits limits;
 	pthread_mutex_t lock;
+	/* A spinlock, never held across anything that sleeps: the doorbell
+	 * write and the queue fields above, so a doorbell can be rung from a
+	 * thread that must not sleep (the dext's delivery thread) without
+	 * the session lock. Taken after lock, never before it. */
+	bool kick_lock;
 	struct rt_kfd_bo *bos;
 	struct rt_kfd_queue *queues;
 	unsigned int queue_count;
@@ -1143,19 +1161,13 @@ static int cpu_transfer(struct amdgpu_bo *abo, uint64_t offset, void *buf,
 	return 0;
 }
 
-static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint64_t bytes)
+/* Waits for a session copy's last @fence (@r its submission's result). A
+ * copy that failed or outlived RT_KFD_COPY_TIMEOUT_MS may still run: the
+ * buffers it names (and the staging) stay retained until its fence signals
+ * (settle_copy_locked). Copies on one ring complete in order, so the latest
+ * covers every earlier one. Caller holds s->lock. Drops @fence. */
+static int copy_wait(struct rt_kfd_session *s, struct dma_fence *fence, int r, uint64_t bytes)
 {
-	struct amdgpu_device *adev = s->adev;
-	struct dma_fence *fence = NULL;
-	int r;
-
-	if (!adev->mman.buffer_funcs_enabled || !adev->mman.buffer_funcs_ring ||
-	    !adev->mman.buffer_funcs_ring->sched.ready)
-		return -ENODEV;
-	mutex_lock(&adev->mman.default_entity.lock);
-	r = amdgpu_copy_buffer(adev, &adev->mman.default_entity, src, dst,
-			       (uint32_t)bytes, NULL, &fence, false, 0);
-	mutex_unlock(&adev->mman.default_entity.lock);
 	if (!r && !fence)
 		r = -EIO;
 	if (!r) {
@@ -1167,9 +1179,6 @@ static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint6
 		r = r > 0 ? 0 : (r == 0 ? -EIO : r);
 	}
 	if (r && fence) {
-		/* The copy may still run: staging and the BO stay retained until
-		 * its fence signals (settle_copy_locked). Copies on the entity
-		 * complete in order, so the latest one covers every earlier one. */
 		pr_err("kfd session %d: SDMA copy of %llu bytes did not complete (%d); "
 		       "keeping the staging and the buffer\n", session_pid(s),
 		       (unsigned long long)bytes, r);
@@ -1180,6 +1189,67 @@ static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint6
 	}
 	dma_fence_put(fence);
 	return r;
+}
+
+static bool copy_engine_ready(struct amdgpu_device *adev)
+{
+	return adev->mman.buffer_funcs_enabled && adev->mman.buffer_funcs_ring &&
+	       adev->mman.buffer_funcs_ring->sched.ready;
+}
+
+static int sdma_copy(struct rt_kfd_session *s, uint64_t src, uint64_t dst, uint64_t bytes)
+{
+	struct amdgpu_device *adev = s->adev;
+	struct dma_fence *fence = NULL;
+	int r;
+
+	if (!copy_engine_ready(adev))
+		return -ENODEV;
+	mutex_lock(&adev->mman.default_entity.lock);
+	r = amdgpu_copy_buffer(adev, &adev->mman.default_entity, src, dst,
+			       (uint32_t)bytes, NULL, &fence, false, 0);
+	mutex_unlock(&adev->mman.default_entity.lock);
+	return copy_wait(s, fence, r, bytes);
+}
+
+/* Whether SDMA reaches @abo's pages through TTM (amdgpu_ttm_copy_mem_to_mem):
+ * VRAM, or system pages in GTT with their DMA addresses, which TTM maps
+ * through a GART window. */
+static bool sdma_reachable(struct amdgpu_bo *abo)
+{
+	struct ttm_resource *res = abo->tbo.resource;
+	struct ttm_tt *ttm = abo->tbo.ttm;
+
+	if (!res)
+		return false;
+	if (res->mem_type == TTM_PL_VRAM)
+		return true;
+	return res->mem_type == TTM_PL_TT && ttm && ttm->dma_address &&
+	       ttm_tt_is_populated(ttm);
+}
+
+/* One SDMA copy between two BO ranges, as TTM moves a buffer on Linux
+ * (amdgpu_move_blit): system pages through the move entity's GART windows,
+ * no CPU copy, one fence for the whole range. Caller holds s->lock and both
+ * reservations. */
+static int bo_sdma_copy(struct rt_kfd_session *s, struct amdgpu_bo *src, uint64_t src_offset,
+			struct amdgpu_bo *dst, uint64_t dst_offset, uint64_t bytes)
+{
+	struct amdgpu_device *adev = s->adev;
+	const struct amdgpu_copy_mem from = {
+		.bo = &src->tbo, .mem = src->tbo.resource, .offset = (unsigned long)src_offset,
+	};
+	const struct amdgpu_copy_mem to = {
+		.bo = &dst->tbo, .mem = dst->tbo.resource, .offset = (unsigned long)dst_offset,
+	};
+	struct dma_fence *fence = NULL;
+	int r;
+
+	if (!copy_engine_ready(adev) || !adev->mman.num_move_entities)
+		return -ENODEV;
+	r = amdgpu_ttm_copy_mem_to_mem(adev, &adev->mman.move_entities[0], &from, &to,
+				       bytes, false, NULL, &fence);
+	return copy_wait(s, fence, r, bytes);
 }
 
 /* SDMA between a VRAM BO range and a contiguous MC range, segment by
@@ -1339,9 +1409,16 @@ int rt_kfd_bo_copy(struct rt_kfd_session *s, struct rt_kfd_bo *src,
 	r = bo_access_kind(src->abo, &sk);
 	if (!r)
 		r = bo_access_kind(dst->abo, &dk);
-	if (!r && sk == ACCESS_VRAM && dk == ACCESS_VRAM)
+	if (!r && sk == ACCESS_VRAM && dk == ACCESS_VRAM) {
 		r = vram_to_vram(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
-	while (!r && bytes && !(sk == ACCESS_VRAM && dk == ACCESS_VRAM)) {
+		bytes = 0;
+	} else if (!r && (sk == ACCESS_VRAM || dk == ACCESS_VRAM) && bytes >= RT_KFD_WINDOW_MIN_BYTES &&
+		   sdma_reachable(src->abo) && sdma_reachable(dst->abo)) {
+		/* System pages and VRAM: SDMA directly, at the link's speed. */
+		r = bo_sdma_copy(s, src->abo, src_offset, dst->abo, dst_offset, bytes);
+		bytes = 0;
+	}
+	while (!r && bytes) {
 		uint64_t n = bytes < RT_KFD_STAGING_BYTES ? bytes : RT_KFD_STAGING_BYTES;
 
 		if (sk == ACCESS_CPU && dk == ACCESS_CPU) {
@@ -1666,7 +1743,9 @@ static bool va_in_bo(const struct rt_kfd_bo *bo, uint64_t va, uint64_t bytes)
 	return va >= bo->va && va - bo->va <= bo->size && bytes <= bo->size - (va - bo->va);
 }
 
-/* libhsakmt's fill_cwsr_header for each XCC's save area. */
+/* libhsakmt's fill_cwsr_header for each XCC's save area. The area is in
+ * VRAM, so the header goes through the staging buffer and SDMA; the rest of
+ * the area is zero (KFD clears VRAM before MAP_MEMORY_TO_GPU returns). */
 static int fill_ctx_header(struct rt_kfd_session *s, struct rt_kfd_bo *ctx)
 {
 	const struct rt_kfd_queue_limits *l = &s->limits;
@@ -1683,12 +1762,8 @@ static int fill_ctx_header(struct rt_kfd_session *s, struct rt_kfd_bo *ctx)
 
 		header.debug_offset = (l->xcc_count - i) * l->ctx_save_bytes;
 		header.debug_size = l->debug_bytes * l->xcc_count;
-		r = amdgpu_bo_reserve(ctx->abo, false);
-		if (r)
-			return r;
-		r = cpu_transfer(ctx->abo, (uint64_t)i * l->ctx_save_bytes, &header,
-				 sizeof(header), true);
-		amdgpu_bo_unreserve(ctx->abo);
+		r = bo_host_transfer(s, ctx, (uint64_t)i * l->ctx_save_bytes, &header,
+				     sizeof(header), true);
 		if (r)
 			return r;
 	}
@@ -1714,6 +1789,10 @@ static void queue_identity(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 
 static int queue_destroy_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
 static void queue_free_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q);
+static void kick_lock(struct rt_kfd_session *s);
+static void kick_unlock(struct rt_kfd_session *s);
+
+void (*rt_kfd_after_queue_create)(struct amdgpu_device *adev);
 
 int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc *desc,
 			struct rt_kfd_queue **out)
@@ -1759,8 +1838,12 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 	if (s->limits.eop_bytes)
 		r = bo_alloc_locked(s, s->limits.eop_bytes, 0, RT_KFD_VRAM,
 				    RT_KFD_PLACE_PRIVATE, &q->eop);
+	/* The context-save area lives in VRAM, where libhsakmt's SVM save area
+	 * starts (prefetched to the GPU node). In GTT its ~30 MB of host pages
+	 * cost ~6 ms to populate and map at every queue create, ~3 ms to
+	 * release, and a CWSR save would write it across the link. */
 	if (!r)
-		r = bo_alloc_locked(s, s->limits.ctx_area_bytes, 0, RT_KFD_GTT,
+		r = bo_alloc_locked(s, s->limits.ctx_area_bytes, 0, RT_KFD_VRAM,
 				    RT_KFD_PLACE_PRIVATE, &q->ctx);
 	if (!r)
 		r = fill_ctx_header(s, q->ctx);
@@ -1830,9 +1913,16 @@ int rt_kfd_queue_create(struct rt_kfd_session *s, const struct rt_kfd_queue_desc
 		pthread_mutex_unlock(&s->lock);
 		return (int)r;
 	}
+	/* Its doorbell may be rung from here until its DESTROY_QUEUE. */
+	kick_lock(s);
+	q->kickable = true;
+	kick_unlock(s);
 	linuxu_process_leave(&saved);
 	pthread_mutex_unlock(&s->lock);
 	*out = q;
+	/* MES mapped the queue and compute is active (rt/wptr_poll.h). */
+	if (rt_kfd_after_queue_create)
+		rt_kfd_after_queue_create(s->adev);
 	return 0;
 }
 
@@ -1868,6 +1958,65 @@ static bool queue_owned(struct rt_kfd_session *s, struct rt_kfd_queue *q)
 	return false;
 }
 
+static void kick_lock(struct rt_kfd_session *s)
+{
+	while (__atomic_test_and_set(&s->kick_lock, __ATOMIC_ACQUIRE))
+		cpu_relax();
+}
+
+static void kick_unlock(struct rt_kfd_session *s)
+{
+	__atomic_clear(&s->kick_lock, __ATOMIC_RELEASE);
+}
+
+/* No doorbell of @q is written from here on (its DESTROY_QUEUE releases
+ * the doorbell, which another queue may then be given). Waits only for a
+ * doorbell write in progress. */
+static void queue_unkick(struct rt_kfd_session *s, struct rt_kfd_queue *q)
+{
+	kick_lock(s);
+	q->kickable = false;
+	kick_unlock(s);
+}
+
+/* Writes @value to @q's doorbell unless a higher one was written. Caller
+ * holds kick_lock; @q is kickable. */
+static void doorbell_write_kicklocked(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
+{
+	if (q->rung && value <= q->last_kick)
+		return;
+	/* Ring, packets and the write index are coherent host memory: order
+	 * them before the doorbell write, as ROCr's release store does.
+	 * 64-bit doorbells on SOC15 (device_info.doorbell_size). */
+	mb();
+	writeq(value, s->adev->doorbell.cpu_addr + q->doorbell_index);
+	q->rung = true;
+	q->last_kick = value;
+}
+
+int rt_kfd_queue_kick_nowait(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
+{
+	struct amdgpu_device *adev;
+	int r = 0;
+
+	if (!s || !q || value == UINT64_MAX)
+		return -EINVAL;
+	adev = s->adev;
+	kick_lock(s);
+	if (!q->kickable || __atomic_load_n(&s->uncertain, __ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&s->closing, __ATOMIC_ACQUIRE))
+		r = -EAGAIN;
+	else if (__atomic_load_n(&s->faulted, __ATOMIC_ACQUIRE))
+		r = -EFAULT;
+	else if (!adev->doorbell.cpu_addr ||
+		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
+		r = -ERANGE;
+	else
+		doorbell_write_kicklocked(s, q, value);
+	kick_unlock(s);
+	return r;
+}
+
 int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
 {
 	struct amdgpu_device *adev;
@@ -1889,11 +2038,12 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
 		 (uint64_t)q->doorbell_index + 2 > adev->doorbell.size / sizeof(u32))
 		r = -ERANGE;
 	if (!r) {
-		/* Ring, packets and the write index are coherent host memory:
-		 * order them before the doorbell write, as ROCr's release store
-		 * does. 64-bit doorbells on SOC15 (device_info.doorbell_size). */
-		mb();
-		writeq(value, adev->doorbell.cpu_addr + q->doorbell_index);
+		kick_lock(s);
+		if (q->kickable)
+			doorbell_write_kicklocked(s, q, value);
+		else
+			r = -ENODEV;
+		kick_unlock(s);
 	}
 	pthread_mutex_unlock(&s->lock);
 	return r;
@@ -1911,6 +2061,7 @@ static int queue_release_locked(struct rt_kfd_session *s, struct rt_kfd_queue *q
 
 	if (q->gone)
 		return 0;
+	queue_unkick(s, q);
 	if (!q->detached) {
 		struct kfd_ioctl_destroy_queue_args destroy = { .queue_id = q->queue_id };
 

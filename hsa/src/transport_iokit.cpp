@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cerrno>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -244,6 +245,7 @@ public:
             (void)handle;
             IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host));
         }
+        if (kickPort) IONotificationPortDestroy(kickPort);
         stopFirmwareService(); // Never left running past initialization.
         if (ownerPort) closeConnection(ownerPort);
         if (pendingProbePort) closeConnection(pendingProbePort);
@@ -597,25 +599,109 @@ public:
         auto node=hardwareQueues.extract(record);node.key()=output[1];hardwareQueues.insert(std::move(node));
         handle=output[1];return HSA_STATUS_SUCCESS;
     }
+    // A doorbell (selector 57) is sent and not waited for: the call returns
+    // once the driver's delivery thread has queued it on the session queue,
+    // which runs the session's calls in order, so the doorbell is written
+    // before anything this connection asks afterwards. Waiting for the
+    // completion as well (a second trip through the driver) doubled what a
+    // doorbell cost the submitting thread. Completions are read later
+    // (drainKicksLocked): by the queue service, which already runs every
+    // millisecond, or here once enough are waiting. What they report reaches
+    // the queue the way a synchronous answer did: a fault through the queue
+    // service, a doorbell refused while the device suspended through
+    // takeRefusedKick (rung again on resume), any other failure as a faulted
+    // connection.
     hsa_status_t kickQueue(uint64_t handle,uint64_t packet) override {
         std::lock_guard lock(sessionMutex);
         if (state!=State::Ready) return HSA_STATUS_ERROR;
+        if (faulted) return kMemoryFaultStatus;
         if (!hardwareQueues.contains(handle) || !handle || packet==UINT64_MAX) return HSA_STATUS_ERROR_INVALID_QUEUE;
-        const std::array<uint64_t,2> input={handle,packet};std::array<uint64_t,1> output{};
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        uint32_t raw=0;
-        const auto status=call(ownerPort,57,input.data(),uint32_t(input.size()),output.data(),
-                               uint32_t(output.size()),&raw);
-        // The process's GPU work faulted: KFD evicted its queues. The
-        // queue service call says where.
-        if (raw==uint32_t(kIOReturnVMError)) {
-            uint64_t inactive=0;
-            (void)serviceQueueLocked(handle,inactive);
-            return kMemoryFaultStatus;
+        // The CP write-pointer polling experiment (linuxu/headers/rt/wptr_poll.h):
+        // with MAC_HSA_DOORBELL=poll the command processor reads the write
+        // index itself, and no doorbell is sent. Only when the driver says
+        // it polls; otherwise the queue fails, said once.
+        static const bool pollRequested = [] {
+            const char *mode = std::getenv("MAC_HSA_DOORBELL");
+            return mode && std::strcmp(mode, "poll") == 0;
+        }();
+        if (pollRequested) {
+            if (wptrPoll < 0) wptrPoll = (sessionFlags(service) & MLG_SESSION_FLAG_WPTR_POLL) ? 1 : 0;
+            if (wptrPoll > 0) return HSA_STATUS_SUCCESS;
+            static std::atomic_flag said = ATOMIC_FLAG_INIT;
+            if (!said.test_and_set())
+                std::fprintf(stderr, "mac_hsa: MAC_HSA_DOORBELL=poll, but the driver does not poll queue write "
+                             "pointers (its personality sets no MacLinuxGPUWptrPollPeriod): no doorbell is sent\n");
+            return HSA_STATUS_ERROR;
         }
-        if (status==kDeviceSuspendedStatus) return status; // nothing rung; replayed after resume
-        if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
+        if (syncKickLocked()) {
+            // From kSyncKickDriverBuild: the driver rings it on its delivery
+            // thread and answers at once, one trip through the driver.
+            const uint64_t input[2]={handle,packet};
+            uint64_t output=UINT64_MAX;uint32_t outputs=1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            const auto kr=IOConnectCallScalarMethod(ownerPort,57,input,2,&output,&outputs);
+            if (kr==KERN_SUCCESS && outputs==1 && !output) return HSA_STATUS_SUCCESS;
+            if (kr==kIOReturnVMError) {
+                uint64_t inactive=0;
+                (void)serviceQueueLocked(handle,inactive);
+                return kMemoryFaultStatus;
+            }
+            if (kr==kIOReturnOffline) return kDeviceSuspendedStatus;	// nothing rung; replayed after resume
+            if (kr!=kIOReturnUnsupported) {
+                if (kr==kIOReturnNoDevice || kr==kIOReturnNotAttached || kr==MACH_SEND_INVALID_DEST) {
+                    static std::atomic_flag said=ATOMIC_FLAG_INIT;
+                    if (!said.test_and_set())
+                        std::fprintf(stderr,"mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
+                                     "this program's GPU session is gone: restart it to use the GPU again\n");
+                }
+                state=State::Faulted;return HSA_STATUS_ERROR;
+            }
+            // Unsupported: the driver leaves this doorbell to its session
+            // queue (a queue it cannot vouch for on the delivery thread).
+        }
+        if (!kickPort) {
+            kickPort=IONotificationPortCreate(kIOMainPortDefault);
+            if (!kickPort) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            // Room for every completion between two drains (kKickDrainAt).
+            mach_port_limits_t limits{MACH_PORT_QLIMIT_LARGE};
+            (void)mach_port_set_attributes(mach_task_self(),IONotificationPortGetMachPort(kickPort),
+                MACH_PORT_LIMITS_INFO,reinterpret_cast<mach_port_info_t>(&limits),MACH_PORT_LIMITS_INFO_COUNT);
+        }
+        if (sentKicks.size()>=kKickDrainAt) {
+            drainKicksLocked();
+            if (faulted) return kMemoryFaultStatus;
+            if (state!=State::Ready) return HSA_STATUS_ERROR;
+        }
+        const uint64_t input[2]={handle,packet};
+        uint64_t token=0;uint32_t outputs=1;
+        io_user_reference_t reference[kIOAsyncCalloutCount]{};
+        reference[kIOAsyncCalloutFuncIndex]=io_user_reference_t(uintptr_t(&kickCompleted));
+        reference[kIOAsyncCalloutRefconIndex]=io_user_reference_t(uintptr_t(this));
+        // The ring, its packets and the write index are coherent host
+        // memory: ordered before the doorbell, as ROCr's release store.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const auto kr=IOConnectCallAsyncScalarMethod(ownerPort,57,IONotificationPortGetMachPort(kickPort),
+            reference,kIOAsyncCalloutCount,input,2,&token,&outputs);
+        if (kr==kIOReturnOffline) return kDeviceSuspendedStatus; // nothing queued; replayed after resume
+        if (kr!=KERN_SUCCESS || outputs!=1) {
+            // As call() says it: the session or the driver is gone.
+            if (kr==kIOReturnNoDevice || kr==kIOReturnNotAttached || kr==MACH_SEND_INVALID_DEST) {
+                static std::atomic_flag said=ATOMIC_FLAG_INIT;
+                if (!said.test_and_set())
+                    std::fprintf(stderr,"mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
+                                 "this program's GPU session is gone: restart it to use the GPU again\n");
+            }
+            state=State::Faulted;return HSA_STATUS_ERROR;
+        }
+        sentKicks.push_back({token,handle,packet});
         return HSA_STATUS_SUCCESS;
+    }
+    bool takeRefusedKick(uint64_t handle,uint64_t &packet) override {
+        std::lock_guard lock(sessionMutex);
+        drainKicksLocked();
+        const auto found=refusedKicks.find(handle);
+        if (found==refusedKicks.end()) return false;
+        packet=found->second;refusedKicks.erase(found);return true;
     }
     hsa_status_t destroyQueue(uint64_t handle) override {
         std::lock_guard lock(sessionMutex);
@@ -638,6 +724,7 @@ public:
     }
     hsa_status_t serviceQueueLocked(uint64_t handle,uint64_t &inactive) {
         inactive=0;
+        drainKicksLocked();
         if (faulted) return kMemoryFaultStatus;
         if (state!=State::Ready) return HSA_STATUS_ERROR;
         if (!handle || !hardwareQueues.contains(handle)) return HSA_STATUS_ERROR_INVALID_QUEUE;
@@ -808,7 +895,7 @@ public:
         const DeviceBuffer &destination, uint64_t destinationOffset, size_t bytes) override {
         std::lock_guard lock(sessionMutex);
         if (state != State::Ready) return HSA_STATUS_ERROR;
-        if (!bytes || bytes > 4 * 1024 * 1024 || sourceOffset > source.size || bytes > source.size - sourceOffset ||
+        if (!bytes || bytes > copyLimitLocked() || sourceOffset > source.size || bytes > source.size - sourceOffset ||
             destinationOffset > destination.size || bytes > destination.size - destinationOffset ||
             (source.handle == destination.handle && sourceOffset < destinationOffset + bytes &&
              destinationOffset < sourceOffset + bytes))
@@ -817,6 +904,10 @@ public:
         const auto status = copyRaw(source.handle, sourceOffset, destination.handle, destinationOffset, bytes);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return status;
+    }
+    uint64_t maxCopyBytes() override {
+        std::lock_guard lock(sessionMutex);
+        return copyLimitLocked();
     }
     hsa_status_t exportBuffer(const DeviceBuffer &buffer, BufferToken &token) override {
         std::lock_guard lock(sessionMutex);
@@ -1020,6 +1111,88 @@ private:
         EventWaiter() : port(IONotificationPortCreate(kIOMainPortDefault)) {}
         ~EventWaiter() { if (port) IONotificationPortDestroy(port); }
     };
+    // Whether the driver rings doorbells synchronously (kSyncKickDriverBuild), asked once.
+    int syncKick = -1;
+    // Whether the CP polls write pointers (MAC_HSA_DOORBELL=poll), asked once.
+    int wptrPoll = -1;
+    bool syncKickLocked() {
+        if (syncKick < 0 && state == State::Ready) {
+            std::array<uint64_t,3> build{};
+            if (scalar(43,{},build) == HSA_STATUS_SUCCESS)
+                syncKick = linuxShim && build[2] >= kSyncKickDriverBuild;
+        }
+        return syncKick > 0;
+    }
+    // BOCopy's limit for this driver (kWindowedCopyDriverBuild), asked once.
+    uint64_t copyLimit = 0;
+    uint64_t copyLimitLocked() {
+        if (!copyLimit && state == State::Ready) {
+            std::array<uint64_t,3> build{};
+            if (scalar(43,{},build) == HSA_STATUS_SUCCESS)
+                copyLimit = linuxShim && build[2] >= kWindowedCopyDriverBuild ? kWindowedCopyBytes : kLegacyCopyBytes;
+        }
+        return copyLimit ? copyLimit : kLegacyCopyBytes;
+    }
+    // Doorbells sent and not yet answered (kickQueue), oldest first: the
+    // session queue answers them in order. Drained under sessionMutex.
+    struct SentKick { uint64_t token, handle, packet; };
+    static constexpr size_t kKickDrainAt = 256;
+    IONotificationPortRef kickPort = nullptr;
+    std::deque<SentKick> sentKicks;
+    std::map<uint64_t,uint64_t> refusedKicks;	// queue handle -> highest refused doorbell
+    bool drainingKicks = false;
+    struct KickAnswer { bool seen=false; IOReturn status=kIOReturnSuccess; uint64_t token=0, call=0, count=0, result=0; };
+    KickAnswer kickAnswer;
+    static void kickCompleted(void *refcon, IOReturn status, void **args, uint32_t count) {
+        auto &answer=static_cast<IOKitConnection *>(refcon)->kickAnswer;
+        answer.seen=true;answer.status=status;
+        // session_state.h's completion: [0] token, [1] the selector's
+        // IOReturn, [2] scalar outputs, [3] structure bytes, [4] out[0].
+        answer.token=count>0 ? uint64_t(uintptr_t(args[0])) : 0;
+        answer.call=count>1 ? uint64_t(uintptr_t(args[1])) : uint64_t(kIOReturnIPCError);
+        answer.count=count>2 ? uint64_t(uintptr_t(args[2])) : 0;
+        answer.result=count>4 ? uint64_t(uintptr_t(args[4])) : UINT64_MAX;
+    }
+    // Reads every doorbell answer that has arrived. Caller holds sessionMutex.
+    void drainKicksLocked() {
+        if (!kickPort || drainingKicks || sentKicks.empty()) return;
+        drainingKicks=true;
+        union {
+            mach_msg_header_t header;
+            uint8_t bytes[512];
+        } message;
+        uint64_t faultedQueue=0;
+        while (!sentKicks.empty()) {
+            std::memset(&message.header,0,sizeof(message.header));
+            const auto received=mach_msg(&message.header,MACH_RCV_MSG|MACH_RCV_TIMEOUT,0,sizeof(message),
+                                         IONotificationPortGetMachPort(kickPort),0,MACH_PORT_NULL);
+            if (received!=MACH_MSG_SUCCESS) break;	// none waiting (MACH_RCV_TIMED_OUT)
+            kickAnswer={};
+            IODispatchCalloutFromMessage(nullptr,&message.header,kickPort);
+            if (!kickAnswer.seen) continue;
+            const auto sent=sentKicks.front();sentKicks.pop_front();
+            const auto call=IOReturn(kickAnswer.call);
+            if (kickAnswer.status!=kIOReturnSuccess || kickAnswer.token!=sent.token) {
+                state=State::Faulted;continue;
+            }
+            if (call==kIOReturnSuccess && kickAnswer.count>=1 && !kickAnswer.result) continue;
+            // The process's GPU work faulted: KFD evicted its queues; the
+            // queue service says where.
+            if (call==kIOReturnVMError) {faultedQueue=sent.handle;continue;}
+            // Refused while the device suspended: nothing was rung.
+            if (call==kIOReturnOffline) {
+                auto &refused=refusedKicks[sent.handle];
+                refused=std::max(refused,sent.packet);continue;
+            }
+            if (call==kIOReturnNoDevice || call==kIOReturnNotAttached) {state=State::Faulted;continue;}
+            state=State::Faulted;
+        }
+        drainingKicks=false;
+        if (faultedQueue && !faulted && state==State::Ready) {
+            uint64_t inactive=0;
+            (void)serviceQueueLocked(faultedQueue,inactive);
+        }
+    }
     static EventWaiter &eventWaiter() {
         thread_local EventWaiter waiter;
         return waiter;

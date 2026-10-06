@@ -1248,3 +1248,208 @@ enum PerformancePlan {
     }
     struct PlanError: Error, Equatable { let message: String }
 }
+
+// ----------------------------------------------------------------
+// MARK: - The driver trail (~/Library/Logs/MacLinuxGPU-driver-trail.log)
+//
+// What the driver was doing, kept on disk by the display agent so it
+// survives a panic: the driver's retained log ring and its cached session
+// state, polled once a second over an observer client (the snapshot query
+// scripts/read-driver-log.py uses), and a line whenever a driver instance
+// appears or disappears. Every write is fsynced; the file rotates to .1.
+// ----------------------------------------------------------------
+
+/// The trail file: appended and fsynced line by line batches, rotated to
+/// `<name>.1` once it passes `maxBytes`.
+struct TrailFile {
+    let url: URL
+    let maxBytes: Int
+
+    static var defaultURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/MacLinuxGPU-driver-trail.log")
+    }
+
+    /// Append `lines` (each gets a newline) and fsync. Errors are returned,
+    /// never swallowed: the caller says so in its own log.
+    func append(_ lines: [String]) -> String? {
+        guard !lines.isEmpty else { return nil }
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
+           size >= maxBytes {
+            let old = URL(fileURLWithPath: url.path + ".1")
+            _ = unlink(old.path)
+            if rename(url.path, old.path) != 0 {
+                return "could not rotate \(url.path): \(String(cString: strerror(errno)))"
+            }
+        }
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0o644)
+        guard fd >= 0 else { return "could not open \(url.path): \(String(cString: strerror(errno)))" }
+        defer { close(fd) }
+        let data = Array(lines.map { $0 + "\n" }.joined().utf8)
+        var written = 0
+        while written < data.count {
+            let n = data[written...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return "could not write \(url.path): \(String(cString: strerror(errno)))"
+            }
+            written += n
+        }
+        if fsync(fd) != 0 { return "could not fsync \(url.path): \(String(cString: strerror(errno)))" }
+        return nil
+    }
+}
+
+/// One cached snapshot of the driver's state, as the trail records it.
+struct TrailState: Equatable {
+    /// Bit names of the session flags (dext/sources/session_state.h, as
+    /// scripts/read-driver-log.py names them).
+    static let sessionFlags = ["closing", "quarantined", "stopping", "pci_open", "modules_running",
+                               "final_cleanup", "releasable", "restart_required", "raw_bar_mapped",
+                               "runtime_device", "isolation_attempted", "device_removed", "retiring",
+                               "gpu_wedged"]
+    static let powerStates = ["active", "suspending", "suspended", "resuming", "lost"]
+
+    var session: [UInt64]?     // LSES words
+    var probe: [UInt64]?       // LPRO words
+    var power: [UInt64]?       // LPWR words
+    var reset: [UInt64]?       // LRST words
+
+    var summary: String {
+        var parts: [String] = []
+        if let s = session, s.count >= 9 {
+            let flags = TrailState.sessionFlags.enumerated().filter { s[1] >> UInt64($0.offset) & 1 == 1 }
+                .map { $0.element }
+            parts.append("session [\(flags.joined(separator: ","))] cause \(s[2]) code \(Int64(bitPattern: s[3])) " +
+                         "blocker \(s[6]) generation \(s[7]) participants \(s[8])")
+        } else {
+            parts.append("session unavailable")
+        }
+        if let p = probe, p.count >= 5 {
+            parts.append("probe attempted \(p[0]) modules \(p[1]) result \(Int64(bitPattern: p[2])) " +
+                         "fault \(p[3]) at \(String(format: "%#llx", p[4]))")
+        }
+        if let w = power, w.count >= 6 {
+            let state = Int(w[1]) < TrailState.powerStates.count ? TrailState.powerStates[Int(w[1])] : "\(w[1])"
+            parts.append("power \(state) flags \(String(format: "%#llx", w[3])) cause \(w[4]) " +
+                         "error \(Int64(bitPattern: w[5]))")
+        }
+        if let r = reset, r.count >= 6 {
+            parts.append("reset generation \(r[1]) flags \(String(format: "%#llx", r[2])) " +
+                         "queue resets \(r[3]) last \(Int64(bitPattern: r[5]))")
+        }
+        return parts.joined(separator: "; ")
+    }
+}
+
+/// The driver's retained log ring, read in bounded chunks (selector 21,
+/// "LLOG": end, next cursor, byte count, then up to 104 bytes), exactly as
+/// scripts/read-driver-log.py reads it.
+enum TrailLogReader {
+    static let tag: UInt64 = 0x4c4c4f47
+    enum Failure: Error, Equatable { case query(Int32), invalid(String) }
+
+    /// The bytes from `cursor` to the ring's end as first seen, the next
+    /// cursor, and how many bytes the ring dropped before `cursor` could
+    /// read them. `query` is one cached query: (status, scalars).
+    static func read(from cursor: UInt64, maxChunks: Int = 512,
+                     query: (UInt64) -> (Int32, [UInt64])) -> Result<(Data, UInt64, UInt64), Failure> {
+        var cursor = cursor
+        var target: UInt64?
+        var collected = Data()
+        var dropped: UInt64 = 0
+        for _ in 0..<maxChunks {
+            let (status, values) = query(cursor)
+            guard status == 0 else { return .failure(.query(status)) }
+            guard values.count >= 3, values.count <= 16 else { return .failure(.invalid("snapshot size")) }
+            let end = values[0], next = values[1], size = values[2]
+            guard size <= UInt64(values.count - 3) * 8, size <= 104, size <= next else {
+                return .failure(.invalid("byte count"))
+            }
+            let start = next - size
+            guard end >= next, !(start < cursor && cursor <= end), size != 0 || next == end else {
+                return .failure(.invalid("cursor"))
+            }
+            if target == nil { target = end }
+            if start > cursor { dropped += start - cursor }
+            var bytes = Data()
+            for value in values[3...] { withUnsafeBytes(of: value.littleEndian) { bytes.append(contentsOf: $0) } }
+            let keep = Int(min(size, target! > start ? target! - start : 0))
+            collected.append(bytes.prefix(keep))
+            cursor = min(next, target!)
+            if next >= target! || size == 0 { return .success((collected, cursor, dropped)) }
+        }
+        // More than a tick's worth: the rest is read on the next tick.
+        return .success((collected, cursor, dropped))
+    }
+}
+
+/// Splits the ring's bytes into whole lines; a partial last line waits for
+/// the rest.
+struct TrailLineBuffer {
+    private var pending = Data()
+    mutating func lines(_ data: Data) -> [String] {
+        pending.append(data)
+        var out: [String] = []
+        while let newline = pending.firstIndex(of: 0x0a) {
+            out.append(String(decoding: pending[pending.startIndex..<newline], as: UTF8.self))
+            pending.removeSubrange(pending.startIndex...newline)
+        }
+        if pending.count > 4096 {
+            out.append(String(decoding: pending, as: UTF8.self) + " [no newline]")
+            pending.removeAll()
+        }
+        return out
+    }
+    mutating func reset() -> String? {
+        defer { pending.removeAll() }
+        return pending.isEmpty ? nil : String(decoding: pending, as: UTF8.self) + " [cut off]"
+    }
+}
+
+/// An upgrade's handover when the previous driver refuses Retire (this app
+/// lacks the session-release authorization): the previous instance can
+/// leave only once its session is closed, so the installer asks it with
+/// ShutdownGPU (selector 42) from a session client of its own, which never
+/// joins the session. One answer, read here.
+enum UpgradeHandover: Equatable {
+    /// The session is closed: the instance leaves once IOKit stops it.
+    case closed
+    /// The close runs; ask again to follow it.
+    case closing
+    /// Other programs use the GPU. A driver from build 263 on remembers the
+    /// request and closes the session when the last of them leaves; an
+    /// older one must be asked again after they leave.
+    case clientsRemain
+    /// The session's close is uncertain: a restart (never a kill) ends it.
+    case quarantined
+    /// No answer to act on (the instance is leaving, or refused the call).
+    case refused(Int32)
+
+    static let busy = Int32(bitPattern: 0xe00002d5)   // kIOReturnBusy
+    static let error = Int32(bitPattern: 0xe00002bc)  // kIOReturnError
+
+    /// @kr: the call's IOReturn; @status, @phase: ShutdownGPU's out[0] and
+    /// out[1] (session_state.h's reference layout: phase 2 closing, 5
+    /// quarantined, 6 closed).
+    static func evaluate(kr: Int32, status: UInt64, phase: UInt64) -> UpgradeHandover {
+        if kr == busy { return .clientsRemain }
+        guard kr == 0 else { return .refused(kr) }
+        let result = Int32(bitPattern: UInt32(truncatingIfNeeded: status))
+        if phase == 5 || result == error { return .quarantined }
+        if phase == 6 && result == 0 { return .closed }
+        if phase == 2 { return .closing }
+        return .refused(result)
+    }
+
+    var summary: String {
+        switch self {
+        case .closed: return "its session is closed; it leaves once macOS stops it"
+        case .closing: return "closing its session through the normal close"
+        case .clientsRemain:
+            return "programs still use the GPU; its session closes when the last of them quits"
+        case .quarantined: return "its session could not close cleanly: restart the Mac, do not kill the driver"
+        case .refused(let kr): return String(format: "did not take ShutdownGPU (kr=%#x)", UInt32(bitPattern: kr))
+        }
+    }
+}

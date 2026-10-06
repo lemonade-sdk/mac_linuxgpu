@@ -371,6 +371,11 @@ static int kfd_code_after_sync_error;
 static uint64_t kfd_stopped_code;	/* the CP stopped queues with this error code */
 int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet)
 { assert(q && q->live); if (q->c==kfd_faulted) return -EFAULT; q->last=packet; ++kfd_kicks; return 0; }
+/* The delivery thread's form: never a queue that went (the kick table
+ * retired it first). */
+static unsigned kfd_direct_kicks;
+int dext_kfd_queue_kick_direct(struct dext_kfd_queue *q, uint64_t packet)
+{ assert(q && q->live); if (q->c==kfd_faulted) return -EFAULT; q->last=packet; ++kfd_direct_kicks; return 0; }
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive)
 {
     assert(q && q->live); *inactive=0;
@@ -476,7 +481,10 @@ int main(int argc, char **argv)
         uint64_t words[8], window[3], ring, meta, q, status;
         startup_failure=7; kfd_supported_error=0;
         assert(dext_compute_start(&pdev)==0);
-        assert(dext_compute_runtime_build(words)==0 && words[2]==258);
+        /* The serving build is the compiled one (RuntimeBuild's out[3]). */
+        uint64_t compiled[4] = {0};
+        assert(dext_compute_runtime_build_cached(compiled)==0);
+        assert(dext_compute_runtime_build(words)==0 && words[2]==compiled[3] && compiled[3]>=258);
         dext_compute_set_kfd_policy(false);
         dext_compute_select_client(3);
         assert(dext_compute_query_info(12,words,8)==8 && words[1]==1 && !words[2]);
@@ -825,6 +833,15 @@ int main(int argc, char **argv)
         assert(dext_compute_aql_queue_create(r0,m1,64,&status,out)==-EBUSY_L);
         assert(!dext_compute_aql_queue_kick(q0,0,&status) && !dext_compute_aql_queue_kick(q1,0,&status));
         assert(kfd_kicks==2);
+        /* The delivery thread's form (kick_table.h) rings the client's own
+         * published queues, and only those. */
+        assert(!dext_compute_aql_queue_kick_direct(7,q0,3) && kfd_direct_kicks==1);
+        assert(dext_compute_aql_queue_kick_direct(8,q0,3)==-EAGAIN_L && kfd_direct_kicks==1);
+        assert(dext_compute_aql_queue_kick_direct(7,0xdead,3)==-EAGAIN_L && kfd_direct_kicks==1);
+        /* None while the device is not taking work (a power transition). */
+        dext_compute_kick_gate(false);
+        assert(dext_compute_aql_queue_kick_direct(7,q0,4)==-EAGAIN_L && kfd_direct_kicks==1);
+        dext_compute_kick_gate(true);
         assert(!dext_compute_aql_queue_service(q1,&status,out) && !out[0]);
         assert(dext_compute_bo_free(r0)==-EBUSY_L);
         /* Copies and bounded launches stay inside the process. */
@@ -838,9 +855,13 @@ int main(int argc, char **argv)
         /* No cross-process sharing of a KFD BO yet. */
         assert(dext_compute_bo_export(code,1,2,info)==-ENOTREADY_L);
         assert(!dext_compute_aql_queue_destroy(q0,&status) && kfd_queue_destroys==1);
+        /* Retired before its destroy: never rung again (the stub asserts). */
+        assert(dext_compute_aql_queue_kick_direct(7,q0,5)==-EAGAIN_L);
+        assert(!dext_compute_aql_queue_kick_direct(7,q1,5) && kfd_direct_kicks==2);
         assert(!dext_compute_bo_free(r0));
         /* Client close: queues, then the KFD process; nothing quarantines. */
         assert(!dext_compute_release_client(7));
+        assert(dext_compute_aql_queue_kick_direct(7,q1,6)==-EAGAIN_L && kfd_direct_kicks==2);
         assert(kfd_queue_destroys==2 && kfd_closes==1 && !kfd_clients[0].live);
         dext_compute_select_client(7);
         assert(dext_compute_bo_get_info(m0,info)==-ENOENT_L);
@@ -1005,6 +1026,8 @@ int main(int argc, char **argv)
         assert(!dext_compute_aql_queue_fault(qa,&flags,&va) &&
                flags==(DEXT_KFD_FAULT_VALID|DEXT_KFD_FAULT_NOT_PRESENT) && va==0x1235d4000ULL);
         assert(dext_compute_aql_queue_kick(qa,0,out)==-EFAULT_L);
+        assert(dext_compute_aql_queue_kick_direct(21,qa,0)==-EFAULT_L);
+        assert(!dext_compute_aql_queue_kick_direct(22,qb,0));
         /* 22 neither sees it nor stops. */
         dext_compute_select_client(22);
         assert(!dext_compute_aql_queue_kick(qb,0,out) && !dext_compute_aql_queue_service(qb,out,out+1));
@@ -1012,6 +1035,7 @@ int main(int argc, char **argv)
         /* 21 leaves; the device and 22 go on; then 22 leaves. */
         dext_compute_select_client(0);
         assert(dext_compute_release_client(21)==0 && kfd_closes==1);
+        assert(dext_compute_aql_queue_kick_direct(21,qa,1)==-EAGAIN_L);
         kfd_faulted=NULL;
         assert(!dext_compute_bo_free(payload));
         dext_compute_select_client(22);

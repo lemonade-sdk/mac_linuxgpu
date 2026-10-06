@@ -10,6 +10,52 @@
 #include <system_error>
 
 namespace mac_hsa::detail {
+namespace {
+// The copy workers. Never destroyed: a process may exit with copies
+// outstanding (without hsa_shut_down).
+struct CopyWorkers {
+    std::mutex mutex;
+    std::condition_variable work, finished;
+    std::deque<CopyJob *> queued;
+    unsigned idle = 0;
+};
+CopyWorkers &copyWorkers = *new CopyWorkers;
+void copyWorker() {
+    auto &w = copyWorkers;
+    std::unique_lock lock(w.mutex);
+    for (;;) {
+        ++w.idle;
+        // An idle worker leaves after a while; the next copy starts one.
+        const bool got = w.work.wait_for(lock, std::chrono::seconds(2), [&] { return !w.queued.empty(); });
+        --w.idle;
+        if (!got) return;
+        auto *job = w.queued.front();
+        w.queued.pop_front();
+        lock.unlock();
+        job->work(job->stop.get_token());
+        lock.lock();
+        job->work = nullptr;	// its captures (buffers, signals) go before it is done
+        job->done.store(true, std::memory_order_release);
+        w.finished.notify_all();
+    }
+}
+}
+void startCopyJob(CopyJob *job) {
+    auto &w = copyWorkers;
+    std::lock_guard lock(w.mutex);
+    // Every queued job has a worker of its own: none waits behind another.
+    if (w.idle <= w.queued.size()) {
+        try { std::thread(copyWorker).detach(); }
+        catch (...) { job->work = nullptr; throw; }	// never queued: nothing to wait for
+    }
+    w.queued.push_back(job);
+    w.work.notify_one();
+}
+CopyJob::~CopyJob() {
+    auto &w = copyWorkers;
+    std::unique_lock lock(w.mutex);
+    w.finished.wait(lock, [&] { return done.load(std::memory_order_acquire) || !work; });
+}
 void reapCopyJobs() {
     std::vector<std::unique_ptr<CopyJob>> retired;
     {
@@ -174,26 +220,35 @@ hsa_status_t copyBytes(void *dst, const void *src, size_t size,
     }
     const auto srcOffset = source ? reinterpret_cast<uintptr_t>(src) - reinterpret_cast<uintptr_t>(source->base) : 0;
     const auto dstOffset = destination ? reinterpret_cast<uintptr_t>(dst) - reinterpret_cast<uintptr_t>(destination->base) : 0;
+    // The driver's copy, in calls of at most its limit. Both buffers stay
+    // retained throughout; the first failure ends the copy (retrying through
+    // another engine cannot prove the first completed).
+    const auto driverCopy = [&](const std::shared_ptr<Connection> &gpu) {
+        const size_t limit = size_t(gpu->maxCopyBytes());
+        for (size_t offset = 0; offset < size;) {
+            const auto bytes = std::min(limit, size - offset);
+            const auto status = gpu->copyBuffers(source->buffer, srcOffset + offset,
+                destination->buffer, dstOffset + offset, bytes);
+            if (status != HSA_STATUS_SUCCESS) return status;
+            offset += bytes;
+        }
+        return HSA_STATUS_SUCCESS;
+    };
+    // A host end that is a shared buffer of the same device is system memory
+    // the GPU already maps: the driver copies between it and the device
+    // buffer itself (SDMA), with no CPU copy through a staging buffer.
+    const auto shared = [](const std::shared_ptr<Allocation> &a, const std::shared_ptr<Connection> &gpu) {
+        return a && a->shared.host && a->connection == gpu && a->buffer.handle;
+    };
+    if (srcGPU && !dstGPU && shared(destination, srcGPU)) return driverCopy(srcGPU);
+    if (dstGPU && !srcGPU && shared(source, dstGPU)) return driverCopy(dstGPU);
     if (srcGPU && !dstGPU) return srcGPU->readBuffer(source->buffer, srcOffset, dst, size);
     if (!srcGPU) return dstGPU->writeBuffer(destination->buffer, dstOffset, src, size);
     if (srcGPU == dstGPU) {
         if (src == dst) return HSA_STATUS_SUCCESS;
         const bool overlap = source->buffer.handle == destination->buffer.handle &&
             srcOffset < dstOffset + size && dstOffset < srcOffset + size;
-        if (!overlap) {
-            // The bounded driver copy RPC accepts at most 4 MiB. Keep both BOs
-            // retained throughout all chunks and propagate the first failure;
-            // retrying through another engine cannot prove the first completed.
-            constexpr size_t maxCopy = 4 * 1024 * 1024;
-            for (size_t offset = 0; offset < size;) {
-                const auto bytes = std::min(maxCopy, size - offset);
-                const auto status = srcGPU->copyBuffers(source->buffer, srcOffset + offset,
-                    destination->buffer, dstOffset + offset, bytes);
-                if (status != HSA_STATUS_SUCCESS) return status;
-                offset += bytes;
-            }
-            return HSA_STATUS_SUCCESS;
-        }
+        if (!overlap) return driverCopy(srcGPU);
     }
     std::array<uint8_t, 4096> staging;
     const bool backwards = srcGPU == dstGPU && source->buffer.handle == destination->buffer.handle &&
@@ -558,8 +613,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
         if (copyJobs.size() >= 64) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         copyJobs.reserve(copyJobs.size() + 1);
         auto job = std::make_unique<CopyJob>();
-        auto jobPointer = job.get();
-        job->worker = std::jthread([=, waiting = std::move(waiting), signal = completed->second]
+        job->work = [=, waiting = std::move(waiting), signal = completed->second]
             (std::stop_token stop) {
             bool failed = false;
             for (const auto &dependency : waiting) {
@@ -579,8 +633,8 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
             if (failed) signal->value().store(-1, std::memory_order_release);
             else signal->value().fetch_sub(1, std::memory_order_release);
             mac_hsa::notifySignal(*signal);
-            jobPointer->done.store(true, std::memory_order_release);
-        });
+        };
+        startCopyJob(job.get());
         copyJobs.push_back(std::move(job));
         return HSA_STATUS_SUCCESS;
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

@@ -25,7 +25,16 @@ CC := clang
 # in a Linux build. Upstream relies on it: amdgpu_vm_bo_update() returns its
 # uninitialized r for a mapping-less PRT update (the first AMDGPU_CS of every
 # render client).
-HOSTCFLAGS := -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_RT_HOST_SHADOW=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
+# Linux's code-generation flags (the top-level Makefile, CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
+# and CONFIG_FRAME_POINTER as arm64 builds it): the upstream sources are written
+# for -O2 with type-punning allowed (-fno-strict-aliasing), signed overflow
+# wrapping (-fno-strict-overflow) and null checks kept even after a
+# dereference (-fno-delete-null-pointer-checks). Frame pointers stay, so a
+# dext crash log still walks the stack. Applied to the dext's objects and to
+# the host builds the offline tests link, so the tests run the same code.
+KERNEL_OPTFLAGS := -O2 -fno-strict-aliasing -fno-strict-overflow -fno-delete-null-pointer-checks \
+	-fno-common -fno-omit-frame-pointer -fno-optimize-sibling-calls
+HOSTCFLAGS := $(KERNEL_OPTFLAGS) -std=gnu11 -D__KERNEL__ -DCONFIG_DRM_FBDEV_OVERALLOC=0 -DLINUXU_RT_HOST_SHADOW=1 -include linux/autoconf.h -ftrivial-auto-var-init=zero -w -MMD -MP -Wno-incompatible-function-pointer-types
 
 # Include order matters: linuxu/headers first (shadow headers override),
 # then the driver-local include roots inside the submodule. Never add

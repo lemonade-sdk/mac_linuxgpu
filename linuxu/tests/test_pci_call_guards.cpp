@@ -9,11 +9,20 @@
  *            BAR, aperture accesses outside BAR0, and every accessor after
  *            Close: refused before any call, a transport fault recorded;
  *   race     Close waits for an admitted access and a raw config read in
- *            flight, and admits nothing new meanwhile. */
+ *            flight, and admits nothing new meanwhile;
+ *   fatal    a child process ends itself by assert(), std::terminate, a
+ *            libc++ hardening assertion and a smashed stack (also with the
+ *            PCI control lock held by another thread, and on two threads at
+ *            once): its session is closed exactly once before it dies, and
+ *            it still dies of SIGABRT; with the session closed normally
+ *            first, no second Close (dext/sources/fatal_close.h). */
 #include "pci_call_mocks.h"
 #include "../../dext/sources/dext_main.mm"
+#include <assert.h>
 #include <mach/mach.h>
 #include <stdarg.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <thread>
 
 #define CHECK(c) do { if (!(c)) { fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
@@ -230,11 +239,126 @@ static void race(void)
 	       "in flight, admits nothing new meanwhile, and a new session opens after it\n");
 }
 
+/* ---- fatal paths close first, in child processes ---- */
+enum fatal_kind { FATAL_ASSERT, FATAL_TERMINATE, FATAL_LIBCXX, FATAL_STACK, FATAL_ASSERT_LOCKED,
+		  FATAL_TWO_THREADS, FATAL_AFTER_CLOSE };
+
+/* A real overrun of a protected frame: the canary check at return calls
+ * __stack_chk_fail (built with -fstack-protector-strong). */
+__attribute__((noinline)) static void smash(size_t n)
+{
+	char buffer[16];
+	volatile char *p = buffer;
+	for (size_t i = 0; i < n; i++) p[i] = 0x41;
+}
+
+static IOPCIDevice *g_child_pci;
+static int g_child_fd;
+static void note_close(void)
+{
+	/* 'C': a Close of the open session, nothing in flight. */
+	const char c = g_child_pci->violations ? 'V' : (g_child_pci->open ? 'C' : 'X');
+	(void)write(g_child_fd, &c, 1);
+}
+
+[[noreturn]] static void run_fatal_child(fatal_kind kind, int fd)
+{
+	/* No crash report for a death the test asks for. */
+	task_set_exception_ports(mach_task_self(), EXC_MASK_CRASH | EXC_MASK_CORPSE_NOTIFY,
+				 MACH_PORT_NULL, EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+	IOPCIDevice *pci = session();
+	g_child_pci = pci;
+	g_child_fd = fd;
+	/* Reported from inside the provider's Close. */
+	pci->during_close = &note_close;
+	switch (kind) {
+	case FATAL_ASSERT:
+		assert(getpid() == 0);
+		break;
+	case FATAL_TERMINATE:
+		std::terminate();
+	case FATAL_LIBCXX:
+		std::__libcpp_verbose_abort("hardening: index %d out of range", 7);
+	case FATAL_STACK:
+		smash(64);
+		break;
+	case FATAL_ASSERT_LOCKED: {
+		std::atomic<bool> held{false};
+		std::thread([&] {
+			dext_pci_control_guard control;
+			held = true;
+			for (;;) pause();
+		}).detach();
+		while (!held) std::this_thread::yield();
+		assert(getpid() == 0);
+		break;
+	}
+	case FATAL_TWO_THREADS: {
+		std::atomic<int> ready{0};
+		for (int i = 0; i < 2; i++)
+			std::thread([&] {
+				ready++;
+				while (ready < 2) {}
+				assert(getpid() == 0);
+			}).detach();
+		for (;;) pause();
+	}
+	case FATAL_AFTER_CLOSE:
+		dext_close();
+		assert(getpid() == 0);
+		break;
+	}
+	_exit(0);
+}
+
+static void fatal_case(fatal_kind kind, const char *name)
+{
+	int fds[2];
+	CHECK(pipe(fds) == 0);
+	fflush(nullptr);
+	const pid_t child = fork();
+	CHECK(child >= 0);
+	if (child == 0) {
+		close(fds[0]);
+		run_fatal_child(kind, fds[1]);
+	}
+	close(fds[1]);
+	char notes[8] = {};
+	ssize_t n = 0, r;
+	while (n < (ssize_t)sizeof(notes) && (r = read(fds[0], notes + n, sizeof(notes) - n)) > 0)
+		n += r;
+	close(fds[0]);
+	int status = 0;
+	CHECK(waitpid(child, &status, 0) == child);
+	if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT || n != 1 || notes[0] != 'C')
+		fprintf(stderr, "%s: status %#x (signal %d), Close notes \"%.*s\"\n", name, status,
+			WIFSIGNALED(status) ? WTERMSIG(status) : 0, (int)n, notes);
+	CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	/* Exactly one Close, of an open session with nothing in flight. */
+	CHECK(n == 1 && notes[0] == 'C');
+}
+
+static void fatal(void)
+{
+	fatal_case(FATAL_ASSERT, "assert");
+	fatal_case(FATAL_TERMINATE, "std::terminate");
+	fatal_case(FATAL_LIBCXX, "libc++ verbose abort");
+	fatal_case(FATAL_STACK, "smashed stack");
+	fatal_case(FATAL_ASSERT_LOCKED, "assert with the PCI control lock held");
+	fatal_case(FATAL_TWO_THREADS, "assert on two threads at once");
+	fatal_case(FATAL_AFTER_CLOSE, "assert after a normal Close");
+	printf("PASS fatal paths close first: assert, std::terminate, a libc++ hardening assertion "
+	       "and a smashed stack (also with the PCI control lock held elsewhere, and on two "
+	       "threads at once) close the session once, then die of SIGABRT; a session closed "
+	       "normally is not closed again\n");
+}
+
 int main(int argc, char **argv)
 {
 	const char *mode = argc > 1 ? argv[1] : "guards";
 	if (!strcmp(mode, "guards")) guards();
 	else if (!strcmp(mode, "race")) race();
-	else { fprintf(stderr, "usage: %s guards|race\n", argv[0]); return 2; }
+	else if (!strcmp(mode, "fatal")) fatal();
+	else { fprintf(stderr, "usage: %s guards|race|fatal\n", argv[0]); return 2; }
 	return 0;
 }

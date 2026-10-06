@@ -11,17 +11,24 @@
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 258u /* 192: KFD compute sessions, QueryInfo tag 12;
+#define DEXT_RUNTIME_BUILD 263u /* 192: KFD compute sessions, QueryInfo tag 12;
                                    243: session calls are async (session_state.h);
                                    256: AQLQueueService reports a GPU memory fault
                                    (kIOReturnVMError, flags and address);
-                                   258: CodeSync (90) */
+                                   258: CodeSync (90);
+                                   262: BOCopy (48) takes up to 16 MiB, and copies
+                                   between system pages and VRAM by SDMA through
+                                   TTM's GART windows;
+                                   263: AQLQueueKick (57) also served synchronously,
+                                   on the delivery thread (kick_table.h) */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u
 #define DEXT_BO_MEMORY_BASE 0x10000u
 #define DEXT_EXPORT_SLOTS 256u
 #define DEXT_CLIENT_SLOTS 64u
+#define KICK_TABLE_SLOTS DEXT_QUEUE_SLOTS
+#include "kick_table.h"
 
 /* A BO is either a VMID0 kernel BO (object) of the legacy path or a BO of
  * the owner's KFD process (kfd). */
@@ -96,6 +103,9 @@ static struct {
      * touching the context (dext_compute_runtime_build_cached). */
     bool runtime_available;
 } production;
+
+/* The KFD queues the delivery thread may ring (kick_table.h). */
+static struct kick_table production_kicks;
 
 uint64_t dext_compute_select_client(uint64_t client)
 {
@@ -292,6 +302,8 @@ static int kfd_error(struct dext_kfd_client *c, int r)
 static int kfd_release(struct production_client *rec)
 {
     struct dext_kfd_client *c = rec->kfd;
+    /* Nothing of the process is rung from the delivery thread from here. */
+    kick_table_retire_owner(&production_kicks, rec->client);
     for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
         if (q->kfd && q->owner == rec->client) memset(q, 0, sizeof(*q));
@@ -1286,6 +1298,9 @@ int dext_compute_aql_queue_create(uint64_t ring_handle,
         slot->handle = ++production.next_queue_handle;
         slot->ring_handle = ring_handle;
         slot->metadata_handle = metadata_handle;
+        /* Ringable on the delivery thread too (a full table leaves the
+         * queue to the session queue's AQLQueueKick alone). */
+        (void)kick_table_publish(&production_kicks, slot->handle, slot->owner, kq);
         *out_status = 0;
         *out_handle = slot->handle;
         return 0;
@@ -1389,12 +1404,37 @@ int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
     return 0;
 }
 
+static int kick_direct_ring(void *queue, uint64_t packet)
+{
+    return dext_kfd_queue_kick_direct((struct dext_kfd_queue *)queue, packet);
+}
+
+void dext_compute_kick_gate(bool open)
+{
+    kick_table_set_closed(&production_kicks, !open);
+}
+
+int dext_compute_aql_queue_kick_direct(uint64_t client, uint64_t handle, uint64_t packet)
+{
+    /* Flags the session queue publishes (dext_compute_runtime_build_cached
+     * reads them the same way); the table keeps the queue alive. */
+    if (!__atomic_load_n(&production.ready, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&production.uncertain, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&production.removed, __ATOMIC_ACQUIRE))
+        return -EAGAIN_L;
+    const int r = kick_table_ring(&production_kicks, client, handle, packet, kick_direct_ring, -ENOENT);
+    if (r == 0) return 0;
+    if (r == -EFAULT) return -EFAULT_L;
+    return -EAGAIN_L;
+}
+
 int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status)
 {
     struct production_queue *q = production_queue_lookup(handle);
     if (!q || !out_status) return -ENOENT_L;
     if (production.uncertain) return -EBUSY_L;
     if (q->kfd) {
+        kick_table_retire(&production_kicks, q->handle);
         /* DESTROY_QUEUE: a removal MES did not confirm even after the
          * session's hung-queue recovery leaves MES running the queue. */
         if (dext_kfd_queue_destroy(q->kfd) != 0) {

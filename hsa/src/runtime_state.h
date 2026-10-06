@@ -5,6 +5,10 @@
 #include <hsa/hsa_ext_amd.h>
 #include <hsa/hsa_ven_amd_loader.h>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <stop_token>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -46,10 +50,19 @@ struct Allocation {
         else if (!backing && type == HSA_EXT_POINTER_TYPE_HSA) std::free(base);
     }
 };
+// An hsa_amd_memory_async_copy: run by a copy worker (memory.cpp), each
+// job on a thread of its own as long as it runs, so a copy that waits for
+// its dependencies never holds up another; the threads are kept and reused
+// rather than made for every copy. Destroying a job waits for it to finish
+// (a stop request makes a job that has not copied yet fail at once).
 struct CopyJob {
     std::atomic<bool> done{false};
-    std::jthread worker;
+    std::stop_source stop;
+    std::function<void(std::stop_token)> work;
+    ~CopyJob();
 };
+// Queues @job for a copy worker, starting one when every worker is busy.
+void startCopyJob(CopyJob *job);
 
 /* The runtime's process-wide state lives until the process ends and is
  * never destroyed: a client may exit with executables, queues and buffers

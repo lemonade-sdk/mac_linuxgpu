@@ -1,0 +1,47 @@
+drm/amdgpu: amdgpu_ttm_copy_mem_to_mem for a KFD session's copies
+
+The MacLinuxGPU driver copies between a KFD process's buffers on the
+host's behalf (linuxu/src/amdgpu-rt/kfd_session.c, rt_kfd_bo_copy). For a
+buffer in system pages it copied through the CPU into a GART-bound staging
+buffer, 1 MiB at a time, each step a CPU copy and a waited SDMA job: about
+3 GB/s on a link where SDMA reaches 7. amdgpu_ttm_copy_mem_to_mem is how
+TTM itself moves such a buffer (amdgpu_move_blit): system pages are mapped
+through the entity's GART windows and SDMA copies them directly, one fence
+for the whole range. Make it callable from outside amdgpu_ttm.c.
+
+Its nonnull attribute covered every pointer argument, resv among them,
+which amdgpu_copy_buffer accepts as NULL (no implicit sync) and the session
+copy passes so. The attribute now names the arguments that must be set.
+Behaviour inside amdgpu_ttm.c is unchanged.
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@ -293,8 +293,8 @@
+  * move and different for a BO to BO copy.
+  *
+  */
+-__attribute__((nonnull))
+-static int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
++__attribute__((nonnull(1, 2, 3, 4, 8)))
++int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
+ 				      struct amdgpu_ttm_buffer_entity *entity,
+ 				      const struct amdgpu_copy_mem *src,
+ 				      const struct amdgpu_copy_mem *dst,
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h
+@@ -186,6 +186,13 @@
+ void amdgpu_ttm_fini(struct amdgpu_device *adev);
+ void amdgpu_ttm_set_buffer_funcs_status(struct amdgpu_device *adev,
+ 					bool enable);
++int amdgpu_ttm_copy_mem_to_mem(struct amdgpu_device *adev,
++			       struct amdgpu_ttm_buffer_entity *entity,
++			       const struct amdgpu_copy_mem *src,
++			       const struct amdgpu_copy_mem *dst,
++			       uint64_t size, bool tmz,
++			       struct dma_resv *resv,
++			       struct dma_fence **f);
+ int amdgpu_copy_buffer(struct amdgpu_device *adev,
+ 		       struct amdgpu_ttm_buffer_entity *entity,
+ 		       uint64_t src_offset,

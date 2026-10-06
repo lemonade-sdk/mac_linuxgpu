@@ -97,6 +97,11 @@ struct RuntimeQueue {
             if (!active || !hardwareHandle || errorDelivered) return;
             uint64_t inactive=0;
             status=connection->serviceQueue(hardwareHandle,inactive);
+            // A doorbell the driver refused while the device suspended
+            // waits, as one refused at once does, and is rung on resume.
+            if (uint64_t refused=0; connection->takeRefusedKick(hardwareHandle,refused)) {
+                pendingDoorbell=std::max(pendingDoorbell,int64_t(refused));paused=true;
+            }
             if (status==kDeviceSuspendedStatus) {paused=true;return;}
             // Taking work again: ring what waited.
             if (status==HSA_STATUS_SUCCESS && paused && !submissionsHeld(connection.get())) {
