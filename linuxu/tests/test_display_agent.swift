@@ -541,3 +541,79 @@ do {
     try? FileManager.default.removeItem(at: dir)
 }
 print("PASS GPU recovery: first read records, a queue reset restarts ended mirrors, lost VRAM re-mirrors, wedged lets go; status round trip")
+
+// Performance controls: the levels, the card's own profile list (the R9700's,
+// as its pp_power_profile_mode shows it), the live line, persistence and what
+// a reapply writes.
+do {
+    check(PerformanceLevel.allCases.map { $0.title } == ["Auto", "High", "Peak", "Low"])
+    check(PerformanceLevel.peak.sysfsValue == "profile_peak" && PerformanceLevel.high.sysfsValue == "high")
+    check(PerformanceLevel(sysfs: "profile_peak\n") == .peak && PerformanceLevel(sysfs: "auto\n") == .auto)
+    check(PerformanceLevel(sysfs: "manual\n") == nil && PerformanceLevel(sysfs: "profile_standard") == nil)
+    check(PerformanceLevel(argument: "peak") == .peak && PerformanceLevel(argument: "HIGH") == .high &&
+          PerformanceLevel(argument: "profile_peak") == .peak && PerformanceLevel(argument: "fast") == nil)
+
+    let modes = """
+    PROFILE_INDEX(NAME) CLOCK_TYPE(NAME) FPS MinActiveFreqType MinActiveFreq BoosterFreqType BoosterFreq
+     0 BOOTUP_DEFAULT*:
+                        0(       GFXCLK)       0       1       0       4     800 4587520  -65536       0
+                        1(         FCLK)       0       3       0       1       0 5898240   -6553   -6553
+     1 3D_FULL_SCREEN :
+                        0(       GFXCLK)       0       1       0       1       0 5570560    -655   -6553
+     2   POWER_SAVING :
+     3          VIDEO :
+     4             VR :
+     5        COMPUTE :
+                        0(       GFXCLK)       0       4     600       1       0 4587520  -16384       0
+     6         CUSTOM :
+     7      WINDOW_3D :
+    """
+    let profiles = PowerProfile.parse(modes)
+    check(profiles.map { $0.index } == Array(0...7), "every profile the card lists, in order")
+    check(profiles[0] == PowerProfile(index: 0, name: "BOOTUP_DEFAULT", active: true))
+    check(profiles.filter { $0.active }.count == 1 && profiles[5].name == "COMPUTE")
+    check(PowerProfile.selectable(profiles).map { $0.title } ==
+          ["Default", "3D Fullscreen", "Power Saving", "Video", "VR", "Compute", "3D Windowed"],
+          "CUSTOM (which takes parameters) is not offered")
+    check(PowerProfile.find("compute", in: profiles)?.index == 5 &&
+          PowerProfile.find("3D Fullscreen", in: profiles)?.index == 1 &&
+          PowerProfile.find("power_saving", in: profiles)?.index == 2 &&
+          PowerProfile.find("default", in: profiles)?.index == 0 &&
+          PowerProfile.find("5", in: profiles)?.name == "COMPUTE")
+    check(PowerProfile.find("custom", in: profiles) == nil && PowerProfile.find("6", in: profiles) == nil &&
+          PowerProfile.find("turbo", in: profiles) == nil)
+    let older = PowerProfile.parse(" 0 BOOTUP_DEFAULT : 70 60 0 0\n 1 3D_FULL_SCREEN*: 70 60 1 3\n")
+    check(older.count == 2 && older[1].active && !older[0].active, "the older one-line layout too")
+
+    check(PerformanceReading.currentMHz("0: 500Mhz \n1: 3462Mhz *\n2: 2350Mhz \n") == 3462)
+    check(PerformanceReading.currentMHz("S: 41Mhz *\n0: 500Mhz \n") == 41)
+    check(PerformanceReading.currentMHz("0: 500Mhz \n") == nil)
+    check(PerformanceReading(gfxMHz: 3462, memoryMHz: 1258, temperatureC: 48, powerW: 41.4).line ==
+          "GFX 3462 MHz  ·  Memory 1258 MHz  ·  48 °C  ·  41 W")
+    check(PerformanceReading(gfxMHz: nil, memoryMHz: 96).line == "GFX ?  ·  Memory 96 MHz")
+
+    // Persisted in the display prefs; older files read as never chosen.
+    let dir = FileManager.default.temporaryDirectory.appendingPathComponent("mlg-perf-\(getpid())")
+    let url = dir.appendingPathComponent("displays.json")
+    let prefs = DisplayPrefs(off: ["k"], disconnected: false, performanceLevel: .high, powerProfile: "COMPUTE")
+    try? prefs.save(to: url)
+    check(DisplayPrefs.load(from: url) == prefs)
+    try? Data(#"{"off": ["k"], "disconnected": false}"#.utf8).write(to: url)
+    let old = DisplayPrefs.load(from: url)
+    check(old.performanceLevel == nil && old.powerProfile == nil && old.off == ["k"])
+    try? Data(#"{"off": [], "performanceLevel": "turbo"}"#.utf8).write(to: url)
+    check(DisplayPrefs.load(from: url).performanceLevel == nil, "an unknown level reads as never chosen")
+    try? FileManager.default.removeItem(at: dir)
+
+    // A reapply writes the level, then the profile by its current index.
+    check(PerformancePlan.writes(prefs: DisplayPrefs(), profiles: profiles) == .success([]),
+          "nothing chosen: nothing written (the driver's Auto)")
+    check(PerformancePlan.writes(prefs: prefs, profiles: profiles) == .success([
+        .init(attribute: .performanceLevel, value: "high"), .init(attribute: .powerProfile, value: "5")]))
+    check(PerformancePlan.writes(prefs: DisplayPrefs(performanceLevel: .peak), profiles: []) ==
+          .success([.init(attribute: .performanceLevel, value: "profile_peak")]))
+    check(PerformancePlan.writes(prefs: DisplayPrefs(powerProfile: "COMPUTE"), profiles: older) ==
+          .failure(.init(message: "the card lists no power profile COMPUTE")), "loudly, never a default")
+    check(SysfsWriteAttribute.performanceLevel.rawValue == 0 && SysfsWriteAttribute.powerProfile.rawValue == 1)
+}
+print("PASS performance controls: levels, the card's profile list, the live line, persistence and the reapply plan")

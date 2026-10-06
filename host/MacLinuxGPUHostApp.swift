@@ -2345,6 +2345,9 @@ struct AppMain {
         if args[1] == "menu-bar" {
             exit(runMenuBar())
         }
+        if ["performance", "performance-level", "power-profile"].contains(args[1]) {
+            exit(runPerformanceCommand(Array(args.dropFirst(1))))
+        }
         if ["display-probe", "display-test", "display-off"].contains(args[1]) {
             exit(runDisplayCommand(args[1], Array(args.dropFirst(2))))
         }

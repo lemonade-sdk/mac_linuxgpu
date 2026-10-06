@@ -836,16 +836,28 @@ struct DisplayPrefs: Codable, Equatable {
     /// driver so the GPU can be unplugged like an ejected disk. Cleared by
     /// "Reconnect GPU", or by the daemon once the GPU has left the bus.
     var disconnected = false
+    /// The performance controls (PerformanceLevel; a power profile by the
+    /// name the card lists it under, e.g. "COMPUTE"). nil: never chosen,
+    /// the driver's own default (Auto, as on Linux). Reapplied whenever the
+    /// GPU comes up (PerformancePlan).
+    var performanceLevel: PerformanceLevel?
+    var powerProfile: String?
 
-    init(off: [String] = [], disconnected: Bool = false) {
+    init(off: [String] = [], disconnected: Bool = false, performanceLevel: PerformanceLevel? = nil,
+         powerProfile: String? = nil) {
         self.off = off
         self.disconnected = disconnected
+        self.performanceLevel = performanceLevel
+        self.powerProfile = powerProfile
     }
-    /// Files from before "disconnected" existed read as connected.
+    /// Files from before "disconnected" or the performance choices existed
+    /// read as connected, with the driver's defaults.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         off = try c.decodeIfPresent([String].self, forKey: .off) ?? []
         disconnected = try c.decodeIfPresent(Bool.self, forKey: .disconnected) ?? false
+        performanceLevel = try? c.decodeIfPresent(PerformanceLevel.self, forKey: .performanceLevel)
+        powerProfile = try c.decodeIfPresent(String.self, forKey: .powerProfile)
     }
 
     func isOn(_ key: String) -> Bool { !off.contains(key) }
@@ -979,14 +991,17 @@ struct DisplayStatus: Codable, Equatable {
     /// The GPU stopped answering and its reset failed: it works again only
     /// once power-cycled.
     var gpuWedged = false
+    /// The daemon could not reapply the persisted performance choices.
+    var performanceError: String?
 
     init(daemon: Int32 = 0, driverAttached: Bool = false, monitors: [Monitor] = [], disconnected: Bool = false,
-         gpuWedged: Bool = false) {
+         gpuWedged: Bool = false, performanceError: String? = nil) {
         self.daemon = daemon
         self.driverAttached = driverAttached
         self.monitors = monitors
         self.disconnected = disconnected
         self.gpuWedged = gpuWedged
+        self.performanceError = performanceError
     }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -995,6 +1010,7 @@ struct DisplayStatus: Codable, Equatable {
         monitors = try c.decodeIfPresent([Monitor].self, forKey: .monitors) ?? []
         disconnected = try c.decodeIfPresent(Bool.self, forKey: .disconnected) ?? false
         gpuWedged = try c.decodeIfPresent(Bool.self, forKey: .gpuWedged) ?? false
+        performanceError = try c.decodeIfPresent(String.self, forKey: .performanceError)
     }
 
     static let wedgedTitle = "The GPU stopped answering and its reset failed"
@@ -1081,4 +1097,154 @@ struct LatencySeries {
 func typeMarkBit(_ seq: Int, _ bit: Int) -> Bool { (seq >> bit) & 1 == 1 }
 func typeMarkIndex(brightness: [Int]) -> Int {
     brightness.prefix(4).enumerated().reduce(0) { $0 | ($1.element >= 128 ? 1 << $1.offset : 0) }
+}
+
+
+// ----------------------------------------------------------------
+// MARK: - performance controls
+// ----------------------------------------------------------------
+
+/// The driver's SysfsWrite attributes (dext/sources/session_state.h,
+/// MLG_SYSFS_WRITE_*): upstream's own store() of each.
+enum SysfsWriteAttribute: UInt64 {
+    case performanceLevel = 0   // power_dpm_force_performance_level
+    case powerProfile = 1       // pp_power_profile_mode
+    var path: String {
+        self == .performanceLevel ? "power_dpm_force_performance_level" : "pp_power_profile_mode"
+    }
+}
+
+/// power_dpm_force_performance_level as the menu offers it. Auto is the
+/// driver's default, as on Linux: pinning clocks costs idle power.
+enum PerformanceLevel: String, CaseIterable, Codable {
+    case auto, high, peak, low
+    /// What the sysfs file takes and shows.
+    var sysfsValue: String { self == .peak ? "profile_peak" : rawValue }
+    var title: String {
+        switch self {
+        case .auto: return "Auto"
+        case .high: return "High"
+        case .peak: return "Peak"
+        case .low: return "Low"
+        }
+    }
+    /// The file's contents (one level, a newline); nil for a level the menu
+    /// does not offer (manual, the other profile_* ones).
+    init?(sysfs text: String) {
+        switch text.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "auto": self = .auto
+        case "high": self = .high
+        case "profile_peak": self = .peak
+        case "low": self = .low
+        default: return nil
+        }
+    }
+    /// A command-line argument: a level's name, or the sysfs spelling.
+    init?(argument: String) {
+        let a = argument.lowercased()
+        if let level = PerformanceLevel(rawValue: a) { self = level } else if let level = PerformanceLevel(sysfs: a) { self = level } else { return nil }
+    }
+}
+
+/// One line of pp_power_profile_mode's list: " 5        COMPUTE*:".
+struct PowerProfile: Equatable {
+    let index: Int
+    let name: String
+    let active: Bool
+    /// The menu's name for it; profiles the card lists that the menu does
+    /// not know keep the card's name, readable.
+    var title: String {
+        switch name {
+        case "BOOTUP_DEFAULT": return "Default"
+        case "3D_FULL_SCREEN": return "3D Fullscreen"
+        case "POWER_SAVING": return "Power Saving"
+        case "COMPUTE": return "Compute"
+        case "VR": return "VR"
+        case "WINDOW_3D": return "3D Windowed"
+        default: return name.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    /// Every profile the file lists, in its order. The per-clock parameter
+    /// lines under each are skipped.
+    static func parse(_ text: String) -> [PowerProfile] {
+        var profiles: [PowerProfile] = []
+        for line in text.split(separator: "\n") {
+            let fields = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard fields.count >= 2, let index = Int(fields[0]) else { continue }
+            var name = String(fields[1])
+            if name.hasSuffix(":") { name.removeLast() }
+            let active = name.hasSuffix("*")
+            if active { name.removeLast() }
+            if name.hasSuffix(":") { name.removeLast() }
+            guard !name.isEmpty, name.allSatisfy({ $0.isUppercase || $0.isNumber || $0 == "_" }),
+                  !profiles.contains(where: { $0.index == index }) else { continue }
+            profiles.append(PowerProfile(index: index, name: name, active: active))
+        }
+        return profiles
+    }
+    /// The ones the menu offers: all but CUSTOM, which takes parameters.
+    static func selectable(_ profiles: [PowerProfile]) -> [PowerProfile] {
+        profiles.filter { $0.name != "CUSTOM" }
+    }
+    /// A command-line argument: a profile's card name, its menu title, or
+    /// its index.
+    static func find(_ argument: String, in profiles: [PowerProfile]) -> PowerProfile? {
+        let key = argument.lowercased().replacingOccurrences(of: " ", with: "").replacingOccurrences(of: "_", with: "")
+        let candidates = selectable(profiles)
+        if let index = Int(argument) { return candidates.first { $0.index == index } }
+        return candidates.first {
+            $0.name.lowercased().replacingOccurrences(of: "_", with: "") == key ||
+                $0.title.lowercased().replacingOccurrences(of: " ", with: "") == key ||
+                (key == "default" && $0.name == "BOOTUP_DEFAULT")
+        }
+    }
+}
+
+/// The live line: the clock level marked current in pp_dpm_sclk/mclk
+/// ("1: 3462Mhz *", "S: 41Mhz *" in deep sleep), the hwmon temperature
+/// (millidegrees) and power (microwatts).
+struct PerformanceReading: Equatable {
+    var gfxMHz: Int?
+    var memoryMHz: Int?
+    var temperatureC: Double?
+    var powerW: Double?
+
+    static func currentMHz(_ dpm: String) -> Int? {
+        for line in dpm.split(separator: "\n") where line.hasSuffix("*") {
+            let digits = line.split(separator: ":").last?.filter { $0.isNumber } ?? ""
+            if let mhz = Int(digits) { return mhz }
+        }
+        return nil
+    }
+    var line: String {
+        var parts: [String] = []
+        parts.append("GFX " + (gfxMHz.map { "\($0) MHz" } ?? "?"))
+        parts.append("Memory " + (memoryMHz.map { "\($0) MHz" } ?? "?"))
+        if let temperatureC { parts.append(String(format: "%.0f °C", temperatureC)) }
+        if let powerW { parts.append(String(format: "%.0f W", powerW)) }
+        return parts.joined(separator: "  ·  ")
+    }
+}
+
+/// What reapplying the persisted choices writes, in order: the level, then
+/// the profile (by the index the card now lists the persisted name under).
+/// Nothing for a choice never made. A persisted profile the card no longer
+/// lists is an error, said, never a silent default.
+enum PerformancePlan {
+    struct Write: Equatable { let attribute: SysfsWriteAttribute; let value: String }
+    static func writes(prefs: DisplayPrefs, profiles: [PowerProfile]) -> Result<[Write], PlanError> {
+        var writes: [Write] = []
+        if let level = prefs.performanceLevel {
+            writes.append(Write(attribute: .performanceLevel, value: level.sysfsValue))
+        }
+        if let name = prefs.powerProfile {
+            guard let profile = PowerProfile.selectable(profiles).first(where: { $0.name == name }) else {
+                return .failure(PlanError(message: "the card lists no power profile \(name)"))
+            }
+            writes.append(Write(attribute: .powerProfile, value: String(profile.index)))
+        }
+        return .success(writes)
+    }
+    struct PlanError: Error, Equatable { let message: String }
 }

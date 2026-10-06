@@ -1301,8 +1301,18 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     }
     var prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
     var prefsToken: Int32 = 0
+    // The performance choices are written again whenever the GPU comes up
+    // (a probe, a power cycle, an upgrade, a reset): reapplyPerformance.
+    var performanceApplied = false
+    var performanceError: String?
     notify_register_dispatch(DisplayControl.prefsChanged, &prefsToken, DispatchQueue.main) { _ in
+        let previous = prefs
         prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        if prefs.performanceLevel != previous.performanceLevel || prefs.powerProfile != previous.powerProfile {
+            // The menu or the CLI set it already; a failure it reported is
+            // its own, so this one starts clean.
+            performanceError = nil
+        }
         agentLog("display-agent: display choices changed")
     }
     defer { notify_cancel(prefsToken) }
@@ -1325,7 +1335,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     func publish() {
         var status = DisplayStatus(daemon: getpid(), driverAttached: watch.present, monitors: [],
                                    disconnected: prefs.disconnected && session == nil && observer == nil &&
-                                       children.isEmpty, gpuWedged: wedged)
+                                       children.isEmpty, gpuWedged: wedged, performanceError: performanceError)
         for m in monitors {
             let child = children[m.connector]
             let on = prefs.isOn(m.key)
@@ -1410,6 +1420,18 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         epoch = .max
         monitors = []
         lastReset = nil
+        performanceApplied = false
+    }
+
+    func reapplyPerformance(_ why: String) {
+        guard let observer, prefs.performanceLevel != nil || prefs.powerProfile != nil else {
+            performanceApplied = true; performanceError = nil; return
+        }
+        performanceError = PerformanceControl.reapply(prefs, host: observer)
+        performanceApplied = true
+        agentLog("display-agent: performance settings (\(why)): " +
+                 (performanceError.map { "not applied: \($0)" } ??
+                  "level \(prefs.performanceLevel?.title ?? "unchanged"), profile \(prefs.powerProfile ?? "unchanged")"))
     }
 
     while !agentInterrupted {
@@ -1462,6 +1484,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             }
             session = s; observer = o
         }
+        if !performanceApplied { reapplyPerformance("the GPU is up") }
         // GPU recovery, from the cached state at this poll's cadence.
         if let reset = observer!.resetState() {
             switch ResetAction.evaluate(previous: lastReset, current: reset) {
@@ -1482,6 +1505,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
                 continue
             case .remirror:
                 agentLog("display-agent: a GPU reset lost VRAM (generation \(reset.generation)); every mirror starts again")
+                performanceApplied = false  // the reset reinitialized power management
                 for child in children.values { stop(child) }
                 children = [:]
                 retryAt = [:]
@@ -1581,6 +1605,151 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
     notify_post(DisplayControl.statusChanged)
     agentLog("display-agent: daemon stopped")
     return 0
+}
+
+// ----------------------------------------------------------------
+// MARK: - performance controls (SysfsWrite, selector 89)
+// ----------------------------------------------------------------
+
+let kSelSysfsWrite: UInt32 = 89
+
+extension MacLinuxGPUHost {
+    /// An allowlisted sysfs write (session_state.h SysfsWrite), run by
+    /// upstream's store(): nil when it took, else why not, said in full.
+    func sysfsWrite(_ attribute: SysfsWriteAttribute, _ value: String) -> String? {
+        let (kr, out, _) = callMethod(kSelSysfsWrite, inScalars: [attribute.rawValue, UInt64(value.utf8.count)],
+                                      inData: Data(value.utf8), outScalars: 1, outSize: 0)
+        let what = "\(attribute.path) = \(value)"
+        switch kr {
+        case kIOReturnSuccess:
+            guard let result = out.first.map({ Int64(bitPattern: $0) }) else {
+                return "\(what): the driver gave no result"
+            }
+            if result >= 0 { return nil }
+            let errno = Int32(clamping: -result)
+            return "\(what): the driver refused it (\(String(cString: strerror(errno))), errno \(errno))"
+        case kern_return_t(bitPattern: 0xe00002c1):
+            return "\(what): this app is not entitled to change the GPU's performance settings"
+        case kern_return_t(bitPattern: 0xe00002e2):
+            return "\(what): not a value the driver allows (or a driver from before build 257)"
+        case kern_return_t(bitPattern: 0xe00002d8):
+            return "\(what): the GPU is not running in an open session"
+        case kern_return_t(bitPattern: 0xe00002d6):
+            return "\(what): the driver did not finish within 250 ms; the setting may still take effect"
+        default:
+            return String(format: "%@: call failed (kr=%#x)", what, kr)
+        }
+    }
+}
+
+/// The performance controls of the menu, the CLI and the daemon's reapply.
+enum PerformanceControl {
+    private static func text(_ host: MacLinuxGPUHost, _ path: String) -> String? {
+        guard let (status, data) = host.sysfsRead(path), status == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+    static func level(_ host: MacLinuxGPUHost) -> PerformanceLevel? {
+        text(host, SysfsWriteAttribute.performanceLevel.path).flatMap { PerformanceLevel(sysfs: $0) }
+    }
+    /// The level as the file shows it, offered or not ("manual").
+    static func levelText(_ host: MacLinuxGPUHost) -> String? {
+        text(host, SysfsWriteAttribute.performanceLevel.path)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    static func profiles(_ host: MacLinuxGPUHost) -> [PowerProfile] {
+        text(host, SysfsWriteAttribute.powerProfile.path).map { PowerProfile.parse($0) } ?? []
+    }
+    static func reading(_ host: MacLinuxGPUHost) -> PerformanceReading {
+        var r = PerformanceReading()
+        r.gfxMHz = text(host, "pp_dpm_sclk").flatMap { PerformanceReading.currentMHz($0) }
+        r.memoryMHz = text(host, "pp_dpm_mclk").flatMap { PerformanceReading.currentMHz($0) }
+        if let hwmon = hwmonDirectory(host) {
+            r.temperatureC = text(host, "\(hwmon)/temp1_input").flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }.map { $0 / 1000 }
+            let power = text(host, "\(hwmon)/power1_average") ?? text(host, "\(hwmon)/power1_input")
+            r.powerW = power.flatMap { Double($0.trimmingCharacters(in: .whitespacesAndNewlines)) }.map { $0 / 1_000_000 }
+        }
+        return r
+    }
+    private static func hwmonDirectory(_ host: MacLinuxGPUHost) -> String? {
+        guard let (status, data) = host.sysfsRead("hwmon", list: true), status == 0 else { return nil }
+        return String(decoding: data, as: UTF8.self).split(separator: "\n")
+            .first { $0.hasPrefix("d hwmon") }.map { "hwmon/" + $0.dropFirst(2) }
+    }
+
+    /// Set the level now and keep it (the display prefs): nil, or why not.
+    static func setLevel(_ level: PerformanceLevel, host: MacLinuxGPUHost) -> String? {
+        if let error = host.sysfsWrite(.performanceLevel, level.sysfsValue) { return error }
+        if let read = levelText(host), read != level.sysfsValue {
+            return "power_dpm_force_performance_level reads \(read) after writing \(level.sysfsValue)"
+        }
+        return persist { $0.performanceLevel = level }
+    }
+    /// Set the profile now (by the index the card lists it under) and keep
+    /// its name: nil, or why not.
+    static func setProfile(_ profile: PowerProfile, host: MacLinuxGPUHost) -> String? {
+        if let error = host.sysfsWrite(.powerProfile, String(profile.index)) { return error }
+        if let active = profiles(host).first(where: { $0.active }), active.index != profile.index {
+            return "pp_power_profile_mode shows \(active.name) active after choosing \(profile.name)"
+        }
+        return persist { $0.powerProfile = profile.name }
+    }
+    private static func persist(_ change: (inout DisplayPrefs) -> Void) -> String? {
+        var prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        change(&prefs)
+        do { try prefs.save(to: DisplayControl.prefsURL) } catch {
+            return "set, but not kept: could not write \(DisplayControl.prefsURL.path): \(error)"
+        }
+        notify_post(DisplayControl.prefsChanged)
+        return nil
+    }
+
+    /// The persisted choices, written again (the GPU came up): nil when
+    /// every write took (or nothing was chosen), else the first failure.
+    static func reapply(_ prefs: DisplayPrefs, host: MacLinuxGPUHost) -> String? {
+        switch PerformancePlan.writes(prefs: prefs, profiles: prefs.powerProfile == nil ? [] : profiles(host)) {
+        case .failure(let error): return error.message
+        case .success(let writes):
+            for write in writes { if let error = host.sysfsWrite(write.attribute, write.value) { return error } }
+            return nil
+        }
+    }
+}
+
+/// MacLinuxGPUHost performance | performance-level <level> | power-profile <name>
+func runPerformanceCommand(_ args: [String]) -> Int32 {
+    let host = MacLinuxGPUHost()
+    guard host.openUserClient(observer: true) else {
+        print("ERROR: failed to open the UserClient (is the driver attached?)")
+        return 1
+    }
+    defer { _ = host.closeUserClient() }
+    switch args.first {
+    case "performance-level":
+        guard args.count == 2, let level = PerformanceLevel(argument: args[1]) else {
+            print("usage: MacLinuxGPUHost performance-level auto|high|peak|low"); return 2
+        }
+        if let error = PerformanceControl.setLevel(level, host: host) { print("ERROR: \(error)"); return 1 }
+        print("performance level: \(level.title) (\(level.sysfsValue)); kept, and set again whenever the GPU comes up")
+        return 0
+    case "power-profile":
+        let profiles = PowerProfile.selectable(PerformanceControl.profiles(host))
+        guard args.count == 2, let profile = PowerProfile.find(args[1], in: profiles) else {
+            print("usage: MacLinuxGPUHost power-profile <name>; the card offers: " +
+                  (profiles.isEmpty ? "(none readable)" : profiles.map { "\($0.title) (\($0.name.lowercased()))" }.joined(separator: ", ")))
+            return 2
+        }
+        if let error = PerformanceControl.setProfile(profile, host: host) { print("ERROR: \(error)"); return 1 }
+        print("power profile: \(profile.title) (\(profile.name), index \(profile.index)); kept, and set again whenever the GPU comes up")
+        return 0
+    default:
+        let prefs = DisplayPrefs.load(from: DisplayControl.prefsURL)
+        print("performance level: \(PerformanceControl.levelText(host) ?? "unreadable")" +
+              " (kept: \(prefs.performanceLevel?.title ?? "none, the driver's Auto"))")
+        let profiles = PerformanceControl.profiles(host)
+        print("power profile: \(profiles.first(where: { $0.active }).map { "\($0.title) (\($0.name))" } ?? "unreadable")" +
+              " (kept: \(prefs.powerProfile ?? "none"))")
+        print(PerformanceControl.reading(host).line)
+        return 0
+    }
 }
 
 // ----------------------------------------------------------------
@@ -1809,8 +1978,133 @@ enum GPUDisconnect {
     }
 }
 
+/// The menu bar's Performance submenu: the level and power profile as the
+/// driver shows them now (an observer client while the menu is open), the
+/// live clocks, temperature and power refreshed each second while it is
+/// open, and a choice written at once (upstream's store()) and kept in the
+/// display prefs, which the display daemon writes again whenever the GPU
+/// comes up. A refused write is shown here, and beeps.
+private final class PerformanceMenu: NSObject, NSMenuDelegate {
+    let menu = NSMenu(title: "Performance")
+    private var host: MacLinuxGPUHost?
+    private var timer: Timer?
+    private weak var liveItem: NSMenuItem?
+    private var lastError: String?
+
+    override init() {
+        super.init()
+        menu.delegate = self
+        menu.autoenablesItems = false
+    }
+
+    private func openHost() -> MacLinuxGPUHost? {
+        if host == nil {
+            let h = MacLinuxGPUHost()
+            h.quiet = true
+            if h.openUserClient(observer: true) { host = h }
+        }
+        return host
+    }
+    private func closeHost() {
+        _ = host?.closeUserClient()
+        host = nil
+    }
+    private func label(_ title: String, indent: Bool = false) -> NSMenuItem {
+        let item = NSMenuItem(title: (indent ? "    " : "") + title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        guard let host = openHost() else {
+            menu.addItem(label("The driver cannot be reached"))
+            return
+        }
+        let live = label(PerformanceControl.reading(host).line)
+        liveItem = live
+        menu.addItem(live)
+        menu.addItem(.separator())
+
+        menu.addItem(label("Performance level"))
+        let current = PerformanceControl.levelText(host)
+        for level in PerformanceLevel.allCases {
+            let item = NSMenuItem(title: level.title, action: #selector(chooseLevel(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = level.rawValue
+            item.state = current == level.sysfsValue ? .on : .off
+            menu.addItem(item)
+        }
+        if let current, PerformanceLevel(sysfs: current) == nil {
+            menu.addItem(label("Now: \(current)", indent: true))
+        } else if current == nil {
+            menu.addItem(label("Unreadable now", indent: true))
+        }
+        menu.addItem(.separator())
+
+        menu.addItem(label("Power profile"))
+        let profiles = PowerProfile.selectable(PerformanceControl.profiles(host))
+        if profiles.isEmpty { menu.addItem(label("The card lists no profiles", indent: true)) }
+        for profile in profiles {
+            let item = NSMenuItem(title: profile.title, action: #selector(chooseProfile(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = profile.index
+            item.state = profile.active ? .on : .off
+            menu.addItem(item)
+        }
+        let daemonError = (DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()).performanceError
+        if let error = lastError ?? daemonError.map({ "not applied when the GPU came up: " + $0 }) {
+            menu.addItem(.separator())
+            menu.addItem(label("Error: " + error))
+        }
+        menu.addItem(.separator())
+
+        // Runtime power management modes come here (always up, autosuspend
+        // after N seconds, unload when idle).
+        menu.addItem(label("Power management"))
+        let always = label("Always up", indent: false)
+        always.state = .on
+        menu.addItem(always)
+        menu.addItem(label("Suspend or unload when idle: in a later version", indent: true))
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            guard let self, let host = self.host, let live = self.liveItem else { return }
+            live.title = PerformanceControl.reading(host).line
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        RunLoop.main.add(timer, forMode: .eventTracking)
+        self.timer = timer
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        timer?.invalidate()
+        timer = nil
+        closeHost()
+    }
+
+    @objc func chooseLevel(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let level = PerformanceLevel(rawValue: raw),
+              let host = openHost() else { NSSound.beep(); return }
+        lastError = PerformanceControl.setLevel(level, host: host)
+        if lastError != nil { NSSound.beep() }
+        closeHost()
+    }
+
+    @objc func chooseProfile(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int, let host = openHost(),
+              let profile = PowerProfile.selectable(PerformanceControl.profiles(host)).first(where: { $0.index == index })
+        else { NSSound.beep(); return }
+        lastError = PerformanceControl.setProfile(profile, host: host)
+        if lastError != nil { NSSound.beep() }
+        closeHost()
+    }
+}
+
 private final class MenuBarController: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    let performance = PerformanceMenu()
     var status = DisplayStatus.load(from: DisplayControl.statusURL) ?? DisplayStatus()
     var token: Int32 = 0
 
@@ -1875,6 +2169,12 @@ private final class MenuBarController: NSObject, NSMenuDelegate {
             }
         }
         menu.addItem(.separator())
+        if !GPUDisconnect.requested && !status.gpuWedged {
+            let item = NSMenuItem(title: "Performance", action: nil, keyEquivalent: "")
+            item.submenu = performance.menu
+            menu.addItem(item)
+            menu.addItem(.separator())
+        }
         if status.driverAttached || GPUDisconnect.requested {
             if GPUDisconnect.requested {
                 let reconnect = NSMenuItem(title: "Reconnect GPU", action: #selector(reconnectGPU), keyEquivalent: "")
