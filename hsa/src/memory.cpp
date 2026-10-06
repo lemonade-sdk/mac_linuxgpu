@@ -10,6 +10,52 @@
 #include <system_error>
 
 namespace mac_hsa::detail {
+namespace {
+// The copy workers. Never destroyed: a process may exit with copies
+// outstanding (without hsa_shut_down).
+struct CopyWorkers {
+    std::mutex mutex;
+    std::condition_variable work, finished;
+    std::deque<CopyJob *> queued;
+    unsigned idle = 0;
+};
+CopyWorkers &copyWorkers = *new CopyWorkers;
+void copyWorker() {
+    auto &w = copyWorkers;
+    std::unique_lock lock(w.mutex);
+    for (;;) {
+        ++w.idle;
+        // An idle worker leaves after a while; the next copy starts one.
+        const bool got = w.work.wait_for(lock, std::chrono::seconds(2), [&] { return !w.queued.empty(); });
+        --w.idle;
+        if (!got) return;
+        auto *job = w.queued.front();
+        w.queued.pop_front();
+        lock.unlock();
+        job->work(job->stop.get_token());
+        lock.lock();
+        job->work = nullptr;	// its captures (buffers, signals) go before it is done
+        job->done.store(true, std::memory_order_release);
+        w.finished.notify_all();
+    }
+}
+}
+void startCopyJob(CopyJob *job) {
+    auto &w = copyWorkers;
+    std::lock_guard lock(w.mutex);
+    // Every queued job has a worker of its own: none waits behind another.
+    if (w.idle <= w.queued.size()) {
+        try { std::thread(copyWorker).detach(); }
+        catch (...) { job->work = nullptr; throw; }	// never queued: nothing to wait for
+    }
+    w.queued.push_back(job);
+    w.work.notify_one();
+}
+CopyJob::~CopyJob() {
+    auto &w = copyWorkers;
+    std::unique_lock lock(w.mutex);
+    w.finished.wait(lock, [&] { return done.load(std::memory_order_acquire) || !work; });
+}
 void reapCopyJobs() {
     std::vector<std::unique_ptr<CopyJob>> retired;
     {
@@ -558,8 +604,7 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
         if (copyJobs.size() >= 64) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         copyJobs.reserve(copyJobs.size() + 1);
         auto job = std::make_unique<CopyJob>();
-        auto jobPointer = job.get();
-        job->worker = std::jthread([=, waiting = std::move(waiting), signal = completed->second]
+        job->work = [=, waiting = std::move(waiting), signal = completed->second]
             (std::stop_token stop) {
             bool failed = false;
             for (const auto &dependency : waiting) {
@@ -579,8 +624,8 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_async_copy(void *dst, hsa_agent_t dst
             if (failed) signal->value().store(-1, std::memory_order_release);
             else signal->value().fetch_sub(1, std::memory_order_release);
             mac_hsa::notifySignal(*signal);
-            jobPointer->done.store(true, std::memory_order_release);
-        });
+        };
+        startCopyJob(job.get());
         copyJobs.push_back(std::move(job));
         return HSA_STATUS_SUCCESS;
     } catch (const std::bad_alloc &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }

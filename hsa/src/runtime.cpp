@@ -151,7 +151,7 @@ hsa_status_t hsa_shut_down() {
                 signal->alive.store(false);
                 signal->changed.notify_all();
             }
-            for (auto &job : copyJobs) job->worker.request_stop();
+            for (auto &job : copyJobs) job->stop.request_stop();
             retiredJobs.swap(copyJobs);
             retiredExecutables.swap(executables);
             clearLoadedImages();
