@@ -298,8 +298,10 @@ static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_c
  * IOReturn as SysfsRead; NotPermitted for any other query. */
 /* SysfsWrite: an allowlisted write of the amdgpu device's sysfs, run by
  * upstream's own store() (amdgpu_pm.c), as root's write on Linux. For the
- * host app's performance controls; an observer client with the
- * session-release entitlement, synchronous and bounded like SysfsRead.
+ * host app's performance controls; any observer client (any process may
+ * already run GPU work through a session client: the allowlist bounds what
+ * this sets, and the driver logs each write with its client), synchronous
+ * and bounded like SysfsRead.
  *   scalar in:  [0] MLG_SYSFS_WRITE_* (the attribute), [1] value bytes
  *   struct in:  the value, 1 to MLG_SYSFS_WRITE_VALUE_MAX bytes, one
  *               trailing newline allowed:
@@ -312,7 +314,7 @@ static inline bool mlg_retire_args_valid(const uint64_t *input, uint32_t input_c
  *   scalar out: [0] store()'s result: the bytes taken, or a negative Linux
  *               errno, sign-extended (EINVAL for a level or profile the
  *               card refuses, EPERM while the GPU is in reset, ...)
- * IOReturn: NotPrivileged without the entitlement, NotPermitted for a value
+ * IOReturn: NotPermitted for a value
  * outside the allowlist, NotReady as SysfsRead, Timeout when store() is
  * still running after MLG_BOUNDED_READ_MS (it may still complete). */
 #define MLG_SYSFS_WRITE_PERF_LEVEL     0u
@@ -614,7 +616,7 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 	case MLG_SELECTOR_DRM_INFO:
 		return input && input_count == 2 && input[1] &&
 		       input[1] <= MLG_SYSFS_CHUNK_MAX;
-	case MLG_SELECTOR_SYSFS_WRITE: /* entitlement-checked in the handler */
+	case MLG_SELECTOR_SYSFS_WRITE: /* the value is checked in the handler */
 		return input && input_count == 2 && input[0] < MLG_SYSFS_WRITE_ATTRS &&
 		       input[1] && input[1] <= MLG_SYSFS_WRITE_VALUE_MAX;
 	case MLG_SELECTOR_DRM_SELFTEST:

@@ -1628,8 +1628,6 @@ extension MacLinuxGPUHost {
             if result >= 0 { return nil }
             let errno = Int32(clamping: -result)
             return "\(what): the driver refused it (\(String(cString: strerror(errno))), errno \(errno))"
-        case kern_return_t(bitPattern: 0xe00002c1):
-            return "\(what): this app is not entitled to change the GPU's performance settings"
         case kern_return_t(bitPattern: 0xe00002e2):
             return "\(what): not a value the driver allows (or a driver from before build 257)"
         case kern_return_t(bitPattern: 0xe00002d8):

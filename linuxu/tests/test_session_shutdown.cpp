@@ -581,7 +581,7 @@ static void checkObserverPolicy() {
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, huge, 2));
     assert(!mlg_observer_selector_allowed(MLG_SELECTOR_DRM_INFO, info, 1));
     // SysfsWrite: an allowlisted attribute and a value size within bounds
-    // (the entitlement and the value are checked in the handler);
+    // (the value itself is checked in the handler);
     // synchronous, like the bounded reads.
     const uint64_t perf[] = {MLG_SYSFS_WRITE_PERF_LEVEL, 4}, profile[] = {MLG_SYSFS_WRITE_POWER_PROFILE, 1};
     const uint64_t badAttr[] = {MLG_SYSFS_WRITE_ATTRS, 4}, empty[] = {MLG_SYSFS_WRITE_PERF_LEVEL, 0};

@@ -4438,15 +4438,12 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             if (selector == MLG_SELECTOR_SYSFS_READ || selector == MLG_SELECTOR_DRM_INFO)
                 return bounded_read(selector, arguments);
             if (selector == MLG_SELECTOR_SYSFS_WRITE) {
-                // The performance controls: the host app, entitled as for
-                // Retire and the quarantine release.
-                OSDictionary *entitlements = nullptr;
-                bool entitled = false;
-                if (CopyClientEntitlements(&entitlements) == kIOReturnSuccess && entitlements) {
-                    entitled = entitlements->getObject(MLG_SESSION_RELEASE_ENTITLEMENT) == kOSBooleanTrue;
-                    entitlements->release();
-                }
-                if (!entitled) return kIOReturnNotPrivileged;
+                // The performance controls. Any observer client, as any
+                // process may already run GPU work through a session
+                // client; the allowlist bounds what it can set, and each
+                // write is logged with the client that made it.
+                MACLINUXGPU_LOG("client %llu: sysfs write (attribute %llu)", ivars->clientID,
+                                (unsigned long long)in[0]);
                 return bounded_read(selector, arguments);
             }
             if (selector == MLG_SELECTOR_DISPLAY) return display_call(this, ivars->clientID, arguments);
