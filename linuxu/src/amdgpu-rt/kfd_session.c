@@ -1098,13 +1098,21 @@ static int bo_access_kind(struct amdgpu_bo *abo, enum access_kind *kind)
 	return -EBUSY;
 }
 
-/* CPU pointer for @offset and the bytes contiguous from it within its page. */
+/* CPU pointer for @offset and the bytes contiguous from it within its page:
+ * only system pages a ttm_tt holds (GTT, system). A VRAM BO has no ttm_tt
+ * and no CPU pointer here; it goes through SDMA (bo_host_transfer). */
 static void *bo_cpu(struct amdgpu_bo *abo, uint64_t offset, uint64_t *avail)
 {
 	struct ttm_tt *ttm = abo->tbo.ttm;
 	uint64_t index = offset >> PAGE_SHIFT;
+	enum access_kind kind;
 	char *page;
 
+	if (bo_access_kind(abo, &kind) || kind != ACCESS_CPU) {
+		pr_err("kfd session: CPU access refused: the buffer is not in populated system pages (memory type %d)\n",
+		       abo->tbo.resource ? (int)abo->tbo.resource->mem_type : -1);
+		return NULL;
+	}
 	if (index >= ttm->num_pages || !ttm->pages[index])
 		return NULL;
 	page = page_address(ttm->pages[index]);

@@ -24,6 +24,7 @@ extern "C" int linuxu_aperture_is_gone(void);
 #import <DriverKit/IOInterruptDispatchSource.h>
 #import <PCIDriverKit/IOPCIDevice.h>
 #import <PCIDriverKit/IOPCIFamilyDefinitions.h>
+#include "pci_crash_close.h"
 
 /* The DMA seam (iokit_bridge.m) needs the same IOPCIDevice; dext_set_pci
  * hands it to both seams so init order between them does not matter. */
@@ -81,7 +82,36 @@ public:
     dext_pci_operation(const dext_pci_operation &) = delete;
     dext_pci_operation &operator=(const dext_pci_operation &) = delete;
 };
+/* Provider calls made outside PCI admission (dext_pci_device_present asks
+ * the device while admission may be closed by the fault that made the caller
+ * ask). Each holds the session open: dext_close waits for them as it waits
+ * for admitted operations, so no call reaches a provider being closed. */
+static unsigned g_pci_raw_calls;
+class dext_pci_raw_call {
+    bool admitted;
+public:
+    dext_pci_raw_call() {
+        dext_pci_control_guard control;
+        admitted = g_pci && __atomic_load_n(&g_pci_open, __ATOMIC_ACQUIRE);
+        if (admitted) __atomic_add_fetch(&g_pci_raw_calls, 1, __ATOMIC_SEQ_CST);
+    }
+    ~dext_pci_raw_call() { if (admitted) __atomic_sub_fetch(&g_pci_raw_calls, 1, __ATOMIC_SEQ_CST); }
+    explicit operator bool() const { return admitted; }
+    dext_pci_raw_call(const dext_pci_raw_call &) = delete;
+    dext_pci_raw_call &operator=(const dext_pci_raw_call &) = delete;
+};
+/* The device memory this session may touch: each BAR's memory index and
+ * size as GetBARInfo reported them right after Open, and nothing else (the
+ * expansion ROM, whose IODeviceMemory entry follows the BARs, is never one
+ * of them). Every MemoryRead/MemoryWrite is checked against it first. */
+struct dext_bar_record {
+	uint64_t size;
+	uint8_t index;
+	bool present;
+};
+static dext_bar_record g_bars[6];
 static void dext_aperture_install(void);
+static void dext_pci_crash_close(void);
 /* Primary fake-MMIO token for the register BAR.  0 until dext_open mints
  * it.  Its window is the whole BAR as assigned (see dext_open). */
 static uint32_t     g_reg_token;
@@ -245,34 +275,88 @@ extern "C" int dext_set_pci(void *pci_device, void *client)
 	__atomic_store_n(&g_transport_sentinel_offset, 0, __ATOMIC_RELAXED);
 	__atomic_store_n(&g_transport_sentinel, DEXT_PCI_SENTINEL_NONE,
 		__ATOMIC_RELEASE);
+	/* Before the session can open: a dext that dies with it open panics
+	 * the Mac (pci_crash_close.h). */
+	static bool crash_close_reported;
+	const int refused = dext_crash_close_install(dext_pci_crash_close);
+	if (!crash_close_reported) {
+		crash_close_reported = true;
+		const uint32_t armed = dext_crash_close_armed();
+		if (refused)
+			IOLog("MacLinuxGPU: ERROR: the PCI session cannot be closed on a crash (signal %d refused, "
+			      "armed %#x); a crash of this driver panics the Mac\n", refused, armed);
+		else
+			IOLog("MacLinuxGPU: a fatal signal closes the PCI session first (signals %#x)\n", armed);
+	}
 	g_pci = static_cast<IOPCIDevice *>(pci_device);
 	g_pci_client = static_cast<IOService *>(client);
 	g_pci_open = false;
+	memset(g_bars, 0, sizeof(g_bars));
 	dext_aperture_install();	/* VRAM only through the kernel, before any mapping */
 	return 0;
 }
 
+/* The crash close (pci_crash_close.h): on a fatal signal, on any thread,
+ * with any lock held. Cached state only, no lock: admission closes, the
+ * session is marked closed, then the provider is closed. An access already
+ * in flight then fails in the kernel (not open), as it would after a normal
+ * Close. Exactly one Close: dext_close takes the same open flag. */
+static void dext_pci_crash_close(void)
+{
+	g_pci_access.block();
+	IOPCIDevice *pci = __atomic_load_n(&g_pci, __ATOMIC_ACQUIRE);
+	IOService *client = __atomic_load_n(&g_pci_client, __ATOMIC_ACQUIRE);
+	if (pci && client && __atomic_exchange_n(&g_pci_open, false, __ATOMIC_ACQ_REL))
+		pci->Close(client, 0);
+}
+
+/* Close the provider once nothing can reach it: admission closes, every
+ * admitted operation and raw call must leave (at most a second), and only
+ * then the session closes and admission reopens for the next one. Refused,
+ * loudly, while a fault holds admission closed (the quarantine owns that
+ * device), during a reset, with live interrupt sources, or when an access
+ * does not leave: the provider then stays open and the driver must not be
+ * killed (a dext that dies with its session open panics the Mac). */
 extern "C" void dext_close(void)
 {
-	dext_pci_control_guard control;
-	if (g_pci_access.closed() || !g_pci_access.drained() ||
-	    __atomic_load_n(&g_pci_resetting, __ATOMIC_ACQUIRE)) return;
-	if (__atomic_load_n(&g_irq_draining, __ATOMIC_ACQUIRE) ||
-	    g_irq_vector_count || g_irq_queue) {
-		IOLog("MacLinuxGPU: dext_close rejected with live IRQ sources\n");
-		return;
+	{
+		dext_pci_control_guard control;
+		if (g_pci_access.closed() ||
+		    __atomic_load_n(&g_pci_resetting, __ATOMIC_ACQUIRE)) {
+			if (g_pci_open)
+				IOLog("MacLinuxGPU: dext_close refused: PCI admission is %s; the provider stays open\n",
+				      g_pci_access.closed() ? "closed by a fault" : "held by a reset");
+			return;
+		}
+		if (__atomic_load_n(&g_irq_draining, __ATOMIC_ACQUIRE) ||
+		    g_irq_vector_count || g_irq_queue) {
+			IOLog("MacLinuxGPU: dext_close rejected with live IRQ sources\n");
+			return;
+		}
+		g_pci_access.block();
 	}
+	for (unsigned waited = 0; !g_pci_access.drained() ||
+	     __atomic_load_n(&g_pci_raw_calls, __ATOMIC_SEQ_CST); ++waited) {
+		if (waited == 1000) {
+			IOLog("MacLinuxGPU: dext_close refused: PCI accesses still in flight after 1 s; "
+			      "the provider stays open, do not kill the driver\n");
+			return;
+		}
+		IOSleep(1);
+	}
+	dext_pci_control_guard control;
 	if (g_reg_token) {
 		rt_mmio_free_token(g_reg_token);
 		g_reg_token = 0;
 	}
 	g_reg_bar = UINT8_MAX;
 	g_reg_window = 0;
-	if (g_pci_open && g_pci && g_pci_client)
+	memset(g_bars, 0, sizeof(g_bars));
+	if (__atomic_exchange_n(&g_pci_open, false, __ATOMIC_ACQ_REL) && g_pci && g_pci_client)
 		g_pci->Close(g_pci_client, 0);
-	g_pci_open = false;
 	g_pci = nullptr;
 	g_pci_client = nullptr;
+	(void)g_pci_access.reopen();
 }
 
 extern "C" int dext_pci_function_reset(void)
@@ -347,18 +431,14 @@ static bool g_pci_removed;
 
 extern "C" int dext_pci_device_present(void)
 {
-	IOPCIDevice *pci;
-	{
-		dext_pci_control_guard control;
-		pci = g_pci;
-		if (pci) pci->retain();
-	}
-	if (!pci) return 1;
 	/* Directly on the provider: admission may already be closed by the
-	 * fault that made the caller ask. A device off the bus reads ~0. */
+	 * fault that made the caller ask. A device off the bus reads ~0. Only
+	 * on an open session (a closed one would answer ~0 too), held open for
+	 * the call (dext_close waits for it). */
+	dext_pci_raw_call call;
+	if (!call) return 1;
 	uint32_t identity = UINT32_MAX;
-	pci->ConfigurationRead32(0, &identity);
-	pci->release();
+	g_pci->ConfigurationRead32(0, &identity);
 	const uint16_t vendor = (uint16_t)identity;
 	return vendor != 0xffff && vendor != 0;
 }
@@ -382,12 +462,13 @@ extern "C" int dext_pci_removed(void)
 extern "C" int dext_pci_close_removed(void)
 {
 	if (!dext_pci_removed()) return -22;
-	for (unsigned waited = 0; !g_pci_access.drained(); ++waited) {
+	for (unsigned waited = 0; !g_pci_access.drained() ||
+	     __atomic_load_n(&g_pci_raw_calls, __ATOMIC_SEQ_CST); ++waited) {
 		if (waited == 1000) return -16;
 		IOSleep(1);
 	}
 	dext_pci_control_guard control;
-	if (!g_pci_access.drained() ||
+	if (!g_pci_access.drained() || __atomic_load_n(&g_pci_raw_calls, __ATOMIC_SEQ_CST) ||
 	    __atomic_load_n(&g_irq_draining, __ATOMIC_ACQUIRE) ||
 	    g_irq_vector_count || g_irq_queue)
 		return -16;
@@ -397,9 +478,9 @@ extern "C" int dext_pci_close_removed(void)
 	}
 	g_reg_bar = UINT8_MAX;
 	g_reg_window = 0;
-	if (g_pci_open && g_pci && g_pci_client)
+	memset(g_bars, 0, sizeof(g_bars));
+	if (__atomic_exchange_n(&g_pci_open, false, __ATOMIC_ACQ_REL) && g_pci && g_pci_client)
 		g_pci->Close(g_pci_client, 0);
-	g_pci_open = false;
 	g_pci = nullptr;
 	g_pci_client = nullptr;
 	__atomic_store_n(&g_pci_resetting, false, __ATOMIC_RELEASE);
@@ -667,11 +748,10 @@ int dext_copy_bar_memory(uint8_t bar, uint64_t *size, void **descriptor)
 		return -1;
 	*descriptor = nullptr;
 	*size = 0;
-	uint8_t memory_index = 0, type = 0;
-	uint64_t length = 0;
-	if (g_pci->GetBARInfo(bar, &memory_index, &length, &type) !=
-	    kIOReturnSuccess || !length)
+	if (!g_bars[bar].present)
 		return -1;
+	const uint8_t memory_index = g_bars[bar].index;
+	const uint64_t length = g_bars[bar].size;
 	IOMemoryDescriptor *memory = nullptr;
 	if (g_pci->_CopyDeviceMemoryWithIndex(memory_index, &memory,
 					    g_pci_client) != kIOReturnSuccess || !memory)
@@ -721,7 +801,16 @@ int dext_open(uint32_t *token)
 	kern_return_t ret = g_pci->Open(g_pci_client, 0);
 	if (ret != kIOReturnSuccess)
 		return -1;
-	g_pci_open = true;
+	__atomic_store_n(&g_pci_open, true, __ATOMIC_RELEASE);
+	/* The memory this session may touch, from the kernel, once. */
+	for (uint8_t bar = 0; bar < 6; bar++) {
+		uint8_t index = 0, type = 0;
+		uint64_t size = 0;
+		g_bars[bar] = {};
+		if (g_pci->GetBARInfo(bar, &index, &size, &type) == kIOReturnSuccess &&
+		    size && type != kPCIBARTypeIO)
+			g_bars[bar] = { size, index, true };
+	}
 
 	/* Select the register BAR the way upstream amdgpu_device_init() does:
 	 * BAR5 on CIK and newer, BAR2 on SI.  The family is not known before
@@ -735,16 +824,19 @@ int dext_open(uint32_t *token)
 	uint8_t  ty = 0;
 	const uint8_t candidates[] = {5, 2};
 	g_reg_bar = UINT8_MAX;
+	(void)ty;
 	for (uint8_t bar : candidates) {
-		if (g_pci->GetBARInfo(bar, &mi, &sz, &ty) == kIOReturnSuccess &&
-		    sz >= 0x40 && ty != kPCIBARTypeIO) {
+		if (g_bars[bar].present && g_bars[bar].size >= 0x40) {
+			mi = g_bars[bar].index;
+			sz = g_bars[bar].size;
 			g_reg_bar = bar;
 			break;
 		}
 	}
 	if (g_reg_bar == UINT8_MAX) {
+		memset(g_bars, 0, sizeof(g_bars));
+		__atomic_store_n(&g_pci_open, false, __ATOMIC_RELEASE);
 		g_pci->Close(g_pci_client, 0);
-		g_pci_open = false;
 		return -1;
 	}
 	/* The accessible window is a capability of the mapping DriverKit
@@ -772,8 +864,9 @@ int dext_open(uint32_t *token)
 	*token = g_reg_token;
 	if (!g_reg_token) {
 		*token = 0;
+		memset(g_bars, 0, sizeof(g_bars));
+		__atomic_store_n(&g_pci_open, false, __ATOMIC_RELEASE);
 		g_pci->Close(g_pci_client, 0);
-		g_pci_open = false;
 		return -1;
 	}
 	return 0;
@@ -807,6 +900,54 @@ int dext_open(uint32_t *token)
 #define LINUXU_DOORBELL_FENCE() \
 	__atomic_thread_fence(__ATOMIC_RELEASE)
 
+/* Whether a MemoryRead/MemoryWrite of @width bytes at @offset of memory
+ * index @index is one the kernel guarantees: the session is open, the index
+ * is one GetBARInfo gave at Open, and the access lies inside that BAR. */
+static bool dext_memory_access_ok(uint8_t index, uint64_t offset, uint64_t width)
+{
+	if (!g_pci || !__atomic_load_n(&g_pci_open, __ATOMIC_ACQUIRE) ||
+	    (width != 1 && width != 2 && width != 4 && width != 8) ||
+	    (offset & (width - 1)) != 0)
+		return false;
+	for (const dext_bar_record &bar : g_bars)
+		if (bar.present && bar.index == index)
+			return offset < bar.size && width <= bar.size - offset;
+	return false;
+}
+
+/* The only MemoryRead/MemoryWrite calls, from inside an admitted
+ * dext_pci_operation. Anything else is a fault, recorded with its offset,
+ * and never reaches the kernel. */
+static bool dext_memory_read(uint8_t index, uint64_t offset, unsigned int width, uint64_t *value)
+{
+	if (!dext_memory_access_ok(index, offset, width)) {
+		dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
+		return false;
+	}
+	switch (width) {
+	case 1: { uint8_t x = UINT8_MAX; g_pci->MemoryRead8(index, offset, &x); *value = x; break; }
+	case 2: { uint16_t x = UINT16_MAX; g_pci->MemoryRead16(index, offset, &x); *value = x; break; }
+	case 4: { uint32_t x = UINT32_MAX; g_pci->MemoryRead32(index, offset, &x); *value = x; break; }
+	default: { uint64_t x = UINT64_MAX; g_pci->MemoryRead64(index, offset, &x); *value = x; break; }
+	}
+	return true;
+}
+
+static bool dext_memory_write(uint8_t index, uint64_t offset, unsigned int width, uint64_t value)
+{
+	if (!dext_memory_access_ok(index, offset, width)) {
+		dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
+		return false;
+	}
+	switch (width) {
+	case 1: g_pci->MemoryWrite8(index, offset, (uint8_t)value); break;
+	case 2: g_pci->MemoryWrite16(index, offset, (uint16_t)value); break;
+	case 4: g_pci->MemoryWrite32(index, offset, (uint32_t)value); break;
+	default: g_pci->MemoryWrite64(index, offset, value); break;
+	}
+	return true;
+}
+
 static int dext_mem_slot(uint32_t token, uint64_t offset, uint64_t width,
 			 uint8_t *mem_index)
 {
@@ -820,7 +961,8 @@ static int dext_mem_slot(uint32_t token, uint64_t offset, uint64_t width,
 	    (offset & (width - 1)) != 0 ||
 	    width > UINT64_MAX - offset ||
 	    rt_mmio_slot_info(token, mem_index, &size) != 0 ||
-	    offset + width > size) {
+	    offset + width > size ||
+	    !dext_memory_access_ok(*mem_index, offset, width)) {
 		dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
 		return -1;
 	}
@@ -838,10 +980,11 @@ int dext_mem_read8(uint32_t token, uint64_t offset, uint8_t *val)
 	dext_pci_operation operation;
 	if (!operation) return -1;
 	uint8_t mi;
-	if (!val || dext_mem_slot(token, offset, 1, &mi) != 0)
+	uint64_t v = UINT64_MAX;
+	if (!val || dext_mem_slot(token, offset, 1, &mi) != 0 ||
+	    !dext_memory_read(mi, offset, 1, &v))
 		return dext_mem_failure(offset);
-	*val = UINT8_MAX;
-	g_pci->MemoryRead8(mi, offset, val);
+	*val = (uint8_t)v;
 	if (*val == UINT8_MAX)
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
 	return 0;
@@ -852,10 +995,11 @@ int dext_mem_read16(uint32_t token, uint64_t offset, uint16_t *val)
 	dext_pci_operation operation;
 	if (!operation) return -1;
 	uint8_t mi;
-	if (!val || dext_mem_slot(token, offset, 2, &mi) != 0)
+	uint64_t v = UINT64_MAX;
+	if (!val || dext_mem_slot(token, offset, 2, &mi) != 0 ||
+	    !dext_memory_read(mi, offset, 2, &v))
 		return dext_mem_failure(offset);
-	*val = UINT16_MAX;
-	g_pci->MemoryRead16(mi, offset, val);
+	*val = (uint16_t)v;
 	if (*val == UINT16_MAX)
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
 	return 0;
@@ -869,7 +1013,8 @@ int dext_mem_write8(uint32_t token, uint64_t offset, uint8_t val)
 	if (dext_mem_slot(token, offset, 1, &mi) != 0)
 		return dext_mem_failure(offset);
 	LINUXU_DOORBELL_FENCE();
-	g_pci->MemoryWrite8(mi, offset, val);
+	if (!dext_memory_write(mi, offset, 1, val))
+		return dext_mem_failure(offset);
 	return 0;
 }
 
@@ -881,7 +1026,8 @@ int dext_mem_write16(uint32_t token, uint64_t offset, uint16_t val)
 	if (dext_mem_slot(token, offset, 2, &mi) != 0)
 		return dext_mem_failure(offset);
 	LINUXU_DOORBELL_FENCE();
-	g_pci->MemoryWrite16(mi, offset, val);
+	if (!dext_memory_write(mi, offset, 2, val))
+		return dext_mem_failure(offset);
 	return 0;
 }
 
@@ -910,10 +1056,11 @@ int dext_mem_read32(uint32_t token, uint64_t offset, uint32_t *val)
 	dext_pci_operation operation;
 	if (!operation) return -1;
 	uint8_t mi;
-	if (!val || dext_mem_slot(token, offset, 4, &mi) != 0)
+	uint64_t v = UINT64_MAX;
+	if (!val || dext_mem_slot(token, offset, 4, &mi) != 0 ||
+	    !dext_memory_read(mi, offset, 4, &v))
 		return dext_mem_failure(offset);
-	*val = UINT32_MAX;
-	g_pci->MemoryRead32(mi, offset, val);
+	*val = (uint32_t)v;
 	if (*val == UINT32_MAX) {
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
 		dext_mmio_all_ones(g_pci);
@@ -926,10 +1073,11 @@ int dext_mem_read64(uint32_t token, uint64_t offset, uint64_t *val)
 	dext_pci_operation operation;
 	if (!operation) return -1;
 	uint8_t mi;
-	if (!val || dext_mem_slot(token, offset, 8, &mi) != 0)
+	uint64_t v = UINT64_MAX;
+	if (!val || dext_mem_slot(token, offset, 8, &mi) != 0 ||
+	    !dext_memory_read(mi, offset, 8, &v))
 		return dext_mem_failure(offset);
-	*val = UINT64_MAX;
-	g_pci->MemoryRead64(mi, offset, val);
+	*val = (uint64_t)v;
 	if (*val == UINT64_MAX) {
 		dext_pci_transport_note_sentinel(DEXT_PCI_SENTINEL_MMIO, offset);
 		dext_mmio_all_ones(g_pci);
@@ -945,7 +1093,8 @@ int dext_mem_write32(uint32_t token, uint64_t offset, uint32_t val)
 	if (dext_mem_slot(token, offset, 4, &mi) != 0)
 		return dext_mem_failure(offset);
 	LINUXU_DOORBELL_FENCE();
-	g_pci->MemoryWrite32(mi, offset, val);
+	if (!dext_memory_write(mi, offset, 4, val))
+		return dext_mem_failure(offset);
 	return 0;
 }
 
@@ -957,7 +1106,8 @@ int dext_mem_write64(uint32_t token, uint64_t offset, uint64_t val)
 	if (dext_mem_slot(token, offset, 8, &mi) != 0)
 		return dext_mem_failure(offset);
 	LINUXU_DOORBELL_FENCE();
-	g_pci->MemoryWrite64(mi, offset, val);
+	if (!dext_memory_write(mi, offset, 8, val))
+		return dext_mem_failure(offset);
 	return 0;
 }
 
@@ -966,24 +1116,29 @@ int dext_mem_write64(uint32_t token, uint64_t offset, uint64_t val)
  * through a mapping of the BAR. A device that left the bus answers reads
  * with all ones here, and a write to it is dropped by the kernel; a CPU
  * store through a mapping instead panics the Mac (builds 239 and 240). */
-/* BAR0's memory index and size, read once per device (g_pci). */
-static IOPCIDevice *g_bar0_pci;
-static uint8_t g_bar0_index;
-static uint64_t g_bar0_size;
+/* BAR0's memory index and size, as GetBARInfo gave them at Open. */
 static bool dext_bar0_info(uint8_t *mi, uint64_t *size)
 {
-	if (g_bar0_pci != g_pci) {
-		uint8_t index = 0, type = 0;
-		uint64_t length = 0;
-		if (g_pci->GetBARInfo(0, &index, &length, &type) != kIOReturnSuccess || !length)
-			return false;
-		g_bar0_index = index;
-		g_bar0_size = length;
-		g_bar0_pci = g_pci;
-	}
-	*mi = g_bar0_index;
-	*size = g_bar0_size;
+	if (!g_bars[0].present)
+		return false;
+	*mi = g_bars[0].index;
+	*size = g_bars[0].size;
 	return true;
+}
+
+/* An aperture access outside BAR0 (rt/device_string.h only passes offsets
+ * inside the CPU mapping, which is never larger) is a driver bug: recorded
+ * as a fault, never a kernel call. A refused admission (a closed session, a
+ * fault already recorded) is not a new fault. */
+static bool dext_aperture_slot(uint64_t offset, unsigned int width, uint8_t *mi)
+{
+	uint64_t size = 0;
+	if (dext_bar0_info(mi, &size) && offset < size && width <= size - offset)
+		return true;
+	printk("<3>linuxu: VRAM aperture access of %u bytes at %#llx is outside BAR0 (%#llx bytes); refused\n",
+	       width, (unsigned long long)offset, (unsigned long long)size);
+	dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
+	return false;
 }
 
 static void dext_aperture_read(uint64_t offset, void *value, unsigned int width)
@@ -991,15 +1146,8 @@ static void dext_aperture_read(uint64_t offset, void *value, unsigned int width)
 	uint64_t v = UINT64_MAX;
 	dext_pci_operation operation;
 	uint8_t mi = 0;
-	uint64_t size = 0;
-	if (operation && dext_bar0_info(&mi, &size) && offset < size && width <= size - offset) {
-		switch (width) {
-		case 1: { uint8_t x = UINT8_MAX; g_pci->MemoryRead8(mi, offset, &x); v = x; break; }
-		case 2: { uint16_t x = UINT16_MAX; g_pci->MemoryRead16(mi, offset, &x); v = x; break; }
-		case 4: { uint32_t x = UINT32_MAX; g_pci->MemoryRead32(mi, offset, &x); v = x; break; }
-		default: g_pci->MemoryRead64(mi, offset, &v); break;
-		}
-	}
+	if (operation && dext_aperture_slot(offset, width, &mi))
+		(void)dext_memory_read(mi, offset, width, &v);
 	for (unsigned int i = 0; i < width; i++)
 		static_cast<uint8_t *>(value)[i] = (uint8_t)(v >> (8 * i));
 }
@@ -1011,15 +1159,8 @@ static void dext_aperture_write(uint64_t offset, const void *value, unsigned int
 		v |= (uint64_t)static_cast<const uint8_t *>(value)[i] << (8 * i);
 	dext_pci_operation operation;
 	uint8_t mi = 0;
-	uint64_t size = 0;
-	if (!operation || !dext_bar0_info(&mi, &size) || offset >= size || width > size - offset)
-		return;
-	switch (width) {
-	case 1: g_pci->MemoryWrite8(mi, offset, (uint8_t)v); break;
-	case 2: g_pci->MemoryWrite16(mi, offset, (uint16_t)v); break;
-	case 4: g_pci->MemoryWrite32(mi, offset, (uint32_t)v); break;
-	default: g_pci->MemoryWrite64(mi, offset, v); break;
-	}
+	if (operation && dext_aperture_slot(offset, width, &mi))
+		(void)dext_memory_write(mi, offset, width, v);
 }
 
 static const struct linuxu_aperture_ops g_aperture_ops = { dext_aperture_read, dext_aperture_write };

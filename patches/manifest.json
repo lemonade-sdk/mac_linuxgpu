@@ -50,6 +50,14 @@
         "drivers/gpu/drm/amd/amdkfd/kfd_mqd_manager_v12.c"
       ],
       "reason": "Allocate GFX12 compute user-queue MQDs in CPU-visible VRAM on a dGPU (amdgpu_bo_create_kernel) and flush HDP after update_mqd, as amdgpu does for its kernel queue MQDs on GFX10+ and KFD for GFX 9.4.3. A dispatch that fills a shader engine exactly is retired only after CP accesses to the MQD; with KFD's GTT MQD behind Thunderbolt that costs +45 us per dispatch (253-256 x 256-thread workgroups on an R9700: 51 us instead of 5), with the VRAM MQD +12 us. Drop if upstream moves GFX12 KFD MQDs to VRAM."
+    },
+    {
+      "patch": "patches/linux/amdgpu-ttm-visible-kmap.patch",
+      "sha256": "f3f80418d797477a1b86eab0ad6f405aa066f3b3affe76be426e338c3d29e434",
+      "files": [
+        "drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c"
+      ],
+      "reason": "amdgpu_ttm_io_mem_reserve gave contiguous VRAM a premapped kernel address, aper_base_kaddr plus the offset, even past the CPU-visible window that aper_base_kaddr maps; a kmap of such a BO pointed past the 256 MiB BAR0 mapping, which the dext treats as process memory, and a store through it crashed the driver process (a dext that dies with its PCI session open panics the Mac). The premapped address is now given only when amdgpu_res_cpu_visible holds; otherwise TTM ioremaps the bus range, rt_ioremap refuses it loudly and the kmap fails. linuxu/tests/visible_kmap_check.c checks both cases. Drop when upstream bounds the premapped address itself."
     }
   ],
   "verified_copies": {
