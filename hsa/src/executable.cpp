@@ -1,5 +1,6 @@
 #include "runtime_state.h"
 #include "code_object.h"
+#include "code_heap.h"
 #include "signal_kernels.h"
 #include "mac_hsa.h"
 #include <array>
@@ -25,9 +26,12 @@ struct LoadedImage {
     std::shared_ptr<CodeReader> reader;
     std::string uri;
     std::shared_ptr<Connection> connection;
-    DeviceBuffer buffer;
+    // Its range of the connection's code heap (code_heap.h).
+    std::shared_ptr<CodeHeap> heap;
+    CodeHeap::Placement placement;
     CodeObject object;
-    ~LoadedImage() { if (buffer.handle) connection->freeBuffer(buffer); }
+    uint64_t address() const { return placement.address(); }
+    ~LoadedImage() { if (heap && placement.size) heap->release(placement); }
 };
 struct Executable {
     std::mutex mutex;
@@ -44,7 +48,10 @@ std::unordered_map<uint64_t, std::shared_ptr<Executable>> &executables = *new st
 std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>> &executableSymbols = *new std::unordered_map<uint64_t, std::shared_ptr<ExecutableSymbol>>;
 std::unordered_map<uint64_t, std::shared_ptr<CodeReader>> &codeReaders = *new std::unordered_map<uint64_t, std::shared_ptr<CodeReader>>;
 static std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>> &loadedImages = *new std::unordered_map<uint64_t, std::weak_ptr<LoadedImage>>;
-void clearLoadedImages() { loadedImages.clear(); }
+// The same images by device address, for address queries and the overlap
+// check of a new load (logarithmic: a program may load thousands).
+static std::map<uint64_t, std::weak_ptr<LoadedImage>> &imagesByAddress = *new std::map<uint64_t, std::weak_ptr<LoadedImage>>;
+void clearLoadedImages() { loadedImages.clear(); imagesByAddress.clear(); }
 
 static std::string readerURI(const CodeReader &reader) {
     if (reader.fd < 0)
@@ -81,7 +88,10 @@ static hsa_status_t synchronizeCode(const std::shared_ptr<mac_hsa::Connection> &
 hsa_status_t flushPendingCodeSync(const std::shared_ptr<mac_hsa::Connection> &connection) {
     if (!connection || !connection->codeSyncPending.exchange(false, std::memory_order_seq_cst))
         return HSA_STATUS_SUCCESS;
-    const auto status = synchronizeCode(connection);
+    // The code staged since the last doorbell lands first (one copy per
+    // run of adjacent ranges), then the caches are synced once for it all.
+    auto status = connection->codeHeap()->flush();
+    if (status == HSA_STATUS_SUCCESS) status = synchronizeCode(connection);
     // Still owed: the next doorbell tries again (and fails the same way).
     if (status != HSA_STATUS_SUCCESS) connection->codeSyncPending.store(true, std::memory_order_seq_cst);
     return status;
@@ -127,6 +137,9 @@ static hsa_status_t dispatchExecutable(bool aql, hsa_executable_symbol_t handle,
     const auto &kernel = image.object.kernels[symbol->kernelIndex];
     if (kernel.kernargSize != kernargSize || kernargSize > 4 * 1024 * 1024)
         return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    // The driver launch reads the code: what is staged lands and is synced.
+    if (const auto flushed = flushPendingCodeSync(image.connection); flushed != HSA_STATUS_SUCCESS)
+        return flushed;
     // AMDHSA descriptor: ENABLE_SGPR_KERNARG_SEGMENT_PTR (bit 3) and the
     // kernel's wave size (bit 10 = wave32). The native PM4 ABI passes only the
     // kernarg pointer in SGPR0-1 and launches wave32. The AQL path lets the
@@ -137,8 +150,8 @@ static hsa_status_t dispatchExecutable(bool aql, hsa_executable_symbol_t handle,
     if (!supported || kernel.preload ||
         kernel.privateSize || kernel.groupSize || kernel.dynamicStack)
         return HSA_STATUS_ERROR_INCOMPATIBLE_ARGUMENTS;
-    request.version = 2; request.codeHandle = image.buffer.handle;
-    request.codeOffset = kernel.entry;
+    request.version = 2; request.codeHandle = image.placement.chunk.handle;
+    request.codeOffset = image.placement.offset + kernel.entry;
     for (const auto &segment : image.object.segments) {
         if ((segment.flags & 1) && kernel.entry >= segment.offset && kernel.entry - segment.offset < segment.size)
             request.codeBytes = (segment.size - (kernel.entry - segment.offset)) & ~uint64_t(3);
@@ -178,8 +191,8 @@ static hsa_status_t dispatchExecutable(bool aql, hsa_executable_symbol_t handle,
     request.buffers[bufferCount] = arguments.buffer.handle;
     if (aql) {
         amdgpu::AQLDispatchRequest packet{};
-        packet.version=1; packet.codeHandle=image.buffer.handle;
-        packet.descriptorOffset=kernel.descriptor; packet.kernargHandle=arguments.buffer.handle;
+        packet.version=1; packet.codeHandle=image.placement.chunk.handle;
+        packet.descriptorOffset=image.placement.offset+kernel.descriptor; packet.kernargHandle=arguments.buffer.handle;
         packet.kernargBytes=kernargSize; packet.timeoutUS=request.timeoutUS;
         for (unsigned i=0;i<3;++i) { packet.groups[i]=groups[i]; packet.threads[i]=threads[i]; }
         for (size_t i=0;i<bufferCount;++i) packet.buffers[i]=request.buffers[i];
@@ -249,7 +262,10 @@ hsa_status_t hsa_executable_destroy(hsa_executable_t handle) {
     std::lock_guard lock(runtimeMutex);
     if (!executables.erase(handle.handle)) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
     for (const auto symbol : executable->symbolHandles) executableSymbols.erase(symbol);
-    for (const auto &image : executable->images) loadedImages.erase(image->handle.handle);
+    for (const auto &image : executable->images) {
+        loadedImages.erase(image->handle.handle);
+        imagesByAddress.erase(image->address());
+    }
     return HSA_STATUS_SUCCESS; // final GPU storage release occurs after both locks
 }
 hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_agent_t agent,
@@ -276,11 +292,11 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
     if (executable->frozen) return HSA_STATUS_ERROR_FROZEN_EXECUTABLE;
     try {
         auto image = std::make_shared<LoadedImage>();
+        const auto heap = connection->codeHeap();
         mac_hsa::DeviceSnapshot device;
-        auto status = connection->read(device);
-        if (status != HSA_STATUS_SUCCESS) return status;
         mac_hsa::IsaTarget isa;
-        if (!mac_hsa::deviceIsa(device, isa)) return HSA_STATUS_ERROR_INVALID_ISA;
+        auto status = heap->device(device, isa);
+        if (status != HSA_STATUS_SUCCESS) return status;
         // Accepts the agent's own processor or its generic family, as ROCr's
         // loader does; anything else is an incompatible code object.
         if (!mac_hsa::parseCodeObject(reader->bytes, image->object, isa)) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
@@ -293,25 +309,27 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
         }
         image->connection = connection; image->agent = agent;
         image->reader = reader; image->executable = handle; image->uri = readerURI(*reader);
-        status = connection->allocateBuffer(image->object.image.size(), image->buffer);
+        // A range of the code heap, at the alignment its segments ask for:
+        // no driver call unless the heap grows by a chunk.
+        status = heap->reserve(image->object.image.size(), image->object.alignment, image->placement);
         if (status != HSA_STATUS_SUCCESS) return status;
-        if (!image->buffer.handle || !image->buffer.address || image->buffer.address % 16384 ||
-            image->buffer.size < image->object.image.size() || image->buffer.address >= (1ull << 48) ||
-            image->buffer.size > (1ull << 48) - image->buffer.address) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-        if (!mac_hsa::relocateCodeObject(image->object, image->buffer.address)) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
-        status = connection->writeBuffer(image->buffer, 0, image->object.image.data(), image->object.image.size());
+        image->heap = heap;
+        if (!mac_hsa::relocateCodeObject(image->object, image->address())) return HSA_STATUS_ERROR_INVALID_CODE_OBJECT;
+        status = heap->stage(image->placement, image->object.image.data(), image->object.image.size());
         if (status != HSA_STATUS_SUCCESS) return status;
         // ROCr RegionMemory::Freeze invalidates agent code caches after upload.
         // AQL acquire fences alone do not retire stale instructions when a
-        // destroyed executable's allocation is reused by a different image.
-        // A driver with CodeSync takes one sync for every load since the
-        // last, before the next doorbell of this connection's queues (no
-        // packet runs before its doorbell): a program loading dozens of
-        // code objects pays once. Older drivers sync each load, as before.
+        // destroyed executable's range is reused by a different image.
+        // A driver with CodeSync takes one upload of everything staged and
+        // one sync for every load since the last, before the next doorbell
+        // of this connection's queues (no packet runs before its doorbell)
+        // or driver launch: a program loading hundreds of code objects pays
+        // once. Older drivers upload and sync each load, as before.
         if (device.build >= mac_hsa::kCodeSyncDriverBuild) {
             connection->codeSyncPending.store(true, std::memory_order_seq_cst);
         } else {
-            status = synchronizeCode(connection);
+            status = heap->flush();
+            if (status == HSA_STATUS_SUCCESS) status = synchronizeCode(connection);
             if (status != HSA_STATUS_SUCCESS) return status;
         }
         std::vector<std::shared_ptr<ExecutableSymbol>> prepared;
@@ -326,18 +344,25 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
             if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
             const auto current = executables.find(handle.handle);
             if (current == executables.end() || current->second != executable) return HSA_STATUS_ERROR_INVALID_EXECUTABLE;
-            for (const auto &[existingID, weak] : loadedImages) {
-                (void)existingID;
-                const auto existing = weak.lock();
-                if (existing && image->buffer.address < existing->buffer.address + existing->buffer.size &&
-                    existing->buffer.address < image->buffer.address + image->buffer.size)
-                    return HSA_STATUS_ERROR_OUT_OF_RESOURCES; // address-only loader queries must be unambiguous
+            // Address-only loader queries must be unambiguous: one heap never
+            // overlaps itself, but distinct GPUs can expose identical addresses.
+            const auto start = image->address(), end = start + image->placement.size;
+            auto next = imagesByAddress.lower_bound(start);
+            if (next != imagesByAddress.end()) {
+                const auto existing = next->second.lock();
+                if (existing && existing->address() < end) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            }
+            if (next != imagesByAddress.begin()) {
+                const auto existing = std::prev(next)->second.lock();
+                if (existing && existing->address() + existing->placement.size > start)
+                    return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
             }
             if (lastHandle == UINT64_MAX || prepared.size() > UINT64_MAX - lastHandle - 1)
                 return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
             try {
                 image->handle.handle = ++lastHandle;
                 loadedImages.emplace(image->handle.handle, image);
+                imagesByAddress.insert_or_assign(start, image);
                 for (auto &symbol : prepared) {
                     const auto id = ++lastHandle;
                     executableSymbols.emplace(id, symbol);
@@ -346,6 +371,7 @@ hsa_status_t hsa_executable_load_agent_code_object(hsa_executable_t handle, hsa_
             } catch (...) {
                 for (const auto id : inserted) executableSymbols.erase(id);
                 loadedImages.erase(image->handle.handle);
+                imagesByAddress.erase(start);
                 throw;
             }
             executable->symbolHandles.insert(executable->symbolHandles.end(), inserted.begin(), inserted.end());
@@ -424,7 +450,7 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t handle,
     case HSA_EXECUTABLE_SYMBOL_INFO_IS_DEFINITION: return writeValue(value, true);
     case HSA_EXECUTABLE_SYMBOL_INFO_AGENT: return writeValue(value, symbol->image->agent);
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT:
-        return writeValue(value, executable->frozen ? symbol->image->buffer.address + kernel.descriptor : uint64_t(0));
+        return writeValue(value, executable->frozen ? symbol->image->address() + kernel.descriptor : uint64_t(0));
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: return writeValue(value, kernel.kernargSize);
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_ALIGNMENT: return writeValue(value, kernel.kernargAlignment);
     case HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: return writeValue(value, kernel.groupSize);
@@ -438,11 +464,21 @@ hsa_status_t hsa_executable_symbol_get_info(hsa_executable_symbol_t handle,
 namespace {
 // The caller holds runtimeMutex. Loaded images are published only after upload.
 std::shared_ptr<LoadedImage> imageAt(uintptr_t address, bool host = false) {
+    if (!host) {
+        auto found = imagesByAddress.upper_bound(address);
+        if (found == imagesByAddress.begin()) return {};
+        const auto image = std::prev(found)->second.lock();
+        if (!image) return {};
+        const auto offset = address - image->address();
+        for (const auto &segment : image->object.segments)
+            if (offset >= segment.offset && offset - segment.offset < segment.size) return image;
+        return {};
+    }
     for (const auto &[id, weak] : loadedImages) {
         (void)id;
         const auto image = weak.lock();
         if (!image) continue;
-        const auto base = host ? reinterpret_cast<uintptr_t>(image->object.image.data()) : image->buffer.address;
+        const auto base = reinterpret_cast<uintptr_t>(image->object.image.data());
         if (address < base) continue;
         const auto offset = address - base;
         for (const auto &segment : image->object.segments)
@@ -459,7 +495,7 @@ HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_query_host_address(const void *de
     *host = nullptr;
     auto image = imageAt(reinterpret_cast<uintptr_t>(device));
     if (image) {
-        *host = image->object.image.data() + (reinterpret_cast<uintptr_t>(device) - image->buffer.address);
+        *host = image->object.image.data() + (reinterpret_cast<uintptr_t>(device) - image->address());
         return HSA_STATUS_SUCCESS;
     }
     if (imageAt(reinterpret_cast<uintptr_t>(device), true)) { *host = device; return HSA_STATUS_SUCCESS; }
@@ -504,11 +540,11 @@ HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_query_segment_descriptors(
                     reader.fd < 0 ? static_cast<const void *>(reader.bytes.data()) : reader.path.c_str(),
                     reader.fd < 0 ? reader.bytes.size() : reader.path.size() + 1,
                     size_t(segment.fileOffset + reader.offset),
-                    reinterpret_cast<const void *>(image->buffer.address + segment.offset), size_t(segment.fileSize)};
+                    reinterpret_cast<const void *>(image->address() + segment.offset), size_t(segment.fileSize)};
             }
             if (segment.size > segment.fileSize) {
                 out[index++] = {image->agent, image->executable, HSA_VEN_AMD_LOADER_CODE_OBJECT_STORAGE_TYPE_NONE,
-                    nullptr, 0, 0, reinterpret_cast<const void *>(image->buffer.address + segment.offset + segment.fileSize),
+                    nullptr, 0, 0, reinterpret_cast<const void *>(image->address() + segment.offset + segment.fileSize),
                     size_t(segment.size - segment.fileSize)};
             }
         }
@@ -560,9 +596,9 @@ HSA_API_EXPORT hsa_status_t hsa_ven_amd_loader_loaded_code_object_get_info(hsa_l
         if (reader.fd < 0) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
         return writeValue(value, reader.fd);
     case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_DELTA:
-        return writeValue(value, int64_t(image->buffer.address - image->object.virtualBase));
-    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_BASE: return writeValue(value, image->buffer.address);
-    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE: return writeValue(value, image->buffer.size);
+        return writeValue(value, int64_t(image->address() - image->object.virtualBase));
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_BASE: return writeValue(value, image->address());
+    case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_LOAD_SIZE: return writeValue(value, image->placement.size);
     case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI_LENGTH: return writeValue(value, uint32_t(image->uri.size()));
     case HSA_VEN_AMD_LOADER_LOADED_CODE_OBJECT_INFO_URI:
         std::memcpy(value, image->uri.c_str(), image->uri.size() + 1); return HSA_STATUS_SUCCESS;

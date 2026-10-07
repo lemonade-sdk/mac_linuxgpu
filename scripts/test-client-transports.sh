@@ -50,7 +50,7 @@ done
 # The HSA runtime (hsa/CMakeLists.txt's sources) and its firmware servicer.
 for source in hsa/src/runtime.cpp hsa/src/gpu_signals.cpp hsa/src/gpu_signal_service.cpp hsa/src/memory.cpp \
               hsa/src/queues.cpp hsa/src/power.cpp hsa/src/device_init.cpp hsa/src/isa.cpp hsa/src/isa_target.cpp \
-              hsa/src/signal_kernels.cpp hsa/src/code_object.cpp hsa/src/executable.cpp hsa/src/virtual_memory.cpp \
+              hsa/src/signal_kernels.cpp hsa/src/code_object.cpp hsa/src/code_heap.cpp hsa/src/executable.cpp hsa/src/virtual_memory.cpp \
               hsa/src/host_services.cpp hsa/src/host_window.cpp hsa/src/allocation_census.cpp \
               hsa/src/ipc_memory.cpp hsa/src/ipc_signal.cpp hsa/src/platform_extensions.cpp \
               hsa/src/transport_iokit.cpp hsa/src/transport_fake.cpp host/fw_mailbox_service.c host/fw_mailbox_iokit.c; do

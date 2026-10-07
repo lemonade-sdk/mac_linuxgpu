@@ -23,6 +23,9 @@ struct Relocation {
 struct CodeObject {
     struct Segment { uint64_t offset, size, fileOffset, fileSize; uint32_t flags; };
     uint64_t virtualBase = 0;
+    // The largest alignment of its loadable segments: the image's device
+    // address must be a multiple of it (relocation keeps segment offsets).
+    uint64_t alignment = 1;
     std::vector<uint8_t> image;
     std::vector<Segment> segments;
     std::vector<KernelMetadata> kernels;
