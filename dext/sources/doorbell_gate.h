@@ -79,6 +79,46 @@ static inline bool mlg_doorbell_ring(struct mlg_doorbell_gate *gate, volatile ui
 	return rung;
 }
 
+/* A client's several stores into the BARs as one bracket, under the same
+ * gate: a submission that writes its kernel arguments into CPU-visible
+ * VRAM, publishes them with the HDP flush register (a store, then a read
+ * back) and rings the doorbell. Each store is a plain store anywhere in
+ * the client's code (a memcpy among them), so the bracket is per
+ * submission, not per store:
+ *
+ *	if (!mlg_bar_write_begin(gate))
+ *		return closed;	// nothing written; ask the driver why
+ *	... memcpy into the VRAM ring, HDP store and read back, doorbell ...
+ *	mlg_bar_write_end(gate);
+ *
+ * Once the driver's close (retire, hold) returns, no bracket is open and
+ * no new one opens: no store of the client reaches the BARs. Brackets
+ * nest (busy counts them), and a doorbell rung with mlg_doorbell_ring
+ * inside one is a nested bracket.
+ *
+ * End completes the bracket's stores before counting out (DSB ST on
+ * arm64): the driver may power the device down or reset it the moment
+ * busy reads zero, and a Device-nGnRE store the core still holds would
+ * land after that. A bracket that ends with a read of the BARs (the HDP
+ * flush's read back) has its stores completed already; the DSB then
+ * costs little. */
+static inline bool mlg_bar_write_begin(struct mlg_doorbell_gate *gate)
+{
+	__atomic_add_fetch(&gate->busy, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&gate->open, __ATOMIC_SEQ_CST))
+		return true;
+	__atomic_sub_fetch(&gate->busy, 1, __ATOMIC_RELEASE);
+	return false;
+}
+
+static inline void mlg_bar_write_end(struct mlg_doorbell_gate *gate)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("dsb st" ::: "memory");
+#endif
+	__atomic_sub_fetch(&gate->busy, 1, __ATOMIC_RELEASE);
+}
+
 /* ---- the driver's registry ---- */
 
 #ifndef MLG_DOORBELL_GATE_SLOTS
