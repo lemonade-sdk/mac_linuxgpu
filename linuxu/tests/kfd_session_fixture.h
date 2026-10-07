@@ -67,6 +67,8 @@ unsigned int fixture_kernel_allocs(void);
 unsigned int fixture_cp_dispatches(void);
 unsigned int fixture_render_balance(void);
 uint64_t fixture_doorbell(uint32_t dword_index);
+/* The doorbell BAR (BAR 2) as the CPU sees it: what a client maps. */
+volatile uint64_t *fixture_doorbell_bar(void);
 void *fixture_va_to_host(uint32_t pasid, uint64_t va, uint64_t bytes);
 uint32_t fixture_pasid_of(uint64_t va);
 /* A GPU page fault of process @pasid at @va, delivered to KFD as the IH

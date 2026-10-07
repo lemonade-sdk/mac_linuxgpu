@@ -16,7 +16,7 @@ def section(start, end, limit):
         raise SystemExit("shutdown fixture extraction exceeded its bounded section")
     return text
 state = section("static IODispatchQueue *s_bringupQueue", "class ComputeClientScope", 140)
-close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 640)
+close = section("static void session_irq_drained(void *context)", "static kern_return_t ensure_open", 700)
 opening = section("static kern_return_t ensure_open(MacLinuxGPUUserClient *client)", "static kern_return_t prepare_interrupts", 50)
 driver_stop = section("kern_return_t\nIMPL(MacLinuxGPU, Stop)", "void\nMacLinuxGPU::FinishSession()", 60)
 finish = section("void\nMacLinuxGPU::FinishSession()", "void\nMacLinuxGPU::FinishStop(IOService *provider)", 100)

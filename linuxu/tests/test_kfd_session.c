@@ -818,6 +818,12 @@ int main(void)
 	assert(rt_kfd_bo_read(s, host, host_info.size - 4, back, 8) == -ERANGE);
 
 	/* ---- queues: two CREATE_QUEUEs become two MES ADD_QUEUEs ---- */
+	{
+		struct rt_kfd_doorbells slice;
+
+		/* No doorbell slice before the first queue maps it. */
+		assert(rt_kfd_session_doorbells(s, &slice) == -ENODEV);
+	}
 	make_queue(s, &q0, 64);
 	make_queue(s, &q1, 256);
 	assert(rt_kfd_session_queue_count(s) == 2);
@@ -843,6 +849,25 @@ int main(void)
 	assert(!rt_kfd_queue_kick_nowait(s, q0.q, 6) && doorbell_bar[mes_doorbells[0] / 2] == 7);
 	assert(!rt_kfd_queue_kick(s, q0.q, 8) && doorbell_bar[mes_doorbells[0] / 2] == 8);
 	assert(rt_kfd_queue_kick_nowait(s, q0.q, UINT64_MAX) == -EINVAL);
+	/* The process's doorbell slice, as libhsakmt maps it: a whole page of
+	 * the doorbell BAR holding both queues' doorbells, at their CREATE_QUEUE
+	 * offsets; what the client writes there is what the kicks write. */
+	{
+		struct rt_kfd_doorbells slice;
+		const uint32_t first = q0.info.doorbell_index -
+			(uint32_t)((q0.info.doorbell_offset & (limits.doorbell_slice_bytes - 1)) / 4);
+
+		assert(!rt_kfd_session_doorbells(s, &slice));
+		assert(slice.bar == 2 && slice.bytes == limits.doorbell_slice_bytes);
+		assert(!(slice.bytes & (PAGE_SIZE - 1)) && !(slice.bar_offset & (PAGE_SIZE - 1)));
+		assert(slice.bar_offset == (uint64_t)first * 4);
+		for (const struct queue_set *q = &q0; q; q = q == &q0 ? &q1 : NULL) {
+			const uint64_t at = q->info.doorbell_offset & (slice.bytes - 1);
+
+			assert(at + 8 <= slice.bytes);
+			assert(slice.bar_offset + at == (uint64_t)q->info.doorbell_index * 4);
+		}
+	}
 	/* The queue's buffers cannot go while it exists. */
 	assert(rt_kfd_bo_free(s, q0.ring) == -EBUSY && rt_kfd_bo_free(s, q0.meta) == -EBUSY);
 
@@ -863,6 +888,15 @@ int main(void)
 	assert(other.info.doorbell_index / (limits.doorbell_slice_bytes / 4) !=
 	       q0.info.doorbell_index / (limits.doorbell_slice_bytes / 4));
 	assert(!rt_kfd_queue_kick(second, other.q, 3));
+	/* Its slice is its own page: no doorbell of the first process in it. */
+	{
+		struct rt_kfd_doorbells mine, theirs;
+
+		assert(!rt_kfd_session_doorbells(s, &mine) && !rt_kfd_session_doorbells(second, &theirs));
+		assert(theirs.bar_offset != mine.bar_offset &&
+		       (theirs.bar_offset >= mine.bar_offset + mine.bytes ||
+			mine.bar_offset >= theirs.bar_offset + theirs.bytes));
+	}
 	assert(doorbell_bar[mes_doorbells[2] / 2] == 3 && mes_pasid[2] == TEST_PASID + 1);
 	/* Session close destroys the queue and frees the memory it left. */
 	assert(!rt_kfd_session_close(second));

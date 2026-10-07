@@ -49,6 +49,13 @@ int dext_pci_config_write8(uint64_t o, uint8_t v) { ++config_writes; if(o>=sizeo
 int dext_pci_config_write16(uint64_t o, uint16_t v) { ++config_writes; if(o+1>=sizeof(cfg) || (int)o==fail_write_at)return -1; if((int)o!=suppress_write_at)wr16(o,v); return 0; }
 int dext_pci_config_write32(uint64_t o, uint32_t v) { ++config_writes; if(o+3>=sizeof(cfg) || (int)o==fail_write_at)return -1; if((int)o!=suppress_write_at)wr32(o,v); return 0; }
 void msleep(unsigned int ms) { (void)ms; }
+/* The MSI-X table, in BAR5. */
+static uint32_t bar5[1024];
+static int bar_write_ignored = -1;	/* a table dword that does not take writes */
+int dext_pci_bar_read32(unsigned int bar, uint64_t o, uint32_t *v)
+{ if (bar != 5 || o + 4 > sizeof(bar5)) return -1; *v = bar5[o / 4]; return 0; }
+int dext_pci_bar_write32(unsigned int bar, uint64_t o, uint32_t v)
+{ if (bar != 5 || o + 4 > sizeof(bar5)) return -1; if ((int)(o / 4) != bar_write_ignored) bar5[o / 4] = v; return 0; }
 int dext_pci_irq_status(unsigned int *armed, unsigned int *type) {
     *armed = armed_irq_vectors;
     *type = actual_irq_type;
@@ -323,10 +330,19 @@ int main(void) {
     assert(rd16(0x88) == 0x123 && rd16(0x90) == 0x40);
     assert(rd32(0x10) == 0x8000000c);
     assert(!pci_load_saved_state(&p, saved));
-    wr32(0x10, 0x9000000c);
-    writes = config_writes;
-    pci_restore_state(&p); /* A changed assignment is never repaired with BAR writes. */
-    assert(faults == fault_before + 1 && config_writes == writes);
+    /* A device-internal reset (mode1) cleared the BARs, the ROM BAR and
+     * the command: the host's assignment goes back, decode off meanwhile. */
+    wr32(0x10, 0x0000000c); wr32(0x14, 0); wr32(0x30, 0); wr16(PCI_COMMAND, 0);
+    pci_restore_state(&p);
+    assert(faults == fault_before && rd32(0x10) == 0x8000000c && rd16(PCI_COMMAND) == 6);
+    /* A BAR that does not take its value fails the restore (the fault
+     * latch), and the command stays without decode. */
+    assert(!pci_load_saved_state(&p, saved));
+    wr32(0x10, 0x0000000c); wr16(PCI_COMMAND, 0);
+    suppress_write_at = 0x10;
+    pci_restore_state(&p);
+    assert(faults == fault_before + 1 && !(rd16(PCI_COMMAND) & PCI_COMMAND_MEMORY));
+    suppress_write_at = -1;
     wr32(0x10, 0x8000000c);
     assert(!pci_load_saved_state(&p, saved));
     wr16(0x88, 0);
@@ -337,6 +353,33 @@ int main(void) {
     assert(!pci_load_saved_state(&p, saved));
     pci_restore_state(&p);
     kfree(saved);
+
+    /* MSI-X as DriverKit programmed it (vector 0 routed, table in BAR5 at
+     * 0x200): saved with the state, written back after a reset cleared it. */
+    assert(cfg[0x50] == PCI_CAP_ID_MSIX && cfg[0x51] == 0x80);	/* PM, MSI-X, PCIe */
+    wr16(0x52, PCI_MSIX_FLAGS_ENABLE | 3);	/* 4 entries */
+    wr32(0x54, 0x200 | 5);
+    for (unsigned i = 0; i < 16; ++i) bar5[0x200 / 4 + i] = 0xabc00000u + i;
+    assert(pci_save_state(&p) == 0);
+    saved = pci_store_saved_state(&p);
+    assert(saved);
+    memset(bar5, 0, sizeof(bar5));
+    wr16(0x52, 3);			/* the reset disabled it */
+    wr32(0x10, 0x0000000c); wr16(PCI_COMMAND, 0);
+    fault_before = faults;
+    pci_restore_state(&p);
+    assert(faults == fault_before && rd16(0x52) == (PCI_MSIX_FLAGS_ENABLE | 3));
+    for (unsigned i = 0; i < 16; ++i) assert(bar5[0x200 / 4 + i] == 0xabc00000u + i);
+    assert(bar5[0x200 / 4 + 16] == 0 && rd16(PCI_COMMAND) == 6 && rd32(0x10) == 0x8000000c);
+    /* A table entry that does not take its value fails the restore. */
+    assert(!pci_load_saved_state(&p, saved));
+    memset(bar5, 0, sizeof(bar5));
+    bar_write_ignored = 0x200 / 4 + 2;
+    pci_restore_state(&p);
+    assert(faults == fault_before + 1);
+    bar_write_ignored = -1;
+    kfree(saved);
+    wr16(0x52, 0); wr32(0x54, 0);
     wr16(0x8a, 0);
     assert(pci_wait_for_pending_transaction(&p) == 1);
     wr16(0x8a, 1 << 5);

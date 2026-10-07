@@ -33,7 +33,7 @@ struct kick_slot {
 
 struct kick_table {
 	bool lock;
-	bool closed;		/* no ring at all (a power transition) */
+	uint32_t holds;		/* no ring at all while any is held (KICK_HOLD_*) */
 	uint32_t used;		/* slots [0, used) may be taken */
 	struct kick_slot slots[KICK_TABLE_SLOTS];
 };
@@ -112,13 +112,21 @@ static inline void kick_table_retire_owner(struct kick_table *t, uint64_t owner)
 	kick_table_unlock(t);
 }
 
-/* The session queue: while @closed, nothing is rung here. Closing also
- * waits for a ring in progress: from the return on, the device sees no
- * doorbell from this path. */
-static inline void kick_table_set_closed(struct kick_table *t, bool closed)
+/* Why nothing may be rung: each reason is held and released on its own,
+ * and the table rings only while none is held. */
+#define KICK_HOLD_POWER 1u	/* a power transition: the device takes no work */
+#define KICK_HOLD_RESET 2u	/* a device reset: the BARs stop decoding */
+
+/* Hold (or release) @reason. While any reason is held nothing is rung
+ * here; holding also waits for a ring in progress: from the return on, the
+ * device sees no doorbell from this path. */
+static inline void kick_table_hold(struct kick_table *t, uint32_t reason, bool hold)
 {
 	kick_table_lock(t);
-	t->closed = closed;
+	if (hold)
+		t->holds |= reason;
+	else
+		t->holds &= ~reason;
 	kick_table_unlock(t);
 }
 
@@ -133,7 +141,7 @@ static inline int kick_table_ring(struct kick_table *t, uint64_t owner, uint64_t
 	if (!handle)
 		return absent;
 	kick_table_lock(t);
-	for (uint32_t i = 0; !t->closed && i < t->used; ++i) {
+	for (uint32_t i = 0; !t->holds && i < t->used; ++i) {
 		const struct kick_slot *slot = &t->slots[i];
 
 		if (slot->handle != handle)

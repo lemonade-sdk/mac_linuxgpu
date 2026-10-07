@@ -11,6 +11,7 @@
  * session's state. */
 #include "session_state.h"
 #include "dext_compute.h"
+#include <rt/recovery.h>
 #include <Block.h>
 #include <atomic>
 #include <cassert>
@@ -29,6 +30,7 @@ enum : int {
     kIOReturnSuccess = 0, kIOReturnBadArgument = 1, kIOReturnBusy = 2, kIOReturnNotReady = 3,
     kIOReturnNoResources = 4, kIOReturnNoMemory = 5, kIOReturnNotFound = 6, kIOReturnNoSpace = 7,
     kIOReturnTimeout = 8, kIOReturnNotPermitted = 9, kIOReturnError = 10, kIOReturnUnsupported = 11,
+    kIOReturnAborted = 12,
 };
 static std::atomic<int> eventsLogged;
 #define MACLINUXGPU_LOG(...) (std::printf("log: " __VA_ARGS__), std::printf("\n"))
@@ -165,7 +167,23 @@ static uint64_t dext_pci_transport_fault_offset() { return 0; }
 static std::atomic<int> powerWaits;
 static kern_return_t power_wait(MacLinuxGPUUserClient *, OSAction *, uint64_t) { ++powerWaits; return kIOReturnSuccess; }
 static void power_snapshot(uint64_t *out) { memset(out, 0, MLG_POWER_STATE_WORDS * 8); out[0] = MLG_POWER_STATE_VERSION; }
-static void reset_state(uint64_t *out) { memset(out, 0, MLG_RESET_STATE_WORDS * 8); out[0] = MLG_RESET_STATE_VERSION; out[1] = 2; }
+// GPU recovery's published state, and what the device-reset gate reads.
+static uint64_t resetGeneration = 2, resetFlags;
+static void reset_state(uint64_t *out)
+{
+    memset(out, 0, MLG_RESET_STATE_WORDS * 8);
+    out[0] = MLG_RESET_STATE_VERSION; out[1] = resetGeneration; out[2] = resetFlags;
+}
+static void reset_state_store(const struct rt_recovery_state *st)
+{
+    resetGeneration = st->generation;
+    resetFlags = st->flags & RT_RECOVERY_WEDGED ? MLG_RESET_FLAG_WEDGED : 0;
+}
+static bool s_deviceResetEnabled;
+struct RawBARLeaseMock { bool mapped = false; bool hasMappings() const { return mapped; } };
+static RawBARLeaseMock s_rawBARLease;
+static unsigned barMappings;
+extern "C" unsigned int rt_lx_bar_mappings(void) { return barMappings; }
 static void session_state(uint64_t *out) { memset(out, 0, MLG_SESSION_STATE_WORDS * 8); out[0] = MLG_SESSION_STATE_VERSION; }
 static size_t klog_read(uint64_t *cursor, char *out, size_t capacity, uint64_t *end)
 {
@@ -357,6 +375,12 @@ int main()
     IOUserClientMethodArguments w{};
     w.scalarInput = waitIn; w.scalarInputCount = 2; w.completion = action;
     assert(direct_call(&client, MLG_SELECTOR_POWER, &w) == kIOReturnSuccess && powerWaits == 1);
+    // RESET_WAIT's registration answers at once too.
+    const uint64_t knownGeneration[1] = {2};
+    IOUserClientMethodArguments rw{};
+    rw.scalarInput = knownGeneration; rw.scalarInputCount = 1; rw.completion = action;
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_RESET_WAIT, knownGeneration, 1));
+    assert(direct_call(&client, MLG_SELECTOR_RESET_WAIT, &rw) == kIOReturnSuccess);
 
     const uint64_t allocIn[4] = {4096, 2, 4096, 0};
     uint64_t allocOut[3] = {};
@@ -472,6 +496,39 @@ int main()
         assert(words[0] == 0x100 && words[15] == 0x10f);
         kept.structureOutput->release();
     }
+
+    // RESET_WAIT: the wait registered above (generation 2) completes when
+    // recovery publishes a new generation, with the wedged flag; a wait for
+    // an old generation completes at once; a client's waits end with it.
+    size_t before;
+    { std::lock_guard lock(completionsLock); before = completions.size(); }
+    struct rt_recovery_state st{};
+    st.generation = 3; st.flags = RT_RECOVERY_WEDGED;
+    recovery_notify(&st);
+    Completion woke = waitCompletion(before);
+    assert(woke.count == MLG_RESET_WAIT_WORDS && woke.args[0] == 3 && woke.args[1] == MLG_RESET_FLAG_WEDGED);
+    const uint64_t stale[1] = {2};
+    rw.scalarInput = stale;
+    assert(direct_call(&client, MLG_SELECTOR_RESET_WAIT, &rw) == kIOReturnSuccess);
+    assert(waitCompletion(before + 1).args[0] == 3);
+    const uint64_t current[1] = {3};
+    rw.scalarInput = current;
+    assert(direct_call(&client, MLG_SELECTOR_RESET_WAIT, &rw) == kIOReturnSuccess);
+    { std::lock_guard lock(completionsLock); assert(completions.size() == before + 2); }
+    reset_cancel_waits(&client);
+    assert(waitCompletion(before + 2).args[0] == 3);
+
+    // The device-reset gate: off unless the personality enables it, and
+    // never while a client maps a BAR.
+    assert(device_reset_gate() && strstr(device_reset_gate(), "MacLinuxGPUDeviceReset"));
+    s_deviceResetEnabled = true;
+    assert(!device_reset_gate());
+    barMappings = 1;
+    assert(device_reset_gate() && strstr(device_reset_gate(), "through a BAR"));
+    barMappings = 0;
+    s_rawBARLease.mapped = true;
+    assert(device_reset_gate() && strstr(device_reset_gate(), "raw lease"));
+    s_rawBARLease.mapped = false;
 
     owner_results_free(&client);
     owner.finish();

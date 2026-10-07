@@ -163,6 +163,13 @@ static int dext_pci_close_removed();
 static int rt_removal_begin(struct pci_dev *) { events.push_back("removal_begin"); return 0; }
 static void rt_removal_end() { events.push_back("removal_end"); }
 static void dext_compute_device_removed() { events.push_back("compute_removed"); }
+// The clients' own doorbells (doorbell_gate.h): retired at every close
+// and client stop; counted, not part of the event order.
+struct IOBufferMemoryDescriptor;
+struct mlg_doorbell_gate;
+#define DEXT_COMPUTE_DOORBELL_DRAIN_MS 20u
+static unsigned doorbellRetires;
+static uint64_t dext_compute_doorbell_gate_retire(uint64_t) { ++doorbellRetires; return 0; }
 // A definite transport fault made the GPU unreachable (rt/removal.h's
 // rt_device_lost): its work completes with -ECANCELED from now on.
 static int rt_device_lost_active(const char *) { events.push_back("device_lost"); return 0; }
@@ -229,8 +236,8 @@ static void driver_stop(MacLinuxGPU *driver, IOService *provider);
 static unsigned watchdogStarts;
 static void session_watchdog_start(MacLinuxGPU *, const char *, bool) { ++watchdogStarts; }
 #include "session_shutdown_production.inc"
-// Hooked in by InitDevice, which these scenarios do not run.
-[[maybe_unused]] static void (*const recoveryNotify)(const struct rt_recovery_state *) = recovery_notify;
+// Published by GPU recovery after the probe, which these scenarios skip.
+[[maybe_unused]] static void (*const resetStateStore)(const struct rt_recovery_state *) = reset_state_store;
 
 // An observer read in flight when the session closes: the close waits, and
 // the read finishes (leaves) while the close sleeps.
@@ -694,7 +701,8 @@ static void checkObserverPolicy() {
     assert(!mlg_sysfs_path_copy(path, tooLong.c_str(), tooLong.size(), false));
     for (uint64_t selector = 1; selector < 128; ++selector) {
         if (selector == MLG_SELECTOR_QUERY_INFO || selector == MLG_SELECTOR_RUNTIME_BUILD ||
-            selector == MLG_SELECTOR_RELEASE_QUARANTINE || selector == MLG_SELECTOR_OWNER_RESULT)
+            selector == MLG_SELECTOR_RELEASE_QUARANTINE || selector == MLG_SELECTOR_OWNER_RESULT ||
+            selector == MLG_SELECTOR_RESET_WAIT)
             continue;
         assert(!mlg_observer_selector_allowed(selector, probe, 1));
     }
@@ -722,6 +730,13 @@ static void checkObserverPolicy() {
     assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_POWER, powerPrepare, 1));
     assert(mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, token, 1));
     assert(!mlg_call_runs_on_delivery(MLG_SELECTOR_OWNER_RESULT, noToken, 1));
+    // RESET_WAIT: an observer's, registered on the delivery thread; LRST
+    // is a cached tag.
+    const uint64_t knownGeneration[] = {0}, resetTag[] = {MLG_QUERY_RESET_STATE};
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_RESET_WAIT, knownGeneration, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_RESET_WAIT, knownGeneration, 1));
+    assert(mlg_observer_selector_allowed(MLG_SELECTOR_QUERY_INFO, resetTag, 1));
+    assert(mlg_call_runs_on_delivery(MLG_SELECTOR_QUERY_INFO, resetTag, 1));
     for (uint64_t selector : {1ull, 2ull, 6ull, 9ull, 16ull, 17ull, 36ull, 49ull, 50ull, 51ull, 54ull,
                               55ull, 56ull, 57ull, 58ull, 59ull, 61ull, 82ull, 85ull, 86ull, 87ull})
         assert(!mlg_call_runs_on_delivery(selector, probe, 1) &&
@@ -756,7 +771,7 @@ static void clientExitReopen(bool queueExhausted) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false, nullptr, nullptr, 0, 0, 0};
     driver.retain(); s_participants = 1;
     // A second queue found every slot held; the client's release covers
     // what it had.
@@ -775,7 +790,7 @@ static void clientExitReopen(bool queueExhausted) {
     // The next client joins the running device: no PCI open, no probe.
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false, nullptr, nullptr, 0, 0, 0};
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && pciOpens == 0 && !saw("pci_open"));
     assert(nextIvars.sessionGeneration == s_sessionGeneration);
@@ -804,7 +819,7 @@ static void clientExitCloses(const std::string &kind) {
     bar0Aliases = probed ? 1 : 0;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false, nullptr, nullptr, 0, 0, 0};
     driver.retain(); s_participants = 1;
     if (kind == "client-exit-release-failure") releaseError = -16;
     if (kind == "client-exit-raw-mapped") {
@@ -971,7 +986,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     bar0Aliases = 1;
     client.ivars = &clientIvars;
     clientIvars = {&driver, nullptr, nullptr, s_sessionGeneration, 1, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
+                   nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false, nullptr, nullptr, 0, 0, 0};
     driver.retain(); s_participants = 1;
     // The KFD close cannot confirm anything once MES is gone.
     computeError = -11006;
@@ -1055,7 +1070,7 @@ static void surpriseRemoval(bool quarantined, bool held = false) {
     devicePresent = true;
     next.ivars = &nextIvars;
     nextIvars = {&driver, nullptr, nullptr, 0, 2, false, false, false, &s_ownerQueueAtOnce, nullptr,
-                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false};
+                 nullptr, 0, nullptr, false, false, nullptr, nullptr, 0, nullptr, 0, false, nullptr, nullptr, 0, 0, 0};
     pciOpenExpected = true;
     assert(ensure_open(&next) == kIOReturnSuccess);
     assert(s_pciOpen && s_participants == 1 && saw("pci_open"));

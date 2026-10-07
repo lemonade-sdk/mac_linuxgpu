@@ -1,5 +1,6 @@
 #include "runtime_state.h"
 #include "mac_hsa.h"
+#include "../../dext/sources/doorbell_gate.h"
 #include <hsa/amd_hsa_queue.h>
 #include <algorithm>
 #include <array>
@@ -56,6 +57,9 @@ struct RuntimeQueue {
     SharedBuffer ring, metadata;
     hsa_agent_t agent{};
     uint64_t hardwareHandle=0;
+    // Its doorbell as this process writes it itself (DirectDoorbell), from
+    // creation until inactivate; empty when the driver rings it.
+    mac_hsa::DirectDoorbell direct;
     std::mutex mutex;
     void (*errorCallback)(hsa_status_t,hsa_queue_t *,void *)=nullptr;
     void *errorData=nullptr;
@@ -150,6 +154,9 @@ struct RuntimeQueue {
         std::lock_guard lock(mutex);
         if (!active) return HSA_STATUS_SUCCESS;
         if (hardwareHandle) {
+            // Never written again from here (the doorbell may go to
+            // another queue once the driver destroys this one).
+            direct={};
             const auto status=connection->destroyQueue(hardwareHandle);
             if (status!=HSA_STATUS_SUCCESS) return status;
             hardwareHandle=0;
@@ -183,6 +190,15 @@ struct RuntimeQueue {
             // the ring already) and is rung on resume.
             if (paused || submissionsHeld(connection.get())) {
                 pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;
+            }
+            if (direct.doorbell) {
+                // A higher one was written already (as the driver's own
+                // doorbell path: a lower value never follows a higher).
+                if (value<=lastKicked) return;
+                // One store to the mapped doorbell, as on Linux. Closed
+                // while the device stops answering: then the driver
+                // answers (kIOReturnOffline while it suspends).
+                if (mlg_doorbell_ring(direct.gate,direct.doorbell,uint64_t(value))) {lastKicked=value;return;}
             }
             status=connection->kickQueue(hardwareHandle,uint64_t(value));
             if (status==kDeviceSuspendedStatus) {pendingDoorbell=std::max(pendingDoorbell,value);paused=true;return;}
@@ -535,6 +551,7 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
         if (status==HSA_STATUS_ERROR_INVALID_ARGUMENT) return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
         if (status!=HSA_STATUS_SUCCESS) return status;
         if (!queue->hardwareHandle) return HSA_STATUS_ERROR;
+        queue->direct=connection->directDoorbell(queue->hardwareHandle);
         auto *pointer=&q.hsa_queue;
         {
             std::lock_guard lock(runtimeMutex);

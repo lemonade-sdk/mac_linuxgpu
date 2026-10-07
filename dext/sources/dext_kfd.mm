@@ -386,6 +386,32 @@ int dext_kfd_queue_kick_direct(dext_kfd_queue *q, uint64_t packet)
     return r ? -EAGAIN : 0;
 }
 
+int dext_kfd_doorbells(dext_kfd_client *c, struct dext_kfd_doorbells *out)
+{
+    struct rt_kfd_doorbells slice{};
+    if (!c || !c->session || !out) return -EINVAL;
+    const int r = rt_kfd_session_doorbells(c->session, &slice);
+    if (r) return r;
+    out->bar = slice.bar;
+    out->bar_offset = slice.bar_offset;
+    out->bytes = slice.bytes;
+    return 0;
+}
+
+int dext_kfd_queue_doorbell(dext_kfd_queue *q, uint64_t *offset)
+{
+    struct rt_kfd_queue_info info{};
+    struct rt_kfd_doorbells slice{};
+    if (!q || !offset || q->retained || !q->client || !q->client->session) return -EINVAL;
+    int r = rt_kfd_queue_info(q->client->session, q->queue, &info);
+    if (!r) r = rt_kfd_session_doorbells(q->client->session, &slice);
+    if (r) return r;
+    // 64-bit doorbells on SOC15 (device_info.doorbell_size).
+    *offset = info.doorbell_offset & (slice.bytes - 1);
+    if (*offset & 7 || *offset + 8 > slice.bytes) return -ERANGE;
+    return 0;
+}
+
 int dext_kfd_fault(dext_kfd_client *c, uint32_t *flags, uint64_t *va)
 {
     struct rt_kfd_fault fault{};

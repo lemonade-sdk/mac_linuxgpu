@@ -155,13 +155,22 @@ extern struct device_memory *devm_register_device_memory(struct device *dev);
 extern void devm_unregister_device_memory(struct device *dev, struct device_memory *dm);
 
 
-/* Only the matched endpoint is exposed by DriverKit. Preserve its assigned
- * BARs and ordinary PCIe controls; MSI routing remains owned by DriverKit. */
+/* Only the matched endpoint is exposed by DriverKit. Its configuration as
+ * the host assigned it: the header (BARs included), the ordinary PCIe
+ * controls, and the MSI-X capability's control and table entries DriverKit
+ * programmed (a device-internal reset such as mode1 clears them, and
+ * nothing in macOS writes them again). */
+#define LINUXU_PCI_MSIX_SAVED	16	/* table entries kept (the vectors in use come first) */
 struct linuxu_pci_state {
 	u32 header[16];
 	u16 pcie_cap;
 	u16 pcie_flags;
 	u16 control[4];
+	u16 msix_cap;		/* 0: none */
+	u16 msix_control;
+	u32 msix_table;		/* table offset | BIR, as the capability holds it */
+	u16 msix_entries;	/* entries saved */
+	u32 msix_entry[LINUXU_PCI_MSIX_SAVED][4];	/* address lo, hi, data, vector control */
 };
 struct pci_saved_state;
 
@@ -474,6 +483,12 @@ extern struct pci_dev *pci_devices(void);
 /* ---- MSI-X / IRQ capability flags (upstream linux/pci.h) ---- */
 #define PCI_MSIX_FLAGS_ENABLE		0x8000
 #define PCI_MSIX_FLAGS_PERVEC_ENABLE	0x4000
+#define PCI_MSIX_FLAGS_QSIZE		0x07FF	/* table size - 1 */
+#define PCI_MSIX_FLAGS_MASKALL		0x4000	/* mask every vector */
+#define PCI_MSIX_TABLE			4	/* table offset | BIR */
+#define PCI_MSIX_TABLE_BIR		0x00000007
+#define PCI_MSIX_TABLE_OFFSET		0xfffffff8
+#define PCI_MSIX_ENTRY_SIZE		16
 #define PCI_IRQ_LEGACY		(1 << 0)
 #define PCI_IRQ_MSIX		(1 << 2)
 #define PCI_IRQ_MSI		(1 << 1)

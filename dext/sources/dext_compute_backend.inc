@@ -5,13 +5,14 @@
 #include <rt/dispatch.h>
 #include <rt/gart.h>
 #include <rt/queue.h>
+#include <rt/recovery.h>
 #include "dext_aql.h"
 #include "dext_kfd.h"
 #include "session_state.h"
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 263u /* 192: KFD compute sessions, QueryInfo tag 12;
+#define DEXT_RUNTIME_BUILD 264u /* 192: KFD compute sessions, QueryInfo tag 12;
                                    243: session calls are async (session_state.h);
                                    256: AQLQueueService reports a GPU memory fault
                                    (kIOReturnVMError, flags and address);
@@ -20,7 +21,9 @@
                                    between system pages and VRAM by SDMA through
                                    TTM's GART windows;
                                    263: AQLQueueKick (57) also served synchronously,
-                                   on the delivery thread (kick_table.h) */
+                                   on the delivery thread (kick_table.h);
+                                   264: a client rings its KFD queues' doorbells
+                                   itself (doorbell_gate.h) */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u
@@ -29,6 +32,11 @@
 #define DEXT_CLIENT_SLOTS 64u
 #define KICK_TABLE_SLOTS DEXT_QUEUE_SLOTS
 #include "kick_table.h"
+#define MLG_DOORBELL_GATE_SLOTS DEXT_CLIENT_SLOTS
+#include "doorbell_gate.h"
+_Static_assert(KICK_HOLD_POWER == MLG_DOORBELL_HOLD_POWER && KICK_HOLD_RESET == MLG_DOORBELL_HOLD_RESET,
+               "one set of reasons for both doorbell paths");
+#include <time.h>
 
 /* A BO is either a VMID0 kernel BO (object) of the legacy path or a BO of
  * the owner's KFD process (kfd). */
@@ -106,6 +114,32 @@ static struct {
 
 /* The KFD queues the delivery thread may ring (kick_table.h). */
 static struct kick_table production_kicks;
+/* The clients that ring their own doorbells (doorbell_gate.h). */
+static struct mlg_doorbell_gates production_gates;
+
+static uint64_t doorbell_now_ns(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+static struct mlg_doorbell_drain doorbell_drain(void)
+{
+    struct mlg_doorbell_drain d = {doorbell_now_ns,
+                                   (uint64_t)DEXT_COMPUTE_DOORBELL_DRAIN_MS * 1000000u, 0, 0};
+    return d;
+}
+
+uint64_t dext_compute_doorbell_gate_retire(uint64_t client)
+{
+    struct mlg_doorbell_drain d = doorbell_drain();
+    mlg_doorbell_gates_retire(&production_gates, client, &d);
+    return d.stuck_owner;
+}
+
+bool dext_compute_doorbell_gate_publish(uint64_t client, void *gate)
+{
+    return mlg_doorbell_gates_publish(&production_gates, client, (struct mlg_doorbell_gate *)gate);
+}
 
 uint64_t dext_compute_select_client(uint64_t client)
 {
@@ -302,8 +336,11 @@ static int kfd_error(struct dext_kfd_client *c, int r)
 static int kfd_release(struct production_client *rec)
 {
     struct dext_kfd_client *c = rec->kfd;
-    /* Nothing of the process is rung from the delivery thread from here. */
+    /* Nothing of the process is rung from the delivery thread, or by the
+     * client itself, from here: its doorbell slice may go to another
+     * process once its KFD process exits. */
     kick_table_retire_owner(&production_kicks, rec->client);
+    (void)dext_compute_doorbell_gate_retire(rec->client);
     for (unsigned i = 0; i < DEXT_QUEUE_SLOTS; ++i) {
         struct production_queue *q = &production.queues[i];
         if (q->kfd && q->owner == rec->client) memset(q, 0, sizeof(*q));
@@ -324,6 +361,8 @@ void dext_compute_device_removed(void)
 {
     production.removed = true;
     production.ready = false;
+    /* No client writes a doorbell of a device that is gone. */
+    (void)dext_compute_doorbell_gate_retire(0);
 }
 
 /* A device frozen only by KFD clients thaws once none of them is uncertain
@@ -424,6 +463,8 @@ int dext_compute_release_client(uint64_t client)
 {
     struct production_client *rec;
     if (!client) return -EINVAL_L;
+    /* A client that leaves rings nothing more, whatever else stays. */
+    (void)dext_compute_doorbell_gate_retire(client);
     rec = client_record(client, false);
     /* A client that dies is torn down as a Linux process that dies: its KFD
      * process is closed even when it is what froze the device, since the
@@ -461,6 +502,35 @@ void dext_compute_start_failure(const char **step, int *error)
     if (step) *step = start_failed_step;
     if (error) *error = start_failed_error;
 }
+
+/* ---- the session's AQL queues across a device reset (rt/recovery.h) ----
+ * On the reset domain's thread: dext_aql keeps its own list of mapped
+ * queues under its lock, and nothing here touches the owner queue's
+ * state. A queue that cannot be mapped again is retained, and its owner's
+ * next call freezes the session (dext_aql_uncertain). */
+static uint64_t doorbells_hold(uint32_t reason, bool hold);
+/* For the whole reset window no doorbell is written, by the driver or by a
+ * client (doorbell_gate.h): the BARs stop decoding until the PCI restore
+ * puts them back. A reset that fails wedges the device, and the hold
+ * stays. */
+static void queues_before_reset(void *arg)
+{
+    (void)arg;
+    (void)doorbells_hold(MLG_DOORBELL_HOLD_RESET, true);
+    dext_aql_reset_prepare();
+}
+
+static void queues_after_reset(void *arg, bool vram_lost)
+{
+    (void)arg;
+    (void)vram_lost;	/* storage is rewritten either way */
+    dext_aql_reset_restore();
+    (void)doorbells_hold(MLG_DOORBELL_HOLD_RESET, false);
+}
+
+static const struct rt_recovery_queue_hooks queue_reset_hooks = {
+    queues_before_reset, queues_after_reset, NULL,
+};
 
 int dext_compute_start(struct pci_dev *pdev)
 {
@@ -541,6 +611,7 @@ int dext_compute_start(struct pci_dev *pdev)
     production.ready = true;
     production.uncertain = false;
     runtime_available_update();
+    rt_recovery_set_queue_hooks(&queue_reset_hooks);
     return 0;
 }
 
@@ -566,6 +637,7 @@ int dext_compute_stop(void)
         return -EBUSY_L;
     production.ready = false;
     __atomic_store_n(&production.runtime_available, false, __ATOMIC_RELEASE);
+    rt_recovery_set_queue_hooks(NULL);
     /* KFD processes first: their queues leave MES and their memory is
      * freed before the kernel BOs and the context go. */
     {
@@ -1409,9 +1481,35 @@ static int kick_direct_ring(void *queue, uint64_t packet)
     return dext_kfd_queue_kick_direct((struct dext_kfd_queue *)queue, packet);
 }
 
-void dext_compute_kick_gate(bool open)
+/* Hold or release a reason no doorbell may be written for, the driver's
+ * on the delivery thread and the clients' own alike (KICK_HOLD_* and
+ * MLG_DOORBELL_HOLD_* are the same bits). */
+static uint64_t doorbells_hold(uint32_t reason, bool hold)
 {
-    kick_table_set_closed(&production_kicks, !open);
+    struct mlg_doorbell_drain d = doorbell_drain();
+    kick_table_hold(&production_kicks, reason, hold);
+    mlg_doorbell_gates_hold(&production_gates, reason, hold, &d);
+    return d.stuck_owner;
+}
+
+uint64_t dext_compute_kick_gate(bool open)
+{
+    return doorbells_hold(MLG_DOORBELL_HOLD_POWER, !open);
+}
+
+int dext_compute_aql_queue_doorbell(uint64_t handle, struct dext_compute_doorbell *out)
+{
+    struct production_queue *q = production_queue_lookup(handle);
+    struct dext_kfd_doorbells slice;
+    struct dext_kfd_client *c;
+    if (!q || !out) return -ENOENT_L;
+    if (!q->kfd || !(c = owner_kfd(q->owner))) return -ENOENT_L;
+    if (dext_kfd_doorbells(c, &slice) != 0 || dext_kfd_queue_doorbell(q->kfd, &out->offset) != 0)
+        return -ENOTREADY_L;
+    out->bar = slice.bar;
+    out->bar_offset = slice.bar_offset;
+    out->bytes = slice.bytes;
+    return 0;
 }
 
 int dext_compute_aql_queue_kick_direct(uint64_t client, uint64_t handle, uint64_t packet)

@@ -36,6 +36,7 @@
 #include "observer_gate.h"
 #include "dext_compute.h"
 #include <rt/lx_abi.h>
+#include <rt/recovery.h>
 #include <mlg_drm.h>
 #include <hsa/hsa.h>
 #include <hsa/hsa_ext_amd.h>
@@ -248,7 +249,18 @@ static int dext_pci_transport_fault() { return 0; }
 static uint64_t dext_pci_transport_fault_offset() { return 0; }
 static kern_return_t power_wait(MacLinuxGPUUserClient *, OSAction *, uint64_t) { return kIOReturnUnsupported; }
 static void power_snapshot(uint64_t *out) { memset(out, 0, MLG_POWER_STATE_WORDS * 8); out[0] = MLG_POWER_STATE_VERSION; }
-static void reset_state(uint64_t *out) { memset(out, 0, MLG_RESET_STATE_WORDS * 8); out[0] = MLG_RESET_STATE_VERSION; }
+// GPU recovery's published state (RESET_WAIT, the device-reset gate).
+static uint64_t resetGeneration;
+static void reset_state(uint64_t *out)
+{
+    memset(out, 0, MLG_RESET_STATE_WORDS * 8);
+    out[0] = MLG_RESET_STATE_VERSION; out[1] = resetGeneration;
+}
+static void reset_state_store(const struct rt_recovery_state *st) { resetGeneration = st->generation; }
+static bool s_deviceResetEnabled;
+struct RawBARLeaseMock { bool hasMappings() const { return false; } };
+static RawBARLeaseMock s_rawBARLease;
+extern "C" unsigned int rt_lx_bar_mappings(void) { return 0; }
 // The driver's lifecycle as NewUserClient and the session state see it.
 static std::atomic<uint64_t> sessionFlagsNow{0};
 static void session_state(uint64_t *out)

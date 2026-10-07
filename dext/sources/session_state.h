@@ -135,6 +135,15 @@ static inline bool mlg_release_blocker_permanent(uint32_t blocker)
  * and nothing is launched. */
 #define MLG_SELECTOR_CODE_SYNC           90u
 #define MLG_CODE_SYNC_TIMEOUT_MAX_US     1000000u
+/* RESET_WAIT  called with IOConnectCallAsync*. in: [0] the reset generation
+ *             the caller knows (LRST out[1]). Completes when the generation
+ *             differs from it (at once if it already does): async data [0]
+ *             the generation, [1] MLG_RESET_FLAG_*. kIOReturnNoResources
+ *             when every waiting slot is taken. A client's waits end with
+ *             it (kIOReturnAborted). Registration only, on the delivery
+ *             thread. */
+#define MLG_SELECTOR_RESET_WAIT          91u
+#define MLG_RESET_WAIT_WORDS             2u
 
 /* Calls that never sleep, and every other call.
  *
@@ -625,6 +634,8 @@ static inline bool mlg_observer_selector_allowed(uint64_t selector,
 		return true;
 	case MLG_SELECTOR_OWNER_RESULT:
 		return input && input_count == 1 && input[0];
+	case MLG_SELECTOR_RESET_WAIT:
+		return input && input_count == 1;
 	case MLG_SELECTOR_RETIRE: /* entitlement-checked in the handler */
 		return mlg_retire_args_valid(input, input_count);
 	case MLG_SELECTOR_QUERY_INFO:
@@ -695,6 +706,8 @@ static inline bool mlg_call_runs_on_delivery(uint64_t selector, const uint64_t *
 		return true;
 	case MLG_SELECTOR_OWNER_RESULT:
 		return input && input_count == 1 && input[0];
+	case MLG_SELECTOR_RESET_WAIT:
+		return input && input_count == 1;
 	case MLG_SELECTOR_QUERY_INFO:
 		if (!input || !input_count)
 			return false;

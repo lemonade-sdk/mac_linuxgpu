@@ -1289,6 +1289,10 @@ void fixture_device_init(void)
 	adev->gmc.private_aperture_end = adev->gmc.private_aperture_start + (4ULL << 30) - 1;
 	adev->doorbell.base = TEST_DOORBELL_BUS;
 	adev->doorbell.size = TEST_DOORBELL_BYTES;
+	/* The doorbells are BAR 2, as on Navi. */
+	fixture_pdev.resource[2].start = TEST_DOORBELL_BUS;
+	fixture_pdev.resource[2].end = TEST_DOORBELL_BUS + TEST_DOORBELL_BYTES - 1;
+	fixture_pdev.resource[2].flags = IORESOURCE_MEM;
 	adev->doorbell.cpu_addr = (u32 *)doorbell_bar;
 	memset(doorbell_bar, 0xff, sizeof(doorbell_bar));
 	adev->mman.buffer_funcs_enabled = true;
@@ -1390,6 +1394,7 @@ unsigned int fixture_kernel_allocs(void) { return kernel_allocs; }
 unsigned int fixture_cp_dispatches(void) { return cp_dispatches; }
 unsigned int fixture_render_balance(void) { return render_opens - render_releases; }
 uint64_t fixture_doorbell(uint32_t index) { return doorbell_bar[index / 2]; }
+volatile uint64_t *fixture_doorbell_bar(void) { return doorbell_bar; }
 
 void fixture_kfd_init(void)
 {

@@ -29,3 +29,8 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# Test fixtures captured from a card (tests/fixtures/local/README.md). Never
+# committed: the VBIOS is AMD's copyrighted image and the repository is public.
+/tests/fixtures/local/*
+!/tests/fixtures/local/README.md

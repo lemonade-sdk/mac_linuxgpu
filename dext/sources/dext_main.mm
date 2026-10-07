@@ -942,6 +942,35 @@ static bool dext_memory_write(uint8_t index, uint64_t offset, unsigned int width
 	return true;
 }
 
+/* A dword of BAR @bar through the kernel (the MSI-X table, rt/dext_pci.h):
+ * the memory index and bounds are the ones GetBARInfo gave at Open, so a
+ * reset that cleared the BAR registers changes nothing here. */
+int dext_pci_bar_read32(unsigned int bar, uint64_t offset, uint32_t *value)
+{
+	dext_pci_operation operation;
+	if (!operation) return -1;
+	uint64_t v = UINT64_MAX;
+	if (!value || bar > 5 || !g_bars[bar].present ||
+	    !dext_memory_read(g_bars[bar].index, offset, 4, &v)) {
+		dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
+		return -1;
+	}
+	*value = (uint32_t)v;
+	return 0;
+}
+
+int dext_pci_bar_write32(unsigned int bar, uint64_t offset, uint32_t value)
+{
+	dext_pci_operation operation;
+	if (!operation) return -1;
+	if (bar > 5 || !g_bars[bar].present ||
+	    !dext_memory_write(g_bars[bar].index, offset, 4, value)) {
+		dext_pci_transport_record_fault(DEXT_PCI_FAULT_MMIO, offset);
+		return -1;
+	}
+	return 0;
+}
+
 static int dext_mem_slot(uint32_t token, uint64_t offset, uint64_t width,
 			 uint8_t *mem_index)
 {

@@ -2017,6 +2017,38 @@ int rt_kfd_queue_kick_nowait(struct rt_kfd_session *s, struct rt_kfd_queue *q, u
 	return r;
 }
 
+int rt_kfd_session_doorbells(struct rt_kfd_session *s, struct rt_kfd_doorbells *out)
+{
+	struct pci_dev *pdev;
+	uint64_t bus, bytes;
+	int r = -ENODEV;
+
+	if (!s || !out)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	pdev = s->adev->pdev;
+	bytes = s->limits.doorbell_slice_bytes;
+	bus = s->adev->doorbell.base + (uint64_t)s->doorbell_first * sizeof(u32);
+	/* The slice is whole pages (kfd_doorbell_process_slice), so a mapping
+	 * of it shows the process nothing but its own doorbells. */
+	if (s->doorbell_mapped && pdev && bytes && !(bytes & (PAGE_SIZE - 1)) &&
+	    !(bus & (PAGE_SIZE - 1))) {
+		r = -ERANGE;
+		for (uint32_t i = 0; i < PCI_ROM_RESOURCE; ++i) {
+			uint64_t start = pci_resource_start(pdev, i);
+			uint64_t len = pci_resource_len(pdev, i);
+
+			if (!len || bus < start || bus - start >= len || bytes > len - (bus - start))
+				continue;
+			*out = (struct rt_kfd_doorbells){ .bar = i, .bar_offset = bus - start, .bytes = bytes };
+			r = 0;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&s->lock);
+	return r;
+}
+
 int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value)
 {
 	struct amdgpu_device *adev;

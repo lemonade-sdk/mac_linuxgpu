@@ -4,6 +4,7 @@
 #include "../abi/amdgpu_vram_accounting.h"
 #include "fw_mailbox_service.h"
 #include "selector_call.h"
+#include "../../dext/sources/doorbell_gate.h"
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
@@ -245,6 +246,12 @@ public:
             (void)handle;
             IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host));
         }
+        // Its queues are gone; the driver retires the gate with the close.
+        if (doorbellSlice)
+            IOConnectUnmapMemory64(ownerPort, MLG_DOORBELL_MEMORY_TYPE, mach_task_self(), doorbellSlice);
+        if (doorbellGate)
+            IOConnectUnmapMemory64(ownerPort, MLG_DOORBELL_GATE_MEMORY_TYPE, mach_task_self(),
+                                   reinterpret_cast<uintptr_t>(doorbellGate));
         if (kickPort) IONotificationPortDestroy(kickPort);
         stopFirmwareService(); // Never left running past initialization.
         if (ownerPort) closeConnection(ownerPort);
@@ -584,9 +591,12 @@ public:
         auto [record,inserted]=hardwareQueues.emplace(0,std::array<uint64_t,2>{ring.device.handle,metadata.device.handle});
         if (!inserted) return HSA_STATUS_ERROR;
         const std::array<uint64_t,3> input={ring.device.handle,metadata.device.handle,packets};
-        std::array<uint64_t,2> output{};
+        // From kDirectDoorbellDriverBuild the third output is the queue's
+        // doorbell in this client's doorbell slice (doorbell_gate.h).
+        const bool direct=linuxShim && build[2]>=kDirectDoorbellDriverBuild;
+        std::array<uint64_t,3> output{};
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        status=scalar(56,input,output);
+        status=scalar(56,input,{output.data(),direct ? 3u : 2u});
         // These RPC errors are returned before any queue map is attempted.
         // Exhausting the driver's queue slots must not poison existing queues.
         if (status==HSA_STATUS_ERROR_OUT_OF_RESOURCES || status==HSA_STATUS_ERROR_INVALID_ARGUMENT ||
@@ -597,7 +607,63 @@ public:
             state=State::Faulted;return HSA_STATUS_ERROR;
         }
         auto node=hardwareQueues.extract(record);node.key()=output[1];hardwareQueues.insert(std::move(node));
+        if (direct && output[2]!=MLG_DOORBELL_NONE) {
+            status=mapDoorbellLocked(output[1],output[2]);
+            if (status!=HSA_STATUS_SUCCESS) {
+                // A queue this client cannot ring goes again.
+                std::array<uint64_t,1> destroyed{};
+                const auto gone=scalar(58,{&output[1],1},destroyed);
+                if (gone!=HSA_STATUS_SUCCESS || destroyed[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
+                hardwareQueues.erase(output[1]);
+                return status;
+            }
+        }
         handle=output[1];return HSA_STATUS_SUCCESS;
+    }
+    // The client's doorbell slice and gate, mapped once with its first KFD
+    // queue (the driver made them then), and @handle's doorbell in it.
+    hsa_status_t mapDoorbellLocked(uint64_t handle,uint64_t offset) {
+        if (!doorbellSlice) {
+            mach_vm_address_t address=0;mach_vm_size_t size=0;
+            // Uncached device memory, as KFD's doorbell mmap.
+            if (IOConnectMapMemory64(ownerPort,MLG_DOORBELL_MEMORY_TYPE,mach_task_self(),&address,&size,
+                                     kIOMapAnywhere|kIOMapInhibitCache)!=KERN_SUCCESS || !address || !size) {
+                std::fprintf(stderr,"mac_hsa: the driver gave no doorbell slice to map (queue %llu)\n",
+                             (unsigned long long)handle);
+                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            }
+            doorbellSlice=address;doorbellBytes=size;
+        }
+        if (!doorbellGate) {
+            mach_vm_address_t address=0;mach_vm_size_t size=0;
+            if (IOConnectMapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),&address,&size,
+                                     kIOMapAnywhere)!=KERN_SUCCESS || !address || size<sizeof(mlg_doorbell_gate)) {
+                std::fprintf(stderr,"mac_hsa: the driver gave no doorbell gate to map (queue %llu)\n",
+                             (unsigned long long)handle);
+                if (address) IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
+                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+            }
+            auto *gate=reinterpret_cast<mlg_doorbell_gate *>(address);
+            if (std::atomic_ref<uint32_t>(gate->magic).load(std::memory_order_acquire)!=MLG_DOORBELL_GATE_MAGIC) {
+                std::fprintf(stderr,"mac_hsa: the driver's doorbell gate is not one (magic %#x)\n",gate->magic);
+                IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
+                return HSA_STATUS_ERROR;
+            }
+            doorbellGate=gate;
+        }
+        if ((offset&7) || offset+8>doorbellBytes) {
+            std::fprintf(stderr,"mac_hsa: queue %llu's doorbell %#llx lies outside the %llu-byte slice\n",
+                         (unsigned long long)handle,(unsigned long long)offset,(unsigned long long)doorbellBytes);
+            return HSA_STATUS_ERROR;
+        }
+        directDoorbells[handle]=reinterpret_cast<volatile uint64_t *>(doorbellSlice+offset);
+        return HSA_STATUS_SUCCESS;
+    }
+    DirectDoorbell directDoorbell(uint64_t handle) override {
+        std::lock_guard lock(sessionMutex);
+        const auto found=directDoorbells.find(handle);
+        if (found==directDoorbells.end() || !doorbellGate) return {};
+        return {doorbellGate,found->second};
     }
     // A doorbell (selector 57) is sent and not waited for: the call returns
     // once the driver's delivery thread has queued it on the session queue,
@@ -711,7 +777,7 @@ public:
         const auto status=scalar(58,{&handle,1},output);
         if (status!=HSA_STATUS_SUCCESS || output[0]) {state=State::Faulted;return HSA_STATUS_ERROR;}
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        hardwareQueues.erase(handle);return HSA_STATUS_SUCCESS;
+        hardwareQueues.erase(handle);directDoorbells.erase(handle);return HSA_STATUS_SUCCESS;
     }
     hsa_status_t serviceQueue(uint64_t handle,uint64_t &inactive) override {
         std::lock_guard lock(sessionMutex);
@@ -1259,6 +1325,12 @@ private:
     DeviceBuffer codeSyncBuffer;
     bool codeSyncUploaded = false;
     std::map<uint64_t,std::array<uint64_t,2>> hardwareQueues;
+    // Doorbells this client rings itself (kDirectDoorbellDriverBuild): the
+    // mapped slice and gate, and each queue's doorbell in the slice.
+    mach_vm_address_t doorbellSlice=0;
+    mach_vm_size_t doorbellBytes=0;
+    mlg_doorbell_gate *doorbellGate=nullptr;
+    std::map<uint64_t,volatile uint64_t *> directDoorbells;
     io_connect_t ownerPort = IO_OBJECT_NULL;
     io_connect_t pendingProbePort = IO_OBJECT_NULL;
     uint64_t lastComputeFence = 0;

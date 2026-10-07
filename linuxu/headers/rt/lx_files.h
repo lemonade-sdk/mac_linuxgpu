@@ -156,6 +156,9 @@ int rt_lx_map_ranges(struct rt_lx_client *c, uint64_t type,
 int rt_lx_mmap_commit(struct rt_lx_client *c, uint64_t type, uint64_t va);
 int rt_lx_munmap(struct rt_lx_client *c, uint64_t type);
 unsigned int rt_lx_mappings(struct rt_lx_client *c);
+/* Mappings of every client that reach the GPU through a BAR (rt_lx_mmap
+ * to rt_lx_munmap): while any exists, a client can store into a BAR. */
+unsigned int rt_lx_bar_mappings(void);
 
 /* In-process access for callers that are the client themselves (the CS
  * self-test): the dext address of byte @offset of a CPU-backed mapping and

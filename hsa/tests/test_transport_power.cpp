@@ -16,6 +16,9 @@
 #define IODispatchCalloutFromMessage test_dispatch_callout
 #define mlg_fw_service_start_connection test_fw_start
 #define mlg_fw_service_stop test_fw_stop
+/* The doorbell slice and gate a client of build 264 maps. */
+#define IOConnectMapMemory64 test_map_memory
+#define IOConnectUnmapMemory64 test_unmap_memory
 /* The IOKit calls are replaced: every selector reaches them synchronously. */
 #define MLG_SELECTOR_CALL_TEST_SYNC
 #include "../src/transport_iokit.cpp"
@@ -34,6 +37,33 @@ static unsigned gpu_calls;
 static uint64_t driver_build = 219;          // RuntimeBuild's out[2]
 static kern_return_t sync_kick_result = KERN_SUCCESS; // selector 57 called synchronously (build 263)
 static unsigned sync_kicks;
+/* Build 264: AQLQueueCreate's doorbell (out[2]), the slice and gate maps. */
+static uint64_t create_doorbell = UINT64_MAX;
+static unsigned destroys, maps, unmaps;
+static kern_return_t map_result = KERN_SUCCESS;
+alignas(16384) static uint64_t test_slice[2048];
+alignas(16384) static mlg_doorbell_gate test_gate;
+extern "C" kern_return_t test_map_memory(io_connect_t port, uint32_t type, task_port_t, mach_vm_address_t *at,
+    mach_vm_size_t *size, IOOptionBits options) {
+    assert(port == test_port && (type == MLG_DOORBELL_MEMORY_TYPE || type == MLG_DOORBELL_GATE_MEMORY_TYPE));
+    ++maps;
+    if (map_result != KERN_SUCCESS) return map_result;
+    if (type == MLG_DOORBELL_MEMORY_TYPE) {
+        /* Device memory: never cached. */
+        assert((options & kIOMapCacheMask) == kIOMapInhibitCache && (options & kIOMapAnywhere));
+        *at = reinterpret_cast<uintptr_t>(test_slice); *size = sizeof(test_slice);
+    } else {
+        *at = reinterpret_cast<uintptr_t>(&test_gate); *size = 16384;
+    }
+    return KERN_SUCCESS;
+}
+extern "C" kern_return_t test_unmap_memory(io_connect_t port, uint32_t type, task_port_t, mach_vm_address_t at) {
+    assert(port == test_port);
+    assert((type == MLG_DOORBELL_MEMORY_TYPE && at == reinterpret_cast<uintptr_t>(test_slice)) ||
+           (type == MLG_DOORBELL_GATE_MEMORY_TYPE && at == reinterpret_cast<uintptr_t>(&test_gate)));
+    ++unmaps;
+    return KERN_SUCCESS;
+}
 
 extern "C" kern_return_t test_service_close(io_connect_t port) {
     assert(port == test_port); return KERN_SUCCESS;
@@ -61,7 +91,13 @@ extern "C" kern_return_t test_scalar(mach_port_t port, uint32_t selector, const 
     if (gpu_result != KERN_SUCCESS) return gpu_result;
     switch (selector) {
     case 16: out[0] = 0x10001; out[1] = 0x200000000ull; out[2] = 0; return KERN_SUCCESS; // BOAlloc
-    case 56: out[0] = 0; out[1] = 9; return KERN_SUCCESS;                               // AQLQueueCreate
+    case 56:                                                                            // AQLQueueCreate
+        /* From build 264 the client asks for the queue's doorbell too. */
+        assert(*count == (driver_build >= 264 ? 3u : 2u));
+        out[0] = 0; out[1] = 9;
+        if (*count == 3) out[2] = create_doorbell;
+        return KERN_SUCCESS;
+    case 58: ++destroys; out[0] = 0; return KERN_SUCCESS;                               // AQLQueueDestroy
     case 57:                                                                            // AQLQueueKick, sync (263)
         assert(driver_build >= 263 && inputs == 2 && in[0] == 9 && *count == 1);
         ++sync_kicks;
@@ -187,6 +223,71 @@ struct IdleDiagnosticAccess {
             sync_kick_result = kIOReturnNotAttached;
             assert(sync.kickQueue(9, 15) == HSA_STATUS_ERROR && sync.state == IOKitConnection::State::Faulted);
             sync_kick_result = KERN_SUCCESS;
+            driver_build = 219;
+        }
+        {
+            /* Build 264: the client rings its KFD queue itself. createQueue
+             * maps the doorbell slice (uncached) and the gate once, and the
+             * queue's doorbell is one store into the slice, with no driver
+             * call; through a closed gate nothing is written (the queue then
+             * asks the driver, as below). A queue with no doorbell of its own
+             * (MLG_DOORBELL_NONE) maps nothing; a slice that cannot be
+             * mapped destroys the queue again and fails loudly. */
+            driver_build = 264;
+            const auto make = [](IOKitConnection &c, uint64_t &handle) {
+                SharedBuffer ring, metadata;
+                ring.device = {0x10010, 0x300000000ull, 16384}; ring.host = reinterpret_cast<void *>(0x300000000ull);
+                metadata.device = {0x10011, 0x300004000ull, 16384}; metadata.host = reinterpret_cast<void *>(0x300004000ull);
+                c.sharedBuffers[ring.device.handle] = ring;
+                c.sharedBuffers[metadata.device.handle] = metadata;
+                const auto status = c.createQueue(ring, metadata, 64, handle);
+                c.sharedBuffers.clear();
+                return status;
+            };
+            {
+                IOKitConnection direct(OriginalAtomicCaps{}, true);
+                direct.ownerPort = test_port;
+                direct.state = IOKitConnection::State::Ready;
+                direct.queueSlotLimit = 4;
+                test_gate = {}; test_gate.magic = MLG_DOORBELL_GATE_MAGIC; test_gate.open = 1;
+                create_doorbell = 16;
+                uint64_t handle = 0;
+                assert(make(direct, handle) == HSA_STATUS_SUCCESS && handle == 9 && maps == 2);
+                const auto bell = direct.directDoorbell(9);
+                assert(bell.gate == &test_gate && bell.doorbell == &test_slice[2]);
+                const auto syncBefore = sync_kicks, callsBefore = gpu_calls;
+                assert(mlg_doorbell_ring(bell.gate, bell.doorbell, 21) && test_slice[2] == 21 && !test_gate.busy);
+                test_gate.open = 0;
+                assert(!mlg_doorbell_ring(bell.gate, bell.doorbell, 22) && test_slice[2] == 21);
+                assert(sync_kicks == syncBefore && gpu_calls == callsBefore);
+                /* Destroyed: never handed out again. */
+                assert(direct.destroyQueue(9) == HSA_STATUS_SUCCESS && destroys == 1);
+                assert(!direct.directDoorbell(9).doorbell);
+                /* No doorbell of its own: nothing mapped again, rung by the driver. */
+                create_doorbell = MLG_DOORBELL_NONE;
+                assert(make(direct, handle) == HSA_STATUS_SUCCESS && maps == 2 && !direct.directDoorbell(9).doorbell);
+                assert(direct.destroyQueue(9) == HSA_STATUS_SUCCESS);
+                /* A doorbell outside the slice is refused, the queue destroyed. */
+                create_doorbell = sizeof(test_slice);
+                const auto destroyed = destroys;
+                assert(make(direct, handle) == HSA_STATUS_ERROR && destroys == destroyed + 1);
+                assert(!direct.hardwareQueues.contains(9) && direct.state == IOKitConnection::State::Ready);
+            }
+            assert(unmaps == 2);	/* both maps go with the connection */
+            {
+                IOKitConnection unmapped(OriginalAtomicCaps{}, true);
+                unmapped.ownerPort = test_port;
+                unmapped.state = IOKitConnection::State::Ready;
+                unmapped.queueSlotLimit = 4;
+                map_result = kIOReturnNoMemory;
+                create_doorbell = 16;
+                uint64_t handle = 0;
+                const auto destroyed = destroys;
+                assert(make(unmapped, handle) == HSA_STATUS_ERROR_OUT_OF_RESOURCES && !handle);
+                assert(destroys == destroyed + 1 && !unmapped.hardwareQueues.contains(9));
+                map_result = KERN_SUCCESS;
+            }
+            create_doorbell = UINT64_MAX;
             driver_build = 219;
         }
         assert(connection.requestPower(amdgpu::power::Query, snapshot) == HSA_STATUS_ERROR_INVALID_ARGUMENT);

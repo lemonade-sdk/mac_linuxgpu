@@ -44,6 +44,12 @@ void cs_fixture_hold_compute(int hold);
 /* Make every queue reset fail (MES does not answer), as a GPU that needs
  * a device reset. */
 void cs_fixture_fail_queue_reset(int fail);
+/* ASIC resets (mode1) upstream's recovery ran on the fixture. */
+unsigned int cs_fixture_asic_resets(void);
+/* IP blocks (GFX, SDMA) resumed after an ASIC reset: their rings restart at 0. */
+unsigned int cs_fixture_ip_resumes(void);
+/* Let the ASIC re-initialize after a reset (no VBIOS needed). */
+void cs_fixture_asic_reinit_ok(int ok);
 /* The same for the SDMA engine (TTM's moves, clears and PTE uploads). */
 void cs_fixture_hold_sdma(int hold);
 /* CPU-visible VRAM (the BAR), set before cs_fixture_init; 0: all VRAM. */

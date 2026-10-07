@@ -592,3 +592,125 @@ void wedge_check(struct pci_dev *pdev)
 	       "with -ENODEV, the state says wedged (%lld ms)\n",
 	       (long long)ktime_ms_delta(ktime_get(), start));
 }
+
+/* ---- a device reset that does not bring the GPU back ----
+ *
+ * With device resets allowed (the platform's gate), a hang the queue reset
+ * cannot end resets the device through upstream's own recovery
+ * (amdgpu_device_gpu_recover: the IPs suspend, the ASIC resets, the IPs
+ * re-initialize). The fixture's GPU does not come back (no VBIOS to
+ * re-initialize it from): the recovery fails once, nothing retries without
+ * bound, and the device wedges; blocked work ends. A process of its own. */
+static const char *reset_allowed(void)
+{
+	return NULL;
+}
+
+void device_reset_check(struct pci_dev *pdev)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	struct amdgpu_ring *ring = &adev->gfx.compute_ring[0];
+	struct rt_recovery_state st;
+	struct bc_client a;
+	ktime_t start = ktime_get();
+
+	client_open(pdev, "hung-client", &a);
+	write_ib(&a, 0x11111111u, RESET_DATA_OFF);
+	rt_recovery_set_full_reset_gate(reset_allowed);
+	CHECK(rt_recovery_full_reset_available());
+	ring->sched.timeout = msecs_to_jiffies(300);
+	cs_fixture_fail_queue_reset(1);
+	cs_fixture_hold_compute(1);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+	for (int i = 0; i < 2000; ++i) {
+		rt_recovery_state(&st);
+		if (st.flags & RT_RECOVERY_WEDGED)
+			break;
+		usleep(5000);
+	}
+	rt_recovery_state(&st);
+	CHECK(st.flags & RT_RECOVERY_WEDGED);
+	/* One ASIC reset ran (the failure came after it), and no more. */
+	CHECK(cs_fixture_asic_resets() >= 1 && cs_fixture_asic_resets() <= 2);
+	usleep(500000);
+	CHECK(cs_fixture_asic_resets() <= 2);
+	CHECK(!amdgpu_in_reset(adev));
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == -ENODEV);
+	rt_recovery_end();
+	printf("PASS device reset: with device resets allowed, a hang the queue reset cannot end "
+	       "runs upstream's device reset; one that does not bring the GPU back wedges the "
+	       "device after %u ASIC reset(s), no unbounded retry (%lld ms)\n",
+	       cs_fixture_asic_resets(), (long long)ktime_ms_delta(ktime_get(), start));
+}
+
+/* ---- a device reset that brings the GPU back ----
+ *
+ * As device_reset_check, with the fixture's ASIC able to re-initialize
+ * (it takes the VBIOS-optional path upstream gives a passthrough device):
+ * upstream's recovery completes, the reset generation advances, the
+ * driver's queue hooks run around it (before the IPs suspend, after they
+ * resume), the guilty context is cancelled and new work runs. A process
+ * of its own. */
+static int hook_before, hook_after, hook_vram_lost = -1;
+static void queues_before_reset(void *arg) { (void)arg; ++hook_before; }
+static void queues_after_reset(void *arg, bool vram_lost)
+{
+	(void)arg;
+	CHECK(hook_before == hook_after + 1);
+	++hook_after;
+	hook_vram_lost = vram_lost;
+}
+
+void device_reset_recovers_check(struct pci_dev *pdev)
+{
+	struct amdgpu_device *adev = cs_fixture_adev();
+	struct amdgpu_ring *ring = &adev->gfx.compute_ring[0];
+	const struct rt_recovery_queue_hooks hooks = { queues_before_reset, queues_after_reset, NULL };
+	struct rt_recovery_state st;
+	struct bc_client a, b;
+	volatile uint32_t *written;
+	ktime_t start = ktime_get();
+
+	client_open(pdev, "hung-client", &a);
+	write_ib(&a, 0x11111111u, RESET_DATA_OFF);
+	rt_recovery_set_full_reset_gate(reset_allowed);
+	rt_recovery_set_queue_hooks(&hooks);
+	cs_fixture_asic_reinit_ok(1);
+	ring->sched.timeout = msecs_to_jiffies(300);
+	cs_fixture_fail_queue_reset(1);
+	cs_fixture_hold_compute(1);
+	cs_args(&a);
+	CHECK(call_async(&a, DRM_IOCTL_AMDGPU_CS, &a.cs) == 0);
+	for (int i = 0; i < 2000; ++i) {
+		rt_recovery_state(&st);
+		if (st.generation)
+			break;
+		usleep(5000);
+	}
+	rt_recovery_state(&st);
+	CHECK(st.generation == 1 && !(st.flags & RT_RECOVERY_WEDGED) && st.last_result == 0);
+	CHECK(cs_fixture_asic_resets() == 1);
+	/* Upstream resumed the GFX and SDMA blocks: their rings start over at 0. */
+	CHECK(cs_fixture_ip_resumes() == 2);
+	CHECK(hook_before == 1 && hook_after == 1 && hook_vram_lost == 1);
+	CHECK(!amdgpu_in_reset(adev));
+	CHECK((st.flags & RT_RECOVERY_LAST_VRAM_LOST) != 0);
+
+	/* New work on the reset device runs, from a new client. */
+	cs_fixture_fail_queue_reset(0);
+	ring->sched.timeout = msecs_to_jiffies(10000);
+	client_open(pdev, "after-reset", &b);
+	write_ib(&b, RESET_VALUE, RESET_DATA_OFF);
+	written = (volatile uint32_t *)((uint8_t *)b.ib + RESET_DATA_OFF);
+	*written = 0;
+	cs_args(&b);
+	CHECK(call_async(&b, DRM_IOCTL_AMDGPU_CS, &b.cs) == 0);
+	for (int i = 0; i < 400 && *written != RESET_VALUE; ++i)
+		usleep(5000);
+	CHECK(*written == RESET_VALUE);
+	printf("PASS device reset recovers: upstream's device reset completes, the generation "
+	       "advances with VRAM lost, the driver's queue hooks run around it, new work runs "
+	       "(%lld ms)\n", (long long)ktime_ms_delta(ktime_get(), start));
+}

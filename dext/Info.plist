@@ -73,6 +73,12 @@
 	        it serves calls: an earlier driver, a previous instance during an
 	        upgrade, serves every selector synchronously and never completes
 	        an async call.
+	      - Optional MacLinuxGPUDeviceReset (boolean, absent = false): true
+	        lets GPU recovery reset the device (mode1) when a hung queue's
+	        own reset fails, as Linux does. Absent or false wedges the GPU
+	        instead (every request fails until it is power-cycled). Queue
+	        resets run either way. Off until a device reset is validated
+	        over Thunderbolt on this GPU.
 	-->
 	<key>IOKitPersonalities</key>
 	<dict>

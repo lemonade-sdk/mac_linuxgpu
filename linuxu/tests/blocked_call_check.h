@@ -17,5 +17,10 @@ void blocked_call_after_removal(void);
 void queue_reset_check(struct pci_dev *pdev);
 /* A hang no queue reset ends: the device wedges (leaves it wedged). */
 void wedge_check(struct pci_dev *pdev);
+/* The same with device resets allowed: upstream's device reset runs, fails
+ * on the fixture, and the device wedges (leaves it wedged). */
+void device_reset_check(struct pci_dev *pdev);
+/* A device reset that succeeds: the queue hooks run, new work runs. */
+void device_reset_recovers_check(struct pci_dev *pdev);
 
 #endif

@@ -220,9 +220,30 @@ int dext_compute_aql_queue_kick(uint64_t handle, uint64_t wptr,
  * queue's session busy); -EFAULT_L after a GPU memory fault of the
  * client's process. */
 int dext_compute_aql_queue_kick_direct(uint64_t client, uint64_t handle, uint64_t packet);
-/* Admit or refuse that form (power transitions); refusing waits for a
- * doorbell write in progress. */
-void dext_compute_kick_gate(bool open);
+/* Admit or refuse that form and the clients' own doorbells (power
+ * transitions); refusing waits for a doorbell write in progress, of the
+ * driver's or a client's. Returns a client whose doorbell write did not
+ * finish within DEXT_COMPUTE_DOORBELL_DRAIN_MS (its thread is stopped
+ * inside one), or 0. */
+uint64_t dext_compute_kick_gate(bool open);
+
+/* Doorbells a client rings itself (doorbell_gate.h): the KFD process's
+ * doorbell slice (BAR, offset and size) and the queue's doorbell in it.
+ * -ENOENT_L for a queue the client does not ring itself. */
+struct dext_compute_doorbell {
+    uint32_t bar;
+    uint64_t bar_offset, bytes;
+    uint64_t offset;
+};
+int dext_compute_aql_queue_doorbell(uint64_t handle, struct dext_compute_doorbell *out);
+/* The session queue: @client's gate (struct mlg_doorbell_gate), opened
+ * while the device takes work. False when no slot is free. */
+bool dext_compute_doorbell_gate_publish(uint64_t client, void *gate);
+/* Close @client's gate (0: every client's, the session's close or the
+ * device's removal) and wait for its writes in progress: from the return
+ * on, the client writes no doorbell. The stuck client as above, or 0. */
+uint64_t dext_compute_doorbell_gate_retire(uint64_t client);
+#define DEXT_COMPUTE_DOORBELL_DRAIN_MS 20u
 
 /* AQLQueueDestroy (58): in handle, out status. */
 int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status);

@@ -447,6 +447,9 @@ RT_SAME_MQD_FIELD(cp_hqd_cntl_stack_offset);
 RT_SAME_MQD_FIELD(cp_hqd_cntl_stack_size);
 RT_SAME_MQD_FIELD(cp_hqd_wg_state_offset);
 RT_SAME_MQD_FIELD(cp_hqd_ctx_save_size);
+RT_SAME_MQD_FIELD(cp_hqd_pq_rptr);
+RT_SAME_MQD_FIELD(cp_hqd_pq_wptr_lo);
+RT_SAME_MQD_FIELD(cp_hqd_pq_wptr_hi);
 typedef struct v12_compute_mqd rt_compute_mqd;
 
 /* cp_hqd_hq_status0.C_QUEUE_DEBUG_EN (named in gc_12_0_0_sh_mask.h), which
@@ -576,6 +579,23 @@ int rt_queue_build_mqd(struct amdgpu_device *adev, uint32_t slot, uint32_t doorb
     if (out != mqd || gart != d->mqd_address)
         return -EINVAL;
     return legacy_kernel_queue(adev, kq, doorbell, d, mqd, mm->mqd_size);
+}
+
+/* Where a mapped queue starts reading: the HQD loads its read and write
+ * pointers from the MQD (in dwords; an AQL packet is 16), as the KFD HQD
+ * loaders compute them from a write pointer in packets
+ * (kgd_gfx_v11_hqd_load's guessed_wptr). */
+int rt_queue_mqd_set_position(void *mqd, uint64_t ring_bytes, uint64_t packet)
+{
+    rt_compute_mqd *m = mqd;
+    const uint64_t ring_dwords = ring_bytes / 4, dwords = packet * 16;
+
+    if (!m || !pow2(ring_bytes) || ring_bytes < 256 || packet > (UINT64_MAX >> 4))
+        return -EINVAL;
+    m->cp_hqd_pq_rptr = (uint32_t)(dwords & (ring_dwords - 1));
+    m->cp_hqd_pq_wptr_lo = lower_32_bits(dwords);
+    m->cp_hqd_pq_wptr_hi = upper_32_bits(dwords);
+    return 0;
 }
 
 int rt_queue_map(struct amdgpu_device *adev, uint32_t slot, uint32_t doorbell,

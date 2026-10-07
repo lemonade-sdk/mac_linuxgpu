@@ -18,6 +18,7 @@
 #include "kfd_session_fixture.h"
 #include "../../dext/sources/dext_kfd.h"
 #include "../../dext/sources/dext_aql.h"
+#include "../../dext/sources/doorbell_gate.h"
 #include "../../dext/amdgpu/amdgpu_aql_packets.h"
 #include <rt/compute.h>
 #include <rt/queue.h>
@@ -168,6 +169,30 @@ int main()
     assert(!dext_kfd_queue_kick_direct(q0.queue, 1));
     assert(wait_value(&signal->value, int64_t(0)) && fixture_cp_dispatches() == 2);
     assert(wait_value(&m0->read_dispatch_id, uint64_t(2)));
+    /* The client's own form (doorbell_gate.h): its KFD process's slice of
+     * the doorbell BAR (BAR 2), and each queue's doorbell in it, the very
+     * word the driver's kicks write. Through an open gate the client's
+     * store lands there; through a closed one nothing is written. */
+    {
+        struct dext_kfd_doorbells slice{};
+        uint64_t at0 = 0, at1 = 0;
+        assert(!dext_kfd_doorbells(c, &slice) && slice.bar == 2 && slice.bytes >= 8192);
+        assert(!dext_kfd_queue_doorbell(q0.queue, &at0) && !dext_kfd_queue_doorbell(q1.queue, &at1));
+        assert(at0 != at1 && at0 + 8 <= slice.bytes && at1 + 8 <= slice.bytes && !(at0 & 7));
+        auto *mapped = reinterpret_cast<volatile uint64_t *>(
+            reinterpret_cast<volatile char *>(fixture_doorbell_bar()) + slice.bar_offset);
+        assert(mapped[at0 / 8] == 1);   /* what kick_direct wrote */
+        mlg_doorbell_gate gate{};
+        gate.magic = MLG_DOORBELL_GATE_MAGIC;
+        assert(!mlg_doorbell_ring(&gate, &mapped[at0 / 8], 2) && mapped[at0 / 8] == 1);
+        gate.open = 1;
+        signal->value = 1;
+        publish(q0, 2, codeVA, signalsVA, 0);
+        assert(mlg_doorbell_ring(&gate, &mapped[at0 / 8], 2) && mapped[at0 / 8] == 2 && !gate.busy);
+        assert(wait_value(&signal->value, int64_t(0)) && fixture_cp_dispatches() == 3);
+        assert(wait_value(&m0->read_dispatch_id, uint64_t(3)));
+        assert(mapped[at1 / 8] == UINT64_MAX);   /* q1 never rung */
+    }
 
     /* A scratch request on q1 (never kicked, so the CP leaves it alone):
      * the dext allocates KFD VRAM scratch and fills the SRD fields. */
@@ -205,10 +230,10 @@ int main()
     assert(!launched);
     assert(!uncertain && out[0] == 0 && out[1] == 0 && out[2] == 5 && out[3] == 0 && out[4] == 1);
     assert(fixture_mes_adds() == adds + 1 && fixture_mes_removes() == removes + 1);
-    assert(fixture_cp_dispatches() == 3);
+    assert(fixture_cp_dispatches() == 4);
     /* Again on the same launch buffers. */
     assert(!dext_kfd_dispatch_bounded(c, codeVA, kernargVA, &request, sizeof(request), out, &uncertain));
-    assert(out[2] == 5 && fixture_cp_dispatches() == 4);
+    assert(out[2] == 5 && fixture_cp_dispatches() == 5);
     /* A launch nobody executes times out; DESTROY_QUEUE takes the queue off
      * MES, so the session stays healthy. */
     fixture_cp_stop();
