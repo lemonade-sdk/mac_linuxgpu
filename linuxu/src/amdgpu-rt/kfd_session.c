@@ -32,6 +32,8 @@
 
 #include "amdgpu.h"
 #include "amdgpu_amdkfd.h"
+#include "amdgpu_discovery.h"
+#include "discovery.h"
 #include "amdgpu_object.h"
 #include "amdgpu_res_cursor.h"
 #include "amdgpu_reset.h"
@@ -92,6 +94,8 @@ struct rt_kfd_bo {
 	enum rt_kfd_domain domain;
 	enum rt_kfd_place place;
 	unsigned int queue_uses;
+	/* Pinned in the CPU-visible VRAM window (rt_kfd_bo_make_cpu_visible). */
+	bool cpu_visible;
 };
 
 struct rt_kfd_queue {
@@ -929,7 +933,7 @@ static int bo_alloc_locked(struct rt_kfd_session *s, uint64_t size, uint64_t ali
 		return -EBUSY;
 	if (!size || size > UINT64_MAX - PAGE_SIZE ||
 	    (domain != RT_KFD_GTT && domain != RT_KFD_VRAM) ||
-	    (place == RT_KFD_PLACE_WINDOW && (!s->window_set || domain != RT_KFD_GTT)))
+	    (place == RT_KFD_PLACE_WINDOW && !s->window_set))
 		return -EINVAL;
 	if (alignment & (alignment - 1))
 		return -EINVAL;
@@ -1023,6 +1027,15 @@ static int bo_free_locked(struct rt_kfd_session *s, struct rt_kfd_bo *bo)
 		;
 	if (!*link)
 		return -ENOENT;
+	if (bo->cpu_visible) {
+		/* KFD's free does not know the session pinned it. */
+		r = amdgpu_bo_reserve(bo->abo, true);
+		if (r)
+			return r;
+		amdgpu_bo_unpin(bo->abo);
+		amdgpu_bo_unreserve(bo->abo);
+		bo->cpu_visible = false;
+	}
 	r = unmap_and_free(s, bo->handle);
 	if (r)
 		return r;
@@ -1086,6 +1099,273 @@ int rt_kfd_bo_info(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
 		*out = (struct rt_kfd_bo_info){ bo->va, bo->size, bo->handle, bo->domain };
 	pthread_mutex_unlock(&s->lock);
 	return r;
+}
+
+/* ---- CPU-visible VRAM and the HDP flush page ---- */
+
+static int map_to_gpu(struct rt_kfd_session *s, uint64_t handle)
+{
+	struct {
+		struct kfd_ioctl_map_memory_to_gpu_args args;
+		uint32_t devices[1];
+	} map;
+	long r;
+
+	memset(&map, 0, sizeof(map));
+	map.args.handle = handle;
+	map.args.device_ids_array_ptr = arena_address(&map, map.devices);
+	map.args.n_devices = 1;
+	map.devices[0] = s->ap.gpu_id;
+	r = session_ioctl(s, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &map, sizeof(map));
+	if (!r && map.args.n_success != 1)
+		r = -EIO;
+	return (int)r;
+}
+
+static int unmap_from_gpu(struct rt_kfd_session *s, uint64_t handle)
+{
+	struct {
+		struct kfd_ioctl_unmap_memory_from_gpu_args args;
+		uint32_t devices[1];
+	} unmap;
+	long r;
+
+	memset(&unmap, 0, sizeof(unmap));
+	unmap.args.handle = handle;
+	unmap.args.device_ids_array_ptr = arena_address(&unmap, unmap.devices);
+	unmap.args.n_devices = 1;
+	unmap.devices[0] = s->ap.gpu_id;
+	r = session_ioctl(s, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &unmap, sizeof(unmap));
+	if (!r && unmap.args.n_success != 1)
+		r = -EIO;
+	return (int)r;
+}
+
+/* Pin @bo's buffer in the CPU-visible window and wait for its move. Caller
+ * holds s->lock, is inside the process, and has unmapped the BO from the
+ * GPU. */
+static int pin_cpu_visible_locked(struct rt_kfd_session *s, struct rt_kfd_bo *bo)
+{
+	struct amdgpu_bo *abo = bo->abo;
+	struct amdkfd_process_info *info = bo->mem ? bo->mem->process_info : NULL;
+	long waited;
+	int r;
+
+	if (!info)
+		return -EINVAL;
+	mutex_lock(&info->lock);
+	r = amdgpu_bo_reserve(abo, true);
+	if (r) {
+		mutex_unlock(&info->lock);
+		return r;
+	}
+	/* Moving a BO that carries the process's eviction fence would evict
+	 * the whole process; a pinned BO never moves again, so it needs no
+	 * eviction fence (amdgpu_amdkfd_gpuvm_map_gtt_bo_to_kernel). */
+	if (info->eviction_fence) {
+		struct dma_fence *stub = dma_fence_get_stub();
+
+		dma_resv_replace_fences(abo->tbo.base.resv, info->eviction_fence->base.context,
+					stub, DMA_RESV_USAGE_BOOKKEEP);
+		dma_fence_put(stub);
+	}
+	abo->flags |= AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+	abo->flags &= ~AMDGPU_GEM_CREATE_NO_CPU_ACCESS;
+	r = amdgpu_bo_pin(abo, AMDGPU_GEM_DOMAIN_VRAM);
+	if (!r) {
+		waited = dma_resv_wait_timeout(abo->tbo.base.resv, DMA_RESV_USAGE_KERNEL, false,
+					       msecs_to_jiffies(RT_KFD_COPY_TIMEOUT_MS));
+		if (waited <= 0 || !abo->tbo.resource ||
+		    abo->tbo.resource->mem_type != TTM_PL_VRAM ||
+		    !amdgpu_res_cpu_visible(s->adev, abo->tbo.resource)) {
+			pr_err("kfd session %d: VRAM buffer at %#llx did not settle in the CPU-visible "
+			       "window (wait %ld, memory type %d)\n", session_pid(s),
+			       (unsigned long long)bo->va, waited,
+			       abo->tbo.resource ? (int)abo->tbo.resource->mem_type : -1);
+			amdgpu_bo_unpin(abo);
+			r = waited < 0 ? (int)waited : (waited == 0 ? -ETIMEDOUT : -EIO);
+		}
+	}
+	if (r)
+		abo->flags &= ~AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+	amdgpu_bo_unreserve(abo);
+	mutex_unlock(&info->lock);
+	return r;
+}
+
+int rt_kfd_bo_make_cpu_visible(struct rt_kfd_session *s, struct rt_kfd_bo *bo)
+{
+	struct linuxu_process_saved saved;
+	int r;
+
+	if (!s || !bo)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	if (s->uncertain)
+		r = -EBUSY;
+	else if (!bo_owned(s, bo) || bo->domain != RT_KFD_VRAM || bo->place != RT_KFD_PLACE_WINDOW)
+		r = -EINVAL;
+	else if (bo->cpu_visible)
+		r = 0;
+	else if (bo->queue_uses)
+		r = -EBUSY;
+	else if (!(r = session_enter(s, &saved))) {
+		r = unmap_from_gpu(s, bo->handle);
+		if (!r) {
+			const int pinned = pin_cpu_visible_locked(s, bo);
+			/* Mapped again wherever the buffer now is. */
+			r = map_to_gpu(s, bo->handle);
+			if (!r && !pinned)
+				bo->cpu_visible = true;
+			else if (!r) {
+				pr_err("kfd session %d: no room for %llu bytes in the CPU-visible VRAM "
+				       "window (%d)\n", session_pid(s), (unsigned long long)bo->size, pinned);
+				r = pinned == -ENOMEM ? -ENOSPC : pinned;
+			} else
+				pr_err("kfd session %d: VRAM buffer at %#llx could not be mapped to the GPU "
+				       "again after its move (%d)\n", session_pid(s),
+				       (unsigned long long)bo->va, r);
+		}
+		linuxu_process_leave(&saved);
+	}
+	pthread_mutex_unlock(&s->lock);
+	return r;
+}
+
+/* The PCI BAR holding bus address [@bus, @bus + @bytes), and the offset in it. */
+static int bar_of(struct amdgpu_device *adev, uint64_t bus, uint64_t bytes, uint32_t *bar,
+		  uint64_t *offset)
+{
+	struct pci_dev *pdev = adev->pdev;
+
+	for (uint32_t i = 0; pdev && i < PCI_ROM_RESOURCE; ++i) {
+		uint64_t start = pci_resource_start(pdev, i);
+		uint64_t len = pci_resource_len(pdev, i);
+
+		if (!len || bus < start || bus - start >= len || bytes > len - (bus - start))
+			continue;
+		*bar = i;
+		*offset = bus - start;
+		return 0;
+	}
+	return -ERANGE;
+}
+
+int rt_kfd_bo_bar_ranges(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
+			 int (*fn)(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes),
+			 void *arg)
+{
+	struct amdgpu_res_cursor cursor;
+	int r = 0;
+
+	if (!s || !bo || !fn)
+		return -EINVAL;
+	pthread_mutex_lock(&s->lock);
+	if (!bo_owned(s, bo) || !bo->cpu_visible || !bo->abo->tbo.resource ||
+	    bo->abo->tbo.resource->mem_type != TTM_PL_VRAM) {
+		pthread_mutex_unlock(&s->lock);
+		return -EINVAL;
+	}
+	/* Pinned: the ranges cannot change while the BO lives. */
+	amdgpu_res_first(bo->abo->tbo.resource, 0, bo->size, &cursor);
+	while (!r && cursor.remaining) {
+		uint64_t start = cursor.start, bytes = cursor.size, offset = 0;
+		uint32_t bar = 0;
+
+		/* Neighbouring blocks as one range. */
+		amdgpu_res_next(&cursor, cursor.size);
+		while (cursor.remaining && cursor.start == start + bytes) {
+			bytes += cursor.size;
+			amdgpu_res_next(&cursor, cursor.size);
+		}
+		if ((start | bytes) & (PAGE_SIZE - 1) ||
+		    start + bytes > s->adev->gmc.visible_vram_size ||
+		    bar_of(s->adev, s->adev->gmc.aper_base + start, bytes, &bar, &offset))
+			r = -ERANGE;
+		else
+			r = fn(arg, bar, offset, bytes);
+	}
+	pthread_mutex_unlock(&s->lock);
+	return r;
+}
+
+int rt_kfd_hdp_page_exclusive(const uint32_t *bases, unsigned int count, uint64_t page,
+			      uint64_t page_bytes, uint64_t hole)
+{
+	for (unsigned int i = 0; i < count; ++i) {
+		const uint64_t at = (uint64_t)bases[i] * 4;
+
+		if (at >= page && at - page < page_bytes && !(at >= hole && at - hole < 4096))
+			return 0;
+	}
+	return 1;
+}
+
+/* Whether no register block of @adev starts in the host page of the register
+ * BAR at @page besides the 4 KiB remap page at @hole. IP discovery's base
+ * addresses are what upstream addresses registers through (adev->reg_offset);
+ * for a table read from the discovery binary each IP's count of bases is in
+ * its header, for the static tables of older ASICs every one has at least
+ * five segments (unused ones zero). */
+static bool hdp_page_exclusive(struct amdgpu_device *adev, uint64_t page, uint64_t hole)
+{
+	const uint8_t *bin = adev->discovery.bin;
+	const size_t bin_bytes = adev->discovery.size;
+
+	for (unsigned int ip = 0; ip < MAX_HWIP; ++ip)
+		for (unsigned int inst = 0; inst < HWIP_MAX_INSTANCE; ++inst) {
+			const uint32_t *bases = adev->reg_offset[ip][inst];
+			unsigned int count = 5;
+
+			if (!bases)
+				continue;
+			if (bin && (const uint8_t *)bases >= bin + offsetof(struct ip_v4, base_address) &&
+			    (const uint8_t *)bases < bin + bin_bytes)
+				count = ((const struct ip_v4 *)((const uint8_t *)bases -
+					 offsetof(struct ip_v4, base_address)))->num_base_address;
+			if (!rt_kfd_hdp_page_exclusive(bases, count, page, PAGE_SIZE, hole)) {
+				pr_err("kfd session: a register block of IP %u instance %u starts in the "
+				       "host page %#llx of the register BAR beside the HDP flush remap page "
+				       "%#llx: the page is not exported\n", ip, inst,
+				       (unsigned long long)page, (unsigned long long)hole);
+				return false;
+			}
+		}
+	return true;
+}
+
+int rt_kfd_session_hdp_flush(struct rt_kfd_session *s, struct rt_kfd_hdp_flush *out)
+{
+	struct amdgpu_device *adev;
+	uint64_t hole, page, bus_page, offset = 0;
+	uint32_t bar = 0;
+
+	if (!s || !out)
+		return -EINVAL;
+	adev = s->adev;
+	memset(out, 0, sizeof(*out));
+	/* No remap page: SR-IOV, or an NBIO without the remap. */
+	if (!adev->rmmio_remap.bus_addr || !adev->rmmio_base ||
+	    adev->rmmio_remap.bus_addr < adev->rmmio_base)
+		return -ENODEV;
+	hole = adev->rmmio_remap.reg_offset;
+	if (hole & (4096 - 1) || adev->rmmio_remap.bus_addr - adev->rmmio_base != hole)
+		return -ENODEV;
+	page = hole & ~(uint64_t)(PAGE_SIZE - 1);
+	bus_page = adev->rmmio_base + page;
+	if (page + PAGE_SIZE > adev->rmmio_size || bar_of(adev, bus_page, PAGE_SIZE, &bar, &offset))
+		return -ERANGE;
+	if (PAGE_SIZE > 4096 && !hdp_page_exclusive(adev, page, hole))
+		return -EPERM;
+	*out = (struct rt_kfd_hdp_flush){
+		.bar = bar,
+		.bar_offset = offset,
+		.bytes = PAGE_SIZE,
+		.mem_flush = (uint32_t)(hole - page) + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL,
+		.reg_flush = (uint32_t)(hole - page) + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL,
+		.visible_vram = adev->gmc.visible_vram_size,
+	};
+	return 0;
 }
 
 /* ---- kernel-side access ----

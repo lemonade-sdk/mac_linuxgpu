@@ -329,6 +329,7 @@ struct fake_bo {
 	void *cpu;		/* kernel CPU mapping for kernel BOs */
 	struct amdgpu_vm *vm;	/* the VM the BO is mapped in */
 	bool mapped, kernel_mem;
+	unsigned int pins;
 	int refs;
 };
 #define MAX_BOS 128
@@ -372,27 +373,45 @@ static void bo_destroy(struct fake_bo *f)
 	free(f);
 }
 
-/* The lowest @block-aligned offset of @block bytes no live VRAM BO uses
- * (freed VRAM is reused, as the VRAM manager does); UINT64_MAX when full. */
+/* The lowest @block-aligned offset of @block bytes below @limit no live VRAM
+ * BO uses (freed VRAM is reused, as the VRAM manager does); UINT64_MAX when
+ * full. */
+/* Whether a live VRAM BO other than @self uses [at, at + block). */
+static bool vram_slot_used(uint64_t at, uint64_t block, const struct fake_bo *self)
+{
+	for (unsigned int i = 0; i < MAX_BOS; ++i) {
+		const struct fake_bo *o = bos[i];
+		uint64_t start, end;
+
+		if (!o || o == self || o->bo.tbo.resource != &o->vres.base)
+			continue;
+		start = o->block.header & GPU_BUDDY_HEADER_OFFSET;
+		end = start + ((uint64_t)PAGE_SIZE << (o->block.header & GPU_BUDDY_HEADER_ORDER));
+		if (start < at + block && at < end)
+			return true;
+	}
+	return false;
+}
+static uint64_t vram_first_fit_below(uint64_t block, uint64_t limit, const struct fake_bo *self)
+{
+	for (uint64_t at = 0; at + block <= limit; at += block)
+		if (!vram_slot_used(at, block, self))
+			return at;
+	return UINT64_MAX;
+}
+/* KFD VRAM BOs go top-down (TTM_PL_FLAG_TOPDOWN): the highest free slot. */
+static uint64_t vram_top_fit(uint64_t block, const struct fake_bo *self)
+{
+	for (uint64_t at = TEST_VRAM_BYTES - block;; at -= block) {
+		if (!vram_slot_used(at, block, self))
+			return at;
+		if (at < block)
+			return UINT64_MAX;
+	}
+}
 static uint64_t vram_first_fit(uint64_t block)
 {
-	for (uint64_t at = 0; at + block <= TEST_VRAM_BYTES; at += block) {
-		bool used = false;
-
-		for (unsigned int i = 0; i < MAX_BOS && !used; ++i) {
-			const struct fake_bo *o = bos[i];
-			uint64_t start, end;
-
-			if (!o || o->bo.tbo.resource != &o->vres.base)
-				continue;
-			start = o->block.header & GPU_BUDDY_HEADER_OFFSET;
-			end = start + ((uint64_t)PAGE_SIZE << (o->block.header & GPU_BUDDY_HEADER_ORDER));
-			used = start < at + block && at < end;
-		}
-		if (!used)
-			return at;
-	}
-	return UINT64_MAX;
+	return vram_first_fit_below(block, TEST_VRAM_BYTES, NULL);
 }
 
 /* A BO whose placement is @domain; GTT ones get system pages. */
@@ -486,6 +505,61 @@ void amdgpu_bo_unref(struct amdgpu_bo **bo)
 		bo_destroy(f);
 }
 u64 amdgpu_bo_gpu_offset(struct amdgpu_bo *bo) { return fake_of(bo)->gpu_offset; }
+/* Pinning, as TTM validates a pinned placement: a VRAM BO that must be
+ * CPU-visible moves into the window first (its block's offset). */
+static unsigned int pinned_bos, pin_moves;
+unsigned int fixture_pinned(void) { return pinned_bos; }
+unsigned int fixture_pin_moves(void) { return pin_moves; }
+struct amdgpu_bo *fixture_kfd_bo_at(uint64_t va)
+{
+	for (unsigned int i = 0; i < MAX_BOS; ++i)
+		if (bos[i] && bos[i]->mem.bo == &bos[i]->bo && bos[i]->mem.va == va)
+			return &bos[i]->bo;
+	return NULL;
+}
+int amdgpu_bo_pin(struct amdgpu_bo *bo, u32 domain)
+{
+	struct fake_bo *f = fake_of(bo);
+
+	dma_resv_assert_held(bo->tbo.base.resv);
+	assert(domain == AMDGPU_GEM_DOMAIN_VRAM && bo->tbo.resource == &f->vres.base);
+	if (!f->pins && (bo->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED)) {
+		const unsigned int order = f->block.header & GPU_BUDDY_HEADER_ORDER;
+		const uint64_t block = (uint64_t)PAGE_SIZE << order;
+		const uint64_t at = f->block.header & GPU_BUDDY_HEADER_OFFSET;
+
+		if (at + block > TEST_VISIBLE_BYTES) {
+			const uint64_t fit = vram_first_fit_below(block, TEST_VISIBLE_BYTES, f);
+
+			if (fit == UINT64_MAX)
+				return -ENOMEM;
+			f->block.header = fit | order;
+			pin_moves++;
+		}
+	}
+	if (!f->pins++)
+		pinned_bos++;
+	return 0;
+}
+void amdgpu_bo_unpin(struct amdgpu_bo *bo)
+{
+	struct fake_bo *f = fake_of(bo);
+
+	dma_resv_assert_held(bo->tbo.base.resv);
+	assert(f->pins);
+	if (!--f->pins)
+		pinned_bos--;
+}
+bool amdgpu_res_cpu_visible(struct amdgpu_device *a, struct ttm_resource *res)
+{
+	struct fake_bo *f = container_of(res, struct fake_bo, vres.base);
+
+	(void)a;
+	if (res->mem_type != TTM_PL_VRAM)
+		return false;
+	return (f->block.header & GPU_BUDDY_HEADER_OFFSET) +
+	       ((uint64_t)PAGE_SIZE << (f->block.header & GPU_BUDDY_HEADER_ORDER)) <= TEST_VISIBLE_BYTES;
+}
 u64 amdgpu_bo_gpu_offset_no_check(struct amdgpu_bo *bo) { return fake_of(bo)->gpu_offset; }
 int amdgpu_bo_create_kernel(struct amdgpu_device *a, unsigned long size, int align,
 			    u32 domain, struct amdgpu_bo **bo_ptr, u64 *gpu_addr, void **cpu_addr)
@@ -647,6 +721,23 @@ int amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu(struct amdgpu_device *a, uint64_t va
 	f = bo_create(size, domain);
 	if (!f)
 		return -ENOMEM;
+	if (domain == AMDGPU_GEM_DOMAIN_VRAM) {
+		const uint64_t block = (uint64_t)PAGE_SIZE << (f->block.header & GPU_BUDDY_HEADER_ORDER);
+		const uint64_t at = vram_top_fit(block, f);
+
+		if (at != UINT64_MAX)
+			f->block.header = at | (f->block.header & GPU_BUDDY_HEADER_ORDER);
+	}
+	{
+		static struct amdkfd_process_info info;
+		static bool info_ready;
+
+		if (!info_ready) {
+			mutex_init(&info.lock);
+			info_ready = true;
+		}
+		f->mem.process_info = &info;
+	}
 	mutex_init(&f->mem.lock);
 	f->mem.bo = &f->bo;
 	f->mem.va = va;
@@ -1287,6 +1378,14 @@ void fixture_device_init(void)
 	adev->gmc.shared_aperture_end = adev->gmc.shared_aperture_start + (4ULL << 30) - 1;
 	adev->gmc.private_aperture_start = 0x1000000000000000ULL;
 	adev->gmc.private_aperture_end = adev->gmc.private_aperture_start + (4ULL << 30) - 1;
+	adev->gmc.aper_base = TEST_VRAM_BAR_BUS;
+	adev->gmc.visible_vram_size = TEST_VISIBLE_BYTES;
+	fixture_pdev.resource[0].start = TEST_VRAM_BAR_BUS;
+	fixture_pdev.resource[0].end = TEST_VRAM_BAR_BUS + TEST_VISIBLE_BYTES - 1;
+	fixture_pdev.resource[0].flags = IORESOURCE_MEM;
+	fixture_pdev.resource[5].start = TEST_MMIO_BUS;
+	fixture_pdev.resource[5].end = TEST_MMIO_BUS + TEST_MMIO_BYTES - 1;
+	fixture_pdev.resource[5].flags = IORESOURCE_MEM;
 	adev->doorbell.base = TEST_DOORBELL_BUS;
 	adev->doorbell.size = TEST_DOORBELL_BYTES;
 	/* The doorbells are BAR 2, as on Navi. */

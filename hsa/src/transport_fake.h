@@ -57,6 +57,9 @@ struct FakeDeviceConfig {
     // Interrupt signals (selectors 86/87): a KFD session on a driver that
     // serves them.
     bool signalEvents = false;
+    // BAR writes (hdp_flush.h): a KFD session on a driver from
+    // kBarWritesDriverBuild that exports the HDP flush page.
+    bool barWrites = false;
 };
 
 class MAC_HSA_FAKE_EXPORT FakeConnection final : public Connection, public InitializationRPC {
@@ -106,6 +109,21 @@ public:
     // ---- Connection: device power (power.h) ----
     hsa_status_t powerState(PowerSnapshot &out) override;
     hsa_status_t requestPower(uint64_t op, PowerSnapshot &out) override;
+
+    // ---- Connection: BAR writes (hdp_flush.h) ----
+    // Served when config().barWrites. The gate is open while the power
+    // state takes work and retired once it is lost, as the driver keeps
+    // it; the HDP flush page is host memory that counts flushes.
+    hsa_status_t enableBarWrites(BarWrites &out, std::string *why) override;
+    BarWrites barWrites() override;
+    hsa_status_t allocateHostableBuffer(uint64_t size, DeviceBuffer &out) override;
+    hsa_status_t mapBufferForCPU(const DeviceBuffer &buffer) override;
+    hsa_status_t barWriteWait(unsigned attempt) override;
+    // Hostable buffers mapped for the CPU, and whether the mappings were
+    // retired (the device lost).
+    size_t cpuMappedCount() const;
+    bool barMappingsRetired() const;
+    mlg_doorbell_gate *gate() const { return gate_; }
 
     // ---- Connection: interrupt signals (KFD signal events) ----
     // Served when config().signalEvents (a KFD session on a driver with
@@ -167,6 +185,7 @@ private:
         void *host = nullptr;
         size_t size = 0;
         bool shared = false; // true = shared GTT (host-mapped), false = VRAM
+        bool hostable = false, cpuMapped = false; // BAR writes: VA == host pointer
     };
     struct Queue {
         uint32_t size = 0;
@@ -214,6 +233,12 @@ private:
     EventStats eventStats_;
     std::condition_variable eventChanged_;
     void raiseEventLocked(uint32_t id);
+    // BAR writes: the gate and HDP page (never freed: a writer may outlive
+    // the connection), enabled or not, and retired mappings.
+    mlg_doorbell_gate *gate_ = nullptr;
+    uint32_t *hdpPage_ = nullptr;
+    bool barWritesEnabled_ = false, barRetired_ = false;
+    void gateFollowPowerLocked();
 };
 
 // Replaces the shared fake with a device built from config. Call before

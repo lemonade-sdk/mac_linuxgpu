@@ -930,6 +930,9 @@ test-kick-table:
 test-doorbell-gate:
 	bash scripts/test-doorbell-gate.sh
 
+test-bar-write-safety:
+	bash scripts/test-bar-write-safety.sh
+
 test-klog:
 	bash scripts/test-klog.sh
 
@@ -1109,8 +1112,8 @@ test: test-dma-buf-lifetime test-hwmon-lifetime test-hsa-shim-init test-shmem-ow
 .PHONY: test-dma-buf-lifetime test-hwmon-lifetime test-hsa-shim-init test-shmem-ownership \
 	test-kthread-worker test-waitqueue-tasks test-timer-service test-devres-concurrency test-hmm-ownership
 
-test: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table test-doorbell-gate
-.PHONY: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table test-doorbell-gate
+test: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table test-doorbell-gate test-bar-write-safety
+.PHONY: test-native-ipc test-hsa-ipc-lifetime test-shmem-driverkit-alias test-raw-bar-lease test-session-shutdown test-kick-table test-doorbell-gate test-bar-write-safety
 
 test: test-klog test-read-driver-log test-upstream-pci-matching
 .PHONY: test-klog test-read-driver-log test-upstream-pci-matching

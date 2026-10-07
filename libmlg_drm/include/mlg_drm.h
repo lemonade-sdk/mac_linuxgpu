@@ -116,6 +116,12 @@ struct mlg_transport {
 	 * and *state is filled. */
 	int (*scanout)(void *ctx, const struct mlg_lx_scanout *req,
 		       struct mlg_lx_scanout_state *state, int64_t *result);
+	/* Optional: nonzero once the driver said the device is gone for this
+	 * process (the GPU left, Disconnect GPU closed its session, the driver
+	 * stopped). Every mapping is then replaced by host memory, as Linux
+	 * revokes a process's mmaps of an unplugged device: a store through
+	 * one, anywhere in the process, never reaches a GPU that left. */
+	int (*gone)(void *ctx);
 };
 /* Install @t (copied) for every later call; NULL restores the default.
  * Returns -1 with EBUSY once descriptors are open. */

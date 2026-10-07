@@ -46,7 +46,7 @@ struct mlg_doorbell_gate {
 	uint32_t magic;		/* the driver's, set before the client maps it */
 	uint32_t open;		/* the driver's: 1 while the client may ring */
 	uint32_t busy;		/* the client's: doorbell writes in progress */
-	uint32_t reserved;
+	uint32_t retired;	/* the driver's: closed for good (a close, a removal) */
 	uint64_t closes;	/* the driver's: how often it was closed */
 };
 
@@ -77,6 +77,57 @@ static inline bool mlg_doorbell_ring(struct mlg_doorbell_gate *gate, volatile ui
 	}
 	__atomic_sub_fetch(&gate->busy, 1, __ATOMIC_RELEASE);
 	return rung;
+}
+
+/* A client's several stores into the BARs as one bracket, under the same
+ * gate: a submission that writes its kernel arguments into CPU-visible
+ * VRAM, publishes them with the HDP flush register (a store, then a read
+ * back) and rings the doorbell. Each store is a plain store anywhere in
+ * the client's code (a memcpy among them), so the bracket is per
+ * submission, not per store:
+ *
+ *	if (!mlg_bar_write_begin(gate))
+ *		return closed;	// nothing written; ask the driver why
+ *	... memcpy into the VRAM ring, HDP store and read back, doorbell ...
+ *	mlg_bar_write_end(gate);
+ *
+ * Once the driver's close (retire, hold) returns, no bracket is open and
+ * no new one opens: no store of the client reaches the BARs. Brackets
+ * nest (busy counts them), and a doorbell rung with mlg_doorbell_ring
+ * inside one is a nested bracket.
+ *
+ * End completes the bracket's stores before counting out (DSB ST on
+ * arm64): the driver may power the device down or reset it the moment
+ * busy reads zero, and a Device-nGnRE store the core still holds would
+ * land after that. A bracket that ends with a read of the BARs (the HDP
+ * flush's read back) has its stores completed already; the DSB then
+ * costs little. */
+static inline bool mlg_bar_write_begin(struct mlg_doorbell_gate *gate)
+{
+	__atomic_add_fetch(&gate->busy, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&gate->open, __ATOMIC_SEQ_CST))
+		return true;
+	__atomic_sub_fetch(&gate->busy, 1, __ATOMIC_RELEASE);
+	return false;
+}
+
+static inline void mlg_bar_write_end(struct mlg_doorbell_gate *gate)
+{
+#if defined(__aarch64__)
+	__asm__ volatile("dsb st" ::: "memory");
+#endif
+	__atomic_sub_fetch(&gate->busy, 1, __ATOMIC_RELEASE);
+}
+
+/* A closed gate is held (a power transition, a reset: it opens again) or
+ * retired: the session closed, the client was retired, the device left. A
+ * retired gate never opens again; its client stops storing into the BARs
+ * for good (and retires its mappings, hsa/src/bar_mapping_retire.h). The
+ * driver marks it before closing it, so a client that sees it closed and
+ * then reads retired as zero is in a hold. */
+static inline bool mlg_doorbell_gate_retired(const struct mlg_doorbell_gate *gate)
+{
+	return __atomic_load_n(&gate->retired, __ATOMIC_SEQ_CST) != 0;
 }
 
 /* ---- the driver's registry ---- */
@@ -191,6 +242,7 @@ static inline void mlg_doorbell_gates_retire(struct mlg_doorbell_gates *g, uint6
 	for (uint32_t i = 0; i < MLG_DOORBELL_GATE_SLOTS; ++i) {
 		if (!g->slots[i].owner || (owner && g->slots[i].owner != owner))
 			continue;
+		__atomic_store_n(&g->slots[i].gate->retired, 1u, __ATOMIC_SEQ_CST);
 		mlg_doorbell_gate_close(g->slots[i].gate);
 	}
 	for (uint32_t i = 0; i < MLG_DOORBELL_GATE_SLOTS; ++i) {

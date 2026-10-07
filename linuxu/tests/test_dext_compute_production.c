@@ -249,7 +249,7 @@ static int kfd_supported_error = -ENODEV, kfd_open_error, kfd_create_error, kfd_
 struct dext_kfd_client { bool live, uncertain; int pid; char comm[32];
     uint64_t window_base, window_size; unsigned queues; };
 struct dext_kfd_queue { bool live; struct dext_kfd_client *c; uint64_t last; };
-struct rt_kfd_bo { bool live; struct dext_kfd_client *c; uint64_t size, va; uint32_t domain; };
+struct rt_kfd_bo { bool live, cpu_visible; struct dext_kfd_client *c; uint64_t size, va; uint32_t domain; };
 static struct dext_kfd_client kfd_clients[4];
 static struct dext_kfd_queue kfd_queues[8];
 static struct rt_kfd_bo kfd_bos[32];
@@ -349,13 +349,13 @@ int dext_kfd_queue_abi(struct dext_aql_limits *out)
 int dext_kfd_bo_alloc(struct dext_kfd_client *c, uint64_t size, uint64_t alignment,
                       uint32_t domain, struct rt_kfd_bo **out, uint64_t *va)
 {
-    assert(c && c->live && size && alignment && (domain==2 || domain==3));
-    /* Shared buffers live in the client's window. */
-    if (domain==2 && !c->window_base) return -EINVAL;
+    assert(c && c->live && size && alignment && domain>=2 && domain<=4);
+    /* Shared buffers and hostable VRAM live in the client's window. */
+    if (domain!=3 && !c->window_base) return -EINVAL;
     for (unsigned i=0;i<32;++i) if (!kfd_bos[i].live) {
         struct rt_kfd_bo *bo=&kfd_bos[i];
-        bo->live=true; bo->c=c; bo->size=size; bo->domain=domain;
-        bo->va=domain==2 ? c->window_base+(uint64_t)i*0x10000 : (kfd_va_next+=0x100000);
+        bo->live=true; bo->cpu_visible=false; bo->c=c; bo->size=size; bo->domain=domain;
+        bo->va=domain!=3 ? c->window_base+(uint64_t)i*0x10000 : (kfd_va_next+=0x100000);
         *out=bo; *va=bo->va; ++kfd_bo_allocs; return 0;
     }
     return -ENOMEM;
@@ -378,6 +378,38 @@ int dext_kfd_bo_ranges(struct dext_kfd_client *c, struct rt_kfd_bo *bo,
     assert(c && bo->live && bo->domain==2);
     int r=fn(arg,kfd_pages[0],8192);
     return r ? r : fn(arg,kfd_pages[1],8192);
+}
+struct bar_got { unsigned n; uint32_t bar; uint64_t bytes; };
+static int collect_bar(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes)
+{
+    struct bar_got *got=arg;
+    (void)offset;
+    got->n++; got->bar=bar; got->bytes+=bytes;
+    return 0;
+}
+/* BAR writes (hdp_flush.h): CPU-visible VRAM and the HDP flush page. */
+static unsigned kfd_visible_pins;
+static int kfd_hdp_error;
+int dext_kfd_bo_make_cpu_visible(struct dext_kfd_client *c, struct rt_kfd_bo *bo)
+{
+    assert(c && bo->live && bo->c==c);
+    if (bo->domain!=4) return -EINVAL;
+    if (!bo->cpu_visible) { bo->cpu_visible=true; ++kfd_visible_pins; }
+    return 0;
+}
+int dext_kfd_bo_bar_ranges(struct dext_kfd_client *c, struct rt_kfd_bo *bo,
+                           int (*fn)(void *, uint32_t, uint64_t, uint64_t), void *arg)
+{
+    assert(c && bo->live && bo->cpu_visible);
+    return fn(arg,0,0x200000+(bo->va&0xffff0000),bo->size);
+}
+int dext_kfd_hdp_flush(struct dext_kfd_client *c, struct dext_kfd_hdp_flush *out)
+{
+    assert(c && c->live);
+    if (kfd_hdp_error) return kfd_hdp_error;
+    *out=(struct dext_kfd_hdp_flush){.bar=5,.bar_offset=0x7c000,.bytes=16384,
+                                     .mem_flush=0x3000,.reg_flush=0x3004,.visible_vram=256ull<<20};
+    return 0;
 }
 int dext_kfd_queue_create(struct dext_kfd_client *c, struct rt_kfd_bo *ring,
                           struct rt_kfd_bo *metadata, uint32_t packets, struct dext_kfd_queue **out)
@@ -941,7 +973,56 @@ int main(int argc, char **argv)
             installed_hooks.after_reset(installed_hooks.arg,false);
             assert(gate.open==1);
             assert(!dext_compute_doorbell_gate_retire(7) && gate.open==0);
+            /* Retired for good, not held: the client stops for good. */
+            assert(mlg_doorbell_gate_retired(&gate));
+            gate.retired=0;
             assert(dext_compute_doorbell_gate_publish(7,&gate) && gate.open==1);
+            /* A hold is not a retire. */
+            assert(!dext_compute_kick_gate(false) && !mlg_doorbell_gate_retired(&gate));
+            assert(!dext_compute_kick_gate(true) && gate.open==1);
+        }
+        /* BAR writes (hdp_flush.h): only after the client enables them,
+         * hostable VRAM (a window VA) and its CPU access through BAR
+         * ranges; the HDP flush page as the device reports it. */
+        {
+            struct dext_compute_hdp_flush page;
+            uint64_t hostable=0, va=0, cpu=0, map[2]={0};
+            void *where=NULL; uint64_t size=0;
+            const unsigned pins=kfd_visible_pins;
+            assert(dext_compute_bo_alloc(1<<20,DEXT_COMPUTE_BO_DOMAIN_DEVICE_VRAM,16384,
+                                         DEXT_COMPUTE_BO_FLAG_HOSTABLE,&hostable,&va,&cpu)==-EINVAL_L);
+            assert(dext_compute_bo_alloc(1<<20,DEXT_COMPUTE_BO_DOMAIN_DEVICE_VRAM,16384,2,
+                                         &hostable,&va,&cpu)==-ENOTREADY_L);	/* unknown flag */
+            kfd_hdp_error=-EPERM;
+            assert(dext_compute_bar_writes_enable(7,&page)==-EINVAL_L);	/* no exportable page */
+            kfd_hdp_error=0;
+            assert(dext_compute_bar_writes_enable(99,&page)==-ENOTREADY_L);	/* not a KFD client */
+            assert(!dext_compute_bar_writes_enable(7,&page) && page.bar==5 && page.bytes==16384 &&
+                   page.mem_flush==0x3000 && page.reg_flush==0x3004);
+            /* GTT can never be hostable. */
+            assert(dext_compute_bo_alloc(1<<20,DEXT_COMPUTE_BO_DOMAIN_GTT,16384,
+                                         DEXT_COMPUTE_BO_FLAG_HOSTABLE,&hostable,&va,&cpu)==-EINVAL_L);
+            assert(!dext_compute_bo_alloc(1<<20,DEXT_COMPUTE_BO_DOMAIN_DEVICE_VRAM,16384,
+                                          DEXT_COMPUTE_BO_FLAG_HOSTABLE,&hostable,&va,&cpu) && va && !cpu);
+            assert(dext_compute_bo_map_needs_device(hostable) && kfd_visible_pins==pins);
+            assert(!dext_compute_bo_map(hostable,map) && map[0]>=0x10000 && map[1]==1<<20);
+            assert(kfd_visible_pins==pins+1 && !dext_compute_bo_map_needs_device(hostable));
+            assert(!dext_compute_bo_map(hostable,map) && kfd_visible_pins==pins+1);	/* once */
+            assert(dext_compute_bo_memory((uint32_t)map[0],&where,&size)==-EREMOTE_L && size==1<<20);
+            {
+                struct bar_got got={0,0,0};
+                assert(!dext_compute_bo_bar_ranges((uint32_t)map[0],collect_bar,&got));
+                assert(got.n==1 && got.bar==0 && got.bytes==1<<20);
+            }
+            /* Another client cannot map or range it. */
+            dext_compute_select_client(8);
+            assert(dext_compute_bo_map(hostable,map)==-ENOENT_L);
+            {
+                struct bar_got got={0,0,0};
+                assert(dext_compute_bo_bar_ranges((uint32_t)map[0],collect_bar,&got)==-ENOENT_L && !got.n);
+            }
+            dext_compute_select_client(7);
+            assert(!dext_compute_bo_free(hostable));
         }
         assert(!dext_compute_aql_queue_service(q1,&status,out) && !out[0]);
         assert(dext_compute_bo_free(r0)==-EBUSY_L);

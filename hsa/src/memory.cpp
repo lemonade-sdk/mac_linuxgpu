@@ -91,6 +91,12 @@ bool poolAccessible(const Pool &pool, const Agent &agent) {
     return pool.owner.handle == agent.handle.handle ||
         (pool.sharedHost && agent.connection == pool.connection);
 }
+// The device's VRAM pool, once its connection enabled BAR writes
+// (mac_hsa_bar_writes_enable): the CPU may be granted an allocation, as
+// ROCr reports a large-BAR device's coarse VRAM pool to a CPU agent.
+bool cpuGrantable(const Pool &pool, const Agent &agent) {
+    return !agent.connection && pool.connection && !pool.sharedHost && pool.connection->barWrites().gate;
+}
 bool validRange(const void *pointer, size_t size, const std::shared_ptr<Allocation> &allocation, bool write = false) {
     const auto address = reinterpret_cast<uintptr_t>(pointer);
     if (!pointer || size > UINTPTR_MAX - address) return false;
@@ -167,7 +173,11 @@ hsa_status_t allocate(uint64_t poolHandle, size_t size, uint32_t flags, void **o
                 allocation->size < rounded || allocation->size > UINTPTR_MAX - address)
                 return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
         } else if (pool.connection) {
-            const auto result = pool.connection->allocateBuffer(rounded, allocation->buffer);
+            // With BAR writes every VRAM allocation has an address the CPU
+            // can be granted later (hsa_amd_agents_allow_access).
+            const auto result = pool.connection->barWrites().gate ?
+                pool.connection->allocateHostableBuffer(rounded, allocation->buffer) :
+                pool.connection->allocateBuffer(rounded, allocation->buffer);
             if (result != HSA_STATUS_SUCCESS) return result;
             allocation->connection = pool.connection;
             allocation->base = reinterpret_cast<void *>(allocation->buffer.address);
@@ -203,7 +213,7 @@ bool accessibleAgent(hsa_agent_t agent, const std::shared_ptr<Allocation> &alloc
     const auto found = findAgent(agent);
     if (!found) return false;
     return allocation && allocation->connection ? found->connection == allocation->connection ||
-        (allocation->shared.host && !found->connection) : !found->connection;
+        ((allocation->shared.host || allocation->cpuMapped) && !found->connection) : !found->connection;
 }
 hsa_status_t copyBytes(void *dst, const void *src, size_t size,
     const std::shared_ptr<Allocation> &destination, const std::shared_ptr<Allocation> &source) {
@@ -439,8 +449,9 @@ HSA_API_EXPORT hsa_status_t hsa_amd_agent_memory_pool_get_info(hsa_agent_t agent
     if (!value) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     switch (attribute) {
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS:
-        return writeValue(value, !poolAccessible(*pool, *found) ? HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED :
-                                                    HSA_AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT);
+        if (poolAccessible(*pool, *found)) return writeValue(value, HSA_AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT);
+        return writeValue(value, cpuGrantable(*pool, *found) ? HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT :
+                                                               HSA_AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED);
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_NUM_LINK_HOPS:
         return writeValue(value, uint32_t(poolAccessible(*pool, *found) && agent.handle != pool->owner.handle));
     case HSA_AMD_AGENT_MEMORY_POOL_INFO_LINK_INFO: {
@@ -481,16 +492,39 @@ HSA_API_EXPORT hsa_status_t hsa_amd_memory_pool_free(void *pointer) {
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_agents_allow_access(uint32_t count, const hsa_agent_t *handles,
     const uint32_t *flags, const void *pointer) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!count || !handles || flags || !pointer) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    const auto allocation = findAllocation(pointer);
-    if (!allocation) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto agent = findAgent(handles[i]);
-        if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
-        if (!accessibleAgent(handles[i], allocation)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    std::shared_ptr<Allocation> allocation;
+    bool grantCPU = false;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!count || !handles || flags || !pointer) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        allocation = findAllocation(pointer);
+        if (!allocation) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto agent = findAgent(handles[i]);
+            if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
+            if (accessibleAgent(handles[i], allocation)) continue;
+            // The CPU granted VRAM of a connection with BAR writes (the
+            // allocation was made hostable then): mapped below, as ROCr
+            // maps it on a large-BAR device.
+            if (!agent->connection && allocation->connection && !allocation->shared.host &&
+                allocation->connection->barWrites().gate && allocation->base == pointer) {
+                grantCPU = true;
+                continue;
+            }
+            return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        }
     }
+    if (!grantCPU) return HSA_STATUS_SUCCESS;
+    // The driver call outside runtimeMutex; the allocation stays retained.
+    const auto status = allocation->connection->mapBufferForCPU(allocation->buffer);
+    if (status != HSA_STATUS_SUCCESS) {
+        std::fprintf(stderr, "mac_hsa: CPU access to VRAM %p+%#zx failed (HSA status %#x)\n",
+                     allocation->base, allocation->size, unsigned(status));
+        return status;
+    }
+    std::lock_guard lock(runtimeMutex);
+    allocation->cpuMapped = true;
     return HSA_STATUS_SUCCESS;
 }
 hsa_status_t hsa_memory_copy(void *dst, const void *src, size_t size) {
@@ -549,14 +583,14 @@ HSA_API_EXPORT hsa_status_t hsa_amd_pointer_info(const void *pointer, hsa_amd_po
             result.type = allocation->type;
             result.agentBaseAddress = allocation->base;
             result.hostBaseAddress = allocation->shared.host ? allocation->shared.host :
-                (allocation->connection ? nullptr : allocation->base);
+                (allocation->connection && !allocation->cpuMapped ? nullptr : allocation->base);
             result.sizeInBytes = allocation->size;
             result.agentOwner = allocation->owner;
             result.userData = allocation->userData;
             result.global_flags = allocation->globalFlags ? allocation->globalFlags :
                 (allocation->connection ? HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_COARSE_GRAINED : HSA_AMD_MEMORY_POOL_GLOBAL_FLAG_FINE_GRAINED);
             result.registered = bool(allocation->connection);
-            if (allocation->shared.host)
+            if (allocation->shared.host || allocation->cpuMapped)
                 for (const auto &agent : agents)
                     if (agent.handle.handle != allocation->owner.handle && accessibleAgent(agent.handle, allocation)) {
                         otherAccess = agent.handle; break;

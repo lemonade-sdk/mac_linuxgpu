@@ -67,6 +67,23 @@
         "drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.h"
       ],
       "reason": "Make amdgpu_ttm_copy_mem_to_mem callable from the KFD session copy (rt_kfd_bo_copy), so a buffer in system pages is copied by SDMA through TTM's GART windows, as amdgpu_move_blit moves it, instead of through CPU copies into a staging buffer. Its nonnull attribute now leaves resv optional, as amdgpu_copy_buffer treats it. Behaviour inside amdgpu_ttm.c is unchanged."
+    },
+    {
+      "patch": "patches/linux/amdgpu-mmio-remap-4k-hole.patch",
+      "sha256": "026066e225b60962fb29623a55152d76f78c2b319730c4d30e5dba0c51044bfa",
+      "files": [
+        "drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c",
+        "drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c"
+      ],
+      "reason": "Keep the NBIO/NBIF HDP flush remap in the 4 KiB register hole the hardware leaves unused (0x80000 - AMDGPU_GPU_PAGE_SIZE) whatever the host page size, and program it on every non-SR-IOV device. Upstream wrote the hole as 0x80000 - PAGE_SIZE and turned the remap off for pages over 4 KiB (CVE-2024-41011), leaving the driver's 16 KiB-page build without the page KFD clients flush HDP through. KFD's MMIO_REMAP allocation and mmap and the MMIO_REMAP TTM BO still refuse pages over 4 KiB; the dext exports the page itself (rt_kfd_session_hdp_flush). No change with 4 KiB pages."
     }
   ],
   "verified_copies": {

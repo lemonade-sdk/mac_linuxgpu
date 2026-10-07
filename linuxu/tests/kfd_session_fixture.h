@@ -14,6 +14,12 @@
 #define TEST_DOORBELL_BUS	0xfc000000ULL
 #define TEST_DOORBELL_BYTES	(2ULL << 20)
 #define TEST_KERNEL_GPU_BASE	0xffff800000000000ULL
+/* VRAM's BAR (BAR 0): the CPU-visible window is its first TEST_VISIBLE_BYTES. */
+#define TEST_VRAM_BAR_BUS	0xe0000000ULL
+#define TEST_VISIBLE_BYTES	(64ULL << 20)
+/* The register BAR (BAR 5). */
+#define TEST_MMIO_BUS		0xfe000000ULL
+#define TEST_MMIO_BYTES		(1ULL << 20)
 
 /* amd_queue_t and AQL packet offsets the fixture's command processor reads. */
 #define FIXTURE_AQL_RING_BASE		8	/* hsa_queue.base_address */
@@ -63,6 +69,11 @@ void fixture_mes_hang_all(bool hung);
 unsigned int fixture_mes_failed_removes(void);
 unsigned int fixture_mes_hang_resets(void);
 unsigned int fixture_live_bos(void);
+/* VRAM BOs pinned (amdgpu_bo_pin) now, and pins that moved a BO. */
+unsigned int fixture_pinned(void);
+unsigned int fixture_pin_moves(void);
+/* The amdgpu BO of the KFD allocation at GPU VA @va, or NULL. */
+struct amdgpu_bo *fixture_kfd_bo_at(uint64_t va);
 unsigned int fixture_kernel_allocs(void);
 unsigned int fixture_cp_dispatches(void);
 unsigned int fixture_render_balance(void);

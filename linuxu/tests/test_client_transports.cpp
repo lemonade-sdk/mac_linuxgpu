@@ -282,6 +282,7 @@ static kern_return_t observer_drm_info(IOUserClientMethodArguments *) { return k
 static kern_return_t display_call(MacLinuxGPUUserClient *, uint64_t, IOUserClientMethodArguments *) { return kIOReturnUnsupported; }
 int dext_compute_bo_memory(uint32_t, void **, uint64_t *) { return -ENOENT_L; }
 static IOMemoryDescriptor *copy_bo_ranges_descriptor(uint32_t, uint64_t) { return nullptr; }
+static IOMemoryDescriptor *copy_bo_bar_descriptor(MacLinuxGPUUserClient *, uint32_t, uint64_t) { return nullptr; }
 static void *dext_dma_copy_descriptor(void *) { return nullptr; }
 extern "C" int rt_bounded_run(void (*fn)(void *), void *arg, void (*)(void *), unsigned int)
 {

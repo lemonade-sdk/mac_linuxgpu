@@ -72,6 +72,23 @@ static int count_range(void *arg, void *cpu, uint64_t bytes)
 	return 0;
 }
 
+/* BAR ranges of a CPU-visible VRAM BO (rt_kfd_bo_bar_ranges). */
+struct bar_count { unsigned int runs; uint32_t bar; uint64_t first, end, bytes; };
+static int count_bar_range(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes)
+{
+	struct bar_count *c = arg;
+	assert(bytes && !(bytes % PAGE_SIZE) && !(offset % PAGE_SIZE));
+	if (!c->runs++) {
+		c->bar = bar;
+		c->first = offset;
+	}
+	assert(bar == c->bar);
+	if (offset + bytes > c->end)
+		c->end = offset + bytes;
+	c->bytes += bytes;
+	return 0;
+}
+
 static void check_ctx_header(const struct queue_set *set,
 			     const struct rt_kfd_queue_limits *limits)
 {
@@ -779,6 +796,92 @@ int main(void)
 		assert(!rt_kfd_bo_cpu_ranges(s, host, count_range, &c));
 		assert(c.bytes == host_info.size && c.runs >= 1);
 		assert(rt_kfd_bo_cpu_ranges(s, code, count_range, &c) == -EINVAL);
+	}
+	{
+		/* CPU access to VRAM (hdp_flush.h): a window VA, then pinned in
+		 * the CPU-visible window, mapped to the GPU again at that VA. */
+		struct rt_kfd_bo *ring = NULL;
+		struct rt_kfd_bo_info ring_info;
+		struct bar_count c = {0};
+		unsigned int maps, unmaps, pinned;
+
+		assert(!rt_kfd_bo_alloc(s, 1 << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_WINDOW, &ring));
+		assert(!rt_kfd_bo_info(s, ring, &ring_info) && ring_info.domain == RT_KFD_VRAM);
+		assert(ring_info.va >= window_base && ring_info.va + ring_info.size <= window_base + window_size);
+		assert(fixture_kfd_bo_at(ring_info.va));
+		assert(!amdgpu_res_cpu_visible(adev, fixture_kfd_bo_at(ring_info.va)->tbo.resource));	/* top-down, above it */
+		assert(rt_kfd_bo_bar_ranges(s, ring, count_bar_range, &c) == -EINVAL && !c.runs);
+		assert(rt_kfd_bo_make_cpu_visible(s, code) == -EINVAL);	/* private VRAM: no window VA */
+		assert(rt_kfd_bo_make_cpu_visible(s, host) == -EINVAL);	/* GTT */
+		maps = kgd_maps;
+		unmaps = kgd_unmaps;
+		pinned = fixture_pinned();
+		assert(!rt_kfd_bo_make_cpu_visible(s, ring));
+		assert(kgd_unmaps == unmaps + 1 && kgd_maps == maps + 1);	/* page tables follow the move */
+		assert(fixture_pinned() == pinned + 1 && fixture_pin_moves() >= 1);
+		assert(fixture_kfd_bo_at(ring_info.va)->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
+		assert(amdgpu_res_cpu_visible(adev, fixture_kfd_bo_at(ring_info.va)->tbo.resource));
+		assert(!rt_kfd_bo_make_cpu_visible(s, ring) && kgd_maps == maps + 1);	/* once */
+		assert(!rt_kfd_bo_bar_ranges(s, ring, count_bar_range, &c));
+		assert(c.bar == 0 && c.bytes == ring_info.size && c.end <= TEST_VISIBLE_BYTES);
+		assert(!rt_kfd_bo_info(s, ring, &ring_info) && ring_info.va >= window_base);	/* same VA */
+		/* Freed unpinned. */
+		assert(!rt_kfd_bo_free(s, ring) && fixture_pinned() == pinned);
+		/* No room in the window: refused, the BO still mapped and usable. */
+		{
+			struct rt_kfd_bo *filler = NULL, *big = NULL;
+			struct rt_kfd_bo_info big_info;
+			unsigned int moves;
+
+			assert(!rt_kfd_bo_alloc(s, TEST_VISIBLE_BYTES / 2, 0, RT_KFD_VRAM, RT_KFD_PLACE_WINDOW, &filler));
+			assert(!rt_kfd_bo_make_cpu_visible(s, filler));
+			assert(!rt_kfd_bo_alloc(s, TEST_VISIBLE_BYTES / 2, 0, RT_KFD_VRAM, RT_KFD_PLACE_WINDOW, &big));
+			assert(!rt_kfd_bo_info(s, big, &big_info));
+			maps = kgd_maps;
+			moves = fixture_pin_moves();
+			assert(rt_kfd_bo_make_cpu_visible(s, big) == -ENOSPC);
+			assert(kgd_maps == maps + 1 && fixture_pinned() == pinned + 1 && fixture_pin_moves() == moves);
+			assert(!(fixture_kfd_bo_at(big_info.va)->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED));
+			assert(!rt_kfd_bo_free(s, big) && !rt_kfd_bo_free(s, filler) && fixture_pinned() == pinned);
+		}
+	}
+	{
+		/* The HDP flush page: the register BAR's host page holding the
+		 * 4 KiB remap page, as KFD's MMIO mmap gives it on Linux. */
+		struct rt_kfd_hdp_flush hdp;
+		static uint32_t bases[2][6];
+
+		adev->rmmio_base = TEST_MMIO_BUS;
+		adev->rmmio_size = TEST_MMIO_BYTES;
+		adev->rmmio_remap.reg_offset = 0;
+		adev->rmmio_remap.bus_addr = 0;
+		assert(rt_kfd_session_hdp_flush(s, &hdp) == -ENODEV);	/* no remap: SR-IOV */
+		adev->rmmio_remap.reg_offset = 0x80000 - 4096;	/* the patched NBIO's hole */
+		adev->rmmio_remap.bus_addr = TEST_MMIO_BUS + adev->rmmio_remap.reg_offset;
+		/* Register blocks well away from the page (static-table form). */
+		bases[0][0] = 0x1260; bases[0][1] = 0xa000; bases[0][2] = 0x1c000;
+		bases[1][0] = 0x10400;
+		adev->reg_offset[GC_HWIP][0] = bases[0];
+		adev->reg_offset[NBIO_HWIP][0] = bases[1];
+		assert(!rt_kfd_session_hdp_flush(s, &hdp));
+		assert(hdp.bar == 5 && hdp.bytes == PAGE_SIZE && !(hdp.bar_offset % PAGE_SIZE));
+		assert(hdp.bar_offset + hdp.mem_flush == adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL);
+		assert(hdp.bar_offset + hdp.reg_flush == adev->rmmio_remap.reg_offset + KFD_MMIO_REMAP_HDP_REG_FLUSH_CNTL);
+		assert(hdp.visible_vram == TEST_VISIBLE_BYTES);
+		/* A block that starts in the host page beside the remap page:
+		 * the page holds live registers, and is not exported. */
+		bases[1][1] = (uint32_t)((0x80000 - PAGE_SIZE) / 4);
+		assert(PAGE_SIZE == 4096 || rt_kfd_session_hdp_flush(s, &hdp) == -EPERM);
+		/* One inside the remap page itself is the remap. */
+		bases[1][1] = (uint32_t)(adev->rmmio_remap.reg_offset / 4);
+		assert(!rt_kfd_session_hdp_flush(s, &hdp));
+		assert(rt_kfd_hdp_page_exclusive(bases[1], 2, 0x80000 - PAGE_SIZE, PAGE_SIZE,
+						 adev->rmmio_remap.reg_offset));
+		adev->reg_offset[GC_HWIP][0] = NULL;
+		adev->reg_offset[NBIO_HWIP][0] = NULL;
+		adev->rmmio_remap.bus_addr = 0;
+		adev->rmmio_base = 0;
+		adev->rmmio_size = 0;
 	}
 	for (size_t i = 0; i < sizeof(pattern); ++i)
 		pattern[i] = (unsigned char)(i * 131 + 7);

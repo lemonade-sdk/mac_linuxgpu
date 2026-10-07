@@ -229,6 +229,7 @@ int dext_compute_bo_memory(uint32_t type, void **cpu, uint64_t *size)
     return 0;
 }
 static IOMemoryDescriptor *copy_bo_ranges_descriptor(uint32_t, uint64_t) { return nullptr; }
+static IOMemoryDescriptor *copy_bo_bar_descriptor(MacLinuxGPUUserClient *, uint32_t, uint64_t) { return nullptr; }
 static void *dext_dma_copy_descriptor(void *) { lastDescriptor = new IOMemoryDescriptor; return lastDescriptor; }
 
 // rt/bounded.h, as linuxu/src/amdgpu-rt/bounded.c behaves (its own test

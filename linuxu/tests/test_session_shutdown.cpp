@@ -169,7 +169,14 @@ struct IOBufferMemoryDescriptor;
 struct mlg_doorbell_gate;
 #define DEXT_COMPUTE_DOORBELL_DRAIN_MS 20u
 static unsigned doorbellRetires;
-static uint64_t dext_compute_doorbell_gate_retire(uint64_t) { ++doorbellRetires; return 0; }
+#define DEXT_COMPUTE_BRACKET_DRAIN_MS 1000u
+static unsigned bracketDrains;
+static uint64_t dext_compute_doorbell_gate_retire_bounded(uint64_t, unsigned bound)
+{
+    ++doorbellRetires;
+    if (bound == DEXT_COMPUTE_BRACKET_DRAIN_MS) ++bracketDrains;
+    return 0;
+}
 // A definite transport fault made the GPU unreachable (rt/removal.h's
 // rt_device_lost): its work completes with -ECANCELED from now on.
 static int rt_device_lost_active(const char *) { events.push_back("device_lost"); return 0; }
@@ -1916,6 +1923,9 @@ int main(int argc, char **argv) {
         expectLog("session close begin: probe=1 result=-38 modules=1 pci=1 quarantine=1");
     else expectLog("session close begin: probe=0 result=0 modules=1 pci=1 quarantine=");
     expectLog("session close: requesting interrupt drain");
+    // The close waits for client brackets of BAR stores with the longer
+    // bound (hdp_flush.h): it runs where it may wait.
+    assert(bracketDrains > 0);
     if (scenario != "irq-failure") {
         expectLog("interrupt drain completed; scheduling final cleanup");
         expectLog("session close: final cleanup entered");

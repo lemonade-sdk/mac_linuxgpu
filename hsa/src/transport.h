@@ -47,10 +47,22 @@ constexpr uint64_t kSyncKickDriverBuild=263;
 // the doorbell slice it maps, behind the gate the driver closes before the
 // device stops answering.
 constexpr uint64_t kDirectDoorbellDriverBuild=264;
+// First driver build that lets a client store into the GPU's BARs on its
+// submission path (MLG_BAR_WRITES_BUILD, dext/sources/hdp_flush.h): the HDP
+// flush page and CPU access to VRAM, behind the client's gate.
+constexpr uint64_t kBarWritesDriverBuild=265;
 // A queue's doorbell as the client writes it itself: the gate, and the
 // queue's doorbell in the mapped slice. Both null for a queue rung through
 // kickQueue.
 struct DirectDoorbell { mlg_doorbell_gate *gate = nullptr; volatile uint64_t *doorbell = nullptr; };
+// BAR writes (kBarWritesDriverBuild, hdp_flush.h), once a connection enabled
+// them: the gate every store into the BARs is bracketed under, and the HDP
+// flush registers as this process maps them (HSA_AMD_AGENT_INFO_HDP_FLUSH).
+struct BarWrites {
+    mlg_doorbell_gate *gate = nullptr;
+    uint32_t *memFlush = nullptr, *regFlush = nullptr;
+    uint64_t visibleVRAM = 0;
+};
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.
@@ -328,6 +340,30 @@ public:
         return HSA_STATUS_ERROR_INVALID_ARGUMENT;
     }
     virtual hsa_status_t requestPower(uint64_t, PowerSnapshot &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    // BAR writes (hdp_flush.h). enableBarWrites asks the driver once and
+    // maps the gate and the HDP flush page; a driver or session without
+    // them declines, saying why in @why. barWrites is what an enabled
+    // connection has (gate null before). From then on VRAM is allocated
+    // hostable (a VA the CPU can map at) and mapBufferForCPU gives the CPU
+    // a write-combined mapping of one at its VA (the driver pins it in the
+    // CPU-visible window), undone by freeBuffer.
+    virtual hsa_status_t enableBarWrites(BarWrites &, std::string *why = nullptr) {
+        if (why) *why = "the transport has no BAR writes";
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    virtual BarWrites barWrites() { return {}; }
+    virtual hsa_status_t allocateHostableBuffer(uint64_t, DeviceBuffer &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
+    virtual hsa_status_t mapBufferForCPU(const DeviceBuffer &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
+    // A bracket found the gate closed: HSA_STATUS_SUCCESS once it may be
+    // tried again (the driver held it for a power transition or a reset
+    // and reopened it, or the wait should look again), or the device is
+    // gone for this process (the gate retired, the session closed, the
+    // device lost): every BAR mapping of the connection is retired first
+    // (bar_mapping_retire.h), so a store that still follows lands in host
+    // memory, and kDeviceLostStatus is returned. Sleeps, longer the more
+    // often @attempt says it waited already (a hold can last: a host
+    // sleep, a client's low-power prepare); never call it inside a bracket.
+    virtual hsa_status_t barWriteWait(unsigned) { return kDeviceLostStatus; }
 };
 
 // Discover the installed DriverKit service and initialize the Linux shim

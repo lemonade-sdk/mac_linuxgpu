@@ -12,7 +12,7 @@
 
 #define DEXT_RUNTIME_MAGIC 0x414d444750554142ull
 #define DEXT_RUNTIME_ABI 1u
-#define DEXT_RUNTIME_BUILD 264u /* 192: KFD compute sessions, QueryInfo tag 12;
+#define DEXT_RUNTIME_BUILD 265u /* 192: KFD compute sessions, QueryInfo tag 12;
                                    243: session calls are async (session_state.h);
                                    256: AQLQueueService reports a GPU memory fault
                                    (kIOReturnVMError, flags and address);
@@ -23,7 +23,10 @@
                                    263: AQLQueueKick (57) also served synchronously,
                                    on the delivery thread (kick_table.h);
                                    264: a client rings its KFD queues' doorbells
-                                   itself (doorbell_gate.h) */
+                                   itself (doorbell_gate.h);
+                                   265: BAR writes (hdp_flush.h): the HDP flush
+                                   page, hostable VRAM a client maps for the CPU,
+                                   behind its gate */
 #define DEXT_BO_SLOTS 8192u
 /* Queue handles across clients: legacy HQDs plus KFD user queues. */
 #define DEXT_QUEUE_SLOTS 1024u
@@ -52,6 +55,9 @@ struct production_bo {
     uint32_t domain;
     uint32_t memory_type;
     bool host_visible;
+    /* VRAM with a window VA (DEXT_COMPUTE_BO_FLAG_HOSTABLE), and whether
+     * BOMap pinned it in the CPU-visible window. */
+    bool hostable, cpu_visible;
 };
 
 struct production_queue {
@@ -74,6 +80,7 @@ struct production_client {
     uint64_t client;
     uint32_t mode;
     bool aware;		/* asked for tag 12: configures its own window */
+    bool bar_writes;	/* enabled BAR writes (hdp_flush.h) */
     struct dext_kfd_client *kfd;
     int open_error;	/* its KFD process could not be opened (-E*_L) */
     int open_raw;	/* the open's own error (Linux errno) */
@@ -122,16 +129,27 @@ static uint64_t doorbell_now_ns(void)
     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
 }
 
+static struct mlg_doorbell_drain doorbell_drain_ms(unsigned ms)
+{
+    struct mlg_doorbell_drain d = {doorbell_now_ns, (uint64_t)ms * 1000000u, 0, 0};
+    return d;
+}
+
 static struct mlg_doorbell_drain doorbell_drain(void)
 {
-    struct mlg_doorbell_drain d = {doorbell_now_ns,
-                                   (uint64_t)DEXT_COMPUTE_DOORBELL_DRAIN_MS * 1000000u, 0, 0};
-    return d;
+    return doorbell_drain_ms(DEXT_COMPUTE_DOORBELL_DRAIN_MS);
 }
 
 uint64_t dext_compute_doorbell_gate_retire(uint64_t client)
 {
     struct mlg_doorbell_drain d = doorbell_drain();
+    mlg_doorbell_gates_retire(&production_gates, client, &d);
+    return d.stuck_owner;
+}
+
+uint64_t dext_compute_doorbell_gate_retire_bounded(uint64_t client, unsigned ms)
+{
+    struct mlg_doorbell_drain d = doorbell_drain_ms(ms);
     mlg_doorbell_gates_retire(&production_gates, client, &d);
     return d.stuck_owner;
 }
@@ -940,7 +958,8 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
     enum rt_compute_domain rt_domain;
     unsigned i;
     int r;
-    if (!out_handle || !size || flags || !production_ready())
+    if (!out_handle || !size || (flags & ~(uint64_t)DEXT_COMPUTE_BO_FLAG_HOSTABLE) ||
+        !production_ready())
         return -ENOTREADY_L;
     if ((r = selected_session_error())) return r;
     if (domain == DEXT_COMPUTE_BO_DOMAIN_GTT ||
@@ -958,6 +977,12 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
     if (!alignment) alignment = 4096;
     {
         struct production_client *rec = selected_session();
+        const bool hostable = (flags & DEXT_COMPUTE_BO_FLAG_HOSTABLE) != 0;
+        /* A hostable buffer: VRAM of a KFD client that enabled BAR writes
+         * and has its window. */
+        if (hostable && (rt_domain != RT_COMPUTE_VRAM || !rec || rec->mode != PRODUCTION_KFD ||
+                         !rec->bar_writes))
+            return -EINVAL_L;
         if (rec && rec->mode == PRODUCTION_KFD) {
             struct rt_kfd_bo *kfd_bo = NULL;
             uint64_t va = 0;
@@ -971,7 +996,7 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
                     (void)dext_kfd_set_window(rec->kfd, base, bytes);
             }
             r = dext_kfd_bo_alloc(rec->kfd, size, alignment,
-                                  rt_domain == RT_COMPUTE_GTT ? 2 : 3, &kfd_bo, &va);
+                                  rt_domain == RT_COMPUTE_GTT ? 2 : (hostable ? 4 : 3), &kfd_bo, &va);
             if (r) return kfd_error(rec->kfd, r);
             slot->kfd = kfd_bo;
             slot->owner = production.selected_client;
@@ -981,6 +1006,7 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
             slot->gpu_address = va;
             slot->domain = domain;
             slot->host_visible = rt_domain == RT_COMPUTE_GTT;
+            slot->hostable = hostable;
             *out_handle = slot->handle;
             if (out_gpu_va) *out_gpu_va = va;
             if (out_cpu_addr) *out_cpu_addr = 0; /* CPU pointers never cross RPC. */
@@ -1105,10 +1131,40 @@ int dext_compute_bo_get_info(uint64_t handle, uint64_t *out)
     return 0;
 }
 
+bool dext_compute_bo_map_needs_device(uint64_t handle)
+{
+    const struct production_bo *bo = production_bo_lookup(handle);
+    return bo && bo->hostable && !bo->cpu_visible;
+}
+
 int dext_compute_bo_map(uint64_t handle, uint64_t *out)
 {
     struct production_bo *bo = production_bo_lookup(handle);
     if (!out || !bo) return -ENOENT_L;
+    if (bo->hostable) {
+        /* CPU access to hostable VRAM: pinned in the CPU-visible window
+         * once, then its BAR ranges are the client's mapping. */
+        struct production_client *rec = client_record(bo->owner, false);
+        struct dext_kfd_client *c = owner_kfd(bo->owner);
+        int r;
+        if (!production_ready()) return -ENOTREADY_L;
+        if (!rec || !rec->bar_writes || !c) return -EINVAL_L;
+        if (!bo->cpu_visible) {
+            r = dext_kfd_bo_make_cpu_visible(c, bo->kfd);
+            if (r == -ENOSPC || r == -ENOMEM) return -ENOMEM_L;
+            if (r == -EBUSY) return -EBUSY_L;
+            if (r) return kfd_error(c, r);
+            bo->cpu_visible = true;
+        }
+        if (!bo->memory_type) {
+            if (production.next_memory_type == UINT32_MAX - DEXT_BO_MEMORY_BASE)
+                return -ENOMEM_L;
+            bo->memory_type = DEXT_BO_MEMORY_BASE + ++production.next_memory_type;
+        }
+        out[0] = bo->memory_type;
+        out[1] = bo->size;
+        return 0;
+    }
     if (!production_ready() || !(bo->cpu_address || bo->host_visible) ||
         (bo->domain != DEXT_COMPUTE_BO_DOMAIN_GTT &&
          bo->domain != DEXT_COMPUTE_BO_DOMAIN_GTT_LEGACY))
@@ -1141,6 +1197,12 @@ int dext_compute_bo_memory(uint32_t memory_type, void **cpu, uint64_t *size)
             *size = bo->size;
             return -EAGAIN_L;
         }
+        /* CPU-visible VRAM: ranges of the BAR. */
+        if (bo->kfd && bo->memory_type == memory_type &&
+            bo->owner == production.selected_client && bo->cpu_visible) {
+            *size = bo->size;
+            return -EREMOTE_L;
+        }
     }
     return -ENOENT_L;
 }
@@ -1161,6 +1223,47 @@ int dext_compute_bo_memory_ranges(uint32_t memory_type,
         return r ? kfd_error(c, r) : 0;
     }
     return -ENOENT_L;
+}
+
+int dext_compute_bo_bar_ranges(uint32_t memory_type,
+                               int (*fn)(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes),
+                               void *arg)
+{
+    if (!fn || memory_type < DEXT_BO_MEMORY_BASE) return -EINVAL_L;
+    if (!production_ready()) return -ENOTREADY_L;
+    for (unsigned i = 0; i < DEXT_BO_SLOTS; ++i) {
+        struct production_bo *bo = &production.bos[i];
+        if (!bo->kfd || bo->memory_type != memory_type ||
+            bo->owner != production.selected_client || !bo->cpu_visible)
+            continue;
+        struct dext_kfd_client *c = owner_kfd(bo->owner);
+        int r = c ? dext_kfd_bo_bar_ranges(c, bo->kfd, fn, arg) : -ENOENT;
+        return r ? kfd_error(c, r) : 0;
+    }
+    return -ENOENT_L;
+}
+
+int dext_compute_bar_writes_enable(uint64_t client, struct dext_compute_hdp_flush *out)
+{
+    struct production_client *rec;
+    struct dext_kfd_hdp_flush page;
+    int r;
+    if (!out) return -EINVAL_L;
+    memset(out, 0, sizeof(*out));
+    if (!production_ready()) return -ENOTREADY_L;
+    rec = client_record(client, false);
+    if (!rec || rec->mode != PRODUCTION_KFD || !rec->kfd) return -ENOTREADY_L;
+    memset(&page, 0, sizeof(page));
+    r = dext_kfd_hdp_flush(rec->kfd, &page);
+    if (r) return -EINVAL_L;
+    out->bar = page.bar;
+    out->bar_offset = page.bar_offset;
+    out->bytes = page.bytes;
+    out->mem_flush = page.mem_flush;
+    out->reg_flush = page.reg_flush;
+    out->visible_vram = page.visible_vram;
+    rec->bar_writes = true;
+    return 0;
 }
 
 int dext_compute_bo_copy(uint64_t source, uint64_t destination,
@@ -1486,7 +1589,13 @@ static int kick_direct_ring(void *queue, uint64_t packet)
  * MLG_DOORBELL_HOLD_* are the same bits). */
 static uint64_t doorbells_hold(uint32_t reason, bool hold)
 {
-    struct mlg_doorbell_drain d = doorbell_drain();
+    /* A reset stops the BARs decoding, and its thread may wait: a client
+     * bracket preempted mid-submission gets the longer bound. A power
+     * hold may come from the delivery thread and keeps the short one
+     * (the device stays powered through a quiesce). */
+    struct mlg_doorbell_drain d = doorbell_drain_ms(reason == MLG_DOORBELL_HOLD_RESET ?
+                                                    DEXT_COMPUTE_BRACKET_DRAIN_MS :
+                                                    DEXT_COMPUTE_DOORBELL_DRAIN_MS);
     kick_table_hold(&production_kicks, reason, hold);
     mlg_doorbell_gates_hold(&production_gates, reason, hold, &d);
     return d.stuck_owner;

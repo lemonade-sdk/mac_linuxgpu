@@ -5,6 +5,8 @@
 #include "fw_mailbox_service.h"
 #include "selector_call.h"
 #include "../../dext/sources/doorbell_gate.h"
+#include "../../dext/sources/hdp_flush.h"
+#include "bar_mapping_retire.h"
 #include <IOKit/IOKitLib.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
@@ -246,6 +248,12 @@ public:
             (void)handle;
             IOConnectUnmapMemory64(ownerPort, buffer.memoryType, mach_task_self(), reinterpret_cast<uintptr_t>(buffer.host));
         }
+        for (const auto &[handle, mapping] : cpuMappings) {
+            (void)handle;
+            IOConnectUnmapMemory64(ownerPort, mapping.memoryType, mach_task_self(), mapping.address);
+        }
+        if (hdpPage)
+            IOConnectUnmapMemory64(ownerPort, MLG_HDP_FLUSH_MEMORY_TYPE, mach_task_self(), hdpPage);
         // Its queues are gone; the driver retires the gate with the close.
         if (doorbellSlice)
             IOConnectUnmapMemory64(ownerPort, MLG_DOORBELL_MEMORY_TYPE, mach_task_self(), doorbellSlice);
@@ -419,10 +427,85 @@ public:
         } else reportAllocationFailureLocked("VRAM", bytes, allocated);
         return allocated;
     }
+    // VRAM whose VA lies in the host window (hdp_flush.h), for a connection
+    // that enabled BAR writes: the CPU can later map it at that VA.
+    hsa_status_t allocateHostableBuffer(uint64_t bytes, DeviceBuffer &buffer) override {
+        std::lock_guard lock(sessionMutex);
+        auto status = ensureReady();
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!barWritesGate) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        status = ensureHostWindow();
+        if (status != HSA_STATUS_SUCCESS) return status;
+        if (!bytes || bytes > capacity || bytes > UINT64_MAX - 16383)
+            return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        const auto rounded = (bytes + 16383) & ~uint64_t(16383);
+        const auto allocated = allocateRaw(rounded, 3, buffer, MLG_BO_FLAG_HOSTABLE);
+        if (allocated != HSA_STATUS_SUCCESS) {
+            reportAllocationFailureLocked("VRAM", bytes, allocated);
+            return allocated;
+        }
+        if (buffer.address < hostWindowBase || buffer.address - hostWindowBase > hostWindowSize ||
+            buffer.size > hostWindowSize - (buffer.address - hostWindowBase)) {
+            std::fprintf(stderr, "mac_linuxgpu: hostable VRAM %#llx+%#llx lies outside the host window "
+                "%#llx+%#llx\n", (unsigned long long)buffer.address, (unsigned long long)buffer.size,
+                (unsigned long long)hostWindowBase, (unsigned long long)hostWindowSize);
+            (void)scalar(17, {&buffer.handle, 1}, {});
+            buffer = {};
+            return HSA_STATUS_ERROR;
+        }
+        vramBytes += buffer.size; ++vramCount;
+        census.add(buffer.handle, AllocationCensus::Kind::VRAM, buffer.size);
+        return HSA_STATUS_SUCCESS;
+    }
+    // CPU access to hostable VRAM: the driver pins it in the CPU-visible
+    // window (BOMap), and it is mapped write combined at its VA, as ROCr
+    // maps VRAM it grants the CPU on a large-BAR device.
+    hsa_status_t mapBufferForCPU(const DeviceBuffer &buffer) override {
+        std::lock_guard lock(sessionMutex);
+        if (state != State::Ready) return HSA_STATUS_ERROR;
+        if (!barWritesGate || barMappingsRetired) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        if (cpuMappings.contains(buffer.handle)) return HSA_STATUS_SUCCESS;
+        std::array<uint64_t, 2> mapping{};
+        auto status = scalar(36, {&buffer.handle, 1}, mapping);
+        if (status != HSA_STATUS_SUCCESS) {
+            std::fprintf(stderr, "mac_linuxgpu: the driver gave VRAM %#llx+%#llx no CPU access (IOReturn %#x)%s\n",
+                (unsigned long long)buffer.address, (unsigned long long)buffer.size, lastIOReturn,
+                lastIOReturn == uint32_t(kIOReturnNoSpace) ? ": the CPU-visible VRAM window is full" : "");
+            return status == HSA_STATUS_ERROR_OUT_OF_RESOURCES ? status : HSA_STATUS_ERROR;
+        }
+        if (mapping[0] > UINT32_MAX || mapping[1] < buffer.size) return HSA_STATUS_ERROR;
+        mach_vm_address_t address = buffer.address;
+        mach_vm_size_t size = 0;
+        const bool taken = hostReservation.take(buffer.address, buffer.size);
+        const auto mapped = IOConnectMapMemory64(ownerPort, uint32_t(mapping[0]), mach_task_self(), &address,
+                                                 &size, kIOMapWriteCombineCache);
+        if (mapped == KERN_SUCCESS && address == buffer.address && size >= buffer.size) {
+            try {
+                cpuMappings.emplace(buffer.handle, CPUMapping{address, size, uint32_t(mapping[0])});
+                return HSA_STATUS_SUCCESS;
+            } catch (const std::bad_alloc &) {}
+        }
+        if (mapped == KERN_SUCCESS) IOConnectUnmapMemory64(ownerPort, uint32_t(mapping[0]), mach_task_self(), address);
+        if (taken) hostReservation.give(buffer.address, buffer.size);
+        std::fprintf(stderr, "mac_linuxgpu: VRAM %#llx+%#llx did not map for the CPU at its VA (IOReturn %#x)%s\n",
+            (unsigned long long)buffer.address, (unsigned long long)buffer.size, unsigned(mapped),
+            taken ? "" : "; something else in the process maps that range");
+        return HSA_STATUS_ERROR;
+    }
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override {
         std::lock_guard lock(sessionMutex);
         if (state != State::Ready) return HSA_STATUS_ERROR;
         if (sharedBuffers.contains(buffer.handle)) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+        // Its CPU mapping goes first: the BAR pages it maps go to another
+        // buffer once the driver frees this one.
+        if (const auto mapped = cpuMappings.find(buffer.handle); mapped != cpuMappings.end()) {
+            if (IOConnectUnmapMemory64(ownerPort, mapped->second.memoryType, mach_task_self(),
+                                       mapped->second.address) != KERN_SUCCESS) {
+                state = State::Faulted; return HSA_STATUS_ERROR;
+            }
+            hostReservation.give(mapped->second.address, mapped->second.size);
+            cpuMappings.erase(mapped);
+        }
         const auto status = scalar(17, {&buffer.handle, 1}, {});
         if (status != HSA_STATUS_SUCCESS) state = State::Faulted;
         else {
@@ -634,22 +717,9 @@ public:
             }
             doorbellSlice=address;doorbellBytes=size;
         }
-        if (!doorbellGate) {
-            mach_vm_address_t address=0;mach_vm_size_t size=0;
-            if (IOConnectMapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),&address,&size,
-                                     kIOMapAnywhere)!=KERN_SUCCESS || !address || size<sizeof(mlg_doorbell_gate)) {
-                std::fprintf(stderr,"mac_hsa: the driver gave no doorbell gate to map (queue %llu)\n",
-                             (unsigned long long)handle);
-                if (address) IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
-                return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
-            }
-            auto *gate=reinterpret_cast<mlg_doorbell_gate *>(address);
-            if (std::atomic_ref<uint32_t>(gate->magic).load(std::memory_order_acquire)!=MLG_DOORBELL_GATE_MAGIC) {
-                std::fprintf(stderr,"mac_hsa: the driver's doorbell gate is not one (magic %#x)\n",gate->magic);
-                IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
-                return HSA_STATUS_ERROR;
-            }
-            doorbellGate=gate;
+        if (const auto status=mapGateLocked(); status!=HSA_STATUS_SUCCESS) {
+            std::fprintf(stderr,"mac_hsa: no doorbell gate for queue %llu\n",(unsigned long long)handle);
+            return status;
         }
         if ((offset&7) || offset+8>doorbellBytes) {
             std::fprintf(stderr,"mac_hsa: queue %llu's doorbell %#llx lies outside the %llu-byte slice\n",
@@ -657,6 +727,134 @@ public:
             return HSA_STATUS_ERROR;
         }
         directDoorbells[handle]=reinterpret_cast<volatile uint64_t *>(doorbellSlice+offset);
+        return HSA_STATUS_SUCCESS;
+    }
+    // The client's gate (doorbell_gate.h), mapped once: with its first KFD
+    // queue, or when it enables BAR writes.
+    hsa_status_t mapGateLocked() {
+        if (doorbellGate) return HSA_STATUS_SUCCESS;
+        mach_vm_address_t address=0;mach_vm_size_t size=0;
+        if (IOConnectMapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),&address,&size,
+                                 kIOMapAnywhere)!=KERN_SUCCESS || !address || size<sizeof(mlg_doorbell_gate)) {
+            std::fprintf(stderr,"mac_hsa: the driver gave no doorbell gate to map\n");
+            if (address) IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
+            return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
+        auto *gate=reinterpret_cast<mlg_doorbell_gate *>(address);
+        if (std::atomic_ref<uint32_t>(gate->magic).load(std::memory_order_acquire)!=MLG_DOORBELL_GATE_MAGIC) {
+            std::fprintf(stderr,"mac_hsa: the driver's doorbell gate is not one (magic %#x)\n",gate->magic);
+            IOConnectUnmapMemory64(ownerPort,MLG_DOORBELL_GATE_MEMORY_TYPE,mach_task_self(),address);
+            return HSA_STATUS_ERROR;
+        }
+        doorbellGate=gate;
+        return HSA_STATUS_SUCCESS;
+    }
+    // BAR writes (hdp_flush.h): asked once; the gate and the HDP flush page
+    // mapped (uncached, as KFD's MMIO mmap).
+    hsa_status_t enableBarWrites(BarWrites &out, std::string *why) override {
+        std::lock_guard lock(sessionMutex);
+        out={};
+        if (barWritesGate) {out=barWritesLocked();return HSA_STATUS_SUCCESS;}
+        const auto say=[&](const char *text) {if (why) *why=text;};
+        if (!linuxShim) {say("the driver is not the Linux-shim driver");return HSA_STATUS_ERROR_INVALID_ARGUMENT;}
+        auto status=ensureReady();
+        if (status!=HSA_STATUS_SUCCESS) {say("the GPU session is not ready");return status;}
+        std::array<uint64_t,3> build{};
+        status=scalar(43,{},build);
+        if (status!=HSA_STATUS_SUCCESS) {say("the driver did not say its build");return status;}
+        if (build[2]<kBarWritesDriverBuild) {
+            say("the installed driver predates BAR writes (build 265)");return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        }
+        if (sessionMode!=ComputeSessionMode::KFD) {
+            say("this program's compute session is not a KFD process");return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        }
+        status=ensureHostWindow();
+        if (status!=HSA_STATUS_SUCCESS) {say("the host window could not be set up");return status;}
+        const uint64_t tag=MLG_QUERY_BAR_WRITES;
+        std::array<uint64_t,MLG_BAR_WRITES_WORDS> words{};
+        status=scalar(21,{&tag,1},words);
+        if (status!=HSA_STATUS_SUCCESS) {
+            say(lastIOReturn==uint32_t(kIOReturnUnsupported) ?
+                "the device has no HDP flush page the driver can export (see the driver log)" :
+                "the driver refused BAR writes (see the driver log)");
+            return status==HSA_STATUS_ERROR_INVALID_ARGUMENT ? status : HSA_STATUS_ERROR;
+        }
+        if (words[MLG_BAR_WRITES_VERSION_WORD]!=MLG_BAR_WRITES_VERSION ||
+            words[MLG_BAR_WRITES_MEM_FLUSH]+4>words[MLG_BAR_WRITES_PAGE_BYTES] ||
+            words[MLG_BAR_WRITES_REG_FLUSH]+4>words[MLG_BAR_WRITES_PAGE_BYTES] ||
+            (words[MLG_BAR_WRITES_MEM_FLUSH]|words[MLG_BAR_WRITES_REG_FLUSH])&3) {
+            say("the driver's BAR-writes answer is not one this runtime knows");return HSA_STATUS_ERROR;
+        }
+        status=mapGateLocked();
+        if (status!=HSA_STATUS_SUCCESS) {say("the driver gave no gate to map");return status;}
+        mach_vm_address_t address=0;mach_vm_size_t size=0;
+        if (IOConnectMapMemory64(ownerPort,MLG_HDP_FLUSH_MEMORY_TYPE,mach_task_self(),&address,&size,
+                                 kIOMapAnywhere|kIOMapInhibitCache)!=KERN_SUCCESS || !address ||
+            size<words[MLG_BAR_WRITES_PAGE_BYTES]) {
+            if (address) IOConnectUnmapMemory64(ownerPort,MLG_HDP_FLUSH_MEMORY_TYPE,mach_task_self(),address);
+            say("the driver gave no HDP flush page to map");return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+        }
+        hdpPage=address;hdpPageBytes=size;
+        memFlush=reinterpret_cast<uint32_t *>(address+words[MLG_BAR_WRITES_MEM_FLUSH]);
+        regFlush=reinterpret_cast<uint32_t *>(address+words[MLG_BAR_WRITES_REG_FLUSH]);
+        visibleVRAM=words[MLG_BAR_WRITES_VISIBLE_VRAM];
+        barWritesGate=doorbellGate;
+        out=barWritesLocked();
+        return HSA_STATUS_SUCCESS;
+    }
+    BarWrites barWritesLocked() const {
+        BarWrites out;
+        if (!barWritesGate) return out;
+        out.gate=barWritesGate;out.memFlush=memFlush;out.regFlush=regFlush;out.visibleVRAM=visibleVRAM;
+        return out;
+    }
+    BarWrites barWrites() override {
+        std::lock_guard lock(sessionMutex);
+        return barWritesLocked();
+    }
+    // Every mapping of the GPU's BARs this process has, replaced by host
+    // memory (bar_mapping_retire.h): the device is gone for it. A failure
+    // would leave a store free to reach a device that left: the process
+    // stops instead. Caller holds sessionMutex.
+    void retireBarMappingsLocked(const char *why) {
+        if (barMappingsRetired) return;
+        barMappingsRetired=true;
+        const auto retire=[&](uint64_t address,uint64_t bytes,const char *what) {
+            if (!address || !bytes) return;
+            const int error=mac_hsa_bar_mapping_retire(reinterpret_cast<void *>(address),size_t(bytes));
+            if (!error) return;
+            std::fprintf(stderr,"mac_linuxgpu: %s: could not retire this process's mapping of the GPU's %s "
+                         "(%#llx+%#llx, errno %d); stopping the process rather than let a store reach a "
+                         "GPU that is gone\n",why,what,(unsigned long long)address,(unsigned long long)bytes,error);
+            std::abort();
+        };
+        for (const auto &[handle,mapping]:cpuMappings) {(void)handle;retire(mapping.address,mapping.size,"VRAM");}
+        retire(hdpPage,hdpPageBytes,"HDP flush page");
+        retire(doorbellSlice,doorbellBytes,"doorbells");
+        std::fprintf(stderr,"mac_linuxgpu: %s: this program's mappings of the GPU are retired; its GPU work "
+                     "fails from now on\n",why);
+    }
+    hsa_status_t barWriteWait(unsigned attempt) override {
+        mlg_doorbell_gate *gate=nullptr;
+        {
+            std::lock_guard lock(sessionMutex);
+            gate=barWritesGate;
+            if (!gate || barMappingsRetired) return kDeviceLostStatus;
+            if (state==State::Faulted || mlg_doorbell_gate_retired(gate)) {
+                retireBarMappingsLocked(state==State::Faulted ? "the GPU session failed" :
+                                                                "the driver closed this program's GPU session");
+                return kDeviceLostStatus;
+            }
+        }
+        // Held: a power transition or a device reset. The driver's answer
+        // says which, and whether the device is gone.
+        PowerSnapshot snapshot;
+        if (powerState(snapshot)==HSA_STATUS_SUCCESS && snapshot.valid() && snapshot.lost()) {
+            std::lock_guard lock(sessionMutex);
+            retireBarMappingsLocked("the GPU was lost");
+            return kDeviceLostStatus;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(attempt < 16 ? 1 : attempt < 64 ? 5 : 20));
         return HSA_STATUS_SUCCESS;
     }
     DirectDoorbell directDoorbell(uint64_t handle) override {
@@ -719,6 +917,7 @@ public:
                     if (!said.test_and_set())
                         std::fprintf(stderr,"mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
                                      "this program's GPU session is gone: restart it to use the GPU again\n");
+                    retireBarMappingsLocked("the GPU was disconnected");
                 }
                 state=State::Faulted;return HSA_STATUS_ERROR;
             }
@@ -756,6 +955,7 @@ public:
                 if (!said.test_and_set())
                     std::fprintf(stderr,"mac_linuxgpu: the GPU was disconnected (Disconnect GPU, or it left the bus); "
                                  "this program's GPU session is gone: restart it to use the GPU again\n");
+                retireBarMappingsLocked("the GPU was disconnected");
             }
             state=State::Faulted;return HSA_STATUS_ERROR;
         }
@@ -1331,6 +1531,17 @@ private:
     mach_vm_size_t doorbellBytes=0;
     mlg_doorbell_gate *doorbellGate=nullptr;
     std::map<uint64_t,volatile uint64_t *> directDoorbells;
+    // BAR writes (hdp_flush.h): the gate once enabled, the HDP flush page,
+    // the VRAM buffers mapped for the CPU, and whether they were retired.
+    static constexpr uint64_t MLG_BO_FLAG_HOSTABLE=1;
+    mlg_doorbell_gate *barWritesGate=nullptr;
+    mach_vm_address_t hdpPage=0;
+    mach_vm_size_t hdpPageBytes=0;
+    uint32_t *memFlush=nullptr,*regFlush=nullptr;
+    uint64_t visibleVRAM=0;
+    struct CPUMapping { mach_vm_address_t address=0; mach_vm_size_t size=0; uint32_t memoryType=0; };
+    std::map<uint64_t,CPUMapping> cpuMappings;
+    bool barMappingsRetired=false;
     io_connect_t ownerPort = IO_OBJECT_NULL;
     io_connect_t pendingProbePort = IO_OBJECT_NULL;
     uint64_t lastComputeFence = 0;
@@ -1728,8 +1939,8 @@ private:
         if (cleanup != HSA_STATUS_SUCCESS) { state = State::Faulted; return cleanup; }
         return status != HSA_STATUS_SUCCESS ? status : HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     }
-    hsa_status_t allocateRaw(uint64_t bytes, uint64_t domain, DeviceBuffer &buffer) {
-        const std::array<uint64_t, 4> input{bytes, domain, 16384, 0};
+    hsa_status_t allocateRaw(uint64_t bytes, uint64_t domain, DeviceBuffer &buffer, uint64_t flags = 0) {
+        const std::array<uint64_t, 4> input{bytes, domain, 16384, flags};
         std::array<uint64_t, 3> output{};
         const auto status = scalar(16, input, output);
         if (status != HSA_STATUS_SUCCESS) return status;

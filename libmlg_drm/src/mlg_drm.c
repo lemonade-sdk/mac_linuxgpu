@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -35,6 +36,8 @@ struct mapping {
 	uint64_t span;		/* as mapped: whole pages */
 	uint64_t handle;
 };
+struct mlg_transport;
+static void retire_if_gone(const struct mlg_transport *t);
 static struct mapping *mappings;
 
 static _Thread_local int last_linux_errno;
@@ -390,12 +393,50 @@ out:
 		free(frame);
 	if (reply != reply_local)
 		free(reply);
-	if (r)
+	if (r) {
+		retire_if_gone(&t);
 		return fail(-r);
+	}
 	if (result < 0)
 		return fail((int)-result);
 	last_linux_errno = 0;
 	return (int)result;
+}
+
+/* ---- a device that is gone ---- */
+
+/* Once the transport says the device is gone for this process, every
+ * mapping of it is replaced by zero-filled host memory in one step (mmap
+ * MAP_FIXED over the range, hsa/src/bar_mapping_retire.h): DriverKit cannot
+ * revoke them, and a CPU store to a GPU that left the Thunderbolt link can
+ * panic the Mac. Later stores and loads anywhere in the process (a Vulkan
+ * app's write to mapped VRAM, a doorbell) land in host memory. The
+ * mappings stay listed: munmap still unmaps them through the transport. A
+ * range that cannot be retired stops the process. */
+static bool mappings_retired;
+
+static void retire_if_gone(const struct mlg_transport *t)
+{
+	if (!t->gone || !t->gone(t->ctx))
+		return;
+	pthread_mutex_lock(&lock);
+	if (!mappings_retired) {
+		mappings_retired = true;
+		for (struct mapping *m = mappings; m; m = m->next) {
+			void *const replaced = mmap(m->addr, (size_t)m->span, PROT_READ | PROT_WRITE,
+						    MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
+			if (replaced != m->addr) {
+				fprintf(stderr, "libmlg_drm: the GPU is gone and its mapping %p+%#llx could not "
+					"be retired (errno %d); stopping the process rather than let a store "
+					"reach it\n", m->addr, (unsigned long long)m->span, errno);
+				abort();
+			}
+		}
+		if (mappings)
+			fprintf(stderr, "libmlg_drm: the GPU is gone for this process; its mappings of the "
+				"GPU are retired\n");
+	}
+	pthread_mutex_unlock(&lock);
 }
 
 /* ---- mmap ---- */
@@ -439,6 +480,7 @@ void *mlg_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t off
 
 	r = t.mmap(t.ctx, fd, (uint64_t)offset, span, lprot, MLG_LX_MAP_SHARED, &at, &handle);
 	if (r) {
+		retire_if_gone(&t);
 		free(m);
 		fail(-r);
 		return MAP_FAILED;
@@ -511,8 +553,10 @@ int mlg_scanout(const struct mlg_lx_scanout *req, struct mlg_lx_scanout_state *s
 	if (!t.scanout)
 		return fail(MLG_LX_ENODEV);
 	r = t.scanout(t.ctx, req, state, &result);
-	if (r)
+	if (r) {
+		retire_if_gone(&t);
 		return fail(-r);
+	}
 	if (result < 0)
 		return fail((int)-result);
 	last_linux_errno = 0;

@@ -57,7 +57,8 @@ struct dext_aql_limits;
  * queues; slots is left to dext_kfd_info. */
 int dext_kfd_queue_abi(struct dext_aql_limits *out);
 
-/* domain: 2 GTT (shared, in the window), 3 VRAM (private). */
+/* domain: 2 GTT (shared, in the window), 3 VRAM (private), 4 VRAM with a
+ * window VA (CPU-mappable at that VA once dext_kfd_bo_make_cpu_visible). */
 int dext_kfd_bo_alloc(struct dext_kfd_client *c, uint64_t size, uint64_t alignment,
                       uint32_t domain, struct rt_kfd_bo **out, uint64_t *va);
 int dext_kfd_bo_free(struct dext_kfd_client *c, struct rt_kfd_bo *bo);
@@ -70,6 +71,20 @@ int dext_kfd_bo_copy(struct dext_kfd_client *c, struct rt_kfd_bo *src, uint64_t 
 /* The host pages of a GTT BO as CPU-contiguous runs (for client mappings). */
 int dext_kfd_bo_ranges(struct dext_kfd_client *c, struct rt_kfd_bo *bo,
                        int (*fn)(void *arg, void *cpu, uint64_t bytes), void *arg);
+/* CPU access to a domain-4 BO (rt_kfd_bo_make_cpu_visible): pinned in the
+ * CPU-visible VRAM window; then its BAR ranges, for the client's mapping. */
+int dext_kfd_bo_make_cpu_visible(struct dext_kfd_client *c, struct rt_kfd_bo *bo);
+int dext_kfd_bo_bar_ranges(struct dext_kfd_client *c, struct rt_kfd_bo *bo,
+                           int (*fn)(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes),
+                           void *arg);
+/* The device's HDP flush page (rt_kfd_session_hdp_flush). */
+struct dext_kfd_hdp_flush {
+    uint32_t bar;
+    uint64_t bar_offset, bytes;
+    uint32_t mem_flush, reg_flush;
+    uint64_t visible_vram;
+};
+int dext_kfd_hdp_flush(struct dext_kfd_client *c, struct dext_kfd_hdp_flush *out);
 
 /* The persistent queue ABI of selectors 56-59 (dext_aql.h's semantics):
  * the runtime's ring and amd_queue_t metadata BOs, the dext fills the

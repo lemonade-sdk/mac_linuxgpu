@@ -1,5 +1,7 @@
 #include "transport_fake.h"
 #include "signal_state.h"
+#include "../../dext/sources/doorbell_gate.h"
+#include <thread>
 #include <hsa/amd_hsa_queue.h>
 #include <algorithm>
 #include <atomic>
@@ -102,6 +104,91 @@ hsa_status_t FakeConnection::allocateBuffer(uint64_t size, DeviceBuffer &out) {
     buffers_.emplace(handle, Buffer{host, size, false});
     out = {handle, deviceAddress, size};
     return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t FakeConnection::allocateHostableBuffer(uint64_t size, DeviceBuffer &out) {
+    std::lock_guard lock(mutex_);
+    if (!barWritesEnabled_) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
+    if (!size || size > (64ull << 30)) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    auto *host = std::calloc(1, size);
+    if (!host) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
+    const auto handle = nextBufferHandle_++;
+    // A window VA: the CPU maps it at that same address once granted.
+    buffers_.emplace(handle, Buffer{host, size, false, true, false});
+    out = {handle, reinterpret_cast<uintptr_t>(host), size};
+    return HSA_STATUS_SUCCESS;
+}
+
+hsa_status_t FakeConnection::mapBufferForCPU(const DeviceBuffer &buffer) {
+    std::lock_guard lock(mutex_);
+    const auto it = buffers_.find(buffer.handle);
+    if (it == buffers_.end() || !it->second.hostable || barRetired_) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    if (const auto refused = powerRefusalLocked(); refused != HSA_STATUS_SUCCESS) return refused;
+    it->second.cpuMapped = true;
+    return HSA_STATUS_SUCCESS;
+}
+
+void FakeConnection::gateFollowPowerLocked() {
+    if (!gate_) return;
+    if (power_.state() == amdgpu::power::PowerState::Lost)
+        __atomic_store_n(&gate_->retired, 1u, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&gate_->open,
+                     power_.state() == amdgpu::power::PowerState::Active && !gate_->retired ? 1u : 0u,
+                     __ATOMIC_SEQ_CST);
+}
+
+hsa_status_t FakeConnection::enableBarWrites(BarWrites &out, std::string *why) {
+    std::lock_guard lock(mutex_);
+    out = {};
+    if (!config_.barWrites || config_.sessionMode != ComputeSessionMode::KFD) {
+        if (why) *why = "the fake device has no BAR writes";
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    }
+    if (!gate_) {
+        gate_ = new mlg_doorbell_gate{};
+        gate_->magic = MLG_DOORBELL_GATE_MAGIC;
+        hdpPage_ = new uint32_t[4096]{};
+    }
+    barWritesEnabled_ = true;
+    gateFollowPowerLocked();
+    out = {gate_, hdpPage_ + 0x3000 / 4, hdpPage_ + 0x3004 / 4, config_.visibleVRAM};
+    return HSA_STATUS_SUCCESS;
+}
+
+BarWrites FakeConnection::barWrites() {
+    std::lock_guard lock(mutex_);
+    if (!barWritesEnabled_) return {};
+    return {gate_, hdpPage_ + 0x3000 / 4, hdpPage_ + 0x3004 / 4, config_.visibleVRAM};
+}
+
+hsa_status_t FakeConnection::barWriteWait(unsigned attempt) {
+    {
+        std::lock_guard lock(mutex_);
+        if (!barWritesEnabled_) return kDeviceLostStatus;
+        if (barRetired_ || mlg_doorbell_gate_retired(gate_)) {
+            barRetired_ = true;
+            for (auto &[handle, buffer] : buffers_) {
+                (void)handle;
+                buffer.cpuMapped = false;
+            }
+            return kDeviceLostStatus;
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(attempt < 16 ? 1 : 5));
+    return HSA_STATUS_SUCCESS;
+}
+
+size_t FakeConnection::cpuMappedCount() const {
+    std::lock_guard lock(mutex_);
+    size_t n = 0;
+    for (const auto &[handle, buffer] : buffers_) { (void)handle; n += buffer.cpuMapped; }
+    return n;
+}
+
+bool FakeConnection::barMappingsRetired() const {
+    std::lock_guard lock(mutex_);
+    return barRetired_;
 }
 
 hsa_status_t FakeConnection::freeBuffer(const DeviceBuffer &buffer) {
@@ -428,6 +515,7 @@ void FakeConnection::setPowerLocked(amdgpu::power::PowerState state, uint32_t fl
     }
     power_.words[State] = uint64_t(state);
     power_.words[Flags] = flags;
+    gateFollowPowerLocked();
 }
 
 void FakeConnection::setPowerState(amdgpu::power::PowerState state, bool vramPreserved) {
