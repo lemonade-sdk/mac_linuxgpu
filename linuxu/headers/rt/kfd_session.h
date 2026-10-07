@@ -215,6 +215,18 @@ int rt_kfd_queue_kick(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t
  * on Linux, where the process writes its doorbell page itself, the value
  * is not checked against the queue's write index. */
 int rt_kfd_queue_kick_nowait(struct rt_kfd_session *s, struct rt_kfd_queue *q, uint64_t value);
+/* The process's doorbell slice, as libhsakmt mmaps it (KFD's doorbell
+ * mmap): which BAR, the slice's byte offset on it and its size (one page,
+ * kfd_doorbell_process_slice). Every queue of the session has its doorbell
+ * in it, at doorbell_offset & (bytes - 1) (rt_kfd_queue_info). -ENODEV
+ * until the first queue mapped the slice; it then stays the session's until
+ * its close. */
+struct rt_kfd_doorbells {
+	uint32_t bar;
+	uint64_t bar_offset;
+	uint64_t bytes;
+};
+int rt_kfd_session_doorbells(struct rt_kfd_session *s, struct rt_kfd_doorbells *out);
 /* DESTROY_QUEUE, then free the queue's EOP and context-save BOs. When MES
  * does not confirm the removal the queue is recovered as in
  * rt_kfd_session_close; if that fails too the session becomes uncertain and

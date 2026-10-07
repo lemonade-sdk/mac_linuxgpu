@@ -14,6 +14,7 @@
 #include "../../dext/sources/dext_compute.h"
 #include "../../dext/sources/dext_aql.h"
 #include "../../dext/sources/dext_kfd.h"
+#include "../../dext/sources/doorbell_gate.h"
 
 struct pci_dev { unsigned unused; };
 struct rt_compute_ctx { bool live; };
@@ -21,6 +22,9 @@ struct rt_compute_bo { bool live; uint64_t size; unsigned domain; };
 struct rt_compute_fence { unsigned unused; };
 struct dext_aql_queue { bool live, retained, mapped; };
 static struct pci_dev pdev;
+/* A client's doorbell gate (doorbell_gate.h): the backend's registry keeps
+ * a pointer to it until the client is released. */
+static struct mlg_doorbell_gate gate;
 /* Clients that come and go in the churn scenarios: four times the
  * backend's record table (DEXT_CLIENT_SLOTS, 64). */
 #define CHURN_CLIENTS 256u
@@ -400,6 +404,17 @@ int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet)
 static unsigned kfd_direct_kicks;
 int dext_kfd_queue_kick_direct(struct dext_kfd_queue *q, uint64_t packet)
 { assert(q && q->live); if (q->c==kfd_faulted) return -EFAULT; q->last=packet; ++kfd_direct_kicks; return 0; }
+/* The client's doorbell slice: BAR2 at 64 KiB per client, one page, a
+ * queue's doorbell at 8 bytes per queue slot. */
+int dext_kfd_doorbells(struct dext_kfd_client *c, struct dext_kfd_doorbells *out)
+{
+    assert(c && c->live && out);
+    if (!c->queues) return -ENODEV;
+    out->bar=2; out->bar_offset=0x10000ull*(uint64_t)(c-kfd_clients+1); out->bytes=16384;
+    return 0;
+}
+int dext_kfd_queue_doorbell(struct dext_kfd_queue *q, uint64_t *offset)
+{ assert(q && q->live && offset); *offset=8u*(unsigned)(q-kfd_queues); return 0; }
 int dext_kfd_queue_service(struct dext_kfd_queue *q, uint64_t *inactive)
 {
     assert(q && q->live); *inactive=0;
@@ -890,9 +905,44 @@ int main(int argc, char **argv)
         assert(dext_compute_aql_queue_kick_direct(8,q0,3)==-EAGAIN_L && kfd_direct_kicks==1);
         assert(dext_compute_aql_queue_kick_direct(7,0xdead,3)==-EAGAIN_L && kfd_direct_kicks==1);
         /* None while the device is not taking work (a power transition). */
-        dext_compute_kick_gate(false);
+        assert(!dext_compute_kick_gate(false));
         assert(dext_compute_aql_queue_kick_direct(7,q0,4)==-EAGAIN_L && kfd_direct_kicks==1);
-        dext_compute_kick_gate(true);
+        assert(!dext_compute_kick_gate(true));
+        /* Doorbells the client rings itself (doorbell_gate.h): its KFD
+         * process's slice and each queue's doorbell in it; only its own
+         * queues. */
+        {
+            struct dext_compute_doorbell db;
+            assert(!dext_compute_aql_queue_doorbell(q0,&db) && db.bar==2 &&
+                   db.bar_offset==0x10000 && db.bytes==16384 && db.offset==0);
+            assert(!dext_compute_aql_queue_doorbell(q1,&db) && db.offset==8);
+            dext_compute_select_client(8);
+            assert(dext_compute_aql_queue_doorbell(q0,&db)==-ENOENT_L);
+            dext_compute_select_client(7);
+            /* The gate opens with the device taking work, closes for a
+             * power transition, and goes with the client's close. */
+            gate.magic=MLG_DOORBELL_GATE_MAGIC;
+            assert(dext_compute_doorbell_gate_publish(7,&gate) && gate.open==1);
+            assert(!dext_compute_kick_gate(false) && gate.open==0 && gate.closes==1);
+            assert(!dext_compute_kick_gate(true) && gate.open==1);
+            /* A client stopped inside a write is named, not waited for. */
+            __atomic_add_fetch(&gate.busy,1,__ATOMIC_SEQ_CST);
+            assert(dext_compute_kick_gate(false)==7 && !gate.open);
+            __atomic_sub_fetch(&gate.busy,1,__ATOMIC_SEQ_CST);
+            assert(!dext_compute_kick_gate(true) && gate.open==1);
+            /* A device reset closes every doorbell path for its whole
+             * window: power coming back inside it opens nothing, the
+             * reset's end does. */
+            assert(installed_hooks.before_reset && installed_hooks.after_reset);
+            installed_hooks.before_reset(installed_hooks.arg);
+            assert(!gate.open && dext_compute_aql_queue_kick_direct(7,q0,3)==-EAGAIN_L);
+            assert(!dext_compute_kick_gate(false) && !dext_compute_kick_gate(true) && !gate.open);
+            assert(dext_compute_aql_queue_kick_direct(7,q0,3)==-EAGAIN_L);
+            installed_hooks.after_reset(installed_hooks.arg,false);
+            assert(gate.open==1);
+            assert(!dext_compute_doorbell_gate_retire(7) && gate.open==0);
+            assert(dext_compute_doorbell_gate_publish(7,&gate) && gate.open==1);
+        }
         assert(!dext_compute_aql_queue_service(q1,&status,out) && !out[0]);
         assert(dext_compute_bo_free(r0)==-EBUSY_L);
         /* Copies and bounded launches stay inside the process. */
@@ -910,8 +960,11 @@ int main(int argc, char **argv)
         assert(dext_compute_aql_queue_kick_direct(7,q0,5)==-EAGAIN_L);
         assert(!dext_compute_aql_queue_kick_direct(7,q1,5) && kfd_direct_kicks==2);
         assert(!dext_compute_bo_free(r0));
-        /* Client close: queues, then the KFD process; nothing quarantines. */
-        assert(!dext_compute_release_client(7));
+        /* Client close: queues, then the KFD process; nothing quarantines.
+         * Its gate closes first (its doorbell slice may go to another
+         * process) and is forgotten: a power transition no longer opens it. */
+        assert(!dext_compute_release_client(7) && gate.open==0);
+        assert(!dext_compute_kick_gate(false) && !dext_compute_kick_gate(true) && gate.open==0);
         assert(dext_compute_aql_queue_kick_direct(7,q1,6)==-EAGAIN_L && kfd_direct_kicks==2);
         assert(kfd_queue_destroys==2 && kfd_closes==1 && !kfd_clients[0].live);
         dext_compute_select_client(7);

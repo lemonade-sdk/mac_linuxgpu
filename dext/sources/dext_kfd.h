@@ -84,6 +84,16 @@ int dext_kfd_queue_kick(struct dext_kfd_queue *q, uint64_t packet);
  * when the session queue's path must answer, -EFAULT after a GPU memory
  * fault of the process. */
 int dext_kfd_queue_kick_direct(struct dext_kfd_queue *q, uint64_t packet);
+/* The client's doorbell slice (rt_kfd_session_doorbells): what the client
+ * maps to ring its queues itself, as libhsakmt maps KFD's doorbell page.
+ * -ENODEV until its first queue exists. */
+struct dext_kfd_doorbells {
+    uint32_t bar;
+    uint64_t bar_offset, bytes;
+};
+int dext_kfd_doorbells(struct dext_kfd_client *c, struct dext_kfd_doorbells *out);
+/* @q's doorbell: its byte offset in the slice. */
+int dext_kfd_queue_doorbell(struct dext_kfd_queue *q, uint64_t *offset);
 /* -EFAULT once the client's process took a GPU memory fault: KFD evicted
  * its queues, which never run again (dext_kfd_fault says where).
  * -ENOEXEC when the CP stopped the queue with an error code (left in

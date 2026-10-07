@@ -39,7 +39,7 @@ struct fake_queue {
 static struct kick_table table;
 static _Atomic uint64_t recent[RECENT];	/* handles, published or not */
 static _Atomic int stop;
-static _Atomic int table_closed;	/* set after kick_table_set_closed(true) returned */
+static _Atomic int table_closed;	/* set after a kick_table_hold returned */
 static _Atomic uint64_t rings, absent, rings_during_slow_session;
 static _Atomic int session_sleeping;
 static _Atomic uint64_t max_ring_ns, max_retire_ns;
@@ -164,12 +164,19 @@ int main(void)
 			closes++;
 		}
 		if (round % 307 == 0) {
-			/* A power transition: nothing rung while closed. */
-			kick_table_set_closed(&table, true);
+			/* A power transition, and a device reset inside it:
+			 * nothing rung while either is held, and releasing one
+			 * leaves the other holding. */
+			kick_table_hold(&table, KICK_HOLD_POWER, true);
 			atomic_store(&table_closed, 1);
+			kick_table_hold(&table, KICK_HOLD_RESET, true);
+			kick_table_hold(&table, KICK_HOLD_POWER, false);
+			usleep(100);
+			kick_table_hold(&table, KICK_HOLD_POWER, true);
+			kick_table_hold(&table, KICK_HOLD_RESET, false);
 			usleep(2000);
 			atomic_store(&table_closed, 0);
-			kick_table_set_closed(&table, false);
+			kick_table_hold(&table, KICK_HOLD_POWER, false);
 			gates++;
 		}
 		if (round % 50 == 0)

@@ -15,6 +15,8 @@
 #include "../abi/amdgpu_atomic_diagnostics.h"
 #include "../abi/amdgpu_atomic_requester.h"
 
+struct mlg_doorbell_gate;
+
 namespace mac_hsa {
 
 constexpr uint64_t kPersistentQueueDriverBuild=187;
@@ -40,6 +42,15 @@ constexpr uint64_t kLegacyCopyBytes=4ull<<20, kWindowedCopyBytes=16ull<<20;
 // First driver build that serves AQLQueueKick (selector 57) synchronously,
 // on its delivery thread (session_state.h's MLG_SYNC_KICK_BUILD).
 constexpr uint64_t kSyncKickDriverBuild=263;
+// First driver build whose KFD queues the client rings itself
+// (MLG_DIRECT_DOORBELL_BUILD, dext/sources/doorbell_gate.h): one store to
+// the doorbell slice it maps, behind the gate the driver closes before the
+// device stops answering.
+constexpr uint64_t kDirectDoorbellDriverBuild=264;
+// A queue's doorbell as the client writes it itself: the gate, and the
+// queue's doorbell in the mapped slice. Both null for a queue rung through
+// kickQueue.
+struct DirectDoorbell { mlg_doorbell_gate *gate = nullptr; volatile uint64_t *doorbell = nullptr; };
 // A GPU memory fault of this process's GPU work: KFD evicted every queue
 // of the process, which never runs again. reason uses the
 // hsa_amd_memory_fault_reason_t bits.
@@ -278,6 +289,11 @@ public:
     virtual bool queueSlotsExhausted() { return false; }
     virtual hsa_status_t createQueue(const SharedBuffer &, const SharedBuffer &, uint32_t, uint64_t &) { return HSA_STATUS_ERROR_OUT_OF_RESOURCES; }
     virtual hsa_status_t kickQueue(uint64_t, uint64_t) { return HSA_STATUS_ERROR; }
+    // The queue's own doorbell (kDirectDoorbellDriverBuild), valid until
+    // destroyQueue; empty for a queue rung through kickQueue. When its gate
+    // is closed (mlg_doorbell_ring returns false) the doorbell is sent
+    // through kickQueue, which answers what the device can take.
+    virtual DirectDoorbell directDoorbell(uint64_t) { return {}; }
     // A transport whose doorbells are not waited for (kickQueue returns once
     // the doorbell is queued): true, with the highest one, when the driver
     // refused doorbells of @handle because the device was suspending. The
