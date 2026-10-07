@@ -28,6 +28,7 @@ set(HSA_RUNTIME_SOURCES
   src/isa_target.cpp
   src/signal_kernels.cpp
   src/code_object.cpp
+  src/code_heap.cpp
   src/executable.cpp
   src/virtual_memory.cpp
   src/host_services.cpp
@@ -141,6 +142,17 @@ if(BUILD_TESTING)
   target_compile_options(hsa-signal-service-test PRIVATE -Wall -Wextra -Werror)
   target_include_directories(hsa-signal-service-test PRIVATE src include third_party/hsa/include)
   add_test(NAME hsa-signal-service COMMAND hsa-signal-service-test)
+
+  # The code-object heap: its allocator, staged uploads and the loader's
+  # use of it (internal code), against the fake transport.
+  add_executable(hsa-code-heap-test tests/test_code_heap.cpp src/code_heap.cpp src/signal_kernels.cpp
+    src/isa_target.cpp src/code_object.cpp)
+  target_link_libraries(hsa-code-heap-test PRIVATE hsa-runtime64)
+  target_compile_options(hsa-code-heap-test PRIVATE -Wall -Wextra -Werror)
+  target_include_directories(hsa-code-heap-test PRIVATE src include third_party/hsa/include)
+  add_test(NAME hsa-code-heap COMMAND hsa-code-heap-test)
+  add_test(NAME hsa-code-heap-legacy COMMAND hsa-code-heap-test legacy)
+  set_tests_properties(hsa-code-heap hsa-code-heap-legacy PROPERTIES ENVIRONMENT "MAC_LINUXGPU_FAKE_TRANSPORT=1")
 
   add_executable(hsa-code-sync-coalesce-test tests/test_code_sync_coalesce.cpp src/signal_kernels.cpp
     src/isa_target.cpp src/code_object.cpp)

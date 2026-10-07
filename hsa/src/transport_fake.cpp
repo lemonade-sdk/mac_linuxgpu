@@ -97,6 +97,7 @@ hsa_status_t FakeConnection::allocateBuffer(uint64_t size, DeviceBuffer &out) {
     auto *host = std::calloc(1, size);
     if (!host) return HSA_STATUS_ERROR_OUT_OF_RESOURCES;
     const auto handle = nextBufferHandle_++;
+    ++allocations_;
     // VRAM buffers have a "device address" that is distinct from the host
     // pointer (models the GPU VA space). Use an offset well above the host
     // range so the runtime's address-collision checks behave realistically.
@@ -216,9 +217,10 @@ hsa_status_t FakeConnection::writeBuffer(const DeviceBuffer &buffer, uint64_t of
     return HSA_STATUS_SUCCESS;
 }
 
-hsa_status_t FakeConnection::copyBuffers(const DeviceBuffer &dst, uint64_t dstOffset,
-                                         const DeviceBuffer &src, uint64_t srcOffset, size_t size) {
+hsa_status_t FakeConnection::copyBuffers(const DeviceBuffer &src, uint64_t srcOffset,
+                                         const DeviceBuffer &dst, uint64_t dstOffset, size_t size) {
     std::lock_guard lock(mutex_);
+    ++copies_;
     const auto dstIt = buffers_.find(dst.handle);
     const auto srcIt = buffers_.find(src.handle);
     if (dstIt == buffers_.end() || srcIt == buffers_.end()) return HSA_STATUS_ERROR;
@@ -643,6 +645,16 @@ size_t FakeConnection::queueCount() const {
 size_t FakeConnection::bufferCount() const {
     std::lock_guard lock(mutex_);
     return buffers_.size();
+}
+
+uint64_t FakeConnection::allocationCount() const {
+    std::lock_guard lock(mutex_);
+    return allocations_;
+}
+
+uint64_t FakeConnection::copyCount() const {
+    std::lock_guard lock(mutex_);
+    return copies_;
 }
 
 uint64_t FakeConnection::aqlDispatchCount() const {

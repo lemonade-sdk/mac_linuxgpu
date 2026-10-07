@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <string>
 #include "atomic_path.h"
@@ -254,13 +255,18 @@ struct SignalEvent { uint32_t id = 0, trigger = 0; uint64_t mailbox = 0; };
 enum class EventWaitResult { Fired, TimedOut };
 struct BufferToken { uint64_t registryID = 0, token[2]{}, size = 0; };
 static_assert(sizeof(BufferToken) == 32);
+class CodeHeap;
 
 class Connection {
 public:
     virtual ~Connection() = default;
-    // Code loaded since the last code sync (kCodeSyncDriverBuild): synced
-    // before the next doorbell of this connection's queues.
+    // Code loaded since the last code sync (kCodeSyncDriverBuild): uploaded
+    // and synced before the next doorbell of this connection's queues.
     std::atomic<bool> codeSyncPending{false};
+    // The connection's code-object heap (code_heap.h), made by the first
+    // load. Never destroyed with GPU work of its own: the driver reclaims
+    // its chunks when the connection closes.
+    std::shared_ptr<CodeHeap> codeHeap();
     virtual hsa_status_t read(DeviceSnapshot &snapshot) = 0;
     virtual bool supportsBuffers() const { return false; }
     virtual hsa_status_t properties(DeviceProperties &) { return HSA_STATUS_ERROR_INVALID_ARGUMENT; }
@@ -364,6 +370,9 @@ public:
     // often @attempt says it waited already (a hold can last: a host
     // sleep, a client's low-power prepare); never call it inside a bracket.
     virtual hsa_status_t barWriteWait(unsigned) { return kDeviceLostStatus; }
+private:
+    std::mutex codeHeapMutex;
+    std::shared_ptr<CodeHeap> codeHeap_;
 };
 
 // Discover the installed DriverKit service and initialize the Linux shim

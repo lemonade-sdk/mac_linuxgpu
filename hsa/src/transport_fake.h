@@ -78,8 +78,8 @@ public:
     hsa_status_t freeBuffer(const DeviceBuffer &buffer) override;
     hsa_status_t readBuffer(const DeviceBuffer &buffer, uint64_t offset, void *dst, size_t size) override;
     hsa_status_t writeBuffer(const DeviceBuffer &buffer, uint64_t offset, const void *src, size_t size) override;
-    hsa_status_t copyBuffers(const DeviceBuffer &dst, uint64_t dstOffset,
-                             const DeviceBuffer &src, uint64_t srcOffset, size_t size) override;
+    hsa_status_t copyBuffers(const DeviceBuffer &src, uint64_t srcOffset,
+                             const DeviceBuffer &dst, uint64_t dstOffset, size_t size) override;
     hsa_status_t invalidateCodeCaches() override;
     hsa_status_t exportBuffer(const DeviceBuffer &buffer, BufferToken &token) override;
     hsa_status_t importBuffer(const BufferToken &token, DeviceBuffer &out) override;
@@ -157,6 +157,10 @@ public:
     uint64_t kickCount(uint64_t handle) const;
     size_t queueCount() const;
     size_t bufferCount() const;
+    // Buffers allocated (allocateBuffer) and driver copies (copyBuffers)
+    // since the connection was made.
+    uint64_t allocationCount() const;
+    uint64_t copyCount() const;
     uint64_t aqlDispatchCount() const;
     // Code-cache synchronizations: through the driver's bounded launch
     // (invalidateCodeCaches), and as AQL packets the fake packet processor
@@ -207,6 +211,7 @@ private:
     std::vector<FirmwareFile> preparedFirmware_;
     std::vector<std::string> uploadedFirmware_;
     uint64_t aqlDispatches_ = 0;
+    uint64_t allocations_ = 0, copies_ = 0;
     uint64_t codeSyncs_ = 0, queueCodeSyncs_ = 0, kicksAtCodeSync_ = 0;
     FakeDeviceConfig config_;
     DeviceSnapshot snapshot_;

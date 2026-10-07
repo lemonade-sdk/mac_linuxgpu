@@ -192,6 +192,7 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output, const Is
             for (const auto &prior : segments)
                 if (ph.address < prior.address + prior.memorySize && prior.address < ph.address + ph.memorySize) return false;
             begin = std::min(begin, ph.address); end = std::max(end, ph.address + ph.memorySize);
+            object.alignment = std::max<uint64_t>(object.alignment, ph.alignment);
             segments.push_back(ph);
         }
         if (ph.type == 4) {
