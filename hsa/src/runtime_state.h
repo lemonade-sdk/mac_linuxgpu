@@ -39,6 +39,9 @@ struct Allocation {
     std::shared_ptr<Connection> connection;
     DeviceBuffer buffer;
     SharedBuffer shared;
+    // Device VRAM the CPU was granted (hsa_amd_agents_allow_access with a
+    // CPU agent, BAR writes): mapped write combined at its own address.
+    bool cpuMapped = false;
     hsa_status_t release() {
         if (!connection || !buffer.handle) return HSA_STATUS_SUCCESS;
         const auto status = shared.host ? connection->freeSharedBuffer(shared) : connection->freeBuffer(buffer);

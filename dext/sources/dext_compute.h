@@ -35,6 +35,7 @@ extern "C" {
 #define EBUSY_L       11006
 #define EFAULT_L      11007	/* the client's process took a GPU memory fault */
 #define EQUEUE_L      11008	/* the CP stopped the queue with an error code */
+#define EREMOTE_L     11009	/* the BO's memory is BAR ranges (dext_compute_bo_bar_ranges) */
 
 /* QueryInfo diagnostic namespace: attempted, bound, signed probe result,
  * transport fault, and transport fault offset. */
@@ -166,6 +167,32 @@ int dext_compute_bo_alloc(uint64_t size, uint32_t domain, uint64_t alignment,
                           uint64_t flags, uint64_t *out_handle,
                           uint64_t *out_gpu_va, uint64_t *out_cpu_addr);
 
+/* BOAlloc flag (in[3]): VRAM (domain 3) whose VA lies in the client's host
+ * window, so the client can map it at that VA once BOMap gave it CPU access
+ * (hdp_flush.h). Only for a KFD client that enabled BAR writes. */
+#define DEXT_COMPUTE_BO_FLAG_HOSTABLE 1u
+
+/* BAR writes (hdp_flush.h's QueryInfo MLG_QUERY_BAR_WRITES) for @client, a
+ * KFD client: from now on it may allocate hostable VRAM and map it, and
+ * here is the device's HDP flush page. -ENOTREADY_L for a legacy client or
+ * no session, -EINVAL_L when the device has no exportable HDP flush page
+ * (rt_kfd_session_hdp_flush said why). */
+struct dext_compute_hdp_flush {
+    uint32_t bar;
+    uint64_t bar_offset, bytes;
+    uint32_t mem_flush, reg_flush;
+    uint64_t visible_vram;
+};
+int dext_compute_bar_writes_enable(uint64_t client, struct dext_compute_hdp_flush *out);
+/* Whether BOMap of @handle would move the BO into the CPU-visible window
+ * (GPU work: refused while the device takes none). */
+bool dext_compute_bo_map_needs_device(uint64_t handle);
+/* The BAR ranges of a mapped CPU-visible VRAM BO (dext_compute_bo_memory
+ * answered -EREMOTE_L): which BAR, offset and bytes, in BO order. */
+int dext_compute_bo_bar_ranges(uint32_t memory_type,
+                               int (*fn)(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes),
+                               void *arg);
+
 /* BOFree (17): in handle. */
 int dext_compute_bo_free(uint64_t handle);
 
@@ -244,6 +271,12 @@ bool dext_compute_doorbell_gate_publish(uint64_t client, void *gate);
  * on, the client writes no doorbell. The stuck client as above, or 0. */
 uint64_t dext_compute_doorbell_gate_retire(uint64_t client);
 #define DEXT_COMPUTE_DOORBELL_DRAIN_MS 20u
+/* The same, waiting up to @ms: for a close that stops the device answering
+ * (the session's close, quarantine, a transport fault, a reset), on a queue
+ * that may wait, so a client thread preempted inside a bracket of BAR
+ * stores (hdp_flush.h) gets to finish it. */
+uint64_t dext_compute_doorbell_gate_retire_bounded(uint64_t client, unsigned ms);
+#define DEXT_COMPUTE_BRACKET_DRAIN_MS 1000u
 
 /* AQLQueueDestroy (58): in handle, out status. */
 int dext_compute_aql_queue_destroy(uint64_t handle, uint64_t *out_status);

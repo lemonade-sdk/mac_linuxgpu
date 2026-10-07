@@ -1,0 +1,192 @@
+drm/amdgpu: keep the HDP flush remap in the 4 KiB register hole
+
+The NBIO/NBIF blocks remap HDP_MEM_FLUSH_CNTL and HDP_REG_FLUSH_CNTL into
+an unused 4 KiB page at the end of the first 512 KiB of the register BAR
+(KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL and _REG_FLUSH_CNTL are offsets 0 and 4
+in it), so a process can flush HDP after storing into VRAM through the BAR.
+The hole is a property of the hardware, but MMIO_REG_HOLE_OFFSET was
+written as 0x80000 - PAGE_SIZE: on a kernel with larger pages it moved into
+live registers, so the remap was turned off there (CVE-2024-41011), and the
+flush went back to the NBIF register with nothing for user space.
+
+The MacLinuxGPU driver runs this code with 16 KiB pages (the host's) and
+hands a KFD client the HDP flush page itself (dext/sources/hdp_flush.h). The
+hole now stays at 0x80000 - AMDGPU_GPU_PAGE_SIZE, the 4 KiB page the
+hardware leaves unused, whatever the page size, and the remap is programmed
+for every non-SR-IOV device as on a 4 KiB kernel. KFD's MMIO_REMAP
+allocation, its MMIO mmap and the MMIO_REMAP TTM BO keep refusing pages
+larger than 4 KiB, so nothing upstream maps the page into a process; the
+driver maps it itself after checking that no register block of the device
+starts in the rest of the host page (rt_kfd_session_hdp_flush). With 4 KiB
+pages nothing changes.
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
+index b6f832c..951710f 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbif_v6_3_1.c
+@@ -493,11 +493,11 @@ static void nbif_v6_3_1_program_aspm(struct amdgpu_device *adev)
+ #endif
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbif_v6_3_1_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c b/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
+index 04041b3..4ee5046 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v2_3.c
+@@ -548,11 +548,11 @@ static void nbio_v2_3_clear_doorbell_interrupt(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v2_3_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c b/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
+index f89e5f4..6ac5c27 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v4_3.c
+@@ -471,11 +471,11 @@ static void nbio_v4_3_program_aspm(struct amdgpu_device *adev)
+ #endif
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v4_3_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+index e911368..68b9093 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v6_1.c
+@@ -389,11 +389,11 @@ static void nbio_v6_1_program_aspm(struct amdgpu_device *adev)
+ #endif
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v6_1_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+index 1569a1e..a05c924 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_0.c
+@@ -285,11 +285,11 @@ static void nbio_v7_0_init_registers(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v7_0_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c
+index 05cbd65..58148ae 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_11.c
+@@ -365,7 +365,7 @@ static void nbio_v7_11_get_clockgating_state(struct amdgpu_device *adev,
+ 
+ static void nbio_v7_11_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
+index acc5f36..c1f2104 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_2.c
+@@ -403,11 +403,11 @@ static void nbio_v7_2_init_registers(struct amdgpu_device *adev)
+ 	}
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v7_2_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
+index 860bc5c..41d64b8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_4.c
+@@ -787,11 +787,11 @@ static void nbio_v7_4_program_aspm(struct amdgpu_device *adev)
+ #endif
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v7_4_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c
+index 2ee60b8..aabc340 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_7.c
+@@ -329,11 +329,11 @@ static void nbio_v7_7_get_clockgating_state(struct amdgpu_device *adev,
+ 		*flags |= AMD_CG_SUPPORT_BIF_LS;
+ }
+ 
+-#define MMIO_REG_HOLE_OFFSET (0x80000 - PAGE_SIZE)
++#define MMIO_REG_HOLE_OFFSET (0x80000 - AMDGPU_GPU_PAGE_SIZE)
+ 
+ static void nbio_v7_7_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {
+diff --git a/drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c b/drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c
+index bdfd291..15d478d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c
++++ b/drivers/gpu/drm/amd/amdgpu/nbio_v7_9.c
+@@ -470,7 +470,7 @@ static void nbio_v7_9_init_registers(struct amdgpu_device *adev)
+ 
+ static void nbio_v7_9_set_reg_remap(struct amdgpu_device *adev)
+ {
+-	if (!amdgpu_sriov_vf(adev) && (PAGE_SIZE <= 4096)) {
++	if (!amdgpu_sriov_vf(adev)) {
+ 		adev->rmmio_remap.reg_offset = MMIO_REG_HOLE_OFFSET;
+ 		adev->rmmio_remap.bus_addr = adev->rmmio_base + MMIO_REG_HOLE_OFFSET;
+ 	} else {

@@ -20,6 +20,7 @@ set(HSA_RUNTIME_SOURCES
   src/gpu_signals.cpp
   src/gpu_signal_service.cpp
   src/memory.cpp
+  src/bar_writes.cpp
   src/queues.cpp
   src/power.cpp
   src/device_init.cpp
@@ -111,7 +112,7 @@ if(BUILD_TESTING)
   # Agent/ISA info and queue-slot degradation against configurable fake
   # devices of several generations, and device power (suspend, resume, lost
   # device memory) against the fake's power model.
-  foreach(name device-info queue-slots power signal-wait memory-fault)
+  foreach(name device-info queue-slots power signal-wait memory-fault bar-writes)
     string(REPLACE "-" "_" source ${name})
     add_executable(hsa-${name}-test tests/test_${source}.cpp)
     target_link_libraries(hsa-${name}-test PRIVATE hsa-runtime64)

@@ -68,6 +68,7 @@
 // gpu-op hook (dext_compute_dk.mm, dext-only).
 #include "dext_compute.h"
 #include "doorbell_gate.h"
+#include "hdp_flush.h"
 #include "observer_gate.h"
 #include "power_state.h"
 #include "raw_bar_lease.h"
@@ -521,6 +522,76 @@ static IOMemoryDescriptor *copy_bo_ranges_descriptor(uint32_t memoryType, uint64
     return descriptor;
 }
 
+// Ranges of the GPU's BARs as one descriptor a client maps: CPU-visible
+// VRAM (BAR ranges of a pinned BO) or the HDP flush page.
+struct BARRanges {
+    uint64_t *offsets, *lengths;
+    uint32_t *bars;
+    size_t count, capacity;
+};
+static int collect_bar_range(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes)
+{
+    auto *ranges = static_cast<BARRanges *>(arg);
+    if (ranges->count == ranges->capacity) return -1;
+    ranges->offsets[ranges->count] = offset;
+    ranges->lengths[ranges->count] = bytes;
+    ranges->bars[ranges->count] = bar;
+    ++ranges->count;
+    return 0;
+}
+static IOMemoryDescriptor *lx_concat(IOMemoryDescriptor **descs, size_t count);
+static IOMemoryDescriptor *bar_ranges_descriptor(MacLinuxGPUUserClient *client, const BARRanges &ranges)
+{
+    if (!s_retainedPCI || !ranges.count) return nullptr;
+    auto **descs = static_cast<IOMemoryDescriptor **>(
+        IOMallocZero(ranges.count * sizeof(IOMemoryDescriptor *)));
+    if (!descs) return nullptr;
+    size_t built = 0;
+    for (; built < ranges.count; ++built) {
+        uint8_t memoryIndex = 0, barType = 0;
+        uint64_t barSize = 0;
+        IOMemoryDescriptor *bar = nullptr;
+        if (ranges.bars[built] > 5 ||
+            s_retainedPCI->GetBARInfo((uint8_t)ranges.bars[built], &memoryIndex, &barSize,
+                                      &barType) != kIOReturnSuccess ||
+            ranges.offsets[built] > barSize || ranges.lengths[built] > barSize - ranges.offsets[built] ||
+            s_retainedPCI->_CopyDeviceMemoryWithIndex(memoryIndex, &bar,
+                                                      client->GetProvider()) != kIOReturnSuccess ||
+            !bar)
+            break;
+        const kern_return_t sub = IOMemoryDescriptor::CreateSubMemoryDescriptor(
+            kIOMemoryDirectionOutIn, ranges.offsets[built], ranges.lengths[built], bar, &descs[built]);
+        bar->release();
+        if (sub != kIOReturnSuccess || !descs[built]) break;
+    }
+    IOMemoryDescriptor *descriptor = nullptr;
+    if (built == ranges.count) descriptor = lx_concat(descs, built);
+    else
+        for (size_t i = 0; i < built; ++i) descs[i]->release();
+    IOFree(descs, ranges.count * sizeof(IOMemoryDescriptor *));
+    return descriptor;
+}
+static IOMemoryDescriptor *copy_bo_bar_descriptor(MacLinuxGPUUserClient *client, uint32_t memoryType,
+                                                  uint64_t size)
+{
+    BARRanges ranges{};
+    ranges.capacity = (size_t)(size / 16384) + 2;
+    ranges.offsets = static_cast<uint64_t *>(IOMalloc(ranges.capacity * sizeof(uint64_t)));
+    ranges.lengths = static_cast<uint64_t *>(IOMalloc(ranges.capacity * sizeof(uint64_t)));
+    ranges.bars = static_cast<uint32_t *>(IOMalloc(ranges.capacity * sizeof(uint32_t)));
+    IOMemoryDescriptor *descriptor = nullptr;
+    if (ranges.offsets && ranges.lengths && ranges.bars &&
+        dext_compute_bo_bar_ranges(memoryType, collect_bar_range, &ranges) == 0)
+        descriptor = bar_ranges_descriptor(client, ranges);
+    if (ranges.offsets) IOFree(ranges.offsets, ranges.capacity * sizeof(uint64_t));
+    if (ranges.lengths) IOFree(ranges.lengths, ranges.capacity * sizeof(uint64_t));
+    if (ranges.bars) IOFree(ranges.bars, ranges.capacity * sizeof(uint32_t));
+    if (descriptor)
+        MACLINUXGPU_LOG("client %llu: maps %llu bytes of CPU-visible VRAM (memory type %#x), behind its gate",
+                        client->ivars->clientID, (unsigned long long)size, memoryType);
+    return descriptor;
+}
+
 // ----------------------------------------------------------------
 // Linux-file clients (type 2): one Linux process each (rt/lx_files.h),
 // created on the client's first Linux-file call. The registry lets a
@@ -627,13 +698,15 @@ static void note_quarantine(uint32_t cause, int code)
         s_quarantineCause, s_quarantineCode, s_quarantineObserved);
 }
 
-static void doorbells_retire(uint64_t client, const char *why);
+static void doorbells_retire(uint64_t client, const char *why, unsigned bound);
 static void quarantine_session(MacLinuxGPU *driver)
 {
     observer_reads_close();
     lx_gate_close();
     // Before the device is isolated: no client writes its doorbells again.
-    doorbells_retire(0, "quarantine");
+    // On the owner's queue, before the device is isolated: a client bracket
+    // of BAR stores (hdp_flush.h) preempted mid-submission gets to finish.
+    doorbells_retire(0, "quarantine", DEXT_COMPUTE_BRACKET_DRAIN_MS);
     note_quarantine(MLG_QUARANTINE_NONE, 0);
     s_dmaQuarantined = true;
     s_sessionClosing = true;
@@ -844,13 +917,13 @@ static void power_device_removed();
 // doorbells stop: @client's (0: every client's). A client whose write did
 // not finish within the bound has a thread stopped inside it, which could
 // still write the BAR once it runs again: said.
-static void doorbells_retire(uint64_t client, const char *why)
+static void doorbells_retire(uint64_t client, const char *why, unsigned bound)
 {
-    const uint64_t stuck = dext_compute_doorbell_gate_retire(client);
+    const uint64_t stuck = dext_compute_doorbell_gate_retire_bounded(client, bound);
     if (stuck)
-        MACLINUXGPU_EVENT("%s: client %llu is stopped inside a doorbell write it began (%u ms); "
-                          "it may still write the GPU's doorbell BAR when it runs again", why,
-                          (unsigned long long)stuck, DEXT_COMPUTE_DOORBELL_DRAIN_MS);
+        MACLINUXGPU_EVENT("%s: client %llu is stopped inside a BAR write it began (%u ms); "
+                          "it may still write the GPU's BARs when it runs again", why,
+                          (unsigned long long)stuck, bound);
 }
 
 // Surprise removal, as Linux handles it (pci_dev_set_disconnected, then
@@ -888,7 +961,7 @@ static void transport_lost(int fault)
 {
     if (__atomic_exchange_n(&s_deviceLost, true, __ATOMIC_ACQ_REL)) return;
     // No client writes a doorbell of a device that no longer answers.
-    doorbells_retire(0, "PCI transport fault");
+    doorbells_retire(0, "PCI transport fault", DEXT_COMPUTE_DOORBELL_DRAIN_MS);
     // Fault 4 is this driver's own isolation of a quarantined session
     // (dext_pci_quarantine): the GPU may still answer, the driver no longer
     // asks it anything.
@@ -964,7 +1037,7 @@ static void close_session(MacLinuxGPU *driver)
     s_finalCleanup = false;
     // Before anything of the session goes: no client writes its doorbells
     // again (their KFD processes and the device go with the session).
-    doorbells_retire(0, "session close");
+    doorbells_retire(0, "session close", DEXT_COMPUTE_BRACKET_DRAIN_MS);
     // No observer read may run an upstream callback past this point.
     observer_reads_close();
     displays_unpublish(driver);
@@ -2684,7 +2757,7 @@ static void session_client_stop(MacLinuxGPUUserClient *client, IOService *provid
     const bool participant = ivars->sessionGeneration == s_sessionGeneration;
     const bool legacyClient = dext_compute_client_legacy(id);
     // A leaving client writes no doorbell from here, whatever else stays.
-    doorbells_retire(id, "client close");
+    doorbells_retire(id, "client close", DEXT_COMPUTE_DOORBELL_DRAIN_MS);
     // What the client owned goes now, unless the session closes with it
     // (which releases everything). A client outside the session releases
     // what it still owns (a KFD process its QueryInfo opened).
@@ -2727,7 +2800,7 @@ MacLinuxGPUUserClient::FinishStop(IOService *provider)
     display_slot_put(ivars->displayResults);
     // Its gate's memory goes with it: never in the registry past here.
     if (ivars->doorbellGate) {
-        doorbells_retire(ivars->clientID, "client stop");
+        doorbells_retire(ivars->clientID, "client stop", DEXT_COMPUTE_DOORBELL_DRAIN_MS);
         ivars->doorbellGate->release();
         ivars->doorbellGate = nullptr;
         ivars->doorbellGateCPU = nullptr;
@@ -3297,6 +3370,78 @@ static kern_return_t lx_copy_memory(MacLinuxGPUUserClient *client, uint64_t type
 
 static bool client_memory_put(MacLinuxGPUUserClient *client, uint64_t handle, uint64_t type,
                               IOMemoryDescriptor *descriptor);
+// On the owner's queue: the client's gate (doorbell_gate.h), a page the
+// client maps, made once; published by the caller.
+static kern_return_t client_gate(MacLinuxGPUUserClient *client)
+{
+    auto *iv = client->ivars;
+    if (iv->doorbellGate) return kIOReturnSuccess;
+    IOBufferMemoryDescriptor *buffer = nullptr;
+    kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, MLG_DOORBELL_GATE_BYTES,
+                                                         MLG_DOORBELL_GATE_BYTES, &buffer);
+    IOAddressSegment range = {};
+    if (ret == kIOReturnSuccess && buffer) ret = buffer->SetLength(MLG_DOORBELL_GATE_BYTES);
+    if (ret == kIOReturnSuccess && buffer) ret = buffer->GetAddressRange(&range);
+    if (ret != kIOReturnSuccess || !buffer || !range.address || range.length < MLG_DOORBELL_GATE_BYTES) {
+        if (buffer) buffer->release();
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    auto *gate = reinterpret_cast<struct mlg_doorbell_gate *>(range.address);
+    memset(gate, 0, MLG_DOORBELL_GATE_BYTES);
+    gate->magic = MLG_DOORBELL_GATE_MAGIC;
+    buffer->retain();
+    if (!client_memory_put(client, 0, MLG_DOORBELL_GATE_MEMORY_TYPE, buffer)) {
+        buffer->release();
+        return kIOReturnNoMemory;
+    }
+    iv->doorbellGate = buffer;
+    iv->doorbellGateCPU = gate;
+    return kIOReturnSuccess;
+}
+
+// On the owner's queue, QueryInfo MLG_QUERY_BAR_WRITES (hdp_flush.h): a KFD
+// client that brackets its stores into the BARs gets its gate, published,
+// the HDP flush page as client memory, and CPU access to hostable VRAM.
+static kern_return_t client_bar_writes(MacLinuxGPUUserClient *client, uint64_t out[MLG_BAR_WRITES_WORDS])
+{
+    auto *iv = client->ivars;
+    struct dext_compute_hdp_flush page = {};
+    if (!s_retainedPCI || s_sessionClosing || iv->sessionGeneration != s_sessionGeneration)
+        return kIOReturnNotOpen;
+    const int r = dext_compute_bar_writes_enable(iv->clientID, &page);
+    if (r) {
+        MACLINUXGPU_EVENT("client %llu: BAR writes refused (%d): %s", iv->clientID, r,
+                          r == -EINVAL_L ? "the device has no HDP flush page this driver can export"
+                                         : "not a KFD compute client");
+        return r == -EINVAL_L ? kIOReturnUnsupported : kIOReturnNotReady;
+    }
+    kern_return_t ret = client_gate(client);
+    if (ret != kIOReturnSuccess) return ret;
+    if (!dext_compute_doorbell_gate_publish(iv->clientID, iv->doorbellGateCPU)) return kIOReturnNoResources;
+    IOMemoryDescriptor *mapped = client_memory_find(client, MLG_HDP_FLUSH_MEMORY_TYPE);
+    if (mapped) mapped->release();
+    else {
+        uint64_t offset = page.bar_offset, length = page.bytes;
+        uint32_t bar = page.bar;
+        BARRanges ranges = {&offset, &length, &bar, 1, 1};
+        IOMemoryDescriptor *descriptor = bar_ranges_descriptor(client, ranges);
+        if (!descriptor) return kIOReturnNoMemory;
+        if (!client_memory_put(client, 0, MLG_HDP_FLUSH_MEMORY_TYPE, descriptor)) return kIOReturnNoMemory;
+    }
+    out[MLG_BAR_WRITES_VERSION_WORD] = MLG_BAR_WRITES_VERSION;
+    out[MLG_BAR_WRITES_PAGE_BYTES] = page.bytes;
+    out[MLG_BAR_WRITES_MEM_FLUSH] = page.mem_flush;
+    out[MLG_BAR_WRITES_REG_FLUSH] = page.reg_flush;
+    out[MLG_BAR_WRITES_BAR] = page.bar;
+    out[MLG_BAR_WRITES_VISIBLE_VRAM] = page.visible_vram;
+    MACLINUXGPU_LOG("client %llu: BAR writes enabled: HDP flush page at BAR%u+%#llx (%llu bytes, "
+                    "MEM_FLUSH +%#x, REG_FLUSH +%#x), CPU-visible VRAM %llu MiB, behind its gate",
+                    iv->clientID, page.bar, (unsigned long long)page.bar_offset,
+                    (unsigned long long)page.bytes, page.mem_flush, page.reg_flush,
+                    (unsigned long long)(page.visible_vram >> 20));
+    return kIOReturnSuccess;
+}
+
 // On the owner's queue, once a KFD queue of the client exists: what the
 // client maps to ring its queues itself (doorbell_gate.h). Its KFD
 // process's doorbell slice, a page of the doorbell BAR with only that
@@ -3314,28 +3459,8 @@ static kern_return_t client_doorbell(MacLinuxGPUUserClient *client, uint64_t han
     if (r == -ENOENT_L) return kIOReturnSuccess;
     if (r || !s_retainedPCI || db.bar > 5 || !db.bytes || db.offset + 8 > db.bytes)
         return kIOReturnNotReady;
-    if (!iv->doorbellGate) {
-        IOBufferMemoryDescriptor *buffer = nullptr;
-        kern_return_t ret = IOBufferMemoryDescriptor::Create(kIOMemoryDirectionInOut, MLG_DOORBELL_GATE_BYTES,
-                                                             MLG_DOORBELL_GATE_BYTES, &buffer);
-        IOAddressSegment range = {};
-        if (ret == kIOReturnSuccess && buffer) ret = buffer->SetLength(MLG_DOORBELL_GATE_BYTES);
-        if (ret == kIOReturnSuccess && buffer) ret = buffer->GetAddressRange(&range);
-        if (ret != kIOReturnSuccess || !buffer || !range.address || range.length < MLG_DOORBELL_GATE_BYTES) {
-            if (buffer) buffer->release();
-            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-        }
-        auto *gate = reinterpret_cast<struct mlg_doorbell_gate *>(range.address);
-        memset(gate, 0, MLG_DOORBELL_GATE_BYTES);
-        gate->magic = MLG_DOORBELL_GATE_MAGIC;
-        buffer->retain();
-        if (!client_memory_put(client, 0, MLG_DOORBELL_GATE_MEMORY_TYPE, buffer)) {
-            buffer->release();
-            return kIOReturnNoMemory;
-        }
-        iv->doorbellGate = buffer;
-        iv->doorbellGateCPU = gate;
-    }
+    const kern_return_t gated = client_gate(client);
+    if (gated != kIOReturnSuccess) return gated;
     if (iv->doorbellBytes != db.bytes || iv->doorbellBar != db.bar || iv->doorbellBarOffset != db.bar_offset) {
         uint8_t memoryIndex = 0, barType = 0;
         uint64_t barSize = 0;
@@ -3389,9 +3514,11 @@ IMPL(MacLinuxGPUUserClient, CopyClientMemoryForType)
     }
     if (ivars->sessionGeneration != __atomic_load_n(&s_sessionGeneration, __ATOMIC_ACQUIRE))
         return kIOReturnNotOpen;
-    if (type >= 0x10000 || type == MLG_DOORBELL_MEMORY_TYPE || type == MLG_DOORBELL_GATE_MEMORY_TYPE) {
-        // BOs, and the doorbell slice and gate made with the client's
-        // first KFD queue (client_doorbell).
+    if (type >= 0x10000 || type == MLG_DOORBELL_MEMORY_TYPE || type == MLG_DOORBELL_GATE_MEMORY_TYPE ||
+        type == MLG_HDP_FLUSH_MEMORY_TYPE) {
+        // BOs, the doorbell slice and gate made with the client's first
+        // KFD queue (client_doorbell), and the HDP flush page and gate of
+        // a client that enabled BAR writes (client_bar_writes).
         IOMemoryDescriptor *descriptor = client_memory_find(this, type);
         if (!descriptor) return kIOReturnBadArgument;
         *options = 0;
@@ -3989,6 +4116,8 @@ static void client_memory_stash(MacLinuxGPUUserClient *client, uint64_t handle, 
     IOMemoryDescriptor *descriptor = nullptr;
     if (located == -EAGAIN_L && size)
         descriptor = copy_bo_ranges_descriptor((uint32_t)type, size);
+    else if (located == -EREMOTE_L && size)
+        descriptor = copy_bo_bar_descriptor(client, (uint32_t)type, size);
     else if (located == 0 && cpu && size)
         descriptor = static_cast<IOMemoryDescriptor *>(dext_dma_copy_descriptor(cpu));
     if (!descriptor) return;  // the mapping then fails (kIOReturnBadArgument)
@@ -5159,6 +5288,19 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnSuccess;
         }
 
+        // BAR writes (hdp_flush.h): the gate, the HDP flush page and CPU
+        // access to hostable VRAM, for a KFD client that brackets them.
+        if (in && arguments->scalarInputCount == 1 && in[0] == MLG_QUERY_BAR_WRITES) {
+            if (!out || arguments->scalarOutputCount < MLG_BAR_WRITES_WORDS)
+                return kIOReturnBadArgument;
+            if (ivars->observer || ivars->linuxFile) return kIOReturnNotPermitted;
+            uint64_t words[MLG_BAR_WRITES_WORDS] = {};
+            const kern_return_t enabled = client_bar_writes(this, words);
+            if (enabled != kIOReturnSuccess) return enabled;
+            memcpy(out, words, sizeof(words));
+            arguments->scalarOutputCount = MLG_BAR_WRITES_WORDS;
+            return kIOReturnSuccess;
+        }
         // The device spec: a structure output (session_state.h), out[0] its size.
         if (in && arguments->scalarInputCount == 1 && in[0] == MLG_QUERY_DEVICE_SPEC) {
             struct mlg_device_spec spec = {};
@@ -5262,9 +5404,16 @@ MacLinuxGPUUserClient::ExternalMethod(uint64_t selector,
             arguments->scalarOutput == nullptr || arguments->scalarOutputCount < 1)
             return kIOReturnBadArgument;
         uint64_t out[2] = {0};
+        // CPU access to hostable VRAM moves the buffer first: GPU work,
+        // which waits for the device to take work again.
+        if (dext_compute_bo_map_needs_device(arguments->scalarInput[0]) &&
+            s_power.state != MLG_POWER_ACTIVE)
+            return kIOReturnOffline;
         int r = dext_compute_bo_map(arguments->scalarInput[0], out);
         if (r == -ENOENT_L) return kIOReturnBadArgument;
         if (r == -ENOTREADY_L) return kIOReturnUnsupported;
+        if (r == -ENOMEM_L) return kIOReturnNoSpace;
+        if (r == -EBUSY_L) return kIOReturnBusy;
         if (r != 0) return kIOReturnBadArgument;
         arguments->scalarOutput[0] = out[0];
         if (arguments->scalarOutputCount >= 2) arguments->scalarOutput[1] = out[1];

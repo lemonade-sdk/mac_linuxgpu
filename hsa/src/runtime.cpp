@@ -296,6 +296,16 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
         if (!properties.timestampFrequency) return HSA_STATUS_ERROR;
         return writeValue(value,properties.timestampFrequency);
     }
+    case HSA_AMD_AGENT_INFO_HDP_FLUSH: {
+        // The HDP flush registers this process maps (KFD's MMIO remap page,
+        // hdp_flush.h), only once it enabled BAR writes: every store it then
+        // makes into the BARs is bracketed under its gate
+        // (mac_hsa_bar_writes_enable). Others store nothing there.
+        if (!agent->connection) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        const auto bar = agent->connection->barWrites();
+        if (!bar.gate || !bar.memFlush || !bar.regFlush) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value, hsa_amd_hdp_flush_t{bar.memFlush, bar.regFlush});
+    }
     case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES:
     case HSA_AMD_AGENT_INFO_SVM_DIRECT_HOST_ACCESS:
         return writeValue(value,false);

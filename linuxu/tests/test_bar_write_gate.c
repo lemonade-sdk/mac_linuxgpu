@@ -168,6 +168,9 @@ int main(void)
 			mlg_doorbell_gates_hold(&gates, round % 2 ? MLG_DOORBELL_HOLD_RESET : MLG_DOORBELL_HOLD_POWER,
 						true, &d);
 			assert(!d.stuck);
+			/* Held, not retired: the client waits for it to open. */
+			for (unsigned i = 0; i < CLIENTS; ++i)
+				assert(!mlg_doorbell_gate_retired(atomic_load(&clients[i].gate)));
 			for (unsigned i = 0; i < CLIENTS; ++i)
 				poison(&clients[i]);
 			quiet_window();
@@ -183,6 +186,8 @@ int main(void)
 			d = drain(1000000000ull);
 			mlg_doorbell_gates_retire(&gates, c->owner, &d);
 			assert(!d.stuck);
+			/* Closed for good: the client stops and retires its mappings. */
+			assert(mlg_doorbell_gate_retired(atomic_load(&c->gate)));
 			poison(c);
 			quiet_window();
 			check_poison(c);
@@ -197,6 +202,8 @@ int main(void)
 			d = drain(1000000000ull);
 			mlg_doorbell_gates_retire(&gates, 0, &d);
 			assert(!d.stuck && mlg_doorbell_gates_count(&gates) == 0);
+			for (unsigned i = 0; i < CLIENTS; ++i)
+				assert(mlg_doorbell_gate_retired(atomic_load(&clients[i].gate)));
 			for (unsigned i = 0; i < CLIENTS; ++i)
 				poison(&clients[i]);
 			quiet_window();

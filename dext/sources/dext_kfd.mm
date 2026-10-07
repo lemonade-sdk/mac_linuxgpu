@@ -181,10 +181,10 @@ int dext_kfd_bo_alloc(dext_kfd_client *c, uint64_t size, uint64_t alignment, uin
                       rt_kfd_bo **out, uint64_t *va)
 {
     struct rt_kfd_bo_info info{};
-    if (!c || !out || !va || (domain != 2 && domain != 3)) return -EINVAL;
-    const bool vram = domain == 3;
+    if (!c || !out || !va || domain < 2 || domain > 4) return -EINVAL;
+    const bool vram = domain != 2;
     int r = rt_kfd_bo_alloc(c->session, size, alignment, vram ? RT_KFD_VRAM : RT_KFD_GTT,
-                            vram ? RT_KFD_PLACE_PRIVATE : RT_KFD_PLACE_WINDOW, out);
+                            domain == 3 ? RT_KFD_PLACE_PRIVATE : RT_KFD_PLACE_WINDOW, out);
     if (!r) r = rt_kfd_bo_info(c->session, *out, &info);
     if (!r) *va = info.va;
     return r;
@@ -212,6 +212,30 @@ int dext_kfd_bo_ranges(dext_kfd_client *c, rt_kfd_bo *bo,
                        int (*fn)(void *, void *, uint64_t), void *arg)
 {
     return c ? rt_kfd_bo_cpu_ranges(c->session, bo, fn, arg) : -EINVAL;
+}
+
+int dext_kfd_bo_make_cpu_visible(dext_kfd_client *c, rt_kfd_bo *bo)
+{
+    return c ? rt_kfd_bo_make_cpu_visible(c->session, bo) : -EINVAL;
+}
+int dext_kfd_bo_bar_ranges(dext_kfd_client *c, rt_kfd_bo *bo,
+                           int (*fn)(void *, uint32_t, uint64_t, uint64_t), void *arg)
+{
+    return c ? rt_kfd_bo_bar_ranges(c->session, bo, fn, arg) : -EINVAL;
+}
+int dext_kfd_hdp_flush(dext_kfd_client *c, struct dext_kfd_hdp_flush *out)
+{
+    struct rt_kfd_hdp_flush page{};
+    if (!c || !c->session || !out) return -EINVAL;
+    const int r = rt_kfd_session_hdp_flush(c->session, &page);
+    if (r) return r;
+    out->bar = page.bar;
+    out->bar_offset = page.bar_offset;
+    out->bytes = page.bytes;
+    out->mem_flush = page.mem_flush;
+    out->reg_flush = page.reg_flush;
+    out->visible_vram = page.visible_vram;
+    return 0;
 }
 
 unsigned int dext_kfd_queue_count(dext_kfd_client *c)

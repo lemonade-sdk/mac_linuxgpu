@@ -26,8 +26,14 @@ struct iokit {
 };
 static struct iokit io = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+/* The driver said the device is gone for this process (struct
+ * mlg_transport's gone). */
+static int device_gone;
+
 static int from_ioreturn(kern_return_t kr)
 {
+	if (kr == kIOReturnNoDevice || kr == kIOReturnNotAttached || kr == MACH_SEND_INVALID_DEST)
+		__atomic_store_n(&device_gone, 1, __ATOMIC_RELEASE);
 	switch (kr) {
 	case kIOReturnSuccess: return 0;
 	case kIOReturnNoMemory:
@@ -572,12 +578,18 @@ static int t_scanout(void *ctx, const struct mlg_lx_scanout *req, struct mlg_lx_
 	return 0;
 }
 
+static int t_gone(void *ctx)
+{
+	(void)ctx;
+	return __atomic_load_n(&device_gone, __ATOMIC_ACQUIRE);
+}
+
 int mlg_default_transport(struct mlg_transport *out)
 {
 	*out = (struct mlg_transport){
 		.open = t_open, .close = t_close, .ioctl = t_ioctl,
 		.mmap = t_mmap, .munmap = t_munmap, .identity = t_identity,
-		.scanout = t_scanout,
+		.scanout = t_scanout, .gone = t_gone,
 	};
 	return 0;
 }

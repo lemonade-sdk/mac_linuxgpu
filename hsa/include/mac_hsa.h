@@ -108,6 +108,42 @@ hsa_status_t mac_hsa_memory_allocate_shared(hsa_agent_t agent, size_t size, void
 __attribute__((visibility("default")))
 void mac_hsa_set_host_memory_budget(uint64_t bytes);
 
+// Stores into the GPU's BARs on a client's submission path, as HRX makes them
+// on Linux: kernel arguments written into CPU-visible VRAM, the HDP flush
+// register stored and read back, the doorbell. On this platform a CPU store
+// to a GPU that stopped answering (it powered down, reset, or left the
+// Thunderbolt link) can panic the Mac, so a client that makes them opts in
+// and brackets every submission's stores:
+//
+//   mac_hsa_bar_writes_enable(gpu, &writer);   // once, before querying the agent
+//   ...
+//   if (mac_hsa_bar_write_begin(writer) == HSA_STATUS_SUCCESS) {
+//       ... memcpy into the kernarg ring, HDP store + read back, doorbell ...
+//       mac_hsa_bar_write_end(writer);
+//   }
+//
+// Only after enable does the agent report HSA_AMD_AGENT_INFO_HDP_FLUSH and
+// the CPU agent's access to the GPU's coarse VRAM pool as
+// HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT; hsa_amd_agents_allow_access
+// with a CPU agent then maps a pool allocation for the CPU (write combined,
+// at its own address, pinned in the CPU-visible VRAM window), as ROCr does
+// on a large-BAR device. Enable fails, saying why on stderr, with a driver
+// older than build 265 or a session that is not a KFD process; nothing is
+// enabled then. begin waits while the driver holds the gate for a power
+// transition or a device reset; once the device is gone for this process it
+// retires every mapping of the GPU (later stores land in host memory) and
+// returns kDeviceLostStatus (HSA_STATUS_ERROR_FATAL) without opening a
+// bracket: do not call end then. Brackets nest; the runtime's own doorbell
+// is a nested one. Keep them short: a driver close waits for open brackets
+// (up to a bound), so a bracket should not wait on the GPU or block.
+typedef struct mac_hsa_bar_writer_s mac_hsa_bar_writer_t;
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_bar_writes_enable(hsa_agent_t agent, mac_hsa_bar_writer_t **writer);
+__attribute__((visibility("default")))
+hsa_status_t mac_hsa_bar_write_begin(mac_hsa_bar_writer_t *writer);
+__attribute__((visibility("default")))
+void mac_hsa_bar_write_end(mac_hsa_bar_writer_t *writer);
+
 // What every GPU this runtime opened holds from its driver, and where in the
 // process each buffer was asked for: buffer counts and bytes (VRAM and
 // shared), a VRAM size histogram, and the callers holding the most VRAM with

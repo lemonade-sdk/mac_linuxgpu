@@ -142,6 +142,43 @@ static int r_identity(void *ctx, struct mlg_pci_identity *out)
 	return 0;
 }
 
+/* A device that leaves (struct mlg_transport's gone): its "BAR" is a
+ * shared memory object the client maps; the device sees the other view. */
+static int gone_flag;
+static void *device_view, *client_view;
+static size_t gone_page;
+
+static int g_ioctl(void *ctx, int fd, uint32_t cmd, const void *frame, size_t bytes, void *reply,
+		   size_t cap, size_t *reply_bytes, int64_t *result, int async)
+{
+	if (gone_flag)
+		return -MLG_LX_ENODEV;
+	return r_ioctl(ctx, fd, cmd, frame, bytes, reply, cap, reply_bytes, result, async);
+}
+
+static int g_mmap(void *ctx, int fd, uint64_t offset, uint64_t length, uint32_t prot,
+		  uint32_t flags, void **addr, uint64_t *handle)
+{
+	(void)ctx; (void)fd; (void)offset; (void)prot; (void)flags;
+	CHECK(length <= gone_page);
+	*addr = client_view;
+	*handle = MLG_LX_MMAP_TYPE_BASE;
+	return 0;
+}
+
+static int g_munmap(void *ctx, uint64_t handle, void *addr, uint64_t length)
+{
+	(void)ctx; (void)handle; (void)length;
+	CHECK(addr == client_view);
+	return 0;
+}
+
+static int g_gone(void *ctx)
+{
+	(void)ctx;
+	return gone_flag;
+}
+
 static const struct mlg_transport recording = {
 	.open = r_open, .close = r_close, .ioctl = r_ioctl, .mmap = r_mmap, .munmap = r_munmap,
 	.identity = r_identity,
@@ -432,8 +469,51 @@ int main(void)
 	      id.revision_id == 0x51 && id.bus == 0 && rec.open_dev == MLG_LX_DEV_RENDER);
 	CHECK(rec.cmd == DRM_IOCTL_AMDGPU_INFO && rec.closed == rec.next_fd - 1);
 	CHECK(mlg_drm_set_transport(NULL) == 0);
+	{
+		/* The device goes: every mapping is retired, so a store through
+		 * one lands in host memory and a load reads zero. */
+		struct mlg_transport leaving = recording;
+		char name[64];
+		int shm, fd;
+		volatile uint8_t *mapped;
+
+		leaving.ioctl = g_ioctl;
+		leaving.mmap = g_mmap;
+		leaving.munmap = g_munmap;
+		leaving.gone = g_gone;
+		gone_page = (size_t)getpagesize();
+		snprintf(name, sizeof(name), "/mlg-gone-%d", (int)getpid());
+		shm = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+		CHECK(shm >= 0 && !shm_unlink(name) && !ftruncate(shm, (off_t)gone_page));
+		device_view = mmap(NULL, gone_page, PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0);
+		client_view = mmap(NULL, gone_page, PROT_READ | PROT_WRITE, MAP_SHARED, shm, 0);
+		CHECK(device_view != MAP_FAILED && client_view != MAP_FAILED);
+		close(shm);
+		CHECK(mlg_drm_set_transport(&leaving) == 0);
+		fd = mlg_open("/dev/dri/renderD128", O_RDWR);
+		CHECK(fd >= 0);
+		mapped = mlg_mmap(NULL, gone_page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		CHECK(mapped == client_view);
+		mapped[0] = 0x11;
+		CHECK(((volatile uint8_t *)device_view)[0] == 0x11);	/* reaches the device */
+		rec.result = 0;
+		CHECK(mlg_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close){ .handle = 1 }) == 0);
+		CHECK(mapped[0] == 0x11);	/* not gone: nothing retired */
+		gone_flag = 1;
+		CHECK(mlg_ioctl(fd, DRM_IOCTL_GEM_CLOSE, &(struct drm_gem_close){ .handle = 1 }) == -1 &&
+		      errno == ENODEV);
+		CHECK(mapped[0] == 0);	/* host memory now */
+		mapped[0] = 0x22;
+		CHECK(((volatile uint8_t *)device_view)[0] == 0x11);	/* never reaches the device */
+		CHECK(mlg_munmap((void *)mapped, gone_page) == 0);
+		CHECK(mlg_close(fd) == 0);
+		CHECK(mlg_drm_set_transport(NULL) == 0);
+		munmap(device_view, gone_page);
+		munmap(client_view, gone_page);
+		gone_flag = 0;
+	}
 	puts("PASS libmlg_drm: Linux request numbers and structures, BSD conversion, errnos, "
 	     "paths and flags, nested request memory, waits and deadlines, replies, mmap, "
-	     "table encodings, PCI identity");
+	     "table encodings, PCI identity, mappings retired once the device is gone");
 	return 0;
 }

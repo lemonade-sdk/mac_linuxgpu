@@ -153,7 +153,8 @@ struct rt_kfd_bo_info {
 /* ALLOC_MEMORY_OF_GPU at a VA the session chooses in @place, then
  * MAP_MEMORY_TO_GPU on the session's device. @alignment is a power of two
  * (0: the page size). GTT is coherent host memory; VRAM is device-local and
- * never CPU-mapped (small BAR). */
+ * not CPU-mapped (small BAR) until rt_kfd_bo_make_cpu_visible. VRAM placed
+ * in the window has a VA the client may later map at. */
 int rt_kfd_bo_alloc(struct rt_kfd_session *s, uint64_t size, uint64_t alignment,
 		    enum rt_kfd_domain domain, enum rt_kfd_place place,
 		    struct rt_kfd_bo **out);
@@ -171,6 +172,55 @@ int rt_kfd_bo_write(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
 int rt_kfd_bo_copy(struct rt_kfd_session *s, struct rt_kfd_bo *src,
 		   uint64_t src_offset, struct rt_kfd_bo *dst,
 		   uint64_t dst_offset, uint64_t bytes);
+/* CPU access to a VRAM BO placed in the window, as ROCr grants it with
+ * hsa_amd_agents_allow_access on a large-BAR device: the BO moves into the
+ * CPU-visible part of VRAM (the BAR window) and is pinned there until it is
+ * freed, so its bus ranges stay what rt_kfd_bo_bar_ranges reports. KFD
+ * refuses PUBLIC VRAM on a small BAR, and an unpinned BO's CPU mapping would
+ * go stale when TTM moves it, so the session pins it itself: it unmaps the
+ * BO from the GPU (UNMAP_MEMORY_FROM_GPU), takes it off the process's
+ * eviction fence (as KFD does for the BOs it kmaps), pins it with
+ * CPU_ACCESS_REQUIRED, waits for the move, and maps it again at the same VA
+ * (MAP_MEMORY_TO_GPU), so its page tables follow the move. Its contents are
+ * kept. -ENOSPC when the CPU-visible window has no room, -EBUSY while a queue
+ * uses the BO; idempotent. */
+int rt_kfd_bo_make_cpu_visible(struct rt_kfd_session *s, struct rt_kfd_bo *bo);
+/* The BAR ranges backing a BO made CPU-visible, in BO order: which BAR, the
+ * byte offset in it and the length (whole pages). @fn returning nonzero
+ * stops the walk with that value. -EINVAL for any other BO. */
+int rt_kfd_bo_bar_ranges(struct rt_kfd_session *s, struct rt_kfd_bo *bo,
+			 int (*fn)(void *arg, uint32_t bar, uint64_t offset, uint64_t bytes),
+			 void *arg);
+
+/* The device's HDP flush page, KFD's MMIO remap page: the 4 KiB page of the
+ * register BAR the NBIO remaps HDP_MEM_FLUSH_CNTL and HDP_REG_FLUSH_CNTL
+ * into (offsets KFD_MMIO_REMAP_HDP_MEM_FLUSH_CNTL and _REG_FLUSH_CNTL),
+ * which ROCr gets through KFD's MMIO mmap and reports as
+ * HSA_AMD_AGENT_INFO_HDP_FLUSH. A store there flushes HDP, so stores into
+ * VRAM through the BAR reach memory before the GPU reads it. A client maps
+ * whole host pages: @bar_offset is the host page that holds the remap page,
+ * @bytes one host page, @mem_flush and @reg_flush the registers' byte
+ * offsets in it. KFD's own mmap refuses host pages over 4 KiB; with them the
+ * rest of the host page is register space too, so the session checks that
+ * no register block of the device (IP discovery's base addresses) starts
+ * there besides the remap page and refuses with -EPERM if one does.
+ * -ENODEV when the device has no remap page. */
+struct rt_kfd_hdp_flush {
+	uint32_t bar;
+	uint64_t bar_offset;
+	uint64_t bytes;
+	uint32_t mem_flush;
+	uint32_t reg_flush;
+	uint64_t visible_vram;	/* the CPU-visible VRAM window's size */
+};
+int rt_kfd_session_hdp_flush(struct rt_kfd_session *s, struct rt_kfd_hdp_flush *out);
+/* Whether the register blocks at dword base addresses @bases[0..@count)
+ * leave the host page [@page, @page + @page_bytes) of the register BAR to
+ * the 4 KiB remap page at @hole (byte offsets): no base lies in the page
+ * outside [@hole, @hole + 4096). Exposed for the host test. */
+int rt_kfd_hdp_page_exclusive(const uint32_t *bases, unsigned int count, uint64_t page,
+			      uint64_t page_bytes, uint64_t hole);
+
 /* Walk the host pages backing a GTT BO as maximal CPU-contiguous runs, in
  * BO order; @fn returning nonzero stops the walk with that value. The pages
  * stay valid until rt_kfd_bo_free. -EINVAL for VRAM. */
