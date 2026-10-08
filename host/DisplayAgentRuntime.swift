@@ -538,9 +538,16 @@ private final class MirroredDisplay: NSObject, SCStreamOutput, SCStreamDelegate 
             guard width == mode.width, height == mode.height else { return } // a frame of the old mode
             IOSurfaceLock(surface, .readOnly, nil)
             let importStart = uptimeNs()
-            let (kr, status, h) = observer.displayImport(base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
+            var (kr, status, h) = (kIOReturnBusy, Int64(0), UInt32(0))
+            // kIOReturnBusy: another op holds the display gate (a STATUS or
+            // PROBE, queued behind other clients' work on the driver's wait
+            // pool); asked again for up to 2 s.
+            for attempt in 0..<400 where kr == kIOReturnBusy {
+                if attempt > 0 { usleep(5_000) }
+                (kr, status, h) = observer.displayImport(base: UnsafeRawPointer(IOSurfaceGetBaseAddress(surface)),
                                                          length: IOSurfaceGetAllocSize(surface), width: width,
                                                          height: height, pitch: IOSurfaceGetBytesPerRow(surface))
+            }
             IOSurfaceUnlock(surface, .readOnly, nil)
             guard kr == kIOReturnSuccess, status == 0, h != 0 else {
                 failure = kr == kIOReturnSuccess ? "IMPORT of capture surface \(id): \(displayErrno(status))" :
@@ -1186,6 +1193,9 @@ private func mirrorMonitor(observer: MacLinuxGPUHost, options: [String], daemon:
         if daemon && Date().timeIntervalSince(lastHotplugCheck) >= 2 {
             lastHotplugCheck = Date()
             let (kr, _, status) = observer.display(.status)
+            // kIOReturnBusy: another op holds the display gate (the daemon's
+            // own STATUS poll, or this process's IMPORT); the next poll reads.
+            if kr == kIOReturnBusy { continue }
             if kr != kIOReturnSuccess { mirror.failure = callFailure(kr, "STATUS"); break }
             if let status, !status.connectors.contains(where: { $0.name == plan.connector && $0.connected }) {
                 print("display-agent: \(plan.connector) disconnected")
@@ -1527,10 +1537,9 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         let pipe = Pipe()
         child.process.standardOutput = pipe
         child.process.standardError = pipe
-        pipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
+        // The read end closes itself at end of file, after the last line.
+        followOutput(of: pipe) { data in
             DispatchQueue.main.async {
-                guard !data.isEmpty else { return }
                 FileHandle.standardOutput.write(data)
                 child.buffer += String(decoding: data, as: UTF8.self)
                 while let newline = child.buffer.firstIndex(of: "\n") {
@@ -1547,7 +1556,6 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         }
         child.process.terminationHandler = { process in
             DispatchQueue.main.async {
-                pipe.fileHandleForReading.readabilityHandler = nil
                 child.exited = true
                 // 0: the monitor left or it was stopped; 3: no monitor.
                 if process.terminationStatus != 0 && process.terminationStatus != 3 {
@@ -1559,6 +1567,9 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         do {
             try child.process.run()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
             lastErrors[connector] = "could not start the mirroring process: \(error)"
             retryAt[connector] = Date().addingTimeInterval(10)
             return
@@ -1739,7 +1750,8 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
                 lastErrors[connector] = nil
             }
             children[connector] = nil
-            agentLog("display-agent: \(connector): mirroring process ended")
+            agentLog("display-agent: \(connector): mirroring process ended" +
+                     (child.exited ? " (status \(child.process.terminationStatus))" : " (did not stop within 15 s)"))
         }
         for connector in wanted where children[connector] == nil {
             if let at = retryAt[connector], at > Date() { continue }

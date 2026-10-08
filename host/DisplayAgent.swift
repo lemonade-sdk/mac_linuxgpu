@@ -1052,6 +1052,24 @@ func parseAgentLine(_ line: String) -> AgentLine {
     return .other
 }
 
+/// A mirroring process's output as it comes: @onData with each chunk (on
+/// the handle's queue), then, at end of file, the read end is closed and
+/// @onEnd called. At end of file availableData is empty and the handler
+/// would otherwise fire again at once, forever, with the descriptor left
+/// open: a daemon up for a day spun at 170-260% CPU holding 2,556 pipes.
+func followOutput(of pipe: Pipe, onEnd: (() -> Void)? = nil, onData: @escaping (Data) -> Void) {
+    pipe.fileHandleForReading.readabilityHandler = { handle in
+        let data = handle.availableData
+        guard !data.isEmpty else {
+            handle.readabilityHandler = nil
+            try? handle.close()
+            onEnd?()
+            return
+        }
+        onData(data)
+    }
+}
+
 /// The connected monitors to mirror: those with an identity the user has
 /// not turned off. (A monitor without a readable EDID cannot be told apart
 /// across replugs; it is mirrored, under its connector's name.)
