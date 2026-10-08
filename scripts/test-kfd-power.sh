@@ -72,7 +72,7 @@ for source in "${sources[@]}"; do
       -Dkfd_dec_compute_active=upstream_kfd_dec_compute_active
       -Dkfd_debugfs_hang_hws=upstream_kfd_debugfs_hang_hws) ;;
   esac
-  clang "${cflags[@]}" "${extra[@]}" -c "$source" -o "$object" &
+  clang "${cflags[@]}" ${extra[@]+"${extra[@]}"} -c "$source" -o "$object" &
   pids+=($!)
   objects+=("$object")
 done
