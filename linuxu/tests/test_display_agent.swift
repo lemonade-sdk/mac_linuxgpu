@@ -694,3 +694,43 @@ do {
     check(UpgradeHandover.clientsRemain.summary.contains("closes when the last of them quits"))
 }
 print("PASS upgrade handover: ShutdownGPU answers read as closed, closing, waiting for clients, quarantined or refused")
+
+// A mirroring process's output (followOutput): every chunk, then the read
+// end closed at end of file. Before, the handler fired again at once at end
+// of file, forever, and each exited process left its pipe open.
+do {
+    func openDescriptors() -> Int { (try? FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count) ?? -1 }
+    func cpuSeconds() -> Double {
+        var usage = rusage()
+        getrusage(RUSAGE_SELF, &usage)
+        return Double(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) +
+            Double(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) / 1e6
+    }
+    let before = openDescriptors()
+    for i in 0..<20 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/echo")
+        process.arguments = ["line \(i)"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        let lock = NSLock(), ended = DispatchSemaphore(value: 0)
+        var received = Data(), ends = 0
+        followOutput(of: pipe, onEnd: { lock.lock(); ends += 1; lock.unlock(); ended.signal() }) { data in
+            lock.lock(); received.append(data); lock.unlock()
+        }
+        do { try process.run() } catch { check(false, "/bin/echo: \(error)") }
+        process.waitUntilExit()
+        check(ended.wait(timeout: .now() + 5) == .success, "end of file seen")
+        lock.lock()
+        check(String(decoding: received, as: UTF8.self) == "line \(i)\n", "every byte before the end")
+        check(ends == 1, "the end is seen once")
+        lock.unlock()
+    }
+    check(openDescriptors() == before, "no pipe left open: \(before) descriptors before, \(openDescriptors()) after")
+    // Nothing fires once every process has ended.
+    let cpu = cpuSeconds()
+    Thread.sleep(forTimeInterval: 0.5)
+    check(cpuSeconds() - cpu < 0.1, "idle after the processes ended")
+}
+print("PASS mirroring process output: every chunk, the read end closed at end of file, no descriptor left, no spin")
