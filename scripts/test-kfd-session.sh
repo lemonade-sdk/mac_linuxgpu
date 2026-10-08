@@ -73,7 +73,7 @@ for source in "${sources[@]}"; do
     # offset, never dereferenced. The kernel builds it without UBSan.
     third_party/linux/drivers/gpu/drm/amd/amdkfd/kfd_events.c) extra=(-fno-sanitize=pointer-overflow) ;;
   esac
-  clang "${cflags[@]}" "${extra[@]}" -c "$source" -o "$object" &
+  clang "${cflags[@]}" ${extra[@]+"${extra[@]}"} -c "$source" -o "$object" &
   pids+=($!)
   objects+=("$object")
 done

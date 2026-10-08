@@ -10,7 +10,7 @@ flags=(-w -std=gnu11 -g -O1 -D__KERNEL__ -include linux/autoconf.h
 for mode in release debug; do
   mode_flags=()
   [ "$mode" = debug ] && mode_flags=(-DDEBUG=1)
-  clang "${flags[@]}" "${mode_flags[@]}" linuxu/tests/test_kmem_release.c \
+  clang "${flags[@]}" ${mode_flags[@]+"${mode_flags[@]}"} linuxu/tests/test_kmem_release.c \
     linuxu/src/kmem/{kmemalloc,kmemcheck}.c linuxu/src/shims/printk.c linuxu/src/spinlock.c \
     -Wl,-dead_strip \
     -o "$test_dir/test_kmem_$mode"

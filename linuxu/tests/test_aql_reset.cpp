@@ -266,7 +266,10 @@ static void concurrency_check()
     for (int round = 0; round < 300; ++round) {
         client_queue a = client_create(64), b = client_create(128);
         for (int i = 0; i < 20; ++i) {
-            meta_of(a)->write_dispatch_id = uint64_t(i) + 1;
+            // The client publishes its write index with a release store, as
+            // the HSA runtime does; the reset thread reads it concurrently.
+            __atomic_store_n(&meta_of(a)->write_dispatch_id, uint64_t(i) + 1,
+                             __ATOMIC_RELEASE);
             const int r = dext_aql_kick(a.q, uint64_t(i));
             assert(r == 0 || r == -19);
         }
