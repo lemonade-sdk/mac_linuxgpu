@@ -33,32 +33,23 @@ Linux/ROCm runs on a Mac with nothing Mac-specific.
 
 ## Performance
 
-**[LemonSeed Engine](https://github.com/Geramy/LSE) 0.5.8, Qwen3.8-27B Q4 (MLX)
-with the Q8 DFlash2 draft and the Q8 MTP head, on an AMD Radeon AI PRO R9700 over
-Thunderbolt 5 (MacBook Pro, Apple M5 Max), driver build 266 with the HSA runtime
-the LSE archive bundles (build 267 provides it system-wide).** Measured from the
-macOS release archive at temperature 0.6 with the defaults (adaptive DFlash2 with
-draft trees, adaptive MTP=3, plain without MTP), median of three runs after a
-warm-up, with draft acceptance and mean verify width in parentheses:
+[LemonSeed Engine](https://github.com/Geramy/LSE) 0.5.8 on an AMD Radeon AI PRO R9700 over Thunderbolt 5.
 
-| Decode | DFlash2 | MTP=3 | Plain |
-|---|---:|---:|---:|
-| Code (HumanEval-style, 302 prompt tokens, 640 out) | **159.4 tok/s** (98%, 8.42) | 111.9 tok/s (97%, 5.94) | 32.2 tok/s |
-| Essay (32 prompt tokens, 640 out) | 73.8 tok/s (75%, 14.86) | 56.9 tok/s (70%, 3.26) | 32.6 tok/s |
-| 2K prompt (2,406 tokens, 256 out) | 82.1 tok/s (81%, 13.84) | 55.5 tok/s (68%, 4.51) | 32.2 tok/s |
-| 4K prompt (4,786 tokens, 256 out) | 80.8 tok/s (81%, 14.45) | 60.1 tok/s (74%, 4.42) | 31.8 tok/s |
+Prefill, tok/s:
 
-| Prefill (DFlash2 server, warm) | Time to first token | Prefill |
-|---|---:|---:|
-| 1,060 tokens | 0.662 s | **1,601 tok/s** |
-| 2,118 tokens | 1.286 s | **1,646 tok/s** |
-| 4,230 tokens | 2.588 s | **1,634 tok/s** |
-| 33,799 tokens | 24.13 s | 1,401 tok/s |
+| GPU | OS | 256 | 1K | 2K | 4K | 32K |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending | Results pending | Results pending |
+| Radeon AI PRO R9700 | macOS | 1,400 | 1,601 | 1,646 | 1,634 | 1,401 |
 
-Model load with the kernel cache on disk: 5.1 s with DFlash2, 4.9 s with MTP=3,
-4.3 s plain. Server flags: `--pool hrx:0 --batch-size 1024 --ubatch-size 1024
---kv-cache-dtype bf16 --kv-len 262100`, with `LSE_REQUIRE_DEVICE_KERNELS=1`, so no
-operation falls back to the CPU.
+Decode, code prompt, tok/s:
+
+| GPU | OS | Baseline | MTP=3 | DFlash2 |
+| --- | --- | ---: | ---: | ---: |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending |
+| Radeon AI PRO R9700 | macOS | 32.2 | 111.9 | **159.4** |
+
+Model: Qwen3.8-27B, 4-bit (MLX). Draft models: MTP 8-bit, DFlash2 8-bit.
 
 ## What works
 
