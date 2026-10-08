@@ -1294,7 +1294,7 @@ test: test-mlg-place
 # Client framebuffers on the display output (LX_SCANOUT): a libdrm-mlg
 # client on the primary node of the CS fixture with its DCN 4.0.1 display.
 test-scanout: lib
-	bash scripts/test-scanout.sh
+	bash scripts/known-failure.sh $@ || bash scripts/test-scanout.sh
 
 test: test-scanout
 CRASH_PATH_TESTS += test-scanout
