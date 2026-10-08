@@ -182,6 +182,21 @@ HSA_API_EXPORT hsa_status_t hsa_amd_vmem_unmap(void *base, size_t size) {
     std::static_pointer_cast<Mapping>(found->second->backing)->base = nullptr;
     allocations.erase(address); mappings.erase(found); return HSA_STATUS_SUCCESS;
 }
+HSA_API_EXPORT hsa_status_t hsa_amd_vmem_get_access(void *base, hsa_access_permission_t *permissions,
+    hsa_agent_t agentHandle) {
+    std::lock_guard lock(runtimeMutex);
+    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+    if (!permissions) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto agent = findAgent(agentHandle);
+    if (!agent) return HSA_STATUS_ERROR_INVALID_AGENT;
+    const auto found = mappings.find(reinterpret_cast<uintptr_t>(base));
+    if (found == mappings.end()) return HSA_STATUS_ERROR_INVALID_ALLOCATION;
+    // hsa_amd_vmem_set_access grants a GPU agent nothing on this transport
+    // (only HSA_ACCESS_PERMISSION_NONE is accepted for it), so a GPU reads as
+    // having no access; the CPU has what set_access last gave it.
+    *permissions = agent->connection ? HSA_ACCESS_PERMISSION_NONE : found->second->access;
+    return HSA_STATUS_SUCCESS;
+}
 HSA_API_EXPORT hsa_status_t hsa_amd_vmem_set_access(void *base, size_t size,
     const hsa_amd_memory_access_desc_t *descriptors, size_t count) {
     try { reapCopyJobs(); }

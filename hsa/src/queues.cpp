@@ -570,6 +570,68 @@ hsa_status_t hsa_queue_create(hsa_agent_t agent,uint32_t size,hsa_queue_type32_t
     } catch (const std::bad_alloc &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
       catch (const std::system_error &) {return HSA_STATUS_ERROR_OUT_OF_RESOURCES;}
 }
+// The descriptor form of queue creation (descriptor version 1). Each compute
+// descriptor is an hsa_queue_create of queue_size_bytes/64 packets with the
+// descriptor's type, scratch size and error callback; group segment sizing is
+// the default, as the descriptor has no field for it. Placement in device
+// memory, SDMA and AIE engines, cooperative queues, priorities other than
+// normal and partial CU masks are not available on this transport and fail
+// that descriptor with HSA_STATUS_ERROR_INVALID_QUEUE_CREATION. A failed
+// descriptor's queue is NULL; earlier descriptors' queues stay valid, and the
+// first error is returned.
+static bool zeroed(const void *bytes,size_t size) {
+    const auto *p=static_cast<const uint8_t *>(bytes);
+    for (size_t i=0;i<size;++i) if (p[i]) return false;
+    return true;
+}
+static hsa_status_t createQueueFromDescriptor(hsa_agent_t agent,hsa_amd_queue_create_desc_t &desc) {
+    if (desc.version!=HSA_AMD_QUEUE_CREATE_DESC_VERSION || desc.traffic_class ||
+        !zeroed(desc.reserved_header,sizeof(desc.reserved_header)) || !zeroed(desc.reserved,sizeof(desc.reserved)) ||
+        !desc.queue_size_bytes || (desc.queue_size_bytes&(desc.queue_size_bytes-1)) ||
+        desc.priority<HSA_AMD_QUEUE_PRIORITY_LOW || desc.priority>HSA_AMD_QUEUE_PRIORITY_HIGH)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    if (desc.engine_type==HSA_AMD_QUEUE_ENGINE_SDMA || desc.engine_type==HSA_AMD_QUEUE_ENGINE_AIE)
+        return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    if (desc.engine_type!=HSA_AMD_QUEUE_ENGINE_COMPUTE) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    const auto &compute=desc.engine.compute;
+    if (!zeroed(compute.reserved,sizeof(compute.reserved)) ||
+        !zeroed(reinterpret_cast<const uint8_t *>(&desc.engine)+sizeof(compute),sizeof(desc.engine)-sizeof(compute)) ||
+        desc.queue_size_bytes%sizeof(hsa_kernel_dispatch_packet_t) || compute.cu_mask_count%32 ||
+        (compute.cu_mask_count && !compute.cu_mask) ||
+        (compute.type!=HSA_QUEUE_TYPE_MULTI && compute.type!=HSA_QUEUE_TYPE_SINGLE &&
+         compute.type!=HSA_QUEUE_TYPE_COOPERATIVE))
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    if (desc.flags!=HSA_AMD_QUEUE_CREATE_SYSTEM_MEM || compute.type==HSA_QUEUE_TYPE_COOPERATIVE ||
+        desc.priority!=HSA_AMD_QUEUE_PRIORITY_NORMAL)
+        return HSA_STATUS_ERROR_INVALID_QUEUE_CREATION;
+    hsa_queue_t *queue=nullptr;
+    auto status=hsa_queue_create(agent,desc.queue_size_bytes/uint32_t(sizeof(hsa_kernel_dispatch_packet_t)),
+        compute.type,desc.callback,desc.callback_data,compute.private_segment_size,UINT32_MAX,&queue);
+    if (status!=HSA_STATUS_SUCCESS) return status;
+    if (compute.cu_mask_count) {
+        status=hsa_amd_queue_cu_set_mask(queue,compute.cu_mask_count,compute.cu_mask);
+        if (status!=HSA_STATUS_SUCCESS) {
+            hsa_queue_destroy(queue);
+            return status==HSA_STATUS_ERROR_INVALID_QUEUE ? HSA_STATUS_ERROR_INVALID_QUEUE_CREATION : status;
+        }
+    }
+    desc.queue=queue;return HSA_STATUS_SUCCESS;
+}
+HSA_API_EXPORT hsa_status_t hsa_amd_queue_create(hsa_agent_t agent,hsa_amd_queue_create_desc_t *descs,uint32_t count) {
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        if (!findAgent(agent)) return HSA_STATUS_ERROR_INVALID_AGENT;
+    }
+    if (!descs || !count) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+    hsa_status_t first=HSA_STATUS_SUCCESS;
+    for (uint32_t i=0;i<count;++i) {
+        descs[i].queue=nullptr;
+        const auto status=createQueueFromDescriptor(agent,descs[i]);
+        if (status!=HSA_STATUS_SUCCESS && first==HSA_STATUS_SUCCESS) first=status;
+    }
+    return first;
+}
 HSA_API_EXPORT hsa_status_t hsa_amd_profiling_set_profiler_enabled(hsa_queue_t *pointer, int enable) {
     std::shared_ptr<RuntimeQueue> queue;
     {
@@ -625,13 +687,28 @@ hsa_status_t mac_hsa_dispatch_timestamps(const hsa_queue_t *pointer,hsa_signal_t
     return HSA_STATUS_SUCCESS;
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_queue_cu_set_mask(const hsa_queue_t *pointer, uint32_t bits, const uint32_t *mask) {
-    std::lock_guard lock(runtimeMutex);
-    if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
-    if (!queues.contains(pointer)) return HSA_STATUS_ERROR_INVALID_QUEUE;
-    if (bits % 32 || (bits && !mask)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
-    // Software queues have no CU affinity; the initial persistent-queue ABI
-    // also has no synchronized MQD update operation.
-    return HSA_STATUS_ERROR_INVALID_QUEUE;
+    std::shared_ptr<mac_hsa::Connection> connection;
+    {
+        std::lock_guard lock(runtimeMutex);
+        if (!references) return HSA_STATUS_ERROR_NOT_INITIALIZED;
+        const auto found=queues.find(pointer);
+        if (found==queues.end()) return HSA_STATUS_ERROR_INVALID_QUEUE;
+        if (bits % 32 || (bits && !mask)) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        connection=found->second->connection;
+    }
+    // Software queues have no CU affinity, and the persistent-queue ABI has
+    // no synchronized MQD update operation, so no queue can be narrowed to a
+    // subset of the CUs. A mask enabling every CU the device has asks for
+    // what the queue already runs on (ROCr ignores bits past the last CU),
+    // which is what a caller that always states its CU set sends.
+    if (!connection) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    mac_hsa::DeviceProperties device{};
+    const auto status=connection->properties(device);
+    if (status!=HSA_STATUS_SUCCESS) return status;
+    if (!device.computeUnits || bits<device.computeUnits) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    for (uint32_t cu=0;cu<device.computeUnits;++cu)
+        if (!(mask[cu/32]&(1u<<(cu%32)))) return HSA_STATUS_ERROR_INVALID_QUEUE;
+    return HSA_STATUS_SUCCESS;
 }
 HSA_API_EXPORT hsa_status_t hsa_amd_queue_set_priority(hsa_queue_t *pointer, hsa_amd_queue_priority_t priority) {
     std::lock_guard lock(runtimeMutex);

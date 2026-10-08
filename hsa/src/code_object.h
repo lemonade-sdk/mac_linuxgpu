@@ -40,4 +40,9 @@ bool parseCodeObject(std::span<const uint8_t> file, CodeObject &output, const Is
 // The e_flags/EI_ABIVERSION of an AMDHSA ELF header, without parsing further.
 bool codeObjectHeader(std::span<const uint8_t> file, uint32_t &flags, uint8_t &abiVersion);
 bool relocateCodeObject(CodeObject &object, uint64_t gpuAddress);
+// Target IDs compare equal when they differ only in how the triple spells an
+// empty environment: LLVM normalizes amdgcn-amd-amdhsa- and
+// amdgcn-amd-amdhsa-unknown- to the same triple, and toolchains write either
+// (HRX System's prebuilt device library says amdgcn-amd-amdhsa-unknown-).
+bool sameTargetId(const std::string &actual, const std::string &expected);
 }
