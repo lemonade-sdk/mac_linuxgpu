@@ -5,6 +5,12 @@
 #include <map>
 
 namespace mac_hsa {
+bool sameTargetId(const std::string &actual, const std::string &expected) {
+    if (actual == expected) return true;
+    static constexpr std::string_view empty = "amdgcn-amd-amdhsa--", unknown = "amdgcn-amd-amdhsa-unknown-";
+    return expected.starts_with(empty) && actual.starts_with(unknown) &&
+        std::string_view(actual).substr(unknown.size()) == std::string_view(expected).substr(empty.size());
+}
 namespace {
 bool range(uint64_t offset, uint64_t size, uint64_t capacity) {
     return offset <= capacity && size <= capacity - offset;
@@ -114,7 +120,7 @@ bool metadata(std::span<const uint8_t> data, std::vector<KernelMetadata> &kernel
         version->array[1].kind != Value::Integer || version->array[1].integer > 2 ||
         !list || list->kind != Value::Array || list->array.empty()) return false;
     const auto target = root.get("amdhsa.target");
-    if (target && (target->kind != Value::String || target->string != expectedTarget)) return false;
+    if (target && (target->kind != Value::String || !sameTargetId(target->string, expectedTarget))) return false;
     for (const auto &item : list->array) {
         KernelMetadata kernel; uint32_t wave = 0;
         if (!string(item, ".name", kernel.name) || !string(item, ".symbol", kernel.symbol) ||

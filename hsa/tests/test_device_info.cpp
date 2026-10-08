@@ -75,6 +75,16 @@ int main() {
         CHECK(info<uint32_t>(gpu, HSA_AMD_AGENT_INFO_CHIP_ID) == 0x0f0f, "chip id");
         CHECK(info<uint32_t>(gpu, HSA_AMD_AGENT_INFO_ASIC_REVISION) == 0x02, "asic revision");
         CHECK(info<uint32_t>(gpu, HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT) == 104, "compute units");
+        // Queues are consumed by the GPU's own command processor, and the GPU
+        // is a discrete device: no PM4 emulation, no APU memory property.
+        hsa_status_t queried = HSA_STATUS_ERROR;
+        CHECK(!info<bool>(gpu, HSA_AMD_AGENT_INFO_PM4_EMULATION, &queried) && queried == HSA_STATUS_SUCCESS,
+              "AQL queues are not PM4-emulated");
+        uint8_t memoryProperties[8];
+        std::memset(memoryProperties, 0xff, sizeof(memoryProperties));
+        CHECK(hsa_agent_get_info(gpu, hsa_agent_info_t(HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES), memoryProperties) ==
+                  HSA_STATUS_SUCCESS && !(memoryProperties[0] & HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU),
+              "memory properties report a discrete GPU");
         CHECK(info<uint32_t>(gpu, HSA_AGENT_INFO_WAVEFRONT_SIZE) == 64, "wavefront size 64");
         CHECK(info<uint32_t>(gpu, HSA_AMD_AGENT_INFO_NUM_SIMDS_PER_CU) == 4, "SIMDs per CU");
         CHECK(info<uint32_t>(gpu, HSA_AMD_AGENT_INFO_MAX_WAVES_PER_CU) == 32, "max waves per CU = SIMDs x waves/SIMD");

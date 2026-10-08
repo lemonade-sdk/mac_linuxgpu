@@ -217,6 +217,21 @@ int main() {
               "converted protocol has no GC 11 load sequence and loads nothing");
     }
 
+    // Metadata target IDs: an empty triple environment may be spelled
+    // "unknown" (HRX System's prebuilt gfx12-generic device library is), and
+    // nothing else about the ID may differ.
+    CHECK(sameTargetId("amdgcn-amd-amdhsa--gfx12-generic", "amdgcn-amd-amdhsa--gfx12-generic"), "identical target IDs match");
+    CHECK(sameTargetId("amdgcn-amd-amdhsa-unknown-gfx12-generic", "amdgcn-amd-amdhsa--gfx12-generic"),
+          "unknown environment matches an empty one");
+    CHECK(sameTargetId("amdgcn-amd-amdhsa-unknown-gfx90a:xnack-", "amdgcn-amd-amdhsa--gfx90a:xnack-"),
+          "unknown environment matches with feature suffixes");
+    CHECK(!sameTargetId("amdgcn-amd-amdhsa-unknown-gfx11-generic", "amdgcn-amd-amdhsa--gfx12-generic"),
+          "a different processor does not match");
+    CHECK(!sameTargetId("amdgcn-amd-amdhsa-gnu-gfx12-generic", "amdgcn-amd-amdhsa--gfx12-generic"),
+          "a named environment does not match");
+    CHECK(!sameTargetId("amdgcn-amd-amdhsa-unknown-gfx90a:xnack+", "amdgcn-amd-amdhsa--gfx90a:xnack-"),
+          "a different feature does not match");
+
     std::fprintf(stderr, "\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
 }

@@ -309,6 +309,19 @@ hsa_status_t hsa_agent_get_info(hsa_agent_t handle, hsa_agent_info_t attribute, 
     case HSA_AMD_AGENT_INFO_COOPERATIVE_QUEUES:
     case HSA_AMD_AGENT_INFO_SVM_DIRECT_HOST_ACCESS:
         return writeValue(value,false);
+    case HSA_AMD_AGENT_INFO_MEMORY_PROPERTIES: {
+        // An 8-byte flag set (hsa_amd_memory_property_agent_t bits). A GPU
+        // behind this transport is a discrete device with its own VRAM, so
+        // none is set: in particular not HSA_AMD_MEMORY_PROPERTY_AGENT_IS_APU.
+        if (!agent->connection) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        std::memset(value, 0, 8);
+        return HSA_STATUS_SUCCESS;
+    }
+    case HSA_AMD_AGENT_INFO_PM4_EMULATION:
+        // The GPU's command processor consumes these AQL queues itself; no
+        // host translates AQL packets into PM4. A CPU agent has no queues.
+        if (!agent->connection) return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        return writeValue(value,false);
     case HSA_AGENT_INFO_DEFAULT_FLOAT_ROUNDING_MODE:
         return writeValue(value,HSA_DEFAULT_FLOAT_ROUNDING_MODE_NEAR);
     // The deprecated agent-level ISA attributes answer for the agent's first
