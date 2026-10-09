@@ -39,14 +39,14 @@ Prefill, tok/s:
 
 | GPU | OS | 256 | 1K | 2K | 4K | 32K |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending | Results pending | Results pending |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | 1,246 | 1,576 | 1,642 | 1,636 | 1,395 |
 | Radeon AI PRO R9700 | macOS | 1,400 | 1,601 | 1,646 | 1,634 | 1,401 |
 
 Decode, code prompt, tok/s:
 
 | GPU | OS | Baseline | MTP=3 | DFlash2 |
 | --- | --- | ---: | ---: | ---: |
-| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | Results pending | Results pending | Results pending |
+| Radeon AI PRO R9700 | iPadOS (LemonSeed Studio) | 31.2 | 108.7 | **158.5** |
 | Radeon AI PRO R9700 | macOS | 32.2 | 111.9 | **159.4** |
 
 Model: Qwen3.8-27B, 4-bit (MLX). Draft models: MTP 8-bit, DFlash2 8-bit.
