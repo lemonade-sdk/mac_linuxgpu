@@ -734,3 +734,18 @@ do {
     check(cpuSeconds() - cpu < 0.1, "idle after the processes ended")
 }
 print("PASS mirroring process output: every chunk, the read end closed at end of file, no descriptor left, no spin")
+
+// A mirroring process that keeps failing: 10 s, doubling, at most 5 min;
+// starts over after a success.
+do {
+    var backoff = MirrorRetryBackoff()
+    let delays = (0..<8).map { _ in backoff.failed() }
+    check(delays == [10, 20, 40, 80, 160, 300, 300, 300], "delays \(delays)")
+    check(backoff.failures == 8)
+    backoff.reset()
+    check(backoff.failures == 0 && backoff.failed() == 10, "a success starts over")
+    var many = MirrorRetryBackoff()
+    for _ in 0..<10_000 { _ = many.failed() }
+    check(many.failed() == 300, "capped however long it fails")
+}
+print("PASS mirror retry backoff: 10 s doubling to 5 min, reset on success")

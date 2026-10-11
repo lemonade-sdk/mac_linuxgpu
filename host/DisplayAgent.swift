@@ -971,6 +971,28 @@ enum ResetAction: Equatable {
     }
 }
 
+/// How long the daemon waits before starting a monitor's mirroring process
+/// again after it ended with an error: 10 s, doubled after each further
+/// failure in a row, at most 5 minutes. A mirror that comes up resets it, as
+/// does the monitor leaving or being turned off. A failure that lasts (a
+/// virtual display the WindowServer refuses while the Mac is locked) then
+/// costs one attempt every 5 minutes, not one every 10 s.
+struct MirrorRetryBackoff: Equatable {
+    static let initial: TimeInterval = 10
+    static let maximum: TimeInterval = 300
+    private(set) var failures = 0
+
+    /// The delay before the next attempt, after one more failure.
+    mutating func failed() -> TimeInterval {
+        failures += 1
+        var delay = MirrorRetryBackoff.initial
+        for _ in 1..<failures where delay < MirrorRetryBackoff.maximum { delay *= 2 }
+        return min(delay, MirrorRetryBackoff.maximum)
+    }
+
+    mutating func reset() { failures = 0 }
+}
+
 /// What the daemon reports for the menu bar.
 struct DisplayStatus: Codable, Equatable {
     enum State: String, Codable { case off, starting, mirroring, error }

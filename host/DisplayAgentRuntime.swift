@@ -1482,6 +1482,7 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
 
     var children: [String: MirrorChild] = [:]
     var retryAt: [String: Date] = [:]
+    var backoff: [String: MirrorRetryBackoff] = [:]
     var lastErrors: [String: String] = [:]
     var monitors: [(connector: String, key: String, name: String)] = []
     var published: DisplayStatus?
@@ -1673,12 +1674,14 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
                 for child in children.values { stop(child) }
                 children = [:]
                 retryAt = [:]
+                backoff = [:]
                 lastErrors = [:]
                 restartNowUntil = Date().addingTimeInterval(15)
             case .restartEnded:
                 agentLog("display-agent: GPU queue reset (generation \(reset.generation), \(reset.queueResets) in all); " +
                          "the outputs redraw, and a mirror that ended starts again now")
                 retryAt = [:]
+                backoff = [:]
                 restartNowUntil = Date().addingTimeInterval(15)
             case .none:
                 break
@@ -1741,11 +1744,22 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
         }
         // Reconcile the children with the choices and the monitors.
         let wanted = Set(connectorsToMirror(connected: monitors.map { ($0.connector, $0.key) }, prefs: prefs))
+        // A mirror that came up starts its connector's backoff over.
+        for (connector, child) in children where child.state == .mirroring { backoff[connector] = nil }
         for (connector, child) in children where child.exited || !wanted.contains(connector) {
             if !child.exited { stop(child) }
             if child.state == .error, let error = child.lastError {
                 lastErrors[connector] = error
-                retryAt[connector] = Date() < restartNowUntil ? nil : Date().addingTimeInterval(10)
+                if Date() < restartNowUntil {
+                    retryAt[connector] = nil
+                } else {
+                    var steps = backoff[connector] ?? MirrorRetryBackoff()
+                    let delay = steps.failed()
+                    backoff[connector] = steps
+                    retryAt[connector] = Date().addingTimeInterval(delay)
+                    agentLog("display-agent: \(connector): mirroring failed \(steps.failures) time(s) in a row; " +
+                             "next attempt in \(Int(delay)) s")
+                }
             } else {
                 lastErrors[connector] = nil
             }
@@ -1759,6 +1773,11 @@ func runDisplayAgentDaemon(_ options: [String]) -> Int32 {
             start(connector)
         }
         for connector in Array(lastErrors.keys) where !wanted.contains(connector) { lastErrors[connector] = nil }
+        // A monitor that left or was turned off starts over when it is back.
+        for connector in Array(backoff.keys) where !wanted.contains(connector) {
+            backoff[connector] = nil
+            retryAt[connector] = nil
+        }
         publish()
         _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(2))
     }
