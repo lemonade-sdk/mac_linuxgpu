@@ -16,6 +16,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/sysinfo.h>
+#include <linux/delay.h>
 #include <linux/dma-fence.h>
 #include <linux/jiffies.h>
 #include <uapi/linux/kfd_ioctl.h>
@@ -74,6 +75,11 @@
  * timeout before it keeps the memory the copy may still touch. */
 #ifndef RT_KFD_SETTLE_MS
 #define RT_KFD_SETTLE_MS	RT_KFD_COPY_TIMEOUT_MS
+#endif
+/* How long a VRAM allocation waits for freed buffers to leave the VRAM
+ * manager (vram_fits_settled) before it is refused. */
+#ifndef RT_KFD_PENDING_FREE_MS
+#define RT_KFD_PENDING_FREE_MS	RT_KFD_COPY_TIMEOUT_MS
 #endif
 
 struct va_range {
@@ -863,9 +869,50 @@ static int unmap_and_free(struct rt_kfd_session *s, uint64_t handle)
 	return (int)r;
 }
 
+/* VRAM still counted by the VRAM manager for buffers already freed: TTM's
+ * delayed delete (ttm_bo_release, bo->deleted) holds a freed buffer's memory
+ * until its fences retire, and every freed KFD VRAM buffer has one, the
+ * SDMA fill of AMDGPU_GEM_CREATE_VRAM_WIPE_ON_RELEASE (measured at about
+ * 12 ms per GB on an R9700). Caller holds the LRU lock. A freed buffer that
+ * was pinned is on the manager's LRU too (ttm_bo_release moves it there). */
+static uint64_t vram_pending_free_locked(struct ttm_resource_manager *man)
+{
+	uint64_t bytes = 0;
+
+	for (unsigned int i = 0; i < TTM_MAX_BO_PRIORITY; i++) {
+		struct ttm_lru_item *lru;
+
+		list_for_each_entry(lru, &man->lru[i], link) {
+			struct ttm_resource *res;
+
+			if (!ttm_lru_item_is_res(lru))
+				continue;
+			res = ttm_lru_item_to_res(lru);
+			if (res->bo && res->bo->deleted)
+				bytes += res->size;
+		}
+	}
+	return bytes;
+}
+
+static uint64_t vram_pending_free(struct amdgpu_device *adev)
+{
+	struct ttm_resource_manager *man = &adev->mman.vram_mgr.manager;
+	uint64_t bytes;
+
+	if (!man->size)
+		return 0;
+	spin_lock(&adev->mman.bdev.lru_lock);
+	bytes = vram_pending_free_locked(man);
+	spin_unlock(&adev->mman.bdev.lru_lock);
+	return bytes;
+}
+
 /* KFD reports why an allocation was refused only at debug level. Say what
  * was asked and what KFD's own limits stood at: its VRAM accounting (used,
- * pinned, available) and the system RAM its system limit derives from. */
+ * pinned, available), the VRAM manager's use and how much of it is freed
+ * buffers not yet released, and the system RAM its system limit derives
+ * from. */
 static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
 				 enum rt_kfd_domain domain, long r)
 {
@@ -875,7 +922,8 @@ static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
 	memset(&info, 0, sizeof(info));
 	si_meminfo(&info);
 	pr_warn("kfd session: %s %llu bytes refused (%ld%s); KFD VRAM used %lld "
-		"pinned %lld available %zu of %llu; VRAM manager used %llu of %llu; RAM %llu\n",
+		"pinned %lld available %zu of %llu; VRAM manager used %llu of %llu "
+		"(%llu freed, still releasing); RAM %llu\n",
 		domain == RT_KFD_VRAM ? "VRAM" : "GTT", (unsigned long long)size, r,
 		r == -ENOSPC ? ": would evict, VRAM manager full" : "",
 		(long long)adev->kfd.vram_used[0], (long long)atomic64_read(&adev->vram_pin_size),
@@ -883,6 +931,7 @@ static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
 		(unsigned long long)adev->gmc.real_vram_size,
 		(unsigned long long)adev->mman.vram_mgr.manager.usage,
 		(unsigned long long)adev->mman.vram_mgr.manager.size,
+		(unsigned long long)vram_pending_free(adev),
 		(unsigned long long)info.totalram * (info.mem_unit ? info.mem_unit : 1));
 }
 
@@ -897,19 +946,56 @@ static void report_alloc_failure(struct rt_kfd_session *s, uint64_t size,
  * a device behind a narrow, BAR-limited link that move is what hangs the
  * copy engine and loses the device. Refusing here keeps an allocation that
  * does not fit an allocation failure. A manager that reports no size (not
- * initialized) is not checked. */
-static bool vram_fits(struct amdgpu_device *adev, uint64_t size)
+ * initialized) is not checked.
+ *
+ * Buffers already freed count until TTM releases them (vram_pending_free);
+ * @pending, when not NULL, gets how much that is when the allocation does
+ * not fit as things stand, and @fits_after whether it would fit once they
+ * are released. */
+static bool vram_fits(struct amdgpu_device *adev, uint64_t size, uint64_t *pending,
+		      bool *fits_after)
 {
 	struct ttm_resource_manager *man = &adev->mman.vram_mgr.manager;
-	uint64_t used;
+	uint64_t used, freed = 0;
+	bool fits;
 
 	if (!man->size)
 		return true;
 	spin_lock(&adev->mman.bdev.lru_lock);
 	used = man->usage;
-	spin_unlock(&adev->mman.bdev.lru_lock);
-	return used <= man->size && size <= man->size - used &&
+	fits = used <= man->size && size <= man->size - used &&
 	       man->size - used - size >= RT_KFD_VRAM_HEADROOM;
+	if (!fits && pending)
+		freed = vram_pending_free_locked(man);
+	spin_unlock(&adev->mman.bdev.lru_lock);
+	if (!fits && pending) {
+		*pending = freed;
+		used -= freed < used ? freed : used;
+		*fits_after = used <= man->size && size <= man->size - used &&
+			      man->size - used - size >= RT_KFD_VRAM_HEADROOM;
+	}
+	return fits;
+}
+
+/* vram_fits, after waiting for freed buffers it needs to leave the VRAM
+ * manager. A runtime that trims its caches when short of memory frees
+ * buffers and asks for the new one at once, before their wipe retires; the
+ * manager still counts them. Upstream TTM waits for such buffers when it
+ * evicts (ttm_bo_evict_cb: bo->deleted), so on Linux that allocation
+ * succeeds; here it would be refused. Wait while what is pending would make
+ * room, bounded by RT_KFD_PENDING_FREE_MS; never when it could not. */
+static bool vram_fits_settled(struct amdgpu_device *adev, uint64_t size)
+{
+	const unsigned long deadline = jiffies + msecs_to_jiffies(RT_KFD_PENDING_FREE_MS);
+	uint64_t pending = 0;
+	bool fits_after = false;
+
+	while (!vram_fits(adev, size, &pending, &fits_after)) {
+		if (!pending || !fits_after || time_after(jiffies, deadline))
+			return false;
+		msleep(1);
+	}
+	return true;
 }
 
 /* Caller holds s->lock and is inside the process. */
@@ -953,7 +1039,7 @@ static int bo_alloc_locked(struct rt_kfd_session *s, uint64_t size, uint64_t ali
 	/* libhsakmt's flags: device-local VRAM, or coherent non-paged system
 	 * memory (fine-grained, shared with the host). Both executable, as
 	 * code objects and signal kernels run from them. */
-	if (domain == RT_KFD_VRAM && !vram_fits(s->adev, size)) {
+	if (domain == RT_KFD_VRAM && !vram_fits_settled(s->adev, size)) {
 		report_alloc_failure(s, size, domain, -ENOSPC);
 		va_free(region, va);
 		kfree(bo);

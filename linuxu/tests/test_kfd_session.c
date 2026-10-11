@@ -32,6 +32,11 @@
 #include "kfd_topology.h"
 #include "kfd_session_fixture.h"
 
+/* kfd_session.c's wait for freed VRAM, as the test script builds it. */
+#ifndef RT_KFD_PENDING_FREE_MS
+#define RT_KFD_PENDING_FREE_MS	RT_KFD_COPY_TIMEOUT_MS
+#endif
+
 /* The context-save header of queue @set, read back through KFD's BO. */
 struct queue_set {
 	struct rt_kfd_bo *ring, *meta;
@@ -63,6 +68,49 @@ static void make_queue(struct rt_kfd_session *s, struct queue_set *set, uint32_t
 }
 
 struct range_count { unsigned int runs; uint64_t bytes; };
+/* A freed buffer TTM has not released yet (its wipe still running), and
+ * TTM's delayed delete releasing it after @delay_ms. */
+struct pending_free {
+	struct amdgpu_device *adev;
+	struct ttm_buffer_object bo;
+	struct ttm_resource res;
+	unsigned int delay_ms;
+};
+
+static void pending_free_add(struct pending_free *p, struct amdgpu_device *adev, uint64_t size)
+{
+	memset(p, 0, sizeof(*p));
+	p->adev = adev;
+	p->bo.deleted = true;
+	p->res.bo = &p->bo;
+	p->res.size = size;
+	ttm_lru_item_init(&p->res.lru, TTM_LRU_RESOURCE);
+	spin_lock(&adev->mman.bdev.lru_lock);
+	list_add_tail(&p->res.lru.link, &adev->mman.vram_mgr.manager.lru[0]);
+	spin_unlock(&adev->mman.bdev.lru_lock);
+}
+
+static void *pending_free_release(void *arg)
+{
+	struct pending_free *p = arg;
+	struct ttm_resource_manager *man = &p->adev->mman.vram_mgr.manager;
+
+	usleep(p->delay_ms * 1000);
+	spin_lock(&p->adev->mman.bdev.lru_lock);
+	list_del_init(&p->res.lru.link);
+	man->usage -= p->res.size;
+	spin_unlock(&p->adev->mman.bdev.lru_lock);
+	return NULL;
+}
+
+static uint64_t monotonic_ms(void)
+{
+	struct timespec t;
+
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return (uint64_t)t.tv_sec * 1000 + (uint64_t)t.tv_nsec / 1000000;
+}
+
 static int count_range(void *arg, void *cpu, uint64_t bytes)
 {
 	struct range_count *c = arg;
@@ -781,6 +829,8 @@ int main(void)
 		struct rt_kfd_bo *tight = NULL;
 
 		spin_lock_init(&adev->mman.bdev.lru_lock);
+		for (unsigned int i = 0; i < TTM_MAX_BO_PRIORITY; i++)
+			INIT_LIST_HEAD(&man->lru[i]);
 		man->size = TEST_VRAM_BYTES;
 		man->usage = TEST_VRAM_BYTES - (160ULL << 20);
 		assert(rt_kfd_bo_alloc(s, 64ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE, &tight) == -ENOMEM);
@@ -788,6 +838,36 @@ int main(void)
 		assert(!rt_kfd_bo_alloc(s, 16ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE, &tight) && tight);
 		assert(kgd_allocs == 3);
 		assert(!rt_kfd_bo_free(s, tight));
+		tight = NULL;
+
+		/* 64 MiB of that use is a buffer freed but not yet released
+		 * (TTM's delayed delete waits for its wipe). */
+		{
+			struct pending_free freed;
+			pthread_t releaser;
+			uint64_t start;
+
+			pending_free_add(&freed, adev, 64ULL << 20);
+			/* Room even once it is released? No: refused at once. */
+			start = monotonic_ms();
+			assert(rt_kfd_bo_alloc(s, 1ULL << 30, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE,
+					       &tight) == -ENOMEM);
+			assert(!tight && kgd_allocs == 3 && monotonic_ms() - start < RT_KFD_PENDING_FREE_MS);
+			/* Room once it is released, which never comes: refused after
+			 * the wait. */
+			start = monotonic_ms();
+			assert(rt_kfd_bo_alloc(s, 64ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE,
+					       &tight) == -ENOMEM);
+			assert(!tight && kgd_allocs == 3 && monotonic_ms() - start + 1 >= RT_KFD_PENDING_FREE_MS);
+			/* Released while the allocation waits: it succeeds. */
+			freed.delay_ms = 20;
+			assert(!pthread_create(&releaser, NULL, pending_free_release, &freed));
+			assert(!rt_kfd_bo_alloc(s, 64ULL << 20, 0, RT_KFD_VRAM, RT_KFD_PLACE_PRIVATE,
+						&tight) && tight);
+			assert(!pthread_join(releaser, NULL));
+			assert(kgd_allocs == 4 && list_empty(&man->lru[0]));
+			assert(!rt_kfd_bo_free(s, tight));
+		}
 		man->size = 0;
 		man->usage = 0;
 	}
